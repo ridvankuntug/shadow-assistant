@@ -1,0 +1,13 @@
+[project]
+name = "whisper-svc"
+version = "0.1.0"
+description = "Turkish speech-to-text HTTP service (faster-whisper) for Shadow Assistant"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "integration: needs the real model and a GPU (opt-in, see scripts/)",
+]

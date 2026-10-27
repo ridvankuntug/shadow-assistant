@@ -1,0 +1,5 @@
+# Runtime dependencies (all platforms). Tested with the versions noted in README.md.
+faster-whisper>=1.2,<2
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.18

@@ -1,0 +1,5 @@
+# Local (non-Docker) GPU run: CUDA 12 cuBLAS + cuDNN 9 as pip wheels, so no system-wide
+# CUDA Toolkit / cuDNN install is needed. whisper_svc adds their DLL folders on Windows.
+# Not needed inside the Docker image (the CUDA base image ships these libraries).
+nvidia-cublas-cu12>=12.4,<13
+nvidia-cudnn-cu12>=9.1,<10
