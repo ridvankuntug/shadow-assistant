@@ -1,0 +1,21 @@
+# Placeholder compose file for Shadow Assistant.
+# Services are added as components get container images:
+#
+#   core         Node + TypeScript Core (WebSocket API)
+#   ui           static build of ui/ served over HTTP
+#   whisper-svc  speech-to-text (faster-whisper)       - T4
+#   tts-svc      text-to-speech (Piper)                 - T5
+#
+# Secrets and addresses are read from ../.env (see ../.env.example).
+#
+# Example shape (not active):
+#
+# services:
+#   core:
+#     build: ../core
+#     env_file: ../.env
+#     ports:
+#       - "${CORE_PORT}:${CORE_PORT}"
+#     restart: unless-stopped
+
+services: {}
