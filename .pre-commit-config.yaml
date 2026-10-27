@@ -1,0 +1,17 @@
+# Secret scanning before every commit.
+# Setup (once per clone):
+#   python -m pip install --user pre-commit
+#   winget install --id Gitleaks.Gitleaks -e --source winget   (or: scoop install gitleaks / brew install gitleaks)
+#   python -m pre_commit install
+#
+# `gitleaks-system` uses the gitleaks binary on PATH, so no Go toolchain or
+# Docker is required (works on Windows, macOS and Linux).
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks-system
+        # Upstream's gitleaks-system hook omits this; without it pre-commit
+        # appends staged file names and `gitleaks git` fails with
+        # "accepts at most 1 arg(s)".
+        pass_filenames: false

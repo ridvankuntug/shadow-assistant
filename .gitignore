@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+
+# Secrets / local config (keep the example file)
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+
+# Shadow Assistant runtime state
+.shadow-assistant/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Speech models (large binaries, downloaded at runtime)
+*.onnx
+*.onnx.json
+
+# Android
+.gradle/
+local.properties
+*.keystore
+*.jks
+android/**/build/
+android/app/release/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE / editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
