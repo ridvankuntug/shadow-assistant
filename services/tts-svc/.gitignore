@@ -1,0 +1,3 @@
+# Downloaded voice models (default TTS_VOICE_DIR) and partial downloads
+voices/
+*.part

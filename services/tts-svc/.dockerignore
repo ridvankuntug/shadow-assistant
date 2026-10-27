@@ -1,0 +1,10 @@
+.venv/
+venv/
+voices/
+tests/
+scripts/
+**/__pycache__/
+.pytest_cache/
+*.onnx
+*.onnx.json
+*.part

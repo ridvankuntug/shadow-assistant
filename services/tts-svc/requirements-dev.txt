@@ -1,0 +1,5 @@
+# Test dependencies. The unit tests mock the synthesis engine, so piper-tts is not needed for them.
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+pytest>=8
+httpx>=0.27
