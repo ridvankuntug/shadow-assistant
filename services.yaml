@@ -1,0 +1,82 @@
+# Shadow Assistant service registry (read by the Core at startup).
+#
+# This file is committed: never put real hosts, IPs, tokens or device names
+# here. Environment-specific values come from the git-ignored `.env` through
+# `${VAR}` or `${VAR:-default}`. A service whose required variable is missing
+# is disabled with a warning instead of failing startup.
+#
+# Permission levels (see docs/02-core-protocol.md, "Permission gate"):
+#   read     - runs without asking
+#   write    - runs and is recorded in the conversation log
+#   confirm  - pauses the turn until the user approves (button or voice);
+#              no answer within 60 s means "no"
+# Lookup order per tool: exact name, then the first matching glob (file
+# order), then the service `permission` default. `confirm_inputs` can only
+# raise a call to `confirm`. Tools of unknown services always need `confirm`.
+# Tool names below are the MCP server's own names, without the SDK's
+# `mcp__<service>__` prefix.
+
+services:
+  - name: home-assistant
+    kind: mcp
+    # HA's /api/mcp (streamable HTTP) is broken on the current HA version
+    # (chunked header + empty body); the SSE endpoint works.
+    transport: sse
+    url: ${HA_URL}/mcp_server/sse
+    token_env: HA_CORE_TOKEN
+    enabled: true
+    # Any HA tool not listed below needs confirmation (safe default).
+    permission: confirm
+    tools:
+      "homeassistant__GetLiveContext": read
+      "llm__GetDateTime": read
+      "todo__get_items": read
+      "intent__HassTurnOn": write
+      "intent__HassTurnOff": write
+      "light__*": write
+      "fan__*": write
+      "todo__HassList*": write
+      "intent__HassCancelAllTimers": write
+      # Risky device classes always ask, whatever the intent name says.
+      "*Lock*": confirm
+      "*Unlock*": confirm
+      "*Alarm*": confirm
+      "*Garage*": confirm
+      "*Cover*": confirm
+      "*Valve*": confirm
+      # Scripts can do anything; broadcasts speak out loud in the home.
+      "script__*": confirm
+      "assist_satellite__*": confirm
+    # Generic intents (HassTurnOn/Off) also drive locks, alarms and covers:
+    # escalate to confirm when the model targets one of these by argument.
+    # Note: a call that names a device only by `name` cannot be classified
+    # here — do not expose locks/alarms/garage doors to the Core in HA's
+    # "Expose" settings unless confirm-by-name is acceptable.
+    confirm_inputs:
+      domain: [lock, alarm_control_panel, cover, valve, garage_door]
+      device_class: [garage, garage_door, door, gate, lock, window]
+
+  - name: shadow-vault
+    kind: vault
+    # Disabled automatically when SHADOW_VAULT_DIR is not set.
+    enabled: true
+    permission: read
+    # Notes the model may read (relative, forward-slash globs). `Private/`,
+    # dot-folders and anything outside the vault are always refused.
+    allow:
+      - "knowledge/**"
+    max_bytes: 65536
+
+  - name: whisper-svc
+    kind: http
+    url: ${WHISPER_SVC_URL:-http://127.0.0.1:8701}
+    health: /health
+    timeout_ms: 60000
+    enabled: true
+
+  - name: tts-svc
+    kind: http
+    url: ${TTS_SVC_URL:-http://127.0.0.1:8702}
+    health: /health
+    timeout_ms: 30000
+    enabled: true

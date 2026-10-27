@@ -1,0 +1,98 @@
+/** Agent SDK bridge tests — no subprocess, no model call. */
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
+
+const base = mkdtempSync(join(tmpdir(), "shadow-agent-test-"));
+after(() => rmSync(base, { recursive: true, force: true }));
+
+const msg = (m: unknown) => m as SDKMessage;
+const textDelta = (text: string) =>
+  msg({ type: "stream_event", parent_tool_use_id: null, session_id: "s1", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } });
+const blockStart = () =>
+  msg({ type: "stream_event", parent_tool_use_id: null, session_id: "s1", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } });
+
+test("buildOptions locks the model down to MCP tools only", () => {
+  const runner = new SdkAgentRunner({ systemPrompt: "sys", mcpServers: () => ({}), cwd: join(base, "cwd") });
+  const opts = runner.buildOptions(
+    { prompt: "x", model: "haiku", signal: new AbortController().signal, canUseTool: async () => ({ behavior: "deny", message: "" }) },
+    new AbortController(),
+  );
+  assert.deepEqual(opts.tools, []);
+  assert.deepEqual(opts.settingSources, []);
+  assert.equal(opts.strictMcpConfig, true);
+  assert.equal(opts.permissionMode, "default");
+  assert.equal(opts.allowedTools, undefined, "nothing may bypass canUseTool");
+  for (const t of ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch"]) assert.ok(opts.disallowedTools?.includes(t), t);
+  assert.ok(DENIED_BUILTIN_TOOLS.length > 10);
+  assert.equal(opts.model, "haiku");
+  assert.equal(opts.systemPrompt, "sys");
+  assert.equal(opts.includePartialMessages, true);
+});
+
+test("subprocessEnv strips device tokens, HA token and empty API key", () => {
+  const env = subprocessEnv({
+    PATH: "p",
+    DEVICE_TOKEN_BROWSER: "secret",
+    HA_CORE_TOKEN: "secret",
+    ANTHROPIC_API_KEY: "",
+    HA_URL: "http://x",
+  });
+  assert.equal(env.PATH, "p");
+  assert.equal(env.DEVICE_TOKEN_BROWSER, undefined);
+  assert.equal(env.HA_CORE_TOKEN, undefined);
+  assert.equal("ANTHROPIC_API_KEY" in env, false);
+  assert.equal(subprocessEnv({ ANTHROPIC_API_KEY: "k" }).ANTHROPIC_API_KEY, "k");
+});
+
+test("TurnStream folds deltas, tool events and usage", () => {
+  const deltas: string[] = [];
+  const tools: string[] = [];
+  const s = new TurnStream({
+    onDelta: (t) => deltas.push(t),
+    onToolUse: (id, name) => tools.push(`use:${id}:${name}`),
+    onToolResult: (id, name, err) => tools.push(`result:${id}:${name}:${err}`),
+  });
+  s.consume(blockStart());
+  s.consume(textDelta("Bakıyorum."));
+  s.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s1", message: { content: [{ type: "tool_use", id: "tu1", name: "mcp__home-assistant__homeassistant__GetLiveContext", input: {} }] } }));
+  s.consume(msg({ type: "user", parent_tool_use_id: null, session_id: "s1", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] } }));
+  // a sub-agent frame is ignored
+  s.consume(msg({ type: "stream_event", parent_tool_use_id: "tu9", session_id: "s1", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "IGNORED" } } }));
+  s.consume(blockStart());
+  s.consume(textDelta("Salon 21 derece."));
+  s.consume(msg({ type: "result", subtype: "success", is_error: false, result: "Salon 21 derece.", session_id: "s1", duration_ms: 1234, total_cost_usd: 0.001, usage: { input_tokens: 10, cache_read_input_tokens: 90, cache_creation_input_tokens: 0, output_tokens: 7 } }));
+  const r = s.result(9999);
+  assert.equal(r.text, "Bakıyorum.\nSalon 21 derece.");
+  assert.deepEqual(deltas, ["Bakıyorum.", "\n", "Salon 21 derece."]);
+  assert.deepEqual(tools, [
+    "use:tu1:mcp__home-assistant__homeassistant__GetLiveContext",
+    "result:tu1:mcp__home-assistant__homeassistant__GetLiveContext:false",
+  ]);
+  assert.equal(r.sessionId, "s1");
+  assert.equal(r.inputTokens, 100);
+  assert.equal(r.outputTokens, 7);
+  assert.equal(r.durationMs, 1234);
+  assert.equal(r.costUsd, 0.001);
+  assert.equal(r.error, undefined);
+});
+
+test("TurnStream: no partials → final text; error results surface", () => {
+  const deltas: string[] = [];
+  const s = new TurnStream({ onDelta: (t) => deltas.push(t) });
+  s.consume(msg({ type: "result", subtype: "success", is_error: false, result: "Merhaba!", session_id: "s2", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  assert.equal(s.result(0).text, "Merhaba!");
+  assert.deepEqual(deltas, ["Merhaba!"]);
+
+  const e = new TurnStream({ onDelta: () => {} });
+  e.consume(msg({ type: "result", subtype: "error_max_turns", is_error: true, errors: ["too many"], session_id: "s3", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  assert.match(e.result(0).error ?? "", /error_max_turns: too many/);
+
+  const a = new TurnStream({ onDelta: () => {} });
+  a.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s4", error: "authentication_failed", message: { content: [] } }));
+  assert.match(a.result(0).error ?? "", /authentication_failed/);
+});
