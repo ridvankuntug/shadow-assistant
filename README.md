@@ -41,7 +41,7 @@ shadow-assistant/
 
 ## Requirements
 
-- Node.js 20.19+ (22 LTS or newer also works) and npm
+- Node.js 22 or newer (CI runs 22 and 24) and npm
 - Python 3.11+ (for `pre-commit`, and later for `whisper-svc`)
 - [gitleaks](https://github.com/gitleaks/gitleaks) and
   [pre-commit](https://pre-commit.com/) for secret scanning (see below)
