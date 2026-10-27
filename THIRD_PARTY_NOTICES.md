@@ -13,10 +13,25 @@ metadata and are not listed individually.
 
 - Source: https://github.com/adewaskar/jarvis
 - License: MIT
-- Usage: Parts of the user interface are planned to be adapted from this
-  project in milestone T3. No code has been copied yet; this notice is added
-  in advance so attribution is in place before any code is brought in.
-  Files adapted from Jarvis will reference this notice in a header comment.
+- Version used: commit `1c4016a` (2026-08-05)
+- Usage: Parts of the user interface (milestone T3) are adapted from this
+  project. Each adapted file starts with a header comment that names its
+  origin and refers to this notice:
+  - `ui/src/scene/Core.tsx` — reactor ring shader (from `src/scene/Core.tsx`)
+  - `ui/src/scene/Particles.tsx` — particle shell (from `src/scene/Particles.tsx`)
+  - `ui/src/scene/Scene.tsx`, `ui/src/scene/drive.ts` — canvas, per-frame rig
+    and the shared drive object (from `src/scene/Scene.tsx`)
+  - `ui/src/scene/Effects.tsx` — postprocessing chain (from `src/scene/Scene.tsx`)
+  - `ui/src/scene/phaseStyle.ts` — phase colours and spin rates (from
+    `src/store.ts` and `src/scene/Scene.tsx`)
+  - `ui/src/platform/web.ts` — microphone/output level metering (from
+    `src/lib/audio.ts`)
+  - `ui/src/index.css` — palette, accent variable, scanline overlay, status
+    dot (from `src/index.css`)
+
+  Not taken: the wake word (Picovoice), Web Speech API speech recognition and
+  synthesis, voice activity detection, the Claude bridge, hand tracking,
+  camera, music, panels and orbit images.
 
 ```
 MIT License
