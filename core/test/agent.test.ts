@@ -30,8 +30,27 @@ test("buildOptions locks the model down to MCP tools only", () => {
   for (const t of ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch"]) assert.ok(opts.disallowedTools?.includes(t), t);
   assert.ok(DENIED_BUILTIN_TOOLS.length > 10);
   assert.equal(opts.model, "haiku");
-  assert.equal(opts.systemPrompt, "sys");
+  assert.deepEqual(opts.systemPrompt, { type: "custom", prompt: "sys", snapshot: false });
   assert.equal(opts.includePartialMessages, true);
+  assert.equal(opts.forkSession, undefined);
+});
+
+test("buildOptions: tier-1 escalation prompt, fork only when resuming, MCP server filter", () => {
+  const runner = new SdkAgentRunner({
+    systemPrompt: "sys",
+    escalationPrompt: "esc",
+    mcpServers: () => ({ a: { type: "sse", url: "http://localhost:1/a" }, b: { type: "sse", url: "http://localhost:1/b" } }),
+    cwd: join(base, "cwd"),
+  });
+  const req = { prompt: "x", model: "haiku", signal: new AbortController().signal, canUseTool: async () => ({ behavior: "deny" as const, message: "" }) };
+  const esc = runner.buildOptions({ ...req, escalatable: true, forkSession: true, resume: "s1", mcpServerNames: ["b"] }, new AbortController());
+  assert.deepEqual(esc.systemPrompt, { type: "custom", prompt: "sys\n\nesc", snapshot: false });
+  assert.equal(esc.forkSession, true);
+  assert.equal(esc.resume, "s1");
+  assert.deepEqual(Object.keys(esc.mcpServers ?? {}), ["b"]);
+  const fresh = runner.buildOptions({ ...req, forkSession: true }, new AbortController());
+  assert.equal(fresh.forkSession, undefined, "nothing to fork without resume");
+  assert.deepEqual(Object.keys(fresh.mcpServers ?? {}), ["a", "b"]);
 });
 
 test("subprocessEnv strips device tokens, HA token and empty API key", () => {
@@ -75,6 +94,9 @@ test("TurnStream folds deltas, tool events and usage", () => {
   ]);
   assert.equal(r.sessionId, "s1");
   assert.equal(r.inputTokens, 100);
+  assert.equal(r.cacheReadTokens, 90);
+  assert.equal(r.cacheWriteTokens, 0);
+  assert.deepEqual(r.tools, ["mcp__home-assistant__homeassistant__GetLiveContext"]);
   assert.equal(r.outputTokens, 7);
   assert.equal(r.durationMs, 1234);
   assert.equal(r.costUsd, 0.001);

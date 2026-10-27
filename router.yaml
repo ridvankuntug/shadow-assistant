@@ -1,0 +1,168 @@
+# Shadow Assistant router (read by the Core at startup; see docs/04-router.md).
+#
+# This file is committed: never put real room or device names here. Patterns
+# use the `<ad>` placeholder for the spoken name; the Core resolves it against
+# the entities Home Assistant exposes at request time.
+#
+# Tiers:
+#   0  no model: a pattern maps the request straight to a Home Assistant tool
+#   1  cheap model (CORE_MODEL_TIER1, default haiku); may escalate to tier 2
+#   2  default model (CORE_MODEL_TIER2, else CORE_MODEL, default sonnet)
+#   3  CORE_MODEL_TIER3 (default opus): only requests matched by a tier-3 rule
+# Requests that match no rule go to tier 1 (or tier 2 when longer than
+# tier1.max_words). Rules are tried top to bottom; the first match wins.
+#
+# Pattern syntax (matching ignores case, punctuation, Turkish letters —
+# "ışığını aç" = "ISIGINI AC" — and the filler words below):
+#   word      literal word          word*     word prefix ("plan*")
+#   {a|b c}   alternatives          {a|}      optional
+#   <ad>      the device/place name *         any words (also none)
+#
+# The permission gate applies to tier 0 exactly as to the model: levels come
+# from services.yaml (read / write / confirm, confirm_inputs, CORE_READ_ONLY).
+# A rule's `permission` can only raise that level, never lower it.
+
+version: 1
+
+# Removed before matching (whole words only).
+fillers: [lütfen, hadi, acaba, bakalım, şimdi]
+
+tier1:
+  # Longer requests skip tier 1: escalating them would cost a second call.
+  max_words: 30
+  # services: [home-assistant]   # optional: MCP servers loaded for tier 1 (default: all)
+
+escalation:
+  # Tier 1 may hand a request to tier 2 with a structured marker.
+  enabled: true
+
+direct:
+  enabled: true
+  # What happens when a direct call cannot be completed (name not found or
+  # ambiguous, tool error, sensor missing): `fallback` hands the request to
+  # tier 1 — nothing in the home was changed, and the model can match names
+  # that are not literal (aliases, "the lamp next to the sofa") or ask back;
+  # `reply` answers with the short message below instead. An unreachable Home
+  # Assistant, a denied permission or a declined confirmation always replies.
+  on_tool_error: fallback
+  # Max words a spoken name may have.
+  max_name_words: 4
+  # Captured names that never mean a device: such requests go to the model.
+  stop_names: [şunu, bunu, onu, şu, bu, o, hepsini, her şeyi, onları, bunları, şunları, ışık, ışığı, ışığını, ışıkları, ışıklarını, lamba, lambayı, lambasını, lambaları, lambalarını]
+  # Max sensors listed in one answer.
+  max_items: 4
+  messages:
+    not_found: Bu adla bir cihaz bulamadım.
+    ambiguous: Hangi cihazı kastettiğinden emin olamadım.
+    unavailable: Ev sistemine şu an ulaşamıyorum.
+    failed: Bunu yapamadım.
+    declined: Tamam, yapmıyorum.
+    read_only: Şu an salt okuma modundayım, bunu yapamam.
+
+rules:
+  # ---------------------------------------------------------------- tier 0: lights
+  - id: light-on
+    tier: 0
+    patterns:
+      - "<ad> {ışığını|ışığı|ışıklarını|ışıkları|lambasını|lambası|lambalarını|lambaları} {aç|açar mısın|açabilir misin|açın|yak|yakar mısın|yakabilir misin}"
+    service: home-assistant
+    tool: intent__HassTurnOn
+    domains: [light, switch]
+    keywords: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
+    reply: "Tamam, {ad} ışığı açıldı."
+
+  - id: light-off
+    tier: 0
+    patterns:
+      - "<ad> {ışığını|ışığı|ışıklarını|ışıkları|lambasını|lambası|lambalarını|lambaları} {kapat|kapatır mısın|kapatabilir misin|kapatın|kapa|söndür|söndürür müsün}"
+    service: home-assistant
+    tool: intent__HassTurnOff
+    domains: [light, switch]
+    keywords: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
+    reply: "Tamam, {ad} ışığı kapatıldı."
+
+  # ---------------------------------------------------------------- tier 0: other switches
+  # "<ad>'ı aç", "<ad>u kapat": the name may carry an accusative suffix with
+  # or without an apostrophe. Only these domains are ever touched at tier 0;
+  # locks, covers, alarms and the like always go through the model.
+  - id: device-on
+    tier: 0
+    patterns:
+      - "<ad> {aç|açar mısın|açabilir misin|açın|çalıştır}"
+    service: home-assistant
+    tool: intent__HassTurnOn
+    domains: [light, switch, fan]
+    reply: "Tamam, {ad} açıldı."
+
+  - id: device-off
+    tier: 0
+    patterns:
+      - "<ad> {kapat|kapatır mısın|kapatabilir misin|kapatın|kapa|durdur}"
+    service: home-assistant
+    tool: intent__HassTurnOff
+    domains: [light, switch, fan]
+    reply: "Tamam, {ad} kapatıldı."
+
+  # ---------------------------------------------------------------- tier 0: sensors
+  - id: temperature-home
+    tier: 0
+    patterns:
+      - "{evde|ev} {sıcaklık|ısı} {kaç|kaç derece|ne kadar|nedir|ne}"
+      - "ev {sıcaklığı|ısısı} {kaç|kaç derece|ne kadar|nedir|ne}"
+      - "{sıcaklık|ısı} {kaç|kaç derece|ne kadar|nedir}"
+      - "ortam kaç derece"
+    service: home-assistant
+    tool: homeassistant__GetLiveContext
+    sensor: temperature
+    default_name: ev
+    reply: "{ad} sıcaklığı {deger}."
+    reply_many: "Sıcaklıklar: {liste}."
+
+  - id: temperature-place
+    tier: 0
+    patterns:
+      - "<ad> {sıcaklığı|ısısı|sıcaklık|ısı} {kaç|kaç derece|ne kadar|nedir}"
+      - "<ad> kaç derece"
+    service: home-assistant
+    tool: homeassistant__GetLiveContext
+    sensor: temperature
+    reply: "{ad} sıcaklığı {deger}."
+    reply_many: "Sıcaklıklar: {liste}."
+
+  - id: humidity-home
+    tier: 0
+    patterns:
+      - "{evde|ev} nem {kaç|ne kadar|nedir|yüzde kaç}"
+      - "ev nemi {kaç|ne kadar|nedir|yüzde kaç}"
+      - "nem {kaç|ne kadar|nedir|yüzde kaç}"
+    service: home-assistant
+    tool: homeassistant__GetLiveContext
+    sensor: humidity
+    default_name: ev
+    reply: "{ad} nemi {deger}."
+    reply_many: "Nem: {liste}."
+
+  - id: humidity-place
+    tier: 0
+    patterns:
+      - "<ad> {nemi|nem} {kaç|ne kadar|nedir|yüzde kaç}"
+    service: home-assistant
+    tool: homeassistant__GetLiveContext
+    sensor: humidity
+    reply: "{ad} nemi {deger}."
+    reply_many: "Nem: {liste}."
+
+  # ---------------------------------------------------------------- tier 3: explicit planning / deep analysis
+  - id: deep-analysis
+    tier: 3
+    patterns:
+      - "* {derin|derinlemesine|detaylı|ayrıntılı|kapsamlı} {analiz*|inceleme*|incele*} *"
+      - "* plan {yap*|hazırla*|çıkar*|oluştur*} *"
+      - "* adım adım plan* *"
+
+  # ---------------------------------------------------------------- tier 2: clearly beyond a short answer
+  - id: long-form
+    tier: 2
+    patterns:
+      - "* {karşılaştır*|değerlendir*|analiz*} *"
+      - "* {özetle*|özet çıkar*} *"

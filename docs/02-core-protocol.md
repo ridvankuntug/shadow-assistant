@@ -151,8 +151,17 @@ non-`read` tool without asking (smoke tests).
 - The Agent SDK uses the machine's Claude Code login; `ANTHROPIC_API_KEY` is an
   optional fallback. The user's `~/.claude` settings, CLAUDE.md files, MCP
   servers and plugins are **not** loaded (`settingSources: []`, `strictMcpConfig`).
-- Model: `CORE_MODEL` (default `sonnet`). Model routing and usage recording go
-  through a small hook ([`core/src/router.ts`](../core/src/router.ts)) that T7 can replace.
+- Models and routing: each turn is handled by one tier — 0 (no model: a
+  [`router.yaml`](../router.yaml) pattern calls a Home Assistant tool directly),
+  1 (`CORE_MODEL_TIER1`, default `haiku`), 2 (`CORE_MODEL_TIER2`, else `CORE_MODEL`,
+  default `sonnet`) or 3 (`CORE_MODEL_TIER3`, default `opus`, only for explicit
+  planning / deep-analysis requests). `CORE_ROUTER=off` restores the single-model
+  behaviour. See [`docs/04-router.md`](04-router.md).
+- Routing does not change the WebSocket protocol: a tier-0 turn produces the same
+  frames as a model turn (`state`, `tool`, `confirm_request` / `confirm_resolved`,
+  `assistant_delta`, `assistant_done`) and its tool calls pass the same permission
+  gate. A tier-1 answer arrives as a single `assistant_delta` (it is buffered so
+  that an escalation to tier 2 stays invisible to the client).
 - Home Assistant is reached through its MCP Server integration over **SSE**
   (`${HA_URL}/mcp_server/sse`, `Authorization: Bearer <HA_CORE_TOKEN>`).
   HA's `/api/mcp` streamable-HTTP endpoint is not used (broken on the current HA version).
@@ -166,7 +175,15 @@ non-`read` tool without asking (smoke tests).
 Each session writes JSONL to
 `<SHADOW_DATA_DIR>/conversations/YYYY-MM-DD/<sessionId>.jsonl`
 (default data dir: `<SHADOW_VAULT_DIR>/.shadow-assistant`). Entry kinds:
-`session_start`, `user`, `assistant`, `tool_call`, `tool_result`, `permission`,
-`usage`, `error`, `session_end`. When the Core creates the data dir it writes a
+`session_start`, `user`, `route`, `assistant`, `tool_call`, `tool_result`,
+`permission`, `usage`, `error`, `session_end`. `route` records the tier, model
+and router rule of a turn (plus a tier-0 fallback reason or an escalation);
+`usage` carries `tier`, cache read/write tokens and an `outcome` besides the
+token counts. Readers must ignore unknown kinds and fields.
+
+Every model call (and every tier-0 turn, with `model: "none"`) is also appended
+to `<SHADOW_DATA_DIR>/usage/YYYY-MM-DD.jsonl` (format:
+[`docs/04-router.md`](04-router.md#usage-records)); that folder gets its own
+self-ignoring `.gitignore` as well. When the Core creates the data dir it writes a
 `.gitignore` containing `*` into it, so the folder ignores itself inside a
 git-tracked vault without editing the vault's own `.gitignore`.

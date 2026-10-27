@@ -6,8 +6,10 @@
  * the `send` callback, so the whole flow is unit-testable without sockets.
  */
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentRunner } from "./agent.js";
+import type { AgentRunner, TurnResult } from "./agent.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
+import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
+import type { DirectToolClient } from "./mcp-direct.js";
 import {
   ConfirmBroker,
   parseVoiceAnswer,
@@ -17,13 +19,32 @@ import {
   type PermissionPolicy,
 } from "./permissions.js";
 import type { ClientFrame, ErrorCode, ServerFrame } from "./protocol.js";
-import type { Router } from "./router.js";
+import type { DirectPlan } from "./router-config.js";
+import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
+import type { PermissionLevel } from "./services.js";
 import { SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 export const DEFAULT_HISTORY_LIMIT = 20;
 export const MAX_HISTORY_LIMIT = 100;
+/** Tier-0 exchanges remembered for the model's next turn. */
+export const MAX_DIRECT_NOTES = 5;
+export const DIRECT_NOTES_HEADER = "(Bilgi: aşağıdaki kısa komutları sistem modelsiz yanıtladı; sen görmedin.)";
+/** Prompt for the stronger model when the cheap one escalated after running tools. */
+export const ESCALATION_CONTINUE =
+  "(Önceki adım bu isteği tamamlayamadı. Yukarıdaki araç sonuçlarını kullan, başarılı olmuş işlemleri tekrarlama ve kullanıcının son isteğini tamamla.)";
+
+const LEVEL_RANK: Record<PermissionLevel, number> = { read: 0, write: 1, confirm: 2 };
+
+/** What the model is told when the gate denies one of its tool calls. */
+const DENY_MESSAGES: Record<DenyReason, string> = {
+  cancelled: "Turn was cancelled.",
+  builtin: "Built-in tools are disabled for this assistant.",
+  read_only: "Read-only mode: only read tools may run.",
+  timeout: "The user did not confirm in time; do not retry.",
+  declined: "The user declined this action; do not retry.",
+};
 
 export interface Logger {
   info(msg: string): void;
@@ -39,6 +60,10 @@ export interface SessionDeps {
   log: ConversationLog;
   logger: Logger;
   confirmTimeoutMs?: number;
+  /** Tier 0 MCP client; without it every direct plan falls back to the model. */
+  direct?: DirectToolClient;
+  /** MCP servers loaded per model tier (router.yaml `tierN.services`); absent = all. */
+  tierServices?: Partial<Record<ModelTier, readonly string[]>>;
 }
 
 export interface SessionInfo {
@@ -67,6 +92,8 @@ export class Session {
   private turnDone: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   private closed = false;
+  /** Tier-0 exchanges not yet shown to the model. */
+  private readonly directNotes: string[] = [];
 
   constructor(
     private readonly deps: SessionDeps,
@@ -222,56 +249,14 @@ export class Session {
     void this.slog.append({ kind: "user", id, text, source });
 
     try {
-      const { model } = await this.deps.router.route({ text, source, device: this.info.device });
-      const result = await this.deps.agent.runTurn(
-        {
-          prompt: text,
-          model,
-          resume: this.sdkSessionId,
-          signal: turn.abort.signal,
-          canUseTool: this.gate(turn),
-        },
-        {
-          onDelta: (chunk) => {
-            turn.text += chunk;
-            if (!turn.abort.signal.aborted) this.emit({ type: "assistant_delta", id, text: chunk });
-          },
-          onToolResult: (_toolUseId, name, isError) => {
-            const tool = this.displayName(name);
-            this.emit({ type: "tool", id, name: tool, status: isError ? "error" : "done" });
-            void this.slog.append({ kind: "tool_result", id, tool: name ?? "unknown", status: isError ? "error" : "done" });
-          },
-        },
-      );
-      if (result.sessionId) this.sdkSessionId = result.sessionId;
-      const cancelled = turn.abort.signal.aborted;
-      const finalText = result.text || turn.text;
-
-      if (result.error && !cancelled) {
-        this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${result.error}`);
-        void this.slog.append({ kind: "error", id, code: "model_error", message: result.error });
-        this.error("model_error", "the model could not complete this turn", id);
-        if (finalText) this.emit({ type: "assistant_done", id, text: finalText });
-      } else {
-        this.emit({ type: "assistant_done", id, text: finalText });
+      const decision = await this.deps.router.route({ text, source, device: this.info.device });
+      if (decision.tier === 0 && decision.direct) {
+        if (await this.runDirect(turn, text, decision, decision.direct)) return;
+        // Fallback: the cheap model takes over (nothing was changed in the home).
+        await this.runModel(turn, text, { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule });
+        return;
       }
-      if (finalText || cancelled) {
-        void this.slog.append({ kind: "assistant", id, text: finalText, ...(cancelled ? { cancelled: true } : {}) });
-      }
-      const usage = {
-        turnId: id,
-        model,
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        durationMs: result.durationMs,
-        costUsd: result.costUsd,
-      };
-      void this.slog.append({ kind: "usage", id, ...usage });
-      try {
-        this.deps.router.onUsage?.(usage);
-      } catch (err) {
-        this.deps.logger.warn(`[shadow-core] router.onUsage failed: ${(err as Error).message}`);
-      }
+      await this.runModel(turn, text, decision);
     } catch (err) {
       this.deps.logger.warn(`[shadow-core] turn ${id} crashed: ${(err as Error).message}`);
       this.error("model_error", "the model could not complete this turn", id);
@@ -280,6 +265,233 @@ export class Session {
       if (this.turn === turn) this.turn = null;
       this.emit({ type: "state", state: "idle" });
     }
+  }
+
+  // ------------------------------------------------------------ tier 0
+
+  /** Runs a direct (model-free) plan. Returns false when the turn must fall back to the model. */
+  private async runDirect(turn: ActiveTurn, text: string, decision: RouteDecision, plan: DirectPlan): Promise<boolean> {
+    const id = turn.id;
+    const started = Date.now();
+    const tools: string[] = [];
+    let outcome: DirectOutcome;
+    const client = this.deps.direct;
+    if (!client) {
+      outcome = { kind: "fallback", reason: "no_direct_client" };
+    } else if (!this.deps.policy.serviceNames.includes(plan.service)) {
+      // Service disabled (e.g. token missing): the model path decides what to tell the user.
+      outcome = { kind: "fallback", reason: "service_disabled" };
+    } else {
+      const call: GatedCall = async (tool, args) => {
+        const full = `mcp__${plan.service}__${tool}`;
+        const auth = await this.authorize(turn, full, args, turn.abort.signal, tool === plan.tool ? plan.permission : undefined);
+        if (!auth.allowed) return { status: "denied", reason: auth.reason };
+        tools.push(tool);
+        try {
+          const result = await client.callTool(plan.service, tool, args, turn.abort.signal);
+          this.toolFinished(id, full, result.isError);
+          return { status: "ok", result };
+        } catch (err) {
+          if (turn.abort.signal.aborted) return { status: "denied", reason: "cancelled" };
+          this.toolFinished(id, full, true);
+          const message = (err as Error).message;
+          this.deps.logger.warn(`[shadow-core] direct ${plan.service}/${tool} failed: ${message}`);
+          return { status: "unavailable", message };
+        }
+      };
+      outcome = await runDirectPlan(plan, call, { fallbackOnError: decision.fallbackOnError === true });
+    }
+    if (turn.abort.signal.aborted) outcome = { kind: "cancelled" };
+
+    const usage = (o: UsageOutcome): UsageRecord => ({
+      turnId: id,
+      sessionId: this.info.sessionId,
+      tier: 0,
+      model: "none",
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      durationMs: Date.now() - started,
+      services: tools.length > 0 ? [plan.service] : [],
+      tools,
+      outcome: o,
+    });
+
+    if (outcome.kind === "fallback") {
+      void this.slog.append({ kind: "route", id, tier: 0, rule: plan.rule, fallback: outcome.reason });
+      this.recordUsage(usage("fallback"));
+      return false;
+    }
+    void this.slog.append({ kind: "route", id, tier: 0, rule: plan.rule });
+    if (outcome.kind === "cancelled") {
+      this.emit({ type: "assistant_done", id, text: "" });
+      void this.slog.append({ kind: "assistant", id, text: "", cancelled: true });
+      this.recordUsage(usage("cancelled"));
+      return true;
+    }
+    turn.text = outcome.text;
+    this.emit({ type: "assistant_delta", id, text: outcome.text });
+    this.emit({ type: "assistant_done", id, text: outcome.text });
+    void this.slog.append({ kind: "assistant", id, text: outcome.text });
+    // The model never saw this exchange; tell it on its next turn.
+    this.directNotes.push(`Kullanıcı: ${text}\nShadow: ${outcome.text}`);
+    if (this.directNotes.length > MAX_DIRECT_NOTES) this.directNotes.shift();
+    this.recordUsage(usage(outcome.status === "done" ? "done" : outcome.status));
+    return true;
+  }
+
+  /** Prefixes tier-0 exchanges the model has not seen yet (then forgets them). */
+  private withDirectNotes(text: string): string {
+    if (this.directNotes.length === 0) return text;
+    const notes = this.directNotes.splice(0).join("\n");
+    return `${DIRECT_NOTES_HEADER}\n${notes}\n\n${text}`;
+  }
+
+  // ------------------------------------------------------------ tiers 1-3
+
+  private async runModel(turn: ActiveTurn, text: string, decision: RouteDecision): Promise<void> {
+    const id = turn.id;
+    const tier: ModelTier = decision.tier === 1 || decision.tier === 3 ? decision.tier : 2;
+    const escalateTo = tier === 1 ? decision.escalateTo : undefined;
+    const prompt = this.withDirectNotes(text);
+    const base = this.sdkSessionId;
+    void this.slog.append({ kind: "route", id, tier, model: decision.model, ...(decision.rule ? { rule: decision.rule } : {}) });
+
+    let call = await this.callModel(turn, { prompt, model: decision.model, tier, escalatable: escalateTo !== undefined, resume: base });
+    let model = decision.model;
+    let callTier: ModelTier = tier;
+    if (escalateTo && call.escalate && !turn.abort.signal.aborted) {
+      this.recordModelUsage(turn, callTier, model, call.result, "escalated");
+      void this.slog.append({ kind: "route", id, tier: escalateTo.tier, model: escalateTo.model, escalated: true });
+      // If the cheap model already ran tools, continue in its session so nothing is done twice;
+      // otherwise start again from the context before this turn.
+      const fork = call.result.sessionId;
+      const resumeFork = (call.result.tools ?? []).length > 0 && fork !== undefined;
+      model = escalateTo.model;
+      callTier = escalateTo.tier;
+      call = await this.callModel(turn, {
+        prompt: resumeFork ? ESCALATION_CONTINUE : prompt,
+        model,
+        tier: callTier,
+        escalatable: false,
+        resume: resumeFork ? fork : base,
+      });
+    }
+
+    const result = call.result;
+    if (result.sessionId) this.sdkSessionId = result.sessionId;
+    const cancelled = turn.abort.signal.aborted;
+    const finalText = turn.text;
+    if (result.error && !cancelled) {
+      this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${result.error}`);
+      void this.slog.append({ kind: "error", id, code: "model_error", message: result.error });
+      this.error("model_error", "the model could not complete this turn", id);
+      if (finalText) this.emit({ type: "assistant_done", id, text: finalText });
+    } else {
+      this.emit({ type: "assistant_done", id, text: finalText });
+    }
+    if (finalText || cancelled) {
+      void this.slog.append({ kind: "assistant", id, text: finalText, ...(cancelled ? { cancelled: true } : {}) });
+    }
+    this.recordModelUsage(turn, callTier, model, result, cancelled ? "cancelled" : result.error ? "error" : "done");
+  }
+
+  /**
+   * One model call. Escalatable (tier 1) calls are buffered: their text reaches
+   * the client only once it is clear the model did not hand the turn on, so the
+   * escalation marker is never shown or spoken.
+   */
+  private async callModel(
+    turn: ActiveTurn,
+    o: { prompt: string; model: string; tier: ModelTier; escalatable: boolean; resume?: string },
+  ): Promise<{ result: TurnResult; escalate: boolean }> {
+    const id = turn.id;
+    let buffer = "";
+    const live = (chunk: string) => {
+      turn.text += chunk;
+      if (!turn.abort.signal.aborted) this.emit({ type: "assistant_delta", id, text: chunk });
+    };
+    const result = await this.deps.agent.runTurn(
+      {
+        prompt: o.prompt,
+        model: o.model,
+        resume: o.resume,
+        signal: turn.abort.signal,
+        canUseTool: this.gate(turn),
+        escalatable: o.escalatable,
+        // Keep the pre-turn session intact in case the turn is escalated.
+        forkSession: o.escalatable,
+        mcpServerNames: this.deps.tierServices?.[o.tier],
+      },
+      {
+        onDelta: (chunk) => {
+          if (o.escalatable) buffer += chunk;
+          else live(chunk);
+        },
+        onToolResult: (_toolUseId, name, isError) => this.toolFinished(id, name, isError),
+      },
+    );
+    if (!o.escalatable) return { result, escalate: false };
+    const marked = buffer.includes(ESCALATION_MARKER);
+    const escalate = marked && !result.error && !turn.abort.signal.aborted;
+    if (!escalate) {
+      const clean = buffer.split(ESCALATION_MARKER).join("").trim();
+      if (clean) live(clean);
+    }
+    return { result, escalate };
+  }
+
+  private recordModelUsage(turn: ActiveTurn, tier: ModelTier, model: string, r: TurnResult, outcome: UsageOutcome): void {
+    const tools: string[] = [];
+    const services = new Set<string>();
+    for (const full of r.tools ?? []) {
+      const ident = this.deps.policy.levelFor(full).identity;
+      tools.push(ident.tool);
+      if (ident.service) services.add(ident.service);
+    }
+    this.recordUsage({
+      turnId: turn.id,
+      sessionId: this.info.sessionId,
+      tier,
+      model,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+      cacheReadTokens: r.cacheReadTokens,
+      cacheWriteTokens: r.cacheWriteTokens,
+      durationMs: r.durationMs,
+      costUsd: r.costUsd,
+      services: [...services],
+      tools,
+      outcome,
+    });
+  }
+
+  private recordUsage(u: UsageRecord): void {
+    void this.slog.append({
+      kind: "usage",
+      id: u.turnId,
+      tier: u.tier,
+      model: u.model,
+      inputTokens: u.inputTokens,
+      outputTokens: u.outputTokens,
+      cacheReadTokens: u.cacheReadTokens,
+      cacheWriteTokens: u.cacheWriteTokens,
+      durationMs: u.durationMs,
+      costUsd: u.costUsd,
+      outcome: u.outcome,
+    });
+    try {
+      this.deps.router.onUsage?.(u);
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] router.onUsage failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** Emits the `tool` done/error frame and logs the result. */
+  private toolFinished(id: string, full: string | undefined, isError: boolean): void {
+    this.emit({ type: "tool", id, name: this.displayName(full), status: isError ? "error" : "done" });
+    void this.slog.append({ kind: "tool_result", id, tool: full ?? "unknown", status: isError ? "error" : "done" });
   }
 
   /** Tool name shown to the client: service-relative (e.g. `intent__HassTurnOff`). */
@@ -291,81 +503,92 @@ export class Session {
   /** Builds the SDK `canUseTool` callback for one turn. */
   gate(turn: ActiveTurn): CanUseTool {
     return async (toolName, input, opts): Promise<PermissionResult> => {
-      const decision = this.deps.policy.levelFor(toolName, input);
-      const { identity } = decision;
-      const tool = identity.tool;
-      const id = turn.id;
+      const r = await this.authorize(turn, toolName, input, opts.signal);
+      return r.allowed
+        ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
+        : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
+    };
+  }
+
+  /**
+   * The permission gate, shared by model tool calls (via `gate`) and tier-0
+   * direct calls. `minLevel` (router.yaml rule `permission`) can only raise
+   * the services.yaml level, never lower it.
+   */
+  private async authorize(
+    turn: ActiveTurn,
+    toolName: string,
+    input: Record<string, unknown>,
+    signal: AbortSignal,
+    minLevel?: PermissionLevel,
+  ): Promise<{ allowed: true } | { allowed: false; reason: DenyReason }> {
+    const decision = this.deps.policy.levelFor(toolName, input);
+    const { identity } = decision;
+    let level = decision.level;
+    let reason = decision.reason;
+    if (minLevel && level !== "deny" && LEVEL_RANK[minLevel] > LEVEL_RANK[level]) {
+      level = minLevel;
+      reason = `${reason}+route:${minLevel}`;
+    }
+    const tool = identity.tool;
+    const id = turn.id;
+    void this.slog.append({ kind: "tool_call", id, tool: identity.full, level, reason, input });
+
+    const deny = (why: DenyReason, by?: string, requestId?: string): { allowed: false; reason: DenyReason } => {
+      this.emit({ type: "tool", id, name: tool, status: "denied" });
       void this.slog.append({
-        kind: "tool_call",
+        kind: "permission",
         id,
         tool: identity.full,
-        level: decision.level,
-        reason: decision.reason,
-        input,
+        decision: "deny",
+        level,
+        ...(by ? { by } : {}),
+        ...(requestId ? { requestId } : {}),
       });
-
-      const deny = (message: string, by?: string, requestId?: string): PermissionResult => {
-        this.emit({ type: "tool", id, name: tool, status: "denied" });
-        void this.slog.append({
-          kind: "permission",
-          id,
-          tool: identity.full,
-          decision: "deny",
-          level: decision.level,
-          ...(by ? { by } : {}),
-          ...(requestId ? { requestId } : {}),
-        });
-        this.deps.logger.info(`[shadow-core] denied ${identity.full} (${decision.reason}${by ? `, by ${by}` : ""})`);
-        return { behavior: "deny", message, toolUseID: opts.toolUseID };
-      };
-      const allow = (by?: string, requestId?: string): PermissionResult => {
-        this.emit({ type: "tool", id, name: tool, status: "started" });
-        void this.slog.append({
-          kind: "permission",
-          id,
-          tool: identity.full,
-          decision: "allow",
-          level: decision.level,
-          ...(by ? { by } : {}),
-          ...(requestId ? { requestId } : {}),
-        });
-        if (decision.level !== "read") {
-          this.deps.logger.info(
-            `[shadow-core] ${decision.level} tool ${identity.full} allowed for device ${this.info.device}${by ? ` (by ${by})` : ""}`,
-          );
-        }
-        return { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID };
-      };
-
-      if (turn.abort.signal.aborted) return deny("Turn was cancelled.");
-      if (decision.level === "deny") return deny("Built-in tools are disabled for this assistant.");
-      if (this.deps.policy.options.readOnly && decision.level !== "read") {
-        return deny("Read-only mode: only read tools may run.");
-      }
-      if (decision.level === "read" || decision.level === "write") return allow();
-
-      // confirm
-      const { request, result } = this.broker.open(id, tool, summarizeToolCall(identity, input));
-      const onAbort = () => this.broker.resolve(request.requestId, false, "cancel");
-      opts.signal.addEventListener("abort", onAbort, { once: true });
-      this.emit({ type: "state", state: "awaiting_confirm" });
-      this.emit({
-        type: "confirm_request",
-        requestId: request.requestId,
-        id,
-        tool,
-        summary: request.summary,
-        expiresAt: request.expiresAt,
-      });
-      const res = await result;
-      opts.signal.removeEventListener("abort", onAbort);
-      if (res.approved) return allow(res.by, request.requestId);
-      return deny(
-        res.by === "timeout" ? "The user did not confirm in time; do not retry." : "The user declined this action; do not retry.",
-        res.by,
-        request.requestId,
-      );
+      this.deps.logger.info(`[shadow-core] denied ${identity.full} (${reason}${by ? `, by ${by}` : ""})`);
+      return { allowed: false, reason: why };
     };
+    const allow = (by?: string, requestId?: string): { allowed: true } => {
+      this.emit({ type: "tool", id, name: tool, status: "started" });
+      void this.slog.append({
+        kind: "permission",
+        id,
+        tool: identity.full,
+        decision: "allow",
+        level,
+        ...(by ? { by } : {}),
+        ...(requestId ? { requestId } : {}),
+      });
+      if (level !== "read") {
+        this.deps.logger.info(
+          `[shadow-core] ${level} tool ${identity.full} allowed for device ${this.info.device}${by ? ` (by ${by})` : ""}`,
+        );
+      }
+      return { allowed: true };
+    };
+
+    if (turn.abort.signal.aborted) return deny("cancelled");
+    if (level === "deny") return deny("builtin");
+    if (this.deps.policy.options.readOnly && level !== "read") return deny("read_only");
+    if (level === "read" || level === "write") return allow();
+
+    // confirm
+    const { request, result } = this.broker.open(id, tool, summarizeToolCall(identity, input));
+    const onAbort = () => this.broker.resolve(request.requestId, false, "cancel");
+    signal.addEventListener("abort", onAbort, { once: true });
+    this.emit({ type: "state", state: "awaiting_confirm" });
+    this.emit({
+      type: "confirm_request",
+      requestId: request.requestId,
+      id,
+      tool,
+      summary: request.summary,
+      expiresAt: request.expiresAt,
+    });
+    const res = await result;
+    signal.removeEventListener("abort", onAbort);
+    if (res.approved) return allow(res.by, request.requestId);
+    return deny(res.by === "timeout" ? "timeout" : "declined", res.by, request.requestId);
   }
 
   private onConfirmResolved(req: ConfirmRequest, res: ConfirmResolution): void {

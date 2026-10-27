@@ -10,10 +10,13 @@ import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, type CoreConfig } from "./config.js";
 import { ConversationLog } from "./conversation-log.js";
 import { PermissionPolicy } from "./permissions.js";
-import { PassthroughRouter } from "./router.js";
+import { McpDirectClient } from "./mcp-direct.js";
+import { checkRouterServices } from "./router-config.js";
+import { PassthroughRouter, TieredRouter, type Router } from "./router.js";
 import { createCoreServer } from "./server.js";
 import { Session, type Logger } from "./session.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
+import { UsageLog } from "./usage-log.js";
 import { createVaultMcpServer, VaultReader } from "./vault.js";
 
 const logger: Logger = {
@@ -60,18 +63,32 @@ export async function main(): Promise<void> {
   }
 
   const systemPrompt = readFileSync(cfg.systemPromptFile, "utf8");
+  const escalationPrompt = readFileSync(join(cfg.systemPromptFile, "..", "tier1.md"), "utf8");
   const log = new ConversationLog(cfg.dataDir);
   await log.ensureDir();
 
   const policy = new PermissionPolicy(cfg.services.services, { readOnly: cfg.readOnly });
   const agent = new SdkAgentRunner({
     systemPrompt,
+    escalationPrompt,
     mcpServers: buildMcpServers(cfg, process.env),
     cwd: join(cfg.dataDir, "agent"),
     env: subprocessEnv(process.env),
     stderr: (line) => logger.warn(`[shadow-core] sdk: ${line.trimEnd()}`),
   });
-  const router = new PassthroughRouter(cfg.model);
+  const usageLog = new UsageLog(cfg.dataDir);
+  let router: Router;
+  let direct: McpDirectClient | undefined;
+  if (cfg.router) {
+    const enabled = cfg.services.services.filter((s) => s.enabled).map((s) => s.name);
+    for (const w of checkRouterServices(cfg.router, enabled)) logger.warn(`[shadow-core] router.yaml: ${w}`);
+    router = new TieredRouter({ config: cfg.router, models: cfg.models, onUsage: (u) => void usageLog.append(u) });
+    direct = cfg.router.direct.enabled ? new McpDirectClient(cfg.services.services, process.env) : undefined;
+  } else {
+    const passthrough = new PassthroughRouter(cfg.model);
+    router = { route: () => passthrough.route(), onUsage: (u) => void usageLog.append(u) };
+  }
+  const tierServices = cfg.router?.tierServices;
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
 
@@ -79,7 +96,11 @@ export async function main(): Promise<void> {
     tokens,
     logger,
     createSession: (info, send) =>
-      new Session({ agent, policy, router, stt, tts, log, logger, confirmTimeoutMs: cfg.confirmTimeoutMs }, info, send),
+      new Session(
+        { agent, policy, router, stt, tts, log, logger, confirmTimeoutMs: cfg.confirmTimeoutMs, direct, tierServices },
+        info,
+        send,
+      ),
     health: () => ({
       services: cfg.services.services.map((s) => ({ name: s.name, enabled: s.enabled })),
     }),
@@ -90,12 +111,19 @@ export async function main(): Promise<void> {
   for (const s of cfg.services.services) {
     logger.info(`[shadow-core] service ${s.name} (${s.kind}): ${s.enabled ? "enabled" : `disabled${s.disabledReason ? ` — ${s.disabledReason}` : ""}`}`);
   }
+  logger.info(
+    `[shadow-core] router=${cfg.router ? "tiered" : "off"} models=1:${cfg.models[1]},2:${cfg.models[2]},3:${cfg.models[3]}`,
+  );
   logger.info(`[shadow-core] model=${cfg.model} readOnly=${cfg.readOnly} devices=${[...tokens.digests.keys()].join(",")}`);
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
 
   const shutdown = () => {
     logger.info("[shadow-core] shutting down");
-    void server.close().then(() => process.exit(0));
+    void server
+      .close()
+      .then(() => direct?.close())
+      .then(() => usageLog.flush())
+      .then(() => process.exit(0));
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

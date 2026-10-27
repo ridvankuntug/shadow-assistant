@@ -148,14 +148,28 @@ test("text turn streams deltas, done, state idle; usage recorded", async () => {
   assert.equal(h.of("state")[0]?.state, "thinking");
   assert.equal(h.of("state")[1]?.state, "idle");
   assert.equal(h.agent.calls[0]?.model, "test-model");
-  assert.deepEqual(h.usage[0], { turnId: "t1", model: "test-model", inputTokens: 3, outputTokens: 2, durationMs: 7, costUsd: undefined });
+  assert.deepEqual(h.usage[0], {
+    turnId: "t1",
+    sessionId: h.session.info.sessionId,
+    tier: 2,
+    model: "test-model",
+    inputTokens: 3,
+    outputTokens: 2,
+    cacheReadTokens: undefined,
+    cacheWriteTokens: undefined,
+    durationMs: 7,
+    costUsd: undefined,
+    services: [],
+    tools: [],
+    outcome: "done",
+  });
 
   // Second turn resumes the SDK session for conversation context.
   await h.send({ type: "user_text", id: "t2", text: "tekrar" });
   assert.equal(h.agent.calls[1]?.resume, "sdk-1");
   await h.session.close("test");
   const kinds = sessionLines(h).map((l) => l.kind);
-  assert.deepEqual(kinds.slice(0, 4), ["session_start", "user", "assistant", "usage"]);
+  assert.deepEqual(kinds.slice(0, 5), ["session_start", "user", "route", "assistant", "usage"]);
   assert.equal(kinds.at(-1), "session_end");
 });
 

@@ -30,11 +30,26 @@ export type LogEntry =
   | {
       kind: "usage";
       id: string;
+      tier?: number;
       model: string;
       inputTokens: number;
       outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
       durationMs: number;
       costUsd?: number;
+      outcome?: string;
+    }
+  | {
+      /** Routing decision (T7): which tier handled the turn, and why. */
+      kind: "route";
+      id: string;
+      tier: number;
+      model?: string;
+      rule?: string;
+      /** Tier 0 only: why the turn fell back to the model. */
+      fallback?: string;
+      escalated?: boolean;
     }
   | { kind: "error"; id?: string; code: string; message: string };
 

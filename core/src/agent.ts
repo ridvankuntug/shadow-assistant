@@ -27,6 +27,15 @@ export interface TurnRequest {
   resume?: string;
   signal: AbortSignal;
   canUseTool: CanUseTool;
+  /**
+   * Tier 1: append the escalation instructions (prompts/tier1.md) to the
+   * system prompt so the model can hand the turn to the stronger tier.
+   */
+  escalatable?: boolean;
+  /** With `resume`: continue in a forked copy, leaving the resumed session untouched (tier 1 attempts). */
+  forkSession?: boolean;
+  /** Only these MCP servers are loaded for the turn (undefined = all enabled). */
+  mcpServerNames?: readonly string[];
 }
 
 export interface TurnCallbacks {
@@ -39,15 +48,24 @@ export interface TurnResult {
   /** Full assistant text as streamed to the client. */
   text: string;
   sessionId?: string;
+  /** Total input tokens, cache reads and writes included. */
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /** Full SDK names of the tools the model called, in call order. */
+  tools?: string[];
   durationMs: number;
   costUsd?: number;
   /** Set when the turn ended on an error (model/auth/API); text may be partial. */
   error?: string;
 }
 
-/** The session talks to this interface only, so unit tests can mock the model. */
+/**
+ * The session talks to this interface only, so unit tests can mock the model.
+ * Implementations must deliver all answer text through `onDelta`: the session
+ * builds the final text from it (`TurnResult.text` is informational).
+ */
 export interface AgentRunner {
   runTurn(req: TurnRequest, cb: TurnCallbacks): Promise<TurnResult>;
 }
@@ -79,6 +97,8 @@ export const DENIED_BUILTIN_TOOLS = [
 
 export interface SdkAgentOptions {
   systemPrompt: string;
+  /** Appended to the system prompt for escalatable (tier 1) turns. */
+  escalationPrompt?: string;
   /** Built per turn: in-process MCP server instances cannot be shared between queries. */
   mcpServers: () => Record<string, McpServerConfig>;
   /** Working directory of the SDK subprocess (keeps its session files apart). */
@@ -107,19 +127,32 @@ export class SdkAgentRunner implements AgentRunner {
   }
 
   buildOptions(req: TurnRequest, abortController: AbortController): Options {
+    const prompt =
+      req.escalatable && this.opts.escalationPrompt
+        ? `${this.opts.systemPrompt}\n\n${this.opts.escalationPrompt}`
+        : this.opts.systemPrompt;
+    let mcpServers = this.opts.mcpServers();
+    if (req.mcpServerNames) {
+      const keep = new Set(req.mcpServerNames);
+      mcpServers = Object.fromEntries(Object.entries(mcpServers).filter(([name]) => keep.has(name)));
+    }
     return {
       model: req.model,
-      systemPrompt: this.opts.systemPrompt,
+      // Static per tier (byte-identical every turn) so the API prompt cache hits.
+      // `snapshot: false`: a resumed session must get this turn's prompt, not the
+      // one recorded when the session started on another tier.
+      systemPrompt: { type: "custom", prompt, snapshot: false },
       tools: [],
       disallowedTools: DENIED_BUILTIN_TOOLS,
       settingSources: [],
       strictMcpConfig: true,
-      mcpServers: this.opts.mcpServers(),
+      mcpServers,
       canUseTool: req.canUseTool,
       permissionMode: "default",
       includePartialMessages: true,
       abortController,
       resume: req.resume,
+      ...(req.resume && req.forkSession ? { forkSession: true } : {}),
       cwd: this.opts.cwd,
       maxTurns: this.opts.maxTurns ?? 12,
       env: this.opts.env ?? subprocessEnv(process.env),
@@ -157,6 +190,9 @@ export class TurnStream {
   private sessionId: string | undefined;
   private inputTokens = 0;
   private outputTokens = 0;
+  private cacheReadTokens = 0;
+  private cacheWriteTokens = 0;
+  private readonly tools: string[] = [];
   private costUsd: number | undefined;
   private durationMs: number | undefined;
   private error: string | undefined;
@@ -192,6 +228,7 @@ export class TurnStream {
         for (const block of msg.message.content) {
           if (block.type === "tool_use") {
             this.toolNames.set(block.id, block.name);
+            this.tools.push(block.name);
             this.cb.onToolUse?.(block.id, block.name);
           }
         }
@@ -210,8 +247,9 @@ export class TurnStream {
       }
       case "result": {
         const u = msg.usage as unknown as Record<string, number | undefined>;
-        this.inputTokens =
-          (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+        this.cacheReadTokens = u.cache_read_input_tokens ?? 0;
+        this.cacheWriteTokens = u.cache_creation_input_tokens ?? 0;
+        this.inputTokens = (u.input_tokens ?? 0) + this.cacheWriteTokens + this.cacheReadTokens;
         this.outputTokens = u.output_tokens ?? 0;
         this.costUsd = msg.total_cost_usd;
         this.durationMs = msg.duration_ms;
@@ -240,6 +278,9 @@ export class TurnStream {
       sessionId: this.sessionId,
       inputTokens: this.inputTokens,
       outputTokens: this.outputTokens,
+      cacheReadTokens: this.cacheReadTokens,
+      cacheWriteTokens: this.cacheWriteTokens,
+      tools: [...this.tools],
       durationMs: this.durationMs ?? elapsedMs,
       costUsd: this.costUsd,
       error: this.error,

@@ -6,6 +6,8 @@ import { existsSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from "./permissions.js";
+import { loadRouterFile, type CompiledRouterConfig } from "./router-config.js";
+import type { TierModels } from "./router.js";
 import { findService, loadServicesFile, type ServiceDef, type ServicesConfig } from "./services.js";
 
 /** Repo root: `core/src/..` or `core/dist/..` → two levels up from this module. */
@@ -16,7 +18,14 @@ export const CORE_ROOT = fileURLToPath(new URL("../", import.meta.url));
 export interface CoreConfig {
   host: string;
   port: number;
+  /** Tier 2 model (CORE_MODEL_TIER2, else the pre-T7 CORE_MODEL, else sonnet). */
   model: string;
+  /** Models per tier: CORE_MODEL_TIER1/2/3 (defaults haiku / CORE_MODEL or sonnet / opus). */
+  models: TierModels;
+  /** CORE_ROUTER=off: every turn on `model`, no tier 0, no escalation (pre-T7 behaviour). */
+  routerEnabled: boolean;
+  /** router.yaml (undefined when the router is off). */
+  router?: CompiledRouterConfig;
   readOnly: boolean;
   confirmTimeoutMs: number;
   vaultDir?: string;
@@ -68,10 +77,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
   const servicesFile = env.SHADOW_SERVICES_FILE || join(REPO_ROOT, "services.yaml");
   const services = loadServicesFile(servicesFile, env);
 
+  const routerEnabled = !/^(0|off|false|no)$/i.test(env.CORE_ROUTER?.trim() ?? "");
+  const routerFile = env.SHADOW_ROUTER_FILE || join(REPO_ROOT, "router.yaml");
+  const router = routerEnabled ? loadRouterFile(routerFile) : undefined;
+  const model = env.CORE_MODEL_TIER2?.trim() || env.CORE_MODEL?.trim() || "sonnet";
+  const models: TierModels = {
+    1: env.CORE_MODEL_TIER1?.trim() || "haiku",
+    2: model,
+    3: env.CORE_MODEL_TIER3?.trim() || "opus",
+  };
+
   return {
     host: env.CORE_HOST?.trim() || "127.0.0.1",
     port,
-    model: env.CORE_MODEL?.trim() || "sonnet",
+    model,
+    models,
+    routerEnabled,
+    router,
     readOnly: flag(env.CORE_READ_ONLY),
     confirmTimeoutMs: positiveInt("CORE_CONFIRM_TIMEOUT_MS", env.CORE_CONFIRM_TIMEOUT_MS, DEFAULT_CONFIRM_TIMEOUT_MS),
     vaultDir,
