@@ -83,6 +83,16 @@ export type HistoryItem = {
 export type HistoryMessage = { type: "history"; items: HistoryItem[] };
 export type ErrorMessage = { type: "error"; id?: string; code: string; message?: string };
 export type PongMessage = { type: "pong" };
+/** Health of one Core service (docs/02-core-protocol.md, "Service health"). */
+export type ServiceHealthStatus = "ok" | "loading" | "down" | "disabled";
+export type ServiceHealth = {
+  name: string;
+  status: ServiceHealthStatus;
+  checkedAt: number;
+  /** Short code (`timeout`, `unreachable`, …); unknown codes are shown as-is. */
+  detail?: string;
+};
+export type ServicesMessage = { type: "services"; items: ServiceHealth[] };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -96,6 +106,7 @@ export type ServerMessage =
   | SpeechMessage
   | HistoryMessage
   | ErrorMessage
+  | ServicesMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +126,7 @@ const oneOf = (o: Obj, k: string, values: readonly string[]) =>
 const SERVER_STATES = ["idle", "thinking", "awaiting_confirm"] as const;
 const TOOL_STATUSES = ["started", "done", "denied", "error"] as const;
 const RESOLVED_BY = ["button", "voice", "timeout"] as const;
+const SERVICE_STATUSES = ["ok", "loading", "down", "disabled"] as const;
 
 function isHistoryItem(v: unknown): v is HistoryItem {
   return (
@@ -124,6 +136,20 @@ function isHistoryItem(v: unknown): v is HistoryItem {
     str(v, "text") &&
     num(v, "ts")
   );
+}
+
+/**
+ * One `services` item, or null when malformed. A status this client does not
+ * know is treated as `down` (the protocol says: not ok); an over-long detail
+ * is cut so it cannot flood the UI.
+ */
+function toServiceHealth(v: unknown): ServiceHealth | null {
+  if (!isObj(v) || !str(v, "name") || !str(v, "status") || !num(v, "checkedAt")) return null;
+  if (v.detail !== undefined && !str(v, "detail")) return null;
+  const status = oneOf(v, "status", SERVICE_STATUSES) ? (v.status as ServiceHealthStatus) : "down";
+  const item: ServiceHealth = { name: (v.name as string).slice(0, 64), status, checkedAt: v.checkedAt as number };
+  if (typeof v.detail === "string" && v.detail) item.detail = v.detail.slice(0, 64);
+  return item;
 }
 
 /**
@@ -165,6 +191,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "history":
       return Array.isArray(o.items)
         ? { type: "history", items: o.items.filter(isHistoryItem) }
+        : null;
+    case "services":
+      return Array.isArray(o.items)
+        ? { type: "services", items: o.items.map(toServiceHealth).filter((i): i is ServiceHealth => i !== null) }
         : null;
     case "error":
       return str(o, "code") && (o.id === undefined || str(o, "id")) ? (o as ErrorMessage) : null;

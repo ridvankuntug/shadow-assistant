@@ -6,7 +6,8 @@ shell) uses. TypeScript types for all frames live in a single module:
 
 - Endpoint: `ws://<core-host>:<CORE_PORT>/ws` (default port `8700`, default bind `127.0.0.1`).
 - Health: `GET http://<core-host>:<CORE_PORT>/health` →
-  `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true}]}`.
+  `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true,"status":"ok"}]}`
+  (`status` as in *Service health*; `unknown` before the first check round. No URLs or tokens.)
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
   every frame that belongs to that turn.
@@ -16,7 +17,8 @@ shell) uses. TypeScript types for all frames live in a single module:
 
 1. The first client frame **must** be `hello`, sent within **5 s** of connecting.
 2. The token goes in the `hello` frame, never in the URL.
-3. On success the Core replies `welcome` followed by `state: idle`.
+3. On success the Core replies `welcome` followed by `state: idle` and, once the
+   first health round has finished, `services` (see *Service health*).
 4. On a missing/late/invalid hello or a wrong token the Core sends
    `{"type":"error","code":"unauthorized","message":"…"}` and closes with code **4401**.
 5. An unsupported `protocol` number gets `error bad_request` and close code **4400**.
@@ -55,7 +57,11 @@ refuses to start.
 | `{"type":"speech","id":"t1","mime":"audio/wav","data":"<base64>"}` | Synthesized audio for a `speak` request. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…"}` | See *Errors*. |
+| `{"type":"services","items":[{"name":"whisper-svc","status":"ok"\|"loading"\|"down"\|"disabled","checkedAt":<epoch ms>,"detail"?:"timeout"}]}` | Service health; see *Service health*. Added in protocol 1 without a version bump. |
 | `{"type":"pong"}` | Reply to `ping`. |
+
+Clients must ignore frame types they do not know (that is how `services` was
+added without a version bump).
 
 Tool names in `tool` and `confirm_request` frames are the service's own tool
 names (e.g. `homeassistant__GetLiveContext`, `intent__HassTurnOff`), without the
@@ -74,6 +80,45 @@ Agent SDK's `mcp__<service>__` prefix.
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
+
+## Service health
+
+The Core checks every `services.yaml` entry every `CORE_HEALTH_INTERVAL_MS`
+(default 30000), each check bounded by `CORE_HEALTH_TIMEOUT_MS` (default 3000).
+Polling runs continuously, whether or not a client is connected; a round starts
+only after the previous one finished, so checks never overlap.
+
+| Kind | Check | `ok` / `loading` |
+|---|---|---|
+| `http` | `GET <url><health>` | 200 → `ok`; 503 `{"status":"loading"}` → `loading`; anything else → `down` |
+| `mcp` (SSE, e.g. Home Assistant) | `GET <url>` with the bearer token, `Accept: text/event-stream`; the stream is closed right after the response headers — no MCP message is sent, no tool is listed or called | 200 `text/event-stream` → `ok` |
+| `mcp` (streamable HTTP) | same GET | any non-auth answer below 500 except 404 → `ok` |
+| `vault` | the vault folder exists | → `ok` |
+
+A disabled service (in the file, or by a missing environment variable) is
+reported as `disabled` and never checked.
+
+`items` is the full list in `services.yaml` order. It is sent to each
+authenticated client after `welcome` + `state` (once the first round has
+finished) and to all clients whenever a `status` or `detail` changes;
+`checkedAt` alone changing does not trigger a frame. `detail` is a short code,
+never a URL, host or token:
+
+| `detail` | Meaning |
+|---|---|
+| `timeout` | No answer within `CORE_HEALTH_TIMEOUT_MS`. |
+| `unreachable` | Connection refused / DNS / network error. |
+| `unauthorized` | 401/403 (wrong or expired token). |
+| `error` | The service reports `{"status":"error"}`. |
+| `bad_response` | 200 but not an event stream (e.g. a proxy page). |
+| `http_<status>` | Any other HTTP status. |
+| `not_found` | The vault folder is missing. |
+| `not_configured` | `disabled`: a required environment variable is missing. |
+| `off` | `disabled`: `enabled: false` in `services.yaml`. |
+
+Clients must treat unknown `status` or `detail` values as "not ok" / free text.
+Features keep their own errors: e.g. an `audio` frame while whisper-svc is down
+still gets `error stt_unavailable`.
 
 ## Turn lifecycle
 

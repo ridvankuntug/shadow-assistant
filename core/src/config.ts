@@ -5,6 +5,7 @@
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_HEALTH_TIMEOUT_MS } from "./health.js";
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from "./permissions.js";
 import { loadRouterFile, type CompiledRouterConfig } from "./router-config.js";
 import type { TierModels } from "./router.js";
@@ -28,6 +29,9 @@ export interface CoreConfig {
   router?: CompiledRouterConfig;
   readOnly: boolean;
   confirmTimeoutMs: number;
+  /** Service health polling: CORE_HEALTH_INTERVAL_MS (default 30 s) / CORE_HEALTH_TIMEOUT_MS (default 3 s). */
+  healthIntervalMs: number;
+  healthTimeoutMs: number;
   vaultDir?: string;
   dataDir: string;
   services: ServicesConfig;
@@ -96,6 +100,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     router,
     readOnly: flag(env.CORE_READ_ONLY),
     confirmTimeoutMs: positiveInt("CORE_CONFIRM_TIMEOUT_MS", env.CORE_CONFIRM_TIMEOUT_MS, DEFAULT_CONFIRM_TIMEOUT_MS),
+    healthIntervalMs: positiveInt("CORE_HEALTH_INTERVAL_MS", env.CORE_HEALTH_INTERVAL_MS, DEFAULT_HEALTH_INTERVAL_MS),
+    healthTimeoutMs: positiveInt("CORE_HEALTH_TIMEOUT_MS", env.CORE_HEALTH_TIMEOUT_MS, DEFAULT_HEALTH_TIMEOUT_MS),
     vaultDir,
     dataDir,
     services,

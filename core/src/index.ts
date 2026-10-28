@@ -9,6 +9,7 @@ import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, type CoreConfig } from "./config.js";
 import { ConversationLog } from "./conversation-log.js";
+import { buildHealthTargets, HealthMonitor } from "./health.js";
 import { PermissionPolicy } from "./permissions.js";
 import { McpDirectClient } from "./mcp-direct.js";
 import { checkRouterServices } from "./router-config.js";
@@ -92,6 +93,13 @@ export async function main(): Promise<void> {
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
 
+  // Built after the vault check above so a missing vault dir reads as disabled.
+  const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, { vaultDir: cfg.vaultDir }), {
+    intervalMs: cfg.healthIntervalMs,
+    timeoutMs: cfg.healthTimeoutMs,
+    logger,
+  });
+
   const server = createCoreServer({
     tokens,
     logger,
@@ -101,9 +109,14 @@ export async function main(): Promise<void> {
         info,
         send,
       ),
-    health: () => ({
-      services: cfg.services.services.map((s) => ({ name: s.name, enabled: s.enabled })),
-    }),
+    // Name, flag and status only: no URL or token leaves through /health.
+    health: () => {
+      const status = new Map((monitor.snapshot() ?? []).map((h) => [h.name, h.status]));
+      return {
+        services: cfg.services.services.map((s) => ({ name: s.name, enabled: s.enabled, status: status.get(s.name) ?? "unknown" })),
+      };
+    },
+    serviceHealth: monitor,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
 
@@ -116,11 +129,14 @@ export async function main(): Promise<void> {
   );
   logger.info(`[shadow-core] model=${cfg.model} readOnly=${cfg.readOnly} devices=${[...tokens.digests.keys()].join(",")}`);
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
+  monitor.start();
+  logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);
 
   const shutdown = () => {
     logger.info("[shadow-core] shutting down");
-    void server
+    void monitor
       .close()
+      .then(() => server.close())
       .then(() => direct?.close())
       .then(() => usageLog.flush())
       .then(() => process.exit(0));

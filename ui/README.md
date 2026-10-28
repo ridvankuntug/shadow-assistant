@@ -25,6 +25,9 @@ Then open the dev server and connect with `ws://localhost:8700/ws` and
 `dev-token`. Messages containing "kilit" trigger a confirmation, "hata" a model
 error. Env: `MOCK_PORT`, `MOCK_HOST`, `MOCK_TOKEN`, `MOCK_TRANSCRIPT` (fixed
 speech-to-text result, e.g. `evet` to answer a confirmation by voice),
-`MOCK_CONFIRM_MS`, `MOCK_TTS_FAIL=1`.
+`MOCK_CONFIRM_MS`, `MOCK_TTS_FAIL=1`. Service health indicator:
+`MOCK_SERVICES_DOWN=whisper-svc,home-assistant` (reported `down`),
+`MOCK_SERVICES_LOADING=tts-svc` (reported `loading`),
+`MOCK_SERVICES_FLAP_MS=10000` (the down list toggles down/ok every N ms).
 
 The microphone needs a secure context: `localhost` or https.

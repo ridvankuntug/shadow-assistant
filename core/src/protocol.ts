@@ -101,6 +101,23 @@ export interface HistoryItem {
   ts: number;
 }
 
+/** Health of one services.yaml entry, as seen by the Core's health monitor. */
+export type ServiceHealthStatus = "ok" | "loading" | "down" | "disabled";
+
+export interface ServiceHealth {
+  /** services.yaml name, e.g. `whisper-svc`, `home-assistant`. */
+  name: string;
+  status: ServiceHealthStatus;
+  /** Epoch ms of the last check (for `disabled`: when the snapshot was taken). */
+  checkedAt: number;
+  /**
+   * Short machine-readable reason, never a URL, host or token:
+   * `timeout`, `unreachable`, `unauthorized`, `error`, `bad_response`,
+   * `http_<status>`, `not_found`, `not_configured`, `off`.
+   */
+  detail?: string;
+}
+
 export type ServerFrame =
   | { type: "welcome"; protocol: number; sessionId: string; device: string }
   | { type: "state"; state: ServerState }
@@ -120,6 +137,7 @@ export type ServerFrame =
   | { type: "speech"; id: string; mime: string; data: string }
   | { type: "history"; items: HistoryItem[] }
   | { type: "error"; id?: string; code: ErrorCode; message: string }
+  | { type: "services"; items: ServiceHealth[] }
   | { type: "pong" };
 
 // ---------------------------------------------------------------- validation

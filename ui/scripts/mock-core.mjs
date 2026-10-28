@@ -5,7 +5,10 @@
 //   node scripts/mock-core.mjs
 //   MOCK_PORT=8700 MOCK_HOST=127.0.0.1 MOCK_TOKEN=dev-token node scripts/mock-core.mjs
 // Optional env: MOCK_TRANSCRIPT (fixed STT text), MOCK_CONFIRM_MS (default 60000),
-//               MOCK_TTS_FAIL=1 (speak always fails with tts_unavailable).
+//               MOCK_TTS_FAIL=1 (speak always fails with tts_unavailable),
+//               MOCK_SERVICES_DOWN=whisper-svc,home-assistant (reported `down`, detail `unreachable`),
+//               MOCK_SERVICES_LOADING=whisper-svc (reported `loading`),
+//               MOCK_SERVICES_FLAP_MS=10000 (the DOWN list toggles down <-> ok every N ms and is broadcast).
 import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 
@@ -19,6 +22,36 @@ const LOCK_TOOL = "intent__HassTurnOff";
 
 // Shared across connections.
 const history = [];
+/** Senders of authenticated sockets, for `services` broadcasts. */
+const authedSockets = new Set();
+
+// ------------------------------------------------------------ service health
+// Same names as services.yaml; statuses from env (see the header).
+const envList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+const SERVICES_DOWN = new Set(envList(process.env.MOCK_SERVICES_DOWN));
+const SERVICES_LOADING = new Set(envList(process.env.MOCK_SERVICES_LOADING));
+const SERVICE_NAMES = ["home-assistant", "shadow-vault", "whisper-svc", "tts-svc"];
+for (const n of [...SERVICES_DOWN, ...SERVICES_LOADING]) if (!SERVICE_NAMES.includes(n)) SERVICE_NAMES.push(n);
+let servicesDownNow = true;
+
+function serviceItems() {
+  const checkedAt = Date.now();
+  return SERVICE_NAMES.map((name) => {
+    if (SERVICES_DOWN.has(name) && servicesDownNow) return { name, status: "down", checkedAt, detail: "unreachable" };
+    if (SERVICES_LOADING.has(name)) return { name, status: "loading", checkedAt };
+    return { name, status: "ok", checkedAt };
+  });
+}
+
+const FLAP_MS = Number(process.env.MOCK_SERVICES_FLAP_MS ?? 0);
+if (FLAP_MS > 0 && SERVICES_DOWN.size > 0) {
+  setInterval(() => {
+    servicesDownNow = !servicesDownNow;
+    const frame = { type: "services", items: serviceItems() };
+    console.log(`[mock-core] services: ${[...SERVICES_DOWN].join(",")} ${servicesDownNow ? "down" : "ok"}`);
+    for (const ws of authedSockets) send(ws, frame);
+  }, FLAP_MS).unref();
+}
 let confirmCounter = 0;
 
 function addHistory(role, text) {
@@ -299,6 +332,8 @@ function onMessage(ctx, raw) {
     clearTimeout(ctx.authTimer);
     send(ctx.ws, { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" });
     send(ctx.ws, { type: "state", state: "idle" });
+    send(ctx.ws, { type: "services", items: serviceItems() });
+    authedSockets.add(ctx.ws);
     return;
   }
   if (!msg || typeof msg !== "object") return sendError(ctx.ws, "bad_request", "Geçersiz çerçeve");
@@ -312,6 +347,7 @@ wss.on("connection", (ws) => {
   ctx.authTimer = setTimeout(() => ws.close(4401, "hello timeout"), AUTH_TIMEOUT_MS);
   ws.on("message", (raw) => onMessage(ctx, raw));
   ws.on("close", () => {
+    authedSockets.delete(ws);
     clearTimeout(ctx.authTimer);
     clearTimers(ctx);
     ctx.turn = null;

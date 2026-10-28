@@ -11,6 +11,7 @@ import type {
   HistoryItem,
   ServerMessage,
   ServerState,
+  ServiceHealth,
   ToolStatus,
 } from "../protocol/types.ts";
 
@@ -89,6 +90,8 @@ export type AssistantState = {
   /** Recently cancelled turn ids; late frames for them are dropped. */
   cancelled: string[];
   notice: Notice | null;
+  /** Latest `services` frame from the Core (empty until the first one). */
+  services: ServiceHealth[];
 };
 
 export type Action =
@@ -129,6 +132,7 @@ export const initialState: AssistantState = {
   lastResolved: null,
   cancelled: [],
   notice: null,
+  services: [],
 };
 
 // ---------------------------------------------------------------------------
@@ -353,6 +357,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         voiceAnswer: null,
         awaitingSpeech: null,
         confirms: [],
+        // A (possibly different) Core sends its own list right after welcome.
+        services: [],
       };
 
     case "state": {
@@ -466,6 +472,9 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         ),
       };
     }
+
+    case "services":
+      return { ...s, services: msg.items };
 
     case "pong":
       return s;

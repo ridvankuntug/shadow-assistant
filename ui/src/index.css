@@ -134,6 +134,7 @@ input:focus-visible {
 }
 
 .topbar {
+  position: relative; /* anchors .svc-list to the bar, not to the indicator */
   display: flex;
   align-items: center;
   gap: 8px;
@@ -181,6 +182,52 @@ input:focus-visible {
 .topbar-actions {
   margin-left: auto;
   display: flex;
+}
+
+/* Service health: hidden while all ok; a dot + count, tap for the reasons. */
+.svc-btn {
+  gap: 4px;
+  grid-auto-flow: column;
+  font-size: 12px;
+  color: var(--muted);
+}
+.svc-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f0a93c;
+}
+.svc-down .svc-dot {
+  background: var(--danger);
+}
+.svc-btn.svc-loading .svc-dot,
+.svc-item.svc-loading .svc-dot {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.svc-list {
+  position: absolute;
+  right: 8px;
+  top: calc(100% + 4px);
+  z-index: 10;
+  margin: 0;
+  padding: 8px 12px;
+  list-style: none;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 24px));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-solid);
+  font-size: 13px;
+}
+.svc-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+}
+.svc-item small {
+  color: var(--muted);
 }
 
 /* -------------------------------------------------------------------- stage */

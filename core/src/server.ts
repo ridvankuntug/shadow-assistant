@@ -17,6 +17,7 @@ import {
   PROTOCOL_VERSION,
   parseClientFrame,
   type ServerFrame,
+  type ServiceHealth,
 } from "./protocol.js";
 import type { Logger, Session, SessionInfo } from "./session.js";
 
@@ -30,6 +31,17 @@ export interface CoreServerOptions {
   helloTimeoutMs?: number;
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
+  /**
+   * Service health source (HealthMonitor). Authenticated clients get the
+   * current list right after `welcome` + `state` and every change as a
+   * `services` frame.
+   */
+  serviceHealth?: ServiceHealthSource;
+}
+
+export interface ServiceHealthSource {
+  snapshot(): ServiceHealth[] | undefined;
+  subscribe(listener: (items: ServiceHealth[]) => void): () => void;
 }
 
 export interface CoreServer {
@@ -62,6 +74,11 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
   const sessions = new Set<Session>();
   /** Set by close(): no new upgrades or sessions are accepted from then on. */
   let shuttingDown = false;
+  /** Senders of authenticated sockets (service health broadcasts). */
+  const authed = new Set<(frame: ServerFrame) => void>();
+  const unsubscribeHealth = opts.serviceHealth?.subscribe((items) => {
+    for (const send of authed) send({ type: "services", items });
+  });
 
   http.on("upgrade", (req: IncomingMessage, socket, head) => {
     const path = (req.url ?? "/").split("?")[0];
@@ -138,6 +155,9 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
         opts.logger.info(`[shadow-core] device '${device}' connected (session ${sessionId})`);
         send({ type: "welcome", protocol: PROTOCOL_VERSION, sessionId, device });
         send({ type: "state", state: "idle" });
+        const items = opts.serviceHealth?.snapshot();
+        if (items) send({ type: "services", items });
+        authed.add(send);
         return;
       }
 
@@ -159,6 +179,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
 
     ws.on("close", () => {
       clearTimeout(helloTimer);
+      authed.delete(send);
       if (session) {
         const s = session;
         opts.logger.info(`[shadow-core] device '${s.info.device}' disconnected`);
@@ -183,6 +204,8 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     },
     async close() {
       shuttingDown = true;
+      unsubscribeHealth?.();
+      authed.clear();
       for (const client of wss.clients) client.close(1001, "server shutting down");
       await Promise.all([...sessions].map((s) => s.close("server_shutdown").catch(() => {})));
       // Peers that never answered the close handshake would keep http.close() waiting.

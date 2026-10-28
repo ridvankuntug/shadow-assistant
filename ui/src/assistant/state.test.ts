@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ServerMessage } from "../protocol/types.ts";
+import type { ServerMessage, ServiceHealth } from "../protocol/types.ts";
 import {
   bargeInTarget,
   canStop,
@@ -374,5 +374,33 @@ describe("queued turns", () => {
     expect(after.queuedTurn).toBeNull();
     expect(after.messages[0]).toMatchObject({ cancelled: true });
     expect(derivePhase(after)).toBe("idle");
+  });
+});
+
+describe("service health", () => {
+  const items: ServiceHealth[] = [
+    { name: "whisper-svc", status: "down", checkedAt: 1, detail: "timeout" },
+    { name: "tts-svc", status: "ok", checkedAt: 1 },
+  ];
+
+  it("starts empty and stores the latest services frame", () => {
+    expect(connected.services).toEqual([]);
+    const s = run([srv({ type: "services", items: [...items] })]);
+    expect(s.services).toEqual(items);
+    const s2 = run([srv({ type: "services", items: [{ name: "whisper-svc", status: "ok", checkedAt: 2 }] })], s);
+    expect(s2.services).toEqual([{ name: "whisper-svc", status: "ok", checkedAt: 2 }]);
+  });
+
+  it("is cleared by a new welcome (the Core resends its list)", () => {
+    const s = run([
+      srv({ type: "services", items: [...items] }),
+      srv({ type: "welcome", protocol: 1, sessionId: "s2", device: "d" }),
+    ]);
+    expect(s.services).toEqual([]);
+  });
+
+  it("does not touch the turn or the phase", () => {
+    const s = run([{ type: "user_text_sent", id: "t1", text: "selam" }, srv({ type: "services", items: [...items] })]);
+    expect(derivePhase(s)).toBe("thinking");
   });
 });

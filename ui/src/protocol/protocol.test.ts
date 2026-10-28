@@ -38,6 +38,13 @@ const VALID: ServerMessage[] = [
   { type: "history", items: [{ id: "h1", role: "user", text: "a", ts: 1 }] },
   { type: "error", code: "unauthorized" },
   { type: "error", id: "t1", code: "stt_unavailable", message: "down" },
+  {
+    type: "services",
+    items: [
+      { name: "whisper-svc", status: "down", checkedAt: 1, detail: "timeout" },
+      { name: "tts-svc", status: "ok", checkedAt: 1 },
+    ],
+  },
   { type: "pong" },
 ];
 
@@ -58,6 +65,7 @@ describe("parseServerMessage", () => {
     ["resolved bad by", '{"type":"confirm_resolved","requestId":"c","approved":true,"by":"magic"}'],
     ["history not array", '{"type":"history","items":{}}'],
     ["error id not string", '{"type":"error","id":5,"code":"x"}'],
+    ["services not array", '{"type":"services","items":{}}'],
   ])("rejects %s", (_name, raw) => {
     expect(parseServerMessage(raw)).toBeNull();
   });
@@ -67,6 +75,29 @@ describe("parseServerMessage", () => {
       JSON.stringify({ type: "history", items: [{ id: "a", role: "user", text: "x", ts: 1 }, { id: "b", role: "bot" }] }),
     );
     expect(msg).toEqual({ type: "history", items: [{ id: "a", role: "user", text: "x", ts: 1 }] });
+  });
+
+  it("services: drops malformed items, maps unknown status to down, cuts long text", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({
+        type: "services",
+        items: [
+          { name: "a", status: "ok", checkedAt: 1, extra: "dropped" },
+          { name: "b", status: "rebooting", checkedAt: 2 },
+          { name: "c", status: "ok" },
+          { name: "d", status: "down", checkedAt: 3, detail: 5 },
+          { name: "e", status: "down", checkedAt: 4, detail: "x".repeat(200) },
+        ],
+      }),
+    );
+    expect(msg).toEqual({
+      type: "services",
+      items: [
+        { name: "a", status: "ok", checkedAt: 1 },
+        { name: "b", status: "down", checkedAt: 2 },
+        { name: "e", status: "down", checkedAt: 4, detail: "x".repeat(64) },
+      ],
+    });
   });
 });
 

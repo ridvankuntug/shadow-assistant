@@ -9,6 +9,7 @@ import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
 import { Conversation } from "./ui/Conversation.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
+import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { Stage } from "./ui/Stage.tsx";
 import { CONNECTION_LABEL, noticeText, resolvedText } from "./ui/strings.ts";
 
@@ -115,6 +116,8 @@ export default function App({ adapter, controller }: Props) {
           )}
         </span>
         <nav className="topbar-actions">
+          {/* Only while connected: after a disconnect the last list is stale. */}
+          {connected && <ServiceIndicator services={state.services} />}
           <button
             type="button"
             className="btn btn-icon"
