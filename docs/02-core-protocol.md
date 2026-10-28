@@ -43,12 +43,15 @@ refuses to start.
 | `{"type":"cancel","id":"t1"}` | Barge-in: stop turn `t1`. |
 | `{"type":"history_request","limit":20}` | Recent conversation items (default 20, max 100). |
 | `{"type":"ping"}` | Keep-alive; answered with `pong`. |
+| `{"type":"speech_prefs","enabled":true,"mode":"audio"\|"text","voice"?:"tr_TR-dfki-medium"}` | Opt in to streamed speech for this socket's turns (feature `speech_stream`). See *Streamed speech*. |
+| `{"type":"memory_list","id":"m1"}` | Ask for the memory contents (feature `memory`). See *Memory*. |
+| `{"type":"memory_delete","id":"m2","entryId":"m-7f3a9c"}` | Delete one memory entry (feature `memory`). See *Memory*. |
 
 ## Core → Client
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser"}` | Authenticated. |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","memory","usage_limit"]}` | Authenticated. `features`: see *Features*. |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -57,14 +60,32 @@ refuses to start.
 | `{"type":"confirm_request","requestId":"c1","id":"t1","tool":"<tool>","summary":"…","expiresAt":<epoch ms>}` | The turn is paused until the user confirms. |
 | `{"type":"confirm_resolved","requestId":"c1","approved":true\|false,"by":"button"\|"voice"\|"timeout"}` | Sent exactly once per `confirm_request`. |
 | `{"type":"speech","id":"t1","mime":"audio/wav","data":"<base64>"}` | Synthesized audio for a `speak` request. |
+| `{"type":"speech_chunk","id":"t1","seq":0,"final":false,"mime"?:"audio/wav","data"?:"<base64>","text"?:"…"}` | One sentence of a turn's spoken answer, only after `speech_prefs` with `enabled:true`. See *Streamed speech*. |
+| `{"type":"memory","id":"m1","brief":{…},"topics":[…],"warnings":[…]}` | Reply to `memory_list` / `memory_delete`. See *Memory*. |
 | `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
-| `{"type":"error","id"?:"t1","code":"…","message":"…"}` | See *Errors*. |
+| `{"type":"error","id"?:"t1","code":"…","message":"…","retryAt"?:<epoch ms>}` | See *Errors*. `retryAt` only with `usage_limit`. |
 | `{"type":"services","items":[{"name":"whisper-svc","status":"ok"\|"loading"\|"down"\|"disabled","checkedAt":<epoch ms>,"detail"?:"timeout"}]}` | Service health; see *Service health*. Added in protocol 1 without a version bump. |
 | `{"type":"pong"}` | Reply to `ping`. |
 
 Clients must ignore frame types they do not know (that is how `services` and
-`voices` were added without a version bump).
+`voices` were added without a version bump). They must also ignore unknown
+fields of known frames.
+
+### Features
+
+`welcome.features` (optional, array of strings) lists optional capabilities of
+this Core. A missing array means none. Clients ignore names they do not know.
+The protocol number stays 1.
+
+| Feature | Meaning |
+|---|---|
+| `speech_stream` | The Core understands `speech_prefs` and sends `speech_chunk` frames to clients that opted in. Without it a client speaks the answer itself after `assistant_done` (`speak`). |
+| `memory` | Memory is enabled: `memory_list` / `memory_delete` are answered. Without it clients hide the memory settings. |
+| `usage_limit` | The Core reports a reached subscription usage limit as `error usage_limit` (+ `retryAt`). |
+
+Old clients ignore `features`. A Core sends `speech_chunk` only after the
+client's first `speech_prefs`, so clients that never send it see no change.
 
 Tool names in `tool` and `confirm_request` frames are the service's own tool
 names (e.g. `homeassistant__GetLiveContext`, `intent__HassTurnOff`), without the
@@ -80,9 +101,73 @@ Agent SDK's `mcp__<service>__` prefix.
 | `tts_unavailable` | tts-svc not configured, unreachable, loading or timed out; also a selected voice that is still being downloaded/loaded (retry shortly) or failed to load, and a `voices` request while tts-svc is not ready. |
 | `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
 | `busy` | A turn is already running (one turn per session at a time). |
+| `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
+
+## Streamed speech
+
+With the feature `speech_stream`, the Core splits the answer into sentences while
+it streams, applies the *Pronunciation lexicon* and sends ordered
+`speech_chunk` frames to clients that opted in. Design:
+[`docs/07-speed.md` §A2](07-speed.md#a2-sentence-by-sentence-speech).
+
+`speech_prefs` (client → Core) can be sent at any time; the latest one applies
+to later chunks:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `enabled` | boolean, required | `false`: no chunks (voice replies are off). |
+| `mode` | `"audio"` \| `"text"`, required | `audio`: tts-svc clips (web). `text`: the lexicon-applied sentence text, for a client that speaks with on-device TTS (Android). |
+| `voice` | string, optional | As `speak.voice`: absent, `null`, empty, over-long or unknown ids use the default voice. A non-string `voice` is a `bad_request`. Used in `audio` mode. |
+
+Before the first `speech_prefs` the Core sends no chunks.
+
+`speech_chunk` (Core → client):
+
+```json
+{"type":"speech_chunk","id":"t1","seq":0,"final":false,"mime":"audio/wav","data":"<base64>"}
+{"type":"speech_chunk","id":"t1","seq":1,"final":false,"text":"Salon ışığı açıldı."}
+{"type":"speech_chunk","id":"t1","seq":2,"final":true}
+```
+
+- `audio` mode carries `mime` + `data`, `text` mode carries `text`.
+- `seq` starts at 0 per turn and has no gaps; frames are sent in `seq` order.
+- The last frame of a turn has `final: true`. It may carry no `data`/`text`
+  when it only marks the end.
+- After a `cancel` of the turn no further chunks are sent, and no `final` is
+  required. Clients drop chunks of turns they cancelled.
+- A synthesis failure sends one `error tts_unavailable` with the turn `id`,
+  stops synthesis for that turn and sends a payload-less `final` chunk. The text
+  answer is still complete.
+- A turn with an empty answer sends no chunks.
+- With streaming on, a client does not send `speak` for the answer (it would be
+  spoken twice). `speak` stays for voice previews and for Cores without the
+  feature.
+
+## Memory
+
+With the feature `memory`. Design: [`docs/06-memory.md`](06-memory.md).
+
+```json
+{"type":"memory","id":"m1",
+ "brief":{"chars":412,"budget":800,"entries":[{"id":"m-a1b2c3","text":"Kullanıcının adı Rıdvan."}]},
+ "topics":[{"topic":"ev","title":"Ev ve cihaz adları","chars":96,
+            "entries":[{"id":"m-7f3a9c","text":"Otomodos = oturma odası","updatedAt":1767340800000}]}],
+ "warnings":[{"code":"note_over_budget","topic":"tercihler"}]}
+```
+
+- `memory_list` is answered with `memory` (same `id`).
+- `memory_delete` deletes one entry (brief or note); the fact is tombstoned so
+  it is not learned again. It is answered with a fresh `memory` frame (same
+  `id`). An unknown `entryId` gets `error bad_request` (with `id`).
+- With memory disabled (`CORE_MEMORY=off`) both requests get `error bad_request`
+  ("memory is disabled").
+- `entries[].updatedAt` (epoch ms) is optional. `warnings[].code` is one of
+  `note_over_budget`, `note_full` (both with `topic`) and `memory_full`; clients
+  show unknown codes as free text.
+- Memory frames go only to the requesting socket.
 
 ## Voices
 
@@ -134,7 +219,7 @@ including Turkish I/ı/İ/i, the replacement inserted as written (`SHADOW` →
 `Şadov`); a suffix after `'` or `’` is kept (`Shadow'u` → `Şadov'u`); multi-word
 keys allowed, longest key first. The matching code (`core/src/pronunciation.ts`)
 has no I/O, so the same entries could later be offered to clients that speak
-with on-device TTS; today only Core-side `speak` uses it.
+with on-device TTS; today Core-side `speak` and `speech_chunk` use it.
 
 ## Service health
 

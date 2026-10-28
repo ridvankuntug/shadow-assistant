@@ -9,7 +9,11 @@
 //               MOCK_SERVICES_DOWN=whisper-svc,home-assistant (reported `down`, detail `unreachable`),
 //               MOCK_SERVICES_LOADING=whisper-svc (reported `loading`),
 //               MOCK_SERVICES_FLAP_MS=10000 (the DOWN list toggles down <-> ok every N ms and is broadcast),
-//               MOCK_STT_IDLE=1 (whisper-svc reported `ok` with detail `idle`).
+//               MOCK_STT_IDLE=1 (whisper-svc reported `ok` with detail `idle`),
+//               MOCK_SPEECH_STREAM=0 (behave like an older Core: no `features`, no speech_chunk).
+// With speech_stream (default) a client that sent speech_prefs gets one speech_chunk per
+// sentence while the answer streams (a sine tone in audio mode, the sentence in text mode).
+// A message containing "limit" is answered with `error usage_limit` (retryAt in 2 hours).
 import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 
@@ -18,6 +22,7 @@ const HOST = process.env.MOCK_HOST ?? "127.0.0.1";
 const TOKEN = process.env.MOCK_TOKEN ?? "dev-token";
 const CONFIRM_MS = Number(process.env.MOCK_CONFIRM_MS ?? 60000);
 const AUTH_TIMEOUT_MS = 5000;
+const SPEECH_STREAM = process.env.MOCK_SPEECH_STREAM !== "0";
 // Like the real Core: service tool names without the Agent SDK's mcp__<service>__ prefix.
 const LOCK_TOOL = "intent__HassTurnOff";
 
@@ -136,7 +141,39 @@ function chunkText(text) {
 }
 
 function createContext(ws) {
-  return { ws, authed: false, timers: new Set(), turn: null };
+  return { ws, authed: false, timers: new Set(), turn: null, speechPrefs: null };
+}
+
+// Sentences with their end offsets in the full text (simplified splitter, mock only).
+function sentences(text) {
+  const parts = text.match(/[^.!?…]+[.!?…]*\s*/g) ?? [];
+  let end = 0;
+  return parts.map((p) => ({ text: p.trim(), end: (end += p.length) })).filter((p) => p.text);
+}
+
+/** Per-turn speech stream: emits a chunk for every sentence the streamed text has completed. */
+function createSpeech(ctx, turn, text) {
+  const prefs = ctx.speechPrefs;
+  if (!SPEECH_STREAM || !prefs?.enabled) return null;
+  return { prefs, list: sentences(text), next: 0, seq: 0, failed: false };
+}
+
+function feedSpeech(ctx, turn, speech, streamedLength, done) {
+  if (!speech || speech.failed) return;
+  while (speech.next < speech.list.length && speech.list[speech.next].end <= streamedLength) {
+    const sentence = speech.list[speech.next++].text;
+    if (process.env.MOCK_TTS_FAIL === "1") {
+      speech.failed = true;
+      sendError(ctx.ws, "tts_unavailable", "Sahte TTS hatası", turn.id);
+      send(ctx.ws, { type: "speech_chunk", id: turn.id, seq: speech.seq++, final: true });
+      return;
+    }
+    const frame = { type: "speech_chunk", id: turn.id, seq: speech.seq++, final: false };
+    if (speech.prefs.mode === "text") frame.text = sentence;
+    else Object.assign(frame, { mime: "audio/wav", data: makeWav(sentence.length).toString("base64") });
+    send(ctx.ws, frame);
+  }
+  if (done && speech.seq > 0) send(ctx.ws, { type: "speech_chunk", id: turn.id, seq: speech.seq++, final: true });
 }
 
 function later(ctx, ms, fn) {
@@ -155,14 +192,17 @@ function clearTimers(ctx) {
 
 function streamAnswer(ctx, turn, text) {
   const chunks = chunkText(text);
+  const speech = createSpeech(ctx, turn, text);
   const step = (i) => {
     if (ctx.turn !== turn) return;
     if (i < chunks.length) {
       turn.streamed += chunks[i];
       send(ctx.ws, { type: "assistant_delta", id: turn.id, text: chunks[i] });
+      feedSpeech(ctx, turn, speech, turn.streamed.length, false);
       later(ctx, 120, () => step(i + 1));
       return;
     }
+    feedSpeech(ctx, turn, speech, text.length, true);
     send(ctx.ws, { type: "assistant_done", id: turn.id, text });
     addHistory("assistant", text);
     send(ctx.ws, { type: "state", state: "idle" });
@@ -211,6 +251,15 @@ function runTurn(ctx, id, text) {
     return;
   }
 
+  if (normalise(text).includes("limit")) {
+    later(ctx, 300, () => {
+      send(ctx.ws, { type: "error", id, code: "usage_limit", message: "Sahte kullanım limiti", retryAt: Date.now() + 2 * 3600_000 });
+      send(ctx.ws, { type: "state", state: "idle" });
+      ctx.turn = null;
+    });
+    return;
+  }
+
   if (normalise(text).includes("hata")) {
     later(ctx, 300, () => {
       sendError(ctx.ws, "model_error", "Sahte model hatası", id);
@@ -220,7 +269,11 @@ function runTurn(ctx, id, text) {
     return;
   }
 
-  streamAnswer(ctx, turn, `Bu bir deneme cevabı: "${text}". Shadow şu an sahte çekirdeğe bağlı.`);
+  streamAnswer(
+    ctx,
+    turn,
+    `Bu bir deneme cevabı: "${text}". Shadow şu an sahte çekirdeğe bağlı. Cevap cümle cümle seslendirilir.`,
+  );
 }
 
 function startTurnOrBusy(ctx, id, text) {
@@ -316,6 +369,14 @@ function handleFrame(ctx, msg) {
       return handleVoices(ctx, msg);
     case "cancel":
       return handleCancel(ctx, msg);
+    case "speech_prefs":
+      if (!SPEECH_STREAM) return sendError(ws, "bad_request", "Bilinmeyen tür: speech_prefs");
+      if (typeof msg.enabled !== "boolean" || (msg.mode !== "audio" && msg.mode !== "text")) {
+        return sendError(ws, "bad_request", "speech_prefs geçersiz");
+      }
+      ctx.speechPrefs = { enabled: msg.enabled, mode: msg.mode };
+      console.log(`[mock-core] speech_prefs: ${msg.enabled ? msg.mode : "off"} voice: ${typeof msg.voice === "string" ? msg.voice : "(default)"}`);
+      return;
     case "history_request": {
       const limit = Math.min(100, Math.max(1, Number(msg.limit) || 20));
       return send(ws, { type: "history", items: history.slice(-limit) });
@@ -349,7 +410,9 @@ function onMessage(ctx, raw) {
     }
     ctx.authed = true;
     clearTimeout(ctx.authTimer);
-    send(ctx.ws, { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" });
+    const welcome = { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" };
+    if (SPEECH_STREAM) welcome.features = ["speech_stream", "usage_limit"];
+    send(ctx.ws, welcome);
     send(ctx.ws, { type: "state", state: "idle" });
     send(ctx.ws, { type: "services", items: serviceItems() });
     authedSockets.add(ctx.ws);

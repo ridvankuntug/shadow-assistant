@@ -13,7 +13,7 @@ import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { sttStatus } from "./ui/serviceHealth.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
-import { CONNECTION_LABEL, noticeText, resolvedText } from "./ui/strings.ts";
+import { CONNECTION_LABEL, noticeMessage, noticeText, resolvedText } from "./ui/strings.ts";
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
@@ -173,7 +173,7 @@ export default function App({ adapter, controller }: Props) {
 
         {notice && (
           <div className="notice" role="alert">
-            <p>{noticeText(notice.code, notice.message)}</p>
+            <p>{noticeMessage(notice)}</p>
             <button type="button" className="btn btn-ghost" onClick={() => controller.dismissNotice()}>
               Tamam
             </button>

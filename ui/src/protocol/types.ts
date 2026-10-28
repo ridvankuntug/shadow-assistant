@@ -35,6 +35,17 @@ export type VoicesRequestMessage = { type: "voices"; id: string };
 export type CancelMessage = { type: "cancel"; id: string };
 export type HistoryRequestMessage = { type: "history_request"; limit: number };
 export type PingMessage = { type: "ping" };
+/** How streamed speech is delivered: tts-svc clips (`audio`) or sentence text for native TTS (`text`). */
+export type SpeechMode = "audio" | "text";
+/**
+ * Opt-in to `speech_chunk` frames (only to a Core with the `speech_stream`
+ * feature). `voice` as in `speak`; only meaningful in `audio` mode.
+ */
+export type SpeechPrefsMessage = { type: "speech_prefs"; enabled: boolean; mode: SpeechMode; voice?: string };
+/** Asks for the memory contents (Core feature `memory`). */
+export type MemoryListMessage = { type: "memory_list"; id: string };
+/** Deletes one memory entry; answered by a fresh `memory` frame. */
+export type MemoryDeleteMessage = { type: "memory_delete"; id: string; entryId: string };
 
 export type ClientMessage =
   | HelloMessage
@@ -45,16 +56,23 @@ export type ClientMessage =
   | VoicesRequestMessage
   | CancelMessage
   | HistoryRequestMessage
-  | PingMessage;
+  | PingMessage
+  | SpeechPrefsMessage
+  | MemoryListMessage
+  | MemoryDeleteMessage;
 
 // ---------------------------------------------------------------------------
 // Core -> Client
 
+/** Optional Core capabilities this client uses (`welcome.features`). */
+export type CoreFeature = "speech_stream" | "memory" | "usage_limit";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;
   sessionId: string;
   device: string;
+  /** Absent on older Cores (= no optional features). Only string entries are kept; unknown names are unused. */
+  features?: string[];
 };
 export type StateMessage = { type: "state"; state: ServerState };
 export type TranscriptMessage = { type: "transcript"; id: string; text: string };
@@ -85,7 +103,8 @@ export type HistoryItem = {
   ts: number;
 };
 export type HistoryMessage = { type: "history"; items: HistoryItem[] };
-export type ErrorMessage = { type: "error"; id?: string; code: string; message?: string };
+/** `retryAt` (epoch ms): when a `usage_limit` resets, if the Core knows it. */
+export type ErrorMessage = { type: "error"; id?: string; code: string; message?: string; retryAt?: number };
 export type PongMessage = { type: "pong" };
 /** Health of one Core service (docs/02-core-protocol.md, "Service health"). */
 export type ServiceHealthStatus = "ok" | "loading" | "down" | "disabled";
@@ -100,6 +119,31 @@ export type ServicesMessage = { type: "services"; items: ServiceHealth[] };
 /** One tts-svc voice. `quality` is free text (e.g. `medium`) and optional. */
 export type Voice = { id: string; label: string; quality?: string };
 export type VoicesMessage = { type: "voices"; id: string; default: string; voices: Voice[] };
+/**
+ * One sentence of a turn's spoken answer (feature `speech_stream`). `seq`
+ * starts at 0 per turn; `final` marks the last frame, which may carry no
+ * payload. Audio mode: `mime` + `data`; text mode: `text`.
+ */
+export type SpeechChunkMessage = {
+  type: "speech_chunk";
+  id: string;
+  seq: number;
+  final: boolean;
+  mime?: string;
+  data?: string;
+  text?: string;
+};
+export type MemoryEntry = { id: string; text: string; updatedAt?: number };
+export type MemoryTopic = { topic: string; title: string; chars: number; entries: MemoryEntry[] };
+/** `code`: `note_over_budget` | `note_full` | `memory_full`; unknown codes are shown as-is. */
+export type MemoryWarning = { code: string; topic?: string };
+export type MemoryMessage = {
+  type: "memory";
+  id: string;
+  brief: { chars: number; budget: number; entries: MemoryEntry[] };
+  topics: MemoryTopic[];
+  warnings: MemoryWarning[];
+};
 
 export type ServerMessage =
   | WelcomeMessage
@@ -115,6 +159,8 @@ export type ServerMessage =
   | ErrorMessage
   | ServicesMessage
   | VoicesMessage
+  | SpeechChunkMessage
+  | MemoryMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -187,6 +233,75 @@ function uniqueVoices(items: unknown[]): Voice[] {
   return out;
 }
 
+const isSeq = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+/**
+ * A `speech_chunk` with only its known fields, or null when malformed. A
+ * payload of the wrong type rejects the frame; empty strings count as absent.
+ * Audio data needs a mime type.
+ */
+function toSpeechChunk(o: Obj): SpeechChunkMessage | null {
+  if (!str(o, "id") || !isSeq(o.seq) || !bool(o, "final")) return null;
+  for (const k of ["mime", "data", "text"]) if (o[k] !== undefined && !str(o, k)) return null;
+  const chunk: SpeechChunkMessage = { type: "speech_chunk", id: o.id as string, seq: o.seq, final: o.final as boolean };
+  if (o.data) {
+    if (!o.mime) return null;
+    chunk.mime = o.mime as string;
+    chunk.data = o.data as string;
+  }
+  if (o.text) chunk.text = o.text as string;
+  return chunk;
+}
+
+function toMemoryEntry(v: unknown): MemoryEntry | null {
+  if (!isObj(v) || !str(v, "id") || !v.id || !str(v, "text")) return null;
+  const entry: MemoryEntry = { id: v.id as string, text: v.text as string };
+  if (num(v, "updatedAt")) entry.updatedAt = v.updatedAt as number;
+  return entry;
+}
+
+const memoryEntries = (v: unknown): MemoryEntry[] | null =>
+  Array.isArray(v) ? v.map(toMemoryEntry).filter((e): e is MemoryEntry => e !== null) : null;
+
+function toMemoryTopic(v: unknown): MemoryTopic | null {
+  if (!isObj(v) || !str(v, "topic") || !num(v, "chars")) return null;
+  const entries = memoryEntries(v.entries);
+  if (!entries) return null;
+  const topic = v.topic as string;
+  const title = typeof v.title === "string" && v.title.trim() ? v.title : topic;
+  return { topic, title, chars: v.chars as number, entries };
+}
+
+function toMemoryWarning(v: unknown): MemoryWarning | null {
+  if (!isObj(v) || !str(v, "code")) return null;
+  const w: MemoryWarning = { code: v.code as string };
+  if (str(v, "topic")) w.topic = v.topic as string;
+  return w;
+}
+
+/**
+ * A `memory` frame with only its known fields, or null when the id or the
+ * brief is malformed. Malformed entries, topics and warnings are dropped; a
+ * missing `topics`/`warnings` array counts as empty.
+ */
+function toMemory(o: Obj): MemoryMessage | null {
+  const brief = o.brief;
+  if (!str(o, "id") || !isObj(brief) || !num(brief, "chars") || !num(brief, "budget")) return null;
+  const briefEntries = memoryEntries(brief.entries);
+  if (!briefEntries) return null;
+  const topics = Array.isArray(o.topics) ? o.topics.map(toMemoryTopic).filter((t): t is MemoryTopic => t !== null) : [];
+  const warnings = Array.isArray(o.warnings)
+    ? o.warnings.map(toMemoryWarning).filter((w): w is MemoryWarning => w !== null)
+    : [];
+  return {
+    type: "memory",
+    id: o.id as string,
+    brief: { chars: brief.chars as number, budget: brief.budget as number, entries: briefEntries },
+    topics,
+    warnings,
+  };
+}
+
 /**
  * Parses one raw text frame. Returns null for anything that is not a valid,
  * known v1 server message (unknown types are ignored for forward
@@ -201,8 +316,14 @@ export function parseServerMessage(raw: string): ServerMessage | null {
   }
   if (!isObj(o) || typeof o.type !== "string") return null;
   switch (o.type) {
-    case "welcome":
-      return num(o, "protocol") && str(o, "sessionId") ? (o as WelcomeMessage) : null;
+    case "welcome": {
+      if (!num(o, "protocol") || !str(o, "sessionId")) return null;
+      // A malformed `features` must not cost the connection: it means "none".
+      const { features, ...rest } = o;
+      const welcome = rest as WelcomeMessage;
+      if (Array.isArray(features)) welcome.features = features.filter((f): f is string => typeof f === "string");
+      return welcome;
+    }
     case "state":
       return oneOf(o, "state", SERVER_STATES) ? (o as StateMessage) : null;
     case "transcript":
@@ -240,8 +361,18 @@ export function parseServerMessage(raw: string): ServerMessage | null {
             voices: uniqueVoices(o.voices),
           }
         : null;
-    case "error":
-      return str(o, "code") && (o.id === undefined || str(o, "id")) ? (o as ErrorMessage) : null;
+    case "error": {
+      if (!str(o, "code") || (o.id !== undefined && !str(o, "id"))) return null;
+      // A malformed `retryAt` is dropped; the error itself still counts.
+      const { retryAt, ...rest } = o;
+      const error = rest as ErrorMessage;
+      if (typeof retryAt === "number" && Number.isFinite(retryAt)) error.retryAt = retryAt;
+      return error;
+    }
+    case "speech_chunk":
+      return toSpeechChunk(o);
+    case "memory":
+      return toMemory(o);
     case "pong":
       return { type: "pong" };
     default:

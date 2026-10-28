@@ -6,12 +6,14 @@ import {
   AssistantController,
   CANCEL_SETTLE_MS,
   MAX_UTTERANCE_MS,
+  SPEECH_FINAL_TIMEOUT_MS,
   VOICES_TIMEOUT_MS,
   VOICE_SAMPLE_TEXT,
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
 import { derivePhase } from "./state.ts";
+import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
 function deferred<T>(): Deferred<T> {
@@ -97,10 +99,15 @@ function fakeClient() {
       opts = o;
       return client;
     },
-    connect() {
+    /** `features`: the Core's `welcome.features` (absent = an older Core). */
+    connect(features?: string[]) {
       connected = true;
       opts.onStatus({ status: "connected", attempt: 0 } satisfies StatusEvent);
-      opts.onMessage({ type: "welcome", protocol: 1, sessionId: "s", device: "browser" });
+      opts.onMessage(
+        features
+          ? { type: "welcome", protocol: 1, sessionId: "s", device: "browser", features }
+          : { type: "welcome", protocol: 1, sessionId: "s", device: "browser" },
+      );
     },
     drop() {
       connected = false;
@@ -111,7 +118,7 @@ function fakeClient() {
   };
 }
 
-function setup(tts?: TtsCapability) {
+function setup(tts?: TtsCapability, features?: string[]) {
   const a = fakeAdapter(tts);
   const c = fakeClient();
   let n = 0;
@@ -122,8 +129,8 @@ function setup(tts?: TtsCapability) {
     newId: () => `t${++n}`,
   });
   controller.connect("ws://localhost:8700/ws", "tok");
-  c.connect();
-  c.sent.length = 0; // drop the history_request sent on welcome
+  c.connect(features);
+  c.sent.length = 0; // drop the history_request (and speech_prefs) sent on welcome
   return { ...a, ...c, controller, phase: () => derivePhase(controller.getState()) };
 }
 
@@ -498,6 +505,16 @@ describe("AssistantController", () => {
     expect(t.controller.getState().confirms).toHaveLength(1);
   });
 
+  it("a usage_limit error shows its reset time in the notice card text", () => {
+    const t = setup();
+    t.controller.sendText("selam");
+    const now = new Date(2026, 9, 28, 12, 0).getTime();
+    const retryAt = new Date(2026, 9, 28, 14, 30).getTime();
+    t.receive({ type: "error", id: "t1", code: "usage_limit", message: "limit", retryAt });
+    const notice = t.controller.getState().notice!;
+    expect(noticeMessage(notice, now)).toBe("Kullanım limitine ulaşıldı; 14:30'da sıfırlanır.");
+  });
+
   it("refuses to send while disconnected", () => {
     const t = setup();
     t.drop();
@@ -516,6 +533,335 @@ describe("AssistantController", () => {
     await t.controller.startTalk(); // barge-in
     expect(stop).toHaveBeenCalled();
     expect(t.sent).toContainEqual({ type: "cancel", id: "t1" });
+  });
+});
+
+describe("streamed speech (speech_stream)", () => {
+  const STREAM = ["speech_stream", "memory", "usage_limit"];
+  const nativeTts = (speak: (text: string) => Promise<void>) => ({ mode: "native" as const, speak: vi.fn(speak), stop: vi.fn() });
+  const chunk = (id: string, seq: number, data?: string, final = false): ServerMessage =>
+    data ? { type: "speech_chunk", id, seq, final, mime: "audio/wav", data } : { type: "speech_chunk", id, seq, final };
+  const playedData = (t: ReturnType<typeof setup>) => vi.mocked(t.adapter.playback.play).mock.calls.map(([clip]) => clip.data);
+
+  it("opts in after a welcome with speech_stream: audio mode for core TTS, with the chosen voice", () => {
+    const a = fakeAdapter();
+    const c = fakeClient();
+    const controller = new AssistantController({ adapter: a.adapter, clientVersion: "x", createClient: c.create });
+    controller.setVoice("tr_TR-b");
+    controller.connect("ws://localhost:8700/ws", "tok");
+    c.connect(STREAM);
+    expect(c.sent).toEqual([
+      { type: "speech_prefs", enabled: true, mode: "audio", voice: "tr_TR-b" },
+      { type: "history_request", limit: 20 },
+    ]);
+  });
+
+  it("native TTS opts in with text mode and no voice", () => {
+    const t = setup(nativeTts(async () => {}));
+    t.controller.setVoice("tr_TR-b");
+    t.drop();
+    t.connect(STREAM);
+    expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: true, mode: "text" });
+  });
+
+  it("sends speech_prefs again only when voice replies or the voice change", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.setVoiceReplies(true); // unchanged
+    t.controller.setVoice(null); // unchanged
+    expect(t.sent).toEqual([]);
+    t.controller.setVoiceReplies(false);
+    t.controller.setVoice("tr_TR-b");
+    t.controller.setVoiceReplies(true);
+    expect(t.sent).toEqual([
+      { type: "speech_prefs", enabled: false, mode: "audio" },
+      { type: "speech_prefs", enabled: false, mode: "audio", voice: "tr_TR-b" },
+      { type: "speech_prefs", enabled: true, mode: "audio", voice: "tr_TR-b" },
+    ]);
+  });
+
+  it("an older Core (no speech_stream) gets no speech_prefs and speak still follows assistant_done", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.setVoiceReplies(false);
+    t.controller.setVoiceReplies(true);
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    expect(t.sentTypes()).toEqual(["user_text", "speak"]);
+  });
+
+  it("plays chunks in order, one after another; speaking from the first chunk until the queue drains after final", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive(chunk("t1", 0, "A"));
+    expect(t.phase()).toBe("speaking");
+    t.receive(chunk("t1", 1, "B"));
+    t.receive({ type: "assistant_delta", id: "t1", text: "…" });
+    expect(playedData(t)).toEqual(["A"]); // B waits for A
+    t.finishPlayback();
+    await flush();
+    expect(playedData(t)).toEqual(["A", "B"]);
+    t.receive({ type: "assistant_done", id: "t1", text: "Bir. İki." });
+    t.receive({ type: "state", state: "idle" });
+    expect(t.phase()).toBe("speaking"); // more may come until final
+    t.finishPlayback();
+    await flush();
+    expect(t.phase()).toBe("speaking");
+    t.receive(chunk("t1", 2, "C", true));
+    expect(playedData(t)).toEqual(["A", "B", "C"]);
+    t.finishPlayback();
+    await flush();
+    expect(t.phase()).toBe("idle");
+  });
+
+  it("does not speak twice: no speak after assistant_done while streaming", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("selam");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive(chunk("t1", 1, undefined, true));
+    expect(t.sentTypes()).toEqual(["user_text"]);
+  });
+
+  it("a payload-less final ends the speaking phase once the last clip finished", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("selam");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, undefined, true));
+    expect(t.phase()).toBe("speaking");
+    t.finishPlayback();
+    await flush();
+    expect(t.controller.getState().playing).toBeNull();
+    expect(t.phase()).toBe("thinking"); // the turn itself has not ended yet
+    expect(playedData(t)).toEqual(["A"]);
+  });
+
+  it("barge-in clears the queue: playback stops, cancel is sent, queued and late chunks are dropped", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    await t.controller.startTalk();
+    expect(t.calls).toContain("playback.stop");
+    expect(t.sent).toContainEqual({ type: "cancel", id: "t1" });
+    expect(t.phase()).toBe("listening");
+    t.receive(chunk("t1", 2, "C"));
+    await flush();
+    expect(playedData(t)).toEqual(["A"]);
+  });
+
+  it("stop() and stopSpeaking() clear the queue; later chunks of that turn stay silent", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    t.controller.stopSpeaking();
+    expect(t.phase()).not.toBe("speaking");
+    t.receive(chunk("t1", 2, "C"));
+    await flush();
+    expect(playedData(t)).toEqual(["A"]);
+
+    const u = setup(undefined, STREAM);
+    u.controller.sendText("anlat");
+    u.receive(chunk("t1", 0, "A"));
+    u.receive(chunk("t1", 1, "B"));
+    u.controller.stop();
+    expect(u.sent).toContainEqual({ type: "cancel", id: "t1" });
+    u.receive(chunk("t1", 2, "C", true));
+    await flush();
+    expect(playedData(u)).toEqual(["A"]);
+    expect(u.phase()).toBe("idle");
+  });
+
+  it("chunks that arrive after voice replies were switched off are ignored", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.controller.setVoiceReplies(false);
+    t.receive(chunk("t1", 0, "A"));
+    expect(playedData(t)).toEqual([]);
+    expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: false, mode: "audio" });
+  });
+
+  it("native mode speaks the chunk texts in order through tts.speak", async () => {
+    const pending: Array<() => void> = [];
+    const tts = nativeTts(() => new Promise<void>((res) => pending.push(res)));
+    const t = setup(tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "speech_chunk", id: "t1", seq: 0, final: false, text: "Birinci cümle." });
+    t.receive({ type: "speech_chunk", id: "t1", seq: 1, final: true, text: "İkinci cümle." });
+    expect(tts.speak.mock.calls.map(([x]) => x)).toEqual(["Birinci cümle."]);
+    expect(t.phase()).toBe("speaking");
+    pending.shift()!();
+    await flush();
+    expect(tts.speak.mock.calls.map(([x]) => x)).toEqual(["Birinci cümle.", "İkinci cümle."]);
+    t.receive({ type: "assistant_done", id: "t1", text: "Birinci cümle. İkinci cümle." });
+    expect(t.sentTypes()).toEqual(["user_text"]);
+    t.receive({ type: "state", state: "idle" });
+    expect(t.phase()).toBe("speaking");
+    pending.shift()!();
+    await flush();
+    expect(t.phase()).toBe("idle");
+    expect(vi.mocked(t.adapter.playback.play)).not.toHaveBeenCalled();
+  });
+
+  it("ignores repeated chunks and chunks without a payload for this client's mode", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 0, "A"));
+    t.receive({ type: "speech_chunk", id: "t1", seq: 1, final: false, text: "metin" });
+    t.finishPlayback();
+    return flush().then(() => expect(playedData(t)).toEqual(["A"]));
+  });
+
+  it("a failed clip shows a notice and skips the rest of the answer", async () => {
+    const t = setup(undefined, STREAM);
+    vi.mocked(t.adapter.playback.play).mockRejectedValueOnce(new PlatformError("playback_failed", "blocked"));
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    await flush();
+    expect(t.controller.getState().notice?.code).toBe("playback_failed");
+    expect(playedData(t)).toEqual(["A"]);
+    expect(t.phase()).toBe("thinking"); // the turn itself still runs
+  });
+
+  it("tts_unavailable during a streamed turn keeps the turn and its text running", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "assistant_delta", id: "t1", text: "Bir" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.receive(chunk("t1", 0, undefined, true));
+    expect(t.controller.getState().notice?.code).toBe("tts_unavailable");
+    expect(t.controller.getState().activeTurn?.id).toBe("t1");
+    t.receive({ type: "assistant_delta", id: "t1", text: " iki" });
+    t.receive({ type: "assistant_done", id: "t1", text: "Bir iki" });
+    const reply = t.controller.getState().messages.find((m) => m.key === "t1:assistant");
+    expect(reply).toMatchObject({ text: "Bir iki", pending: false });
+    expect(reply?.failed).toBeUndefined();
+    expect(t.sentTypes()).toEqual(["user_text"]);
+  });
+
+  it("a chunk of a newer turn replaces what is left of the previous one", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("bir");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    t.receive(chunk("t9", 0, "X"));
+    await flush();
+    expect(playedData(t)).toEqual(["A", "X"]);
+    expect(t.controller.getState().playing).toBe("t9");
+  });
+
+  it("a dropped socket plays what arrived and then ends the speaking phase", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    t.drop();
+    t.finishPlayback();
+    await flush();
+    expect(playedData(t)).toEqual(["A", "B"]);
+    t.finishPlayback();
+    await flush();
+    expect(t.phase()).toBe("idle");
+  });
+
+  it("disconnect() plays what arrived and then ends the speaking phase", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B"));
+    t.controller.disconnect();
+    t.finishPlayback();
+    await flush();
+    expect(playedData(t)).toEqual(["A", "B"]);
+    t.finishPlayback();
+    await flush();
+    expect(t.controller.getState().playing).toBeNull();
+  });
+
+  it("a turn that ended before its first chunk still speaks when nothing else happened", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("bir");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "assistant_done", id: "t1", text: "A" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive(chunk("t1", 0, "A", true));
+    expect(playedData(t)).toEqual(["A"]);
+  });
+
+  it("late chunks of a turn that ended before its first chunk stay silent after a new turn, stop or push-to-talk", async () => {
+    const run = async (act: (t: ReturnType<typeof setup>) => Promise<void> | void) => {
+      const t = setup(undefined, STREAM);
+      t.controller.sendText("bir");
+      t.receive({ type: "state", state: "thinking" });
+      t.receive({ type: "assistant_done", id: "t1", text: "A" });
+      t.receive({ type: "state", state: "idle" });
+      await act(t);
+      t.receive(chunk("t1", 0, "A"));
+      t.receive(chunk("t1", 1, "B", true));
+      await flush();
+      expect(playedData(t)).toEqual([]);
+      expect(t.controller.getState().playing).toBeNull();
+      return t;
+    };
+    const typed = await run((t) => void t.controller.sendText("iki"));
+    // The new turn's own speech still plays.
+    typed.receive(chunk("t2", 0, "X", true));
+    expect(playedData(typed)).toEqual(["X"]);
+    await run((t) => t.controller.stop());
+    const talk = await run((t) => t.controller.startTalk());
+    expect(talk.phase()).toBe("listening");
+  });
+
+  it("a new welcome opts in again", () => {
+    const t = setup(undefined, STREAM);
+    t.drop();
+    t.connect(STREAM);
+    expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: true, mode: "audio" });
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("after assistant_done a missing final ends the queue after SPEECH_FINAL_TIMEOUT_MS", async () => {
+      const t = setup(undefined, STREAM);
+      t.controller.sendText("anlat");
+      t.receive(chunk("t1", 0, "A"));
+      t.receive({ type: "assistant_done", id: "t1", text: "A" });
+      t.receive({ type: "state", state: "idle" });
+      t.finishPlayback();
+      await vi.advanceTimersByTimeAsync(SPEECH_FINAL_TIMEOUT_MS - 1);
+      expect(t.phase()).toBe("speaking");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(t.phase()).toBe("idle");
+    });
+
+    it("a turn error without a final chunk also ends the queue after the timeout", async () => {
+      const t = setup(undefined, STREAM);
+      t.controller.sendText("anlat");
+      t.receive(chunk("t1", 0, "A"));
+      t.receive({ type: "error", id: "t1", code: "model_error", message: "x" });
+      t.finishPlayback();
+      await vi.advanceTimersByTimeAsync(SPEECH_FINAL_TIMEOUT_MS);
+      expect(t.controller.getState().playing).toBeNull();
+      expect(t.phase()).toBe("idle");
+    });
+
+    it("no timeout before assistant_done (a confirm may pause the turn for long)", async () => {
+      const t = setup(undefined, STREAM);
+      t.controller.sendText("anlat");
+      t.receive({ type: "state", state: "thinking" });
+      t.receive(chunk("t1", 0, "A"));
+      t.finishPlayback();
+      await vi.advanceTimersByTimeAsync(SPEECH_FINAL_TIMEOUT_MS * 3);
+      expect(t.controller.getState().playing).toBe("t1");
+      t.receive(chunk("t1", 1, "B", true));
+      expect(playedData(t)).toEqual(["A", "B"]);
+    });
   });
 });
 

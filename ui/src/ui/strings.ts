@@ -1,5 +1,5 @@
 /** User-facing Turkish strings. */
-import type { Phase } from "../assistant/state.ts";
+import type { Notice, Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
 import type { Quality } from "../scene/quality.ts";
 import type { SttStatus } from "./serviceHealth.ts";
@@ -35,6 +35,7 @@ const NOTICE_TEXT: Record<string, string> = {
   tts_unavailable: "Seslendirme servisine ulaşılamıyor; cevap yalnızca yazılı.",
   model_error: "Model bir hata verdi. Tekrar dener misin?",
   busy: "Shadow şu an başka bir isteği işliyor.",
+  usage_limit: "Kullanım limitine ulaşıldı.",
   internal: "Çekirdekte beklenmeyen bir hata oluştu.",
   incompatible: "Çekirdek bu arayüzün protokol sürümünü desteklemiyor. Arayüzü ya da çekirdeği güncelle.",
   confirm_pending: "Önce onay kartını yanıtla: düğmeyle ya da sesle (“evet” / “hayır”).",
@@ -71,8 +72,47 @@ export function sttNote(status: SttStatus): { text: string; soft: boolean } | nu
   }
 }
 
-export function noticeText(code: string, message?: string): string {
+/**
+ * `retryAt`: only used for `usage_limit` (the reset time, epoch ms); `now` is
+ * for tests.
+ */
+export function noticeText(code: string, message?: string, retryAt?: number, now = Date.now()): string {
+  if (code === "usage_limit") return usageLimitText(retryAt, now);
   return NOTICE_TEXT[code] ?? (message ? `Hata: ${message}` : `Beklenmeyen hata (${code}).`);
+}
+
+/** The text of a notice card, with everything the notice carries (e.g. a usage_limit reset time). */
+export function noticeMessage(notice: Notice, now = Date.now()): string {
+  return noticeText(notice.code, notice.message, notice.retryAt, now);
+}
+
+// Locative suffix (-da/-de/-ta/-te) after a clock time, from the last number
+// word as it is read aloud: "14:30" -> otuz -> 'da, "14:00" -> dört -> 'te.
+const UNIT_SUFFIX = ["da", "de", "de", "te", "te", "te", "da", "de", "de", "da"]; // sıfır, bir … dokuz
+const TENS_SUFFIX = ["", "da", "de", "da", "ta", "de"]; // on, yirmi, otuz, kırk, elli
+
+/** `'da` / `'de` / `'ta` / `'te` for a time `hour:minute` (hour 0-23, minute 0-59). */
+export function timeLocativeSuffix(hour: number, minute: number): string {
+  const n = minute === 0 ? hour : minute;
+  if (n === 0) return "'da";
+  return `'${n % 10 !== 0 ? UNIT_SUFFIX[n % 10] : TENS_SUFFIX[Math.floor(n / 10) % 10]}`;
+}
+
+/**
+ * "Kullanım limitine ulaşıldı; 14:30'da sıfırlanır." The date is added when the
+ * reset is not today; without a usable future `retryAt` only the first part.
+ */
+export function usageLimitText(retryAt: number | undefined, now = Date.now()): string {
+  const base = NOTICE_TEXT.usage_limit;
+  if (retryAt === undefined || !Number.isFinite(retryAt) || retryAt <= now) return base;
+  const d = new Date(retryAt);
+  if (Number.isNaN(d.getTime())) return base;
+  const h = d.getHours();
+  const m = d.getMinutes();
+  const hhmm = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  const sameDay = new Date(now).toDateString() === d.toDateString();
+  const when = sameDay ? hhmm : `${d.toLocaleDateString("tr-TR", { day: "numeric", month: "long" })} ${hhmm}`;
+  return `${base.slice(0, -1)}; ${when}${timeLocativeSuffix(h, m)} sıfırlanır.`;
 }
 
 export function toolStatusText(status: "started" | "done" | "denied" | "error"): string {

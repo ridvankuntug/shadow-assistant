@@ -90,12 +90,33 @@ type Utterance = { mime: string; data: string; durationMs: number };
   turn the controller holds the next `user_text`/`audio` until the Core's
   `state: idle`, at most 2 s, because the Core answers `busy` until the
   cancelled turn has wound down.)
-- **Replies.** On `assistant_done`, if voice replies are on:
+- **Replies, streamed (Core with `speech_stream`).** After `welcome` lists the
+  feature, the app sends `speech_prefs` ([02 §Streamed speech](02-core-protocol.md#streamed-speech)):
+  `enabled` = the voice-replies switch, mode `audio` for `tts.mode === "core"`
+  (with the voice from Settings → Ses) and `text` for `"native"`. It sends it
+  again when the switch or the voice changes. The Core then sends the answer
+  sentence by sentence as `speech_chunk` frames while the text streams, and the
+  app does **not** send `speak` after `assistant_done` (that would speak twice).
+  The **queue rule**: one queue per turn; each chunk is played with
+  `playback.play(clip)` (core mode) or `tts.speak(text)` (native mode), and each
+  call starts only after the previous promise resolved, so the adapter never gets
+  two overlapping calls. "Speaking" is shown from the first chunk until the
+  queue is empty after the turn's `final` chunk (or 35 s after `assistant_done`
+  without one, or when the socket drops). Barge-in, Durdur and switching voice
+  replies off call `playback.stop()` / `tts.stop()` and clear the queue; later
+  chunks of that turn are dropped. A failing clip shows a notice and skips the
+  rest of that answer. The adapter interface is the same as for the
+  non-streamed path; the Android bridge speaks one text per `tts.speak` call.
+- **Replies, after the answer (older Core, no `speech_stream`).** On
+  `assistant_done`, if voice replies are on:
   `tts.mode === "core"` → the app sends `speak` and plays the returned
   `speech` clip with `playback.play`; `tts.mode === "native"` → `tts.speak(text)`.
   "Speaking" is shown while that promise is pending. In core mode the `speak`
   frame carries the voice chosen in Settings → Ses (`voice`, omitted for the
-  default).
+  default). The voice preview ("Dene") always uses `speak`.
+- **Usage limit.** `error usage_limit` is shown as "Kullanım limitine ulaşıldı;
+  HH:MM'de sıfırlanır." (the time from `retryAt`, with the date when it is not
+  today; without `retryAt` only the first part).
 - **Lifecycle.** While `isVisible()` is false the 3D render loop stops. Coming
   back to the foreground triggers an immediate reconnect attempt if the socket
   dropped.

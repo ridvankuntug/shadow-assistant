@@ -74,3 +74,46 @@ test("speak.voice is optional; voices request needs an id", () => {
   bad({ type: "voices" });
   bad({ type: "voices", id: "" });
 });
+
+test("speech_prefs: enabled + mode required, voice follows speak.voice rules, unknown fields ignored", () => {
+  assert.deepEqual(ok({ type: "speech_prefs", enabled: true, mode: "audio", voice: "tr_TR-dfki-medium", extra: 1 }), {
+    type: "speech_prefs",
+    enabled: true,
+    mode: "audio",
+    voice: "tr_TR-dfki-medium",
+  });
+  assert.deepEqual(ok({ type: "speech_prefs", enabled: false, mode: "text" }), {
+    type: "speech_prefs",
+    enabled: false,
+    mode: "text",
+  });
+  // null / empty / over-long voice → absent (default voice), not an error.
+  for (const voice of [null, "", "x".repeat(129)]) {
+    assert.deepEqual(ok({ type: "speech_prefs", enabled: true, mode: "audio", voice }), {
+      type: "speech_prefs",
+      enabled: true,
+      mode: "audio",
+    });
+  }
+  bad({ type: "speech_prefs", mode: "audio" });
+  bad({ type: "speech_prefs", enabled: "yes", mode: "audio" });
+  bad({ type: "speech_prefs", enabled: true });
+  bad({ type: "speech_prefs", enabled: true, mode: "video" });
+  bad({ type: "speech_prefs", enabled: true, mode: "audio", voice: 5 });
+});
+
+test("memory_list / memory_delete need ids; unknown fields ignored", () => {
+  assert.deepEqual(ok({ type: "memory_list", id: "m1", extra: true }), { type: "memory_list", id: "m1" });
+  assert.deepEqual(ok({ type: "memory_delete", id: "m2", entryId: "m-7f3a9c", extra: 1 }), {
+    type: "memory_delete",
+    id: "m2",
+    entryId: "m-7f3a9c",
+  });
+  bad({ type: "memory_list" });
+  bad({ type: "memory_list", id: "" });
+  assert.equal(bad({ type: "memory_delete", id: "m2" }).id, "m2");
+  bad({ type: "memory_delete", id: "m2", entryId: "" });
+  bad({ type: "memory_delete", id: "m2", entryId: 7 });
+  bad({ type: "memory_delete", id: "m2", entryId: "x".repeat(129) });
+  bad({ type: "memory_delete", entryId: "m-1" });
+});

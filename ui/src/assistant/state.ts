@@ -8,6 +8,7 @@
 import type { StatusEvent } from "../protocol/client.ts";
 import type {
   ConfirmResolvedBy,
+  CoreFeature,
   HistoryItem,
   ServerMessage,
   ServerState,
@@ -48,6 +49,8 @@ export type Notice = {
   code: string;
   message?: string;
   turnId?: string;
+  /** `usage_limit`: when the limit resets (epoch ms), if the Core knows it. */
+  retryAt?: number;
 };
 
 export type ActiveTurn = {
@@ -80,9 +83,15 @@ export type VoicePreview = { id: string; failed: boolean };
 export type AssistantState = {
   connection: StatusEvent;
   sessionId: string | null;
+  /** `welcome.features` of the connected Core (empty for an older Core). */
+  features: string[];
   serverState: ServerState;
   capture: CaptureState;
-  /** Turn whose reply is playing (speaking phase). */
+  /**
+   * Turn whose reply is playing (speaking phase). With streamed speech it is
+   * set from the first `speech_chunk` until the turn's queue has drained
+   * after its `final` chunk.
+   */
   playing: string | null;
   /** Turn whose `speech` clip has been requested but not received yet. */
   awaitingSpeech: string | null;
@@ -141,6 +150,7 @@ const MAX_CANCELLED = 20;
 export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
   sessionId: null,
+  features: [],
   serverState: "idle",
   capture: "off",
   playing: null,
@@ -235,6 +245,11 @@ export function confirmPending(s: AssistantState): boolean {
 
 export function isCancelled(s: AssistantState, turnId: string): boolean {
   return s.cancelled.includes(turnId);
+}
+
+/** The connected Core advertised `feature` in its `welcome`. */
+export function hasFeature(s: AssistantState, feature: CoreFeature): boolean {
+  return s.features.includes(feature);
 }
 
 /** Should an incoming `speech` clip be played? */
@@ -406,6 +421,7 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       return {
         ...s,
         sessionId: msg.sessionId,
+        features: msg.features ?? [],
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -506,7 +522,12 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       };
 
     case "speech":
+    case "speech_chunk":
       // Playback itself is a side effect (controller); nothing to store here.
+      return s;
+
+    case "memory":
+      // Rendered by the memory panel (M8); nothing to store here yet.
       return s;
 
     case "history":
@@ -526,10 +547,23 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       }
       if (msg.code === "unauthorized") return { ...s, notice: { code: msg.code, message: msg.message } };
       const id = msg.id;
+      // With streamed speech a synthesis failure can arrive while the turn is
+      // still running (the text answer goes on, a `final` chunk follows): it
+      // must not end or fail the turn. Before streaming it only ever answered
+      // a `speak`, after the turn.
+      if (msg.code === "tts_unavailable") {
+        return {
+          ...s,
+          notice: { code: msg.code, message: msg.message, turnId: id },
+          awaitingSpeech: id !== undefined && s.awaitingSpeech === id ? null : s.awaitingSpeech,
+        };
+      }
       // `busy` for a voice answer: it was not a yes/no and the paused turn is
       // still running, so the confirm still needs an answer.
       const code = id && id === s.voiceAnswer && msg.code === "busy" ? "not_an_answer" : msg.code;
-      const next: AssistantState = { ...s, notice: { code, message: msg.message, turnId: id } };
+      const notice: Notice = { code, message: msg.message, turnId: id };
+      if (msg.code === "usage_limit" && msg.retryAt !== undefined) notice.retryAt = msg.retryAt;
+      const next: AssistantState = { ...s, notice };
       if (!id) return next;
       return {
         ...next,

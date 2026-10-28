@@ -80,6 +80,37 @@ export interface PingFrame {
   type: "ping";
 }
 
+/** How a client wants streamed speech (`speech_chunk`) for its turns. */
+export type SpeechMode = "audio" | "text";
+
+/**
+ * Opt-in to sentence-by-sentence speech (feature `speech_stream`). Can be sent
+ * again at any time; the latest one applies. Before the first one the Core
+ * sends no `speech_chunk` frames.
+ */
+export interface SpeechPrefsFrame {
+  type: "speech_prefs";
+  /** false: no chunks (voice replies switched off). */
+  enabled: boolean;
+  /** `audio`: tts-svc clips (web); `text`: lexicon-applied sentence text (native TTS). */
+  mode: SpeechMode;
+  /** Same rules as `speak.voice`: absent or unknown → default voice. */
+  voice?: string;
+}
+
+/** Asks for the memory contents (feature `memory`); answered by `memory` or `error`. */
+export interface MemoryListFrame {
+  type: "memory_list";
+  id: string;
+}
+
+/** Deletes one memory entry (brief or note); answered by a fresh `memory` frame or `error`. */
+export interface MemoryDeleteFrame {
+  type: "memory_delete";
+  id: string;
+  entryId: string;
+}
+
 export type ClientFrame =
   | HelloFrame
   | UserTextFrame
@@ -89,7 +120,10 @@ export type ClientFrame =
   | VoicesRequestFrame
   | CancelFrame
   | HistoryRequestFrame
-  | PingFrame;
+  | PingFrame
+  | SpeechPrefsFrame
+  | MemoryListFrame
+  | MemoryDeleteFrame;
 
 // ---------------------------------------------------------------- core → client
 
@@ -103,7 +137,14 @@ export type ErrorCode =
   | "tts_unavailable"
   | "model_error"
   | "busy"
+  | "usage_limit"
   | "internal";
+
+/**
+ * Optional capabilities a Core lists in `welcome.features`. Clients must
+ * ignore names they do not know; a missing name means the feature is off.
+ */
+export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit";
 
 export interface HistoryItem {
   id: string;
@@ -140,8 +181,60 @@ export interface VoiceInfo {
   quality?: string;
 }
 
+/**
+ * One streamed piece of a turn's spoken answer. `seq` starts at 0 per turn and
+ * has no gaps; the last frame has `final: true` and may carry no payload.
+ * `audio` mode: `mime` + `data` (base64); `text` mode: `text`.
+ */
+export interface SpeechChunkFrame {
+  type: "speech_chunk";
+  id: string;
+  seq: number;
+  final: boolean;
+  mime?: string;
+  data?: string;
+  text?: string;
+}
+
+export interface MemoryEntry {
+  /** Stable entry id, e.g. `m-7f3a9c`; send it back as `memory_delete.entryId`. */
+  id: string;
+  text: string;
+  /** Epoch ms of the last change (topic notes). */
+  updatedAt?: number;
+}
+
+export interface MemoryTopic {
+  topic: string;
+  title: string;
+  chars: number;
+  entries: MemoryEntry[];
+}
+
+/** `code`: `note_over_budget` | `note_full` | `memory_full` (clients show unknown codes as-is). */
+export interface MemoryWarning {
+  code: string;
+  topic?: string;
+}
+
+export interface MemoryFrame {
+  type: "memory";
+  /** The `memory_list` / `memory_delete` request id. */
+  id: string;
+  brief: { chars: number; budget: number; entries: MemoryEntry[] };
+  topics: MemoryTopic[];
+  warnings: MemoryWarning[];
+}
+
 export type ServerFrame =
-  | { type: "welcome"; protocol: number; sessionId: string; device: string }
+  | {
+      type: "welcome";
+      protocol: number;
+      sessionId: string;
+      device: string;
+      /** Optional capabilities; absent on older Cores (= none). */
+      features?: ProtocolFeature[];
+    }
   | { type: "state"; state: ServerState }
   | { type: "transcript"; id: string; text: string }
   | { type: "assistant_delta"; id: string; text: string }
@@ -158,7 +251,10 @@ export type ServerFrame =
   | { type: "confirm_resolved"; requestId: string; approved: boolean; by: ConfirmResolvedBy }
   | { type: "speech"; id: string; mime: string; data: string }
   | { type: "history"; items: HistoryItem[] }
-  | { type: "error"; id?: string; code: ErrorCode; message: string }
+  | SpeechChunkFrame
+  | MemoryFrame
+  /** `retryAt` (epoch ms): only on `usage_limit`, when the reset time is known. */
+  | { type: "error"; id?: string; code: ErrorCode; message: string; retryAt?: number }
   | { type: "services"; items: ServiceHealth[] }
   | { type: "voices"; id: string; default: string; voices: VoiceInfo[] }
   | { type: "pong" };
@@ -263,6 +359,24 @@ export function parseClientFrame(raw: string): ParseResult {
     }
     case "ping":
       return { ok: true, frame: { type: "ping" } };
+    case "speech_prefs": {
+      if (typeof data.enabled !== "boolean") return bad("speech_prefs.enabled must be a boolean");
+      if (data.mode !== "audio" && data.mode !== "text") return bad('speech_prefs.mode must be "audio" or "text"');
+      const voice = data.voice;
+      if (voice !== undefined && voice !== null && typeof voice !== "string") return bad("speech_prefs.voice must be a string");
+      // Same rule as speak.voice: unusable ids mean the default voice.
+      const usable = typeof voice === "string" && voice.length > 0 && voice.length <= MAX_VOICE_ID_CHARS;
+      const frame: SpeechPrefsFrame = { type: "speech_prefs", enabled: data.enabled, mode: data.mode };
+      if (usable) frame.voice = voice;
+      return { ok: true, frame };
+    }
+    case "memory_list":
+      if (!isId(data.id)) return bad("memory_list.id must be a non-empty string");
+      return { ok: true, frame: { type: "memory_list", id: data.id } };
+    case "memory_delete":
+      if (!isId(data.id)) return bad("memory_delete.id must be a non-empty string");
+      if (!isId(data.entryId)) return bad("memory_delete.entryId must be a non-empty string");
+      return { ok: true, frame: { type: "memory_delete", id: data.id, entryId: data.entryId } };
     default:
       return bad(`unknown frame type`);
   }

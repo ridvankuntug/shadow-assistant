@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { noticeText, timeLocativeSuffix, usageLimitText } from "../ui/strings.ts";
 import type { ServerMessage, ServiceHealth } from "../protocol/types.ts";
 import {
   bargeInTarget,
   canStop,
   currentConfirm,
   derivePhase,
+  hasFeature,
   initialState,
   reducer,
   shouldPlaySpeech,
@@ -402,5 +404,97 @@ describe("service health", () => {
   it("does not touch the turn or the phase", () => {
     const s = run([{ type: "user_text_sent", id: "t1", text: "selam" }, srv({ type: "services", items: [...items] })]);
     expect(derivePhase(s)).toBe("thinking");
+  });
+});
+
+describe("protocol additions (features, speech_chunk, memory, usage_limit)", () => {
+  const welcome = (features?: string[]): ServerMessage =>
+    features
+      ? { type: "welcome", protocol: 1, sessionId: "s", device: "d", features }
+      : { type: "welcome", protocol: 1, sessionId: "s", device: "d" };
+
+  it("welcome stores the Core's features; an older Core has none", () => {
+    const s = run([srv(welcome(["speech_stream", "x"]))]);
+    expect(hasFeature(s, "speech_stream")).toBe(true);
+    expect(hasFeature(s, "memory")).toBe(false);
+    const older = run([srv(welcome())], s);
+    expect(older.features).toEqual([]);
+    expect(hasFeature(older, "speech_stream")).toBe(false);
+  });
+
+  it("speech_chunk and memory frames do not change the state", () => {
+    const s = run([{ type: "user_text_sent", id: "t1", text: "x" }]);
+    expect(run([srv({ type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "A" })], s)).toBe(s);
+    expect(
+      run([srv({ type: "memory", id: "m1", brief: { chars: 0, budget: 800, entries: [] }, topics: [], warnings: [] })], s),
+    ).toBe(s);
+  });
+
+  it("usage_limit: notice with retryAt; the turn ends like other turn errors", () => {
+    const s = run([
+      { type: "user_text_sent", id: "t1", text: "x" },
+      srv({ type: "error", id: "t1", code: "usage_limit", message: "limit", retryAt: 1767340800000 }),
+    ]);
+    expect(s.notice).toEqual({ code: "usage_limit", message: "limit", turnId: "t1", retryAt: 1767340800000 });
+    expect(s.activeTurn).toBeNull();
+    expect(derivePhase(s)).toBe("idle");
+    const noTime = run([srv({ type: "error", id: "t2", code: "usage_limit", message: "limit" })]);
+    expect(noTime.notice).toEqual({ code: "usage_limit", message: "limit", turnId: "t2" });
+  });
+
+  it("tts_unavailable for a running turn only shows a notice (streamed speech failed, the text goes on)", () => {
+    const s = run([
+      { type: "user_text_sent", id: "t1", text: "x" },
+      srv({ type: "state", state: "thinking" }),
+      srv({ type: "assistant_delta", id: "t1", text: "Bir" }),
+      srv({ type: "error", id: "t1", code: "tts_unavailable", message: "down" }),
+    ]);
+    expect(s.notice).toEqual({ code: "tts_unavailable", message: "down", turnId: "t1" });
+    expect(s.activeTurn?.id).toBe("t1");
+    expect(s.messages.find((m) => m.key === "t1:assistant")).toMatchObject({ pending: true });
+  });
+});
+
+describe("usage_limit text", () => {
+  const at = (h: number, m: number, dayOffset = 0) => new Date(2026, 9, 28 + dayOffset, h, m).getTime();
+  const now = at(10, 0);
+
+  it("shows the reset time with the right suffix", () => {
+    expect(usageLimitText(at(14, 30), now)).toBe("Kullanım limitine ulaşıldı; 14:30'da sıfırlanır.");
+    expect(usageLimitText(at(14, 0), now)).toBe("Kullanım limitine ulaşıldı; 14:00'te sıfırlanır.");
+    expect(noticeText("usage_limit", "limit", at(12, 5), now)).toBe("Kullanım limitine ulaşıldı; 12:05'te sıfırlanır.");
+  });
+
+  it("adds the date when the reset is not today", () => {
+    expect(usageLimitText(at(9, 0, 2), now)).toBe("Kullanım limitine ulaşıldı; 30 Ekim 09:00'da sıfırlanır.");
+  });
+
+  it("without a usable future time only the fixed text", () => {
+    const base = "Kullanım limitine ulaşıldı.";
+    expect(usageLimitText(undefined, now)).toBe(base);
+    expect(usageLimitText(at(9, 0), now)).toBe(base);
+    expect(usageLimitText(Number.NaN, now)).toBe(base);
+    expect(noticeText("usage_limit", "raw sdk text")).toBe(base);
+  });
+
+  it.each([
+    [0, 0, "'da"],
+    [1, 0, "'de"],
+    [3, 0, "'te"],
+    [6, 0, "'da"],
+    [9, 0, "'da"],
+    [10, 0, "'da"],
+    [12, 0, "'de"],
+    [13, 0, "'te"],
+    [20, 0, "'de"],
+    [8, 10, "'da"],
+    [8, 20, "'de"],
+    [8, 30, "'da"],
+    [8, 40, "'ta"],
+    [8, 50, "'de"],
+    [8, 45, "'te"],
+    [8, 59, "'da"],
+  ])("%i:%i -> %s", (h, m, suffix) => {
+    expect(timeLocativeSuffix(h, m)).toBe(suffix);
   });
 });

@@ -56,6 +56,29 @@ const VALID: ServerMessage[] = [
   },
   { type: "voices", id: "v2", default: "x", voices: [] },
   { type: "pong" },
+  { type: "welcome", protocol: 1, sessionId: "s1", device: "browser", features: ["speech_stream", "memory", "usage_limit"] },
+  { type: "welcome", protocol: 1, sessionId: "s1", device: "browser", features: [] },
+  { type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "UklGRg==" },
+  { type: "speech_chunk", id: "t1", seq: 1, final: false, text: "Salon ışığı açıldı." },
+  { type: "speech_chunk", id: "t1", seq: 2, final: true },
+  { type: "speech_chunk", id: "t1", seq: 3, final: true, text: "Son cümle." },
+  { type: "error", id: "t1", code: "usage_limit", message: "limit", retryAt: 1767340800000 },
+  { type: "error", id: "t1", code: "usage_limit", message: "limit" },
+  {
+    type: "memory",
+    id: "m1",
+    brief: { chars: 412, budget: 800, entries: [{ id: "m-a1b2c3", text: "Kullanıcının adı Rıdvan." }] },
+    topics: [
+      {
+        topic: "ev",
+        title: "Ev ve cihaz adları",
+        chars: 96,
+        entries: [{ id: "m-7f3a9c", text: "Otomodos = oturma odası", updatedAt: 1767340800000 }],
+      },
+    ],
+    warnings: [{ code: "note_over_budget", topic: "tercihler" }, { code: "memory_full" }],
+  },
+  { type: "memory", id: "m2", brief: { chars: 0, budget: 800, entries: [] }, topics: [], warnings: [] },
 ];
 
 describe("parseServerMessage", () => {
@@ -79,6 +102,19 @@ describe("parseServerMessage", () => {
     ["voices without id", '{"type":"voices","default":"a","voices":[]}'],
     ["voices without default", '{"type":"voices","id":"v","voices":[]}'],
     ["voices not array", '{"type":"voices","id":"v","default":"a","voices":{}}'],
+    ["chunk without id", '{"type":"speech_chunk","seq":0,"final":false,"text":"a"}'],
+    ["chunk without seq", '{"type":"speech_chunk","id":"t","final":false,"text":"a"}'],
+    ["chunk negative seq", '{"type":"speech_chunk","id":"t","seq":-1,"final":false,"text":"a"}'],
+    ["chunk fractional seq", '{"type":"speech_chunk","id":"t","seq":1.5,"final":false,"text":"a"}'],
+    ["chunk without final", '{"type":"speech_chunk","id":"t","seq":0,"text":"a"}'],
+    ["chunk final not boolean", '{"type":"speech_chunk","id":"t","seq":0,"final":"yes","text":"a"}'],
+    ["chunk data without mime", '{"type":"speech_chunk","id":"t","seq":0,"final":false,"data":"AAAA"}'],
+    ["chunk data not string", '{"type":"speech_chunk","id":"t","seq":0,"final":false,"mime":"audio/wav","data":5}'],
+    ["chunk text not string", '{"type":"speech_chunk","id":"t","seq":0,"final":false,"text":{}}'],
+    ["memory without id", '{"type":"memory","brief":{"chars":0,"budget":1,"entries":[]},"topics":[],"warnings":[]}'],
+    ["memory without brief", '{"type":"memory","id":"m","topics":[],"warnings":[]}'],
+    ["memory brief without budget", '{"type":"memory","id":"m","brief":{"chars":0,"entries":[]}}'],
+    ["memory brief entries not array", '{"type":"memory","id":"m","brief":{"chars":0,"budget":1,"entries":{}}}'],
   ])("rejects %s", (_name, raw) => {
     expect(parseServerMessage(raw)).toBeNull();
   });
@@ -144,6 +180,83 @@ describe("parseServerMessage voices", () => {
         { id: "d", label: "L".repeat(80) },
       ],
     });
+  });
+});
+
+describe("parseServerMessage protocol additions (speech_stream, memory, usage_limit)", () => {
+  it("welcome: keeps only string features, ignores a malformed features field and unknown fields", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "d", features: ["speech_stream", 5, null, "x"] }),
+      ),
+    ).toEqual({ type: "welcome", protocol: 1, sessionId: "s", device: "d", features: ["speech_stream", "x"] });
+    const noFeatures = parseServerMessage(
+      JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "d", features: "speech_stream" }),
+    );
+    expect(noFeatures).toEqual({ type: "welcome", protocol: 1, sessionId: "s", device: "d" });
+    expect(noFeatures && "features" in noFeatures).toBe(false);
+    // An old Core's welcome is unchanged.
+    expect(parseServerMessage(JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "d" }))).toEqual({
+      type: "welcome",
+      protocol: 1,
+      sessionId: "s",
+      device: "d",
+    });
+  });
+
+  it("error: a malformed retryAt is dropped, the error still counts", () => {
+    for (const retryAt of ["soon", null, Number.NaN]) {
+      const msg = parseServerMessage(JSON.stringify({ type: "error", id: "t1", code: "usage_limit", retryAt }));
+      expect(msg).toEqual({ type: "error", id: "t1", code: "usage_limit" });
+      expect(msg && "retryAt" in msg).toBe(false);
+    }
+  });
+
+  it("speech_chunk: keeps only known fields; empty payload strings count as absent", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "AAAA", extra: 1 }),
+      ),
+    ).toEqual({ type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "AAAA" });
+    expect(
+      parseServerMessage(JSON.stringify({ type: "speech_chunk", id: "t1", seq: 4, final: true, data: "", text: "" })),
+    ).toEqual({ type: "speech_chunk", id: "t1", seq: 4, final: true });
+    // A mime without data is ignored (nothing to play).
+    expect(
+      parseServerMessage(JSON.stringify({ type: "speech_chunk", id: "t1", seq: 1, final: false, mime: "audio/wav" })),
+    ).toEqual({ type: "speech_chunk", id: "t1", seq: 1, final: false });
+  });
+
+  it("memory: drops malformed entries, topics and warnings; missing lists are empty; title falls back to the topic", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({
+        type: "memory",
+        id: "m1",
+        extra: true,
+        brief: {
+          chars: 10,
+          budget: 800,
+          entries: [{ id: "a", text: "x", updatedAt: "yesterday", extra: 1 }, { id: "", text: "y" }, { text: "z" }, "w"],
+        },
+        topics: [
+          { topic: "ev", chars: 3, entries: [{ id: "b", text: "t", updatedAt: 5 }] },
+          { topic: "bad", chars: 1, entries: "no" },
+          { title: "no topic", chars: 1, entries: [] },
+          { topic: "nochars", entries: [] },
+        ],
+        warnings: [{ code: "note_full", topic: "ev" }, { code: "memory_full", topic: 3 }, { topic: "x" }],
+      }),
+    );
+    expect(msg).toEqual({
+      type: "memory",
+      id: "m1",
+      brief: { chars: 10, budget: 800, entries: [{ id: "a", text: "x" }] },
+      topics: [{ topic: "ev", title: "ev", chars: 3, entries: [{ id: "b", text: "t", updatedAt: 5 }] }],
+      warnings: [{ code: "note_full", topic: "ev" }, { code: "memory_full" }],
+    });
+    expect(
+      parseServerMessage(JSON.stringify({ type: "memory", id: "m2", brief: { chars: 0, budget: 800, entries: [] } })),
+    ).toEqual({ type: "memory", id: "m2", brief: { chars: 0, budget: 800, entries: [] }, topics: [], warnings: [] });
   });
 });
 
