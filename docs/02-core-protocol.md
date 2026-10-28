@@ -6,8 +6,9 @@ shell) uses. TypeScript types for all frames live in a single module:
 
 - Endpoint: `ws://<core-host>:<CORE_PORT>/ws` (default port `8700`, default bind `127.0.0.1`).
 - Health: `GET http://<core-host>:<CORE_PORT>/health` →
-  `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true,"status":"ok"}]}`
-  (`status` as in *Service health*; `unknown` before the first check round. No URLs or tokens.)
+  `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true,"status":"down","detail"?:"timeout"}]}`
+  (`status` and `detail` as in *Service health*; `status` is `unknown` before the first check round and
+  `detail` is present only when the check set one. No URLs, tokens or error messages.)
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
   every frame that belongs to that turn.
@@ -102,7 +103,7 @@ reported as `disabled` and never checked.
 authenticated client after `welcome` + `state` (once the first round has
 finished) and to all clients whenever a `status` or `detail` changes;
 `checkedAt` alone changing does not trigger a frame. `detail` is a short code,
-never a URL, host or token:
+never a URL, host or token; a value outside this table is sent as `error`:
 
 | `detail` | Meaning |
 |---|---|

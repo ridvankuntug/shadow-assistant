@@ -46,6 +46,55 @@ export interface HealthTarget {
 
 export type FetchFn = typeof fetch;
 
+/**
+ * The fixed `detail` vocabulary. Checks only ever produce these, but `detail`
+ * is typed as a string, so every value is passed through `safeDetail` before it
+ * reaches a client or `GET /health`: anything outside the vocabulary (e.g. a
+ * future check that copies an error message, which may contain a URL) becomes
+ * `error` instead of leaking free text.
+ */
+const DETAIL_CODES = new Set([
+  "timeout",
+  "unreachable",
+  "unauthorized",
+  "error",
+  "bad_response",
+  "not_found",
+  "not_configured",
+  "off",
+]);
+const HTTP_DETAIL = /^http_[1-5][0-9]{2}$/;
+
+export function safeDetail(detail: string | undefined): string | undefined {
+  if (detail === undefined || detail === "") return undefined;
+  return DETAIL_CODES.has(detail) || HTTP_DETAIL.test(detail) ? detail : "error";
+}
+
+/** Entry of `services` in `GET /health`: name, flag, status and the short detail code only. */
+export interface PublicServiceHealth {
+  name: string;
+  enabled: boolean;
+  status: ServiceHealthStatus | "unknown";
+  detail?: string;
+}
+
+/**
+ * `services` for `GET /health` (unauthenticated): services.yaml order, status
+ * `unknown` before the first round. No URL, token or error message: `detail`
+ * is re-checked against the vocabulary here as well.
+ */
+export function publicServiceHealth(
+  services: readonly Pick<ServiceDef, "name" | "enabled">[],
+  snapshot: readonly ServiceHealth[] | undefined,
+): PublicServiceHealth[] {
+  const byName = new Map((snapshot ?? []).map((h) => [h.name, h]));
+  return services.map((s) => {
+    const h = byName.get(s.name);
+    const detail = safeDetail(h?.detail);
+    return { name: s.name, enabled: s.enabled, status: h?.status ?? "unknown", ...(detail ? { detail } : {}) };
+  });
+}
+
 interface MonitorLogger {
   info(message: string): void;
   warn(message: string): void;
@@ -226,7 +275,10 @@ export class HealthMonitor {
 
   private async runOne(t: HealthTarget): Promise<ServiceHealth> {
     const check = t.check;
-    if (!check) return { name: t.name, status: "disabled", checkedAt: this.now(), ...(t.disabledDetail ? { detail: t.disabledDetail } : {}) };
+    if (!check) {
+      const detail = safeDetail(t.disabledDetail);
+      return { name: t.name, status: "disabled", checkedAt: this.now(), ...(detail ? { detail } : {}) };
+    }
     const timeout = AbortSignal.timeout(this.timeoutMs);
     const signal = AbortSignal.any([timeout, this.stopper.signal]);
     let result: CheckResult;
@@ -250,7 +302,8 @@ export class HealthMonitor {
     } catch {
       result = { status: "down", detail: timeout.aborted ? "timeout" : "unreachable" };
     }
-    return { name: t.name, status: result.status, checkedAt: this.now(), ...(result.detail ? { detail: result.detail.slice(0, 32) } : {}) };
+    const detail = safeDetail(result.detail);
+    return { name: t.name, status: result.status, checkedAt: this.now(), ...(detail ? { detail } : {}) };
   }
 
   private async round(): Promise<void> {

@@ -9,13 +9,14 @@ import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, type CoreConfig } from "./config.js";
 import { ConversationLog } from "./conversation-log.js";
-import { buildHealthTargets, HealthMonitor } from "./health.js";
+import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { PermissionPolicy } from "./permissions.js";
 import { McpDirectClient } from "./mcp-direct.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router } from "./router.js";
 import { createCoreServer } from "./server.js";
 import { Session, type Logger } from "./session.js";
+import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
 import { createVaultMcpServer, VaultReader } from "./vault.js";
@@ -109,13 +110,8 @@ export async function main(): Promise<void> {
         info,
         send,
       ),
-    // Name, flag and status only: no URL or token leaves through /health.
-    health: () => {
-      const status = new Map((monitor.snapshot() ?? []).map((h) => [h.name, h.status]));
-      return {
-        services: cfg.services.services.map((s) => ({ name: s.name, enabled: s.enabled, status: status.get(s.name) ?? "unknown" })),
-      };
-    },
+    // Name, flag, status and short detail code only: no URL or token leaves through /health.
+    health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
     serviceHealth: monitor,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
@@ -132,17 +128,16 @@ export async function main(): Promise<void> {
   monitor.start();
   logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);
 
-  const shutdown = () => {
-    logger.info("[shadow-core] shutting down");
+  // SIGBREAK is Windows Ctrl+Break; onShutdownSignal runs the shutdown only once.
+  onShutdownSignal(process, SHUTDOWN_SIGNALS, (signal) => {
+    logger.info(`[shadow-core] shutting down (${signal})`);
     void monitor
       .close()
       .then(() => server.close())
       .then(() => direct?.close())
       .then(() => usageLog.flush())
       .then(() => process.exit(0));
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  });
 }
 
 main().catch((err: Error) => {

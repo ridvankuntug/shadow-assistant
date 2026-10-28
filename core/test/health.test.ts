@@ -11,6 +11,8 @@ import {
   HealthMonitor,
   httpHealthCheck,
   mcpHealthCheck,
+  publicServiceHealth,
+  safeDetail,
   type CheckResult,
   type HealthTarget,
 } from "../src/health.js";
@@ -189,6 +191,97 @@ test("monitor: timeout and unreachable become down without leaking the error tex
     ],
   );
   await m.close();
+});
+
+test("safeDetail: vocabulary and http_<status> pass, anything else becomes error", () => {
+  for (const d of ["timeout", "unreachable", "unauthorized", "error", "bad_response", "not_found", "not_configured", "off", "http_404", "http_503"]) {
+    assert.equal(safeDetail(d), d);
+  }
+  assert.equal(safeDetail(undefined), undefined);
+  assert.equal(safeDetail(""), undefined);
+  for (const d of ["http://host/?token=abc", "ECONNREFUSED 10.0.0.5:8123", "http_", "http_99", "http_5000", "Timeout", "timeout "]) {
+    assert.equal(safeDetail(d), "error", d);
+  }
+});
+
+test("monitor: a free-text detail from a check is replaced by the fixed code", async () => {
+  const m = new HealthMonitor([
+    { name: "leaky-svc", check: async () => ({ status: "down", detail: "fetch http://10.0.0.5/?token=abc" }) },
+    { name: "odd-disabled", disabledDetail: "missing HA_TOKEN=abc" },
+  ]);
+  await m.checkNow();
+  assert.deepEqual(
+    m.snapshot()?.map((i) => [i.name, i.status, i.detail]),
+    [
+      ["leaky-svc", "down", "error"],
+      ["odd-disabled", "disabled", "error"],
+    ],
+  );
+  await m.close();
+});
+
+test("publicServiceHealth: name/enabled/status plus detail only when present; unknown before the first round", () => {
+  const services = [
+    { name: "whisper-svc", enabled: true, url: "http://10.0.0.5:8701", tokenEnv: "SECRET_ENV" },
+    { name: "home-assistant", enabled: true },
+    { name: "piper-svc", enabled: false },
+    { name: "vault", enabled: true },
+  ];
+  assert.deepEqual(publicServiceHealth(services, undefined), [
+    { name: "whisper-svc", enabled: true, status: "unknown" },
+    { name: "home-assistant", enabled: true, status: "unknown" },
+    { name: "piper-svc", enabled: false, status: "unknown" },
+    { name: "vault", enabled: true, status: "unknown" },
+  ]);
+  const snap: ServiceHealth[] = [
+    { name: "whisper-svc", status: "down", checkedAt: 1, detail: "timeout" },
+    { name: "home-assistant", status: "ok", checkedAt: 1 },
+    { name: "piper-svc", status: "disabled", checkedAt: 1, detail: "off" },
+    { name: "vault", status: "down", checkedAt: 1, detail: "secret http://x/?token=y" },
+  ];
+  const out = publicServiceHealth(services, snap);
+  assert.deepEqual(out, [
+    { name: "whisper-svc", enabled: true, status: "down", detail: "timeout" },
+    { name: "home-assistant", enabled: true, status: "ok" },
+    { name: "piper-svc", enabled: false, status: "disabled", detail: "off" },
+    { name: "vault", enabled: true, status: "down", detail: "error" },
+  ]);
+  const text = JSON.stringify(out);
+  assert.ok(!text.includes("10.0.0.5") && !text.includes("SECRET_ENV") && !text.includes("token") && !text.includes("checkedAt"));
+});
+
+test("server: GET /health carries the per-service detail code", async () => {
+  const monitor = new HealthMonitor([
+    { name: "whisper-svc", check: async () => ({ status: "down", detail: "unreachable" }) },
+    { name: "home-assistant", check: async () => ({ status: "ok" }) },
+  ]);
+  await monitor.checkNow();
+  const defs = [
+    { name: "whisper-svc", enabled: true },
+    { name: "home-assistant", enabled: true },
+  ];
+  const server = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),
+    logger: quiet,
+    health: () => ({ services: publicServiceHealth(defs, monitor.snapshot()) }),
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  const { port } = await server.listen(0, "127.0.0.1");
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(body.status, "ok");
+    assert.equal(body.service, "core");
+    assert.equal(typeof body.version, "string");
+    assert.deepEqual(body.services, [
+      { name: "whisper-svc", enabled: true, status: "down", detail: "unreachable" },
+      { name: "home-assistant", enabled: true, status: "ok" },
+    ]);
+  } finally {
+    await server.close();
+    await monitor.close();
+  }
 });
 
 test("monitor: broadcasts the first round and only changes afterwards", async () => {
