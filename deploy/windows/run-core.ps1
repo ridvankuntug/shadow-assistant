@@ -3,9 +3,13 @@
     Runs the Shadow Assistant Core (node core/dist/index.js) in a supervised loop.
 
 .DESCRIPTION
-    Started by the "Shadow Assistant Core" scheduled task (install-core-task.ps1)
-    at logon, in the signed-in user's own session, so the Claude Agent SDK can use
-    the user's Claude Code login. Can also be run by hand.
+    Manual fallback. The "Shadow Assistant Core" scheduled task
+    (install-core-task.ps1) now starts the tray app (tray\, ShadowTray.exe),
+    which supervises the Core the same way without PowerShell or a console
+    window. Use this script by hand when the tray app cannot run (e.g. no .NET
+    runtime). It shares the tray app's single-instance mutex, so the two never
+    run at the same time in one session. Run it in the signed-in user's own
+    session, so the Claude Agent SDK can use the user's Claude Code login.
 
     - Restarts the Core when it exits with a non-zero code, with exponential
       backoff (InitialDelaySeconds doubling up to MaxDelaySeconds). The delay

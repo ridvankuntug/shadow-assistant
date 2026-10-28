@@ -11,13 +11,15 @@ its own.
 | Piece | Runs as | Files |
 | --- | --- | --- |
 | whisper-svc, tts-svc | Docker containers, ports on 127.0.0.1 only | `deploy/docker-compose.yml` |
-| Core | Scheduled task at sign-in, your user, not elevated | `deploy/windows/` |
+| Core | Tray app started by a scheduled task at sign-in, your user, not elevated | `deploy/windows/` |
 | Backup | Script (optionally a daily scheduled task), your user | `deploy/backup/` |
 
 ## 1. Prerequisites
 
 - Windows 10 1803+ / Windows 11 (`tar.exe` and Task Scheduler are built in).
 - Node.js 22+ (`node --version`).
+- .NET 10 SDK to build the tray app (`dotnet --list-sdks`); running it needs
+  the .NET 10 Desktop Runtime and ASP.NET Core Runtime, which the SDK includes.
 - Docker Desktop with the WSL 2 backend; for whisper-svc on the GPU, an NVIDIA
   driver with WSL CUDA support (`docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` must work).
 - Claude Code installed and signed in as the same Windows user that will run
@@ -57,7 +59,7 @@ docker compose --env-file ../.env down            # stop; model/voice volumes ar
   curl.exe -s http://127.0.0.1:8702/health
   ```
 
-## 3. Core as a scheduled task
+## 3. Core: tray app started by a scheduled task
 
 ### Why a task in your own session
 
@@ -70,54 +72,89 @@ are signed in. Locking the screen is fine; signing out stops it.
 
 ### What runs
 
-The task starts `deploy/windows/run-core.ps1`, a small supervisor that:
+The task starts the tray app `deploy/windows/tray/publish/ShadowTray.exe`
+([README](../deploy/windows/tray/README.md)), which:
 
-- runs `node core/dist/index.js` from the repo root (the Core reads `.env`,
-  `services.yaml`, `router.yaml` there);
+- runs `node core/dist/index.js` from the repo root **directly**: no
+  PowerShell or cmd.exe in between and no console window (the Core reads
+  `.env`, `services.yaml`, `router.yaml` there);
 - restarts the Core after a crash with exponential backoff (5 s doubling to
   5 min; the delay resets after 10 min of uptime) and gives up after 20 short
   runs in a row, so a broken setup does not loop forever;
 - does not restart after a clean exit (code 0);
 - writes the Core's output to `%LOCALAPPDATA%\ShadowAssistant\logs\core.log`,
   rotated at 10 MB, keeping 5 old files (`core.1.log` ...);
-- allows only one instance per session.
+- allows only one instance per session;
+- keeps the Core in a job object, so the Core ends when the tray app ends;
+- shows a green / yellow / red icon in the notification area with a menu:
+  status of the Core and of each service (from the Core's `GET /health`),
+  **Arayüzü aç** (serves `ui/dist` at `http://localhost:8703/`, port
+  `SHADOW_UI_PORT`), **Yeniden başlat / Durdur / Başlat**, start/stop of the
+  speech containers (`docker compose up -d` / `down`), **Logları aç** and
+  **Çıkış**.
+
+Stopping (menu or Çıkış) is graceful: the tray sends the Core Ctrl+C, which
+the Core handles like SIGINT (closes connections, flushes logs, exits 0); after
+10 s it is killed.
 
 The task itself has no time limit, ignores a second start while running, and
 has Task Scheduler's own "restart on failure" (3 times, every 5 min) as a
-second line of defence for when the supervisor itself fails.
+second line of defence for when the tray app itself fails.
 
-Paths are not hard-coded: the repo root defaults to two folders above the
-script, `node` comes from PATH. Override with parameters or the environment
+Paths are not hard-coded: the repo root defaults to the first folder above
+the exe that contains `core\` and `services.yaml`, `node` comes from PATH.
+Override with `--repo-root`, `--node-path`, `--log-dir` or the environment
 variables `SHADOW_REPO_ROOT`, `SHADOW_NODE_PATH`, `SHADOW_CORE_LOG_DIR`. The
-installer writes the resolved paths into the task, so the task does not depend
-on those variables later.
+installer writes the resolved repo root and node path into the task's
+arguments, so the task does not depend on those variables later.
+
+`deploy/windows/run-core.ps1` (the PowerShell supervisor the task used before)
+stays as a **manual fallback**, e.g. when the .NET runtime is missing:
+`.\run-core.ps1 -DryRun`, then `.\run-core.ps1`. It shares the tray app's
+single-instance lock, so the two never run a Core at the same time.
+
+### Build the tray app
+
+From `deploy/windows/tray/` (if `dotnet` on PATH is a runtime-only install,
+call the SDK's `dotnet.exe` by its full path):
+
+```powershell
+dotnet test ShadowTray.slnx                                            # unit tests
+dotnet publish src\ShadowTray\ShadowTray.csproj -c Release -o publish  # framework-dependent build
+```
+
+Output: `deploy/windows/tray/publish/ShadowTray.exe` (git-ignored). Stop the
+tray app (menu → Çıkış) before publishing again: a running exe is locked.
 
 ### Install
 
 From `deploy/windows/` in a normal (non-admin) PowerShell:
 
 ```powershell
-.\run-core.ps1 -DryRun               # checks node, core\dist and .env, starts nothing
-.\install-core-task.ps1 -WhatIf      # shows the task that would be registered
+.\install-core-task.ps1 -WhatIf      # checks the tray exe, node, core\dist and .env; shows the task, registers nothing
 .\install-core-task.ps1 -StartNow    # [USER ACTION] registers \ShadowAssistant\Shadow Assistant Core and starts it
 ```
 
 If the scripts are blocked by the execution policy, run them with
 `powershell -ExecutionPolicy Bypass -File .\install-core-task.ps1 ...`. The task
-itself runs PowerShell with `-ExecutionPolicy Bypass` for that one process only.
+itself starts `ShadowTray.exe` directly; PowerShell is not involved at sign-in.
 
-Options: `-NodePath`, `-RepoRoot`, `-LogDir`, `-LogonDelaySeconds` (default 30),
-`-Force` (replace an existing task). Re-run with `-Force` after moving the repo
-or changing Node.js.
+Options: `-TrayPath`, `-NodePath`, `-RepoRoot`, `-LogDir`, `-LogonDelaySeconds`
+(default 30), `-Force` (replace an existing task). Re-run with `-Force` after
+moving the repo or changing Node.js.
 
-Check it: `Get-ScheduledTask -TaskPath \ShadowAssistant\` and
+**Switching from the earlier run-core.ps1 task:** `-Force` replaces the task
+definition but not a running instance. Run `.\uninstall-core-task.ps1` first
+(stops the old task and its Core), then publish and install as above.
+
+Check it: the tray icon, `Get-ScheduledTask -TaskPath \ShadowAssistant\` and
 `Get-Content $env:LOCALAPPDATA\ShadowAssistant\logs\core.log -Tail 50 -Wait`.
 
 ### Uninstall
 
 ```powershell
 .\uninstall-core-task.ps1 -WhatIf
-.\uninstall-core-task.ps1            # [USER ACTION] stops and removes the task, and stops a leftover Core process
+.\uninstall-core-task.ps1            # [USER ACTION] stops and removes the task, a tray app started from this repo and a leftover Core process
 ```
 
 Logs are kept; delete `%LOCALAPPDATA%\ShadowAssistant\logs` by hand if wanted.
@@ -239,10 +276,12 @@ Without the scripts, the same remote can be defined in plain rclone:
 | Symptom | Check |
 | --- | --- |
 | `install-core-task.ps1`: "Access is denied" | Some managed PCs block per-user task creation. Run the installer once from an elevated PowerShell; the task still runs as you, not elevated. |
-| Core not reachable; task "Ready" with last result 1 | `core.log`: a config error (e.g. no device tokens) makes the Core exit; after 20 quick failures the supervisor gives up. Fix the cause, then `Start-ScheduledTask -TaskPath \ShadowAssistant\ -TaskName 'Shadow Assistant Core'`. |
-| `run-core.ps1 -DryRun` warns "Core is not built" | `npm ci` and `npm run build` in `core/`. |
+| Tray icon red, menu says "vazgeçildi" | `core.log`: a config error (e.g. no device tokens) makes the Core exit; after 20 quick failures the tray gives up. Fix the cause, then **Başlat** in the tray menu. |
+| No tray icon after sign-in | Task last result in Task Scheduler; `ShadowTray.exe` missing (publish it) or the .NET 10 runtime missing. Start it by hand to see. A second instance exits silently while one (or `run-core.ps1`) is running. |
+| Tray menu: "Arayüz: port 8703 kullanılamıyor" | Another program uses the port: set `SHADOW_UI_PORT` in `.env`, then restart the tray app. |
+| "Core derlenmemiş" in the tray menu, or `run-core.ps1 -DryRun` warns "Core is not built" | `npm ci` and `npm run build` in `core/`, then **Başlat**. |
 | Core answers "not logged in" / auth errors | Sign in to Claude Code as the same Windows user (`claude` in a terminal), then restart the task. |
-| A console window flashes at sign-in | Expected: Task Scheduler opens PowerShell before `-WindowStyle Hidden` takes effect. |
+| A console window opens at sign-in | The task still runs the old `run-core.ps1` (Windows Terminal ignores `-WindowStyle Hidden`). Re-install the task (see "Switching from the earlier run-core.ps1 task"). |
 | whisper-svc stays "starting" | First start downloads ~3 GB; see `docker compose logs whisper-svc`. GPU errors: check the CUDA test in Prerequisites. |
 | `curl` from Git Bash to `/synthesize` returns 400 for Turkish text | Bash on Windows may re-encode command-line arguments. Send the JSON from a UTF-8 file: `curl --data-binary @body.json ...`. |
 | Backup: "rclone remote 'gdrive' not found" | Step 1 of the backup setup, or set `SHADOW_BACKUP_DRIVE_REMOTE` / `SHADOW_BACKUP_RCLONE_CONFIG`. |

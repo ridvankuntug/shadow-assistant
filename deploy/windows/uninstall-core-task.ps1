@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     Stops the task if it is running, unregisters it and then stops any
-    node.exe process still running this repository's core\dist\index.js
-    (a child the task's wrapper may leave behind). Log files are kept.
+    ShadowTray.exe started from this repository (e.g. started by hand) and
+    any node.exe process still running this repository's core\dist\index.js
+    (a child an older run-core.ps1 task may leave behind). Stopping the tray
+    app also ends its Core (job object). Log files are kept.
     Nothing is changed with -WhatIf.
 
 .PARAMETER TaskName
@@ -48,9 +50,24 @@ else {
     }
 }
 
-# A Core started by the task (or by hand) from this repo. CimCmdlets is loaded
-# with WhatIf off: its module script sets aliases, which -WhatIf would echo.
+# A tray app started from this repo (task or by hand). Killing it closes its
+# job object, which ends its Core too; the node.exe check below then finds nothing.
 & { $WhatIfPreference = $false; Import-Module CimCmdlets }
+$trayDir = Join-Path $PSScriptRoot 'tray'
+$trays = @(Get-CimInstance Win32_Process -Filter "Name = 'ShadowTray.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($trayDir + '\',[StringComparison]::OrdinalIgnoreCase)) -or
+        ($_.CommandLine -and $_.CommandLine.IndexOf("`"$RepoRoot`"", [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    })
+foreach ($p in $trays) {
+    if ($PSCmdlet.ShouldProcess("ShadowTray.exe PID $($p.ProcessId)", 'Stop process')) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Output "Stopped tray app $($p.ProcessId)."
+    }
+}
+if ($trays) { Start-Sleep -Seconds 1 }
+
+# A Core started by the task (or by hand) from this repo.
 $entry = Join-Path $RepoRoot 'core\dist\index.js'
 $leftover = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($entry, [StringComparison]::OrdinalIgnoreCase) -ge 0 })

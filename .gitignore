@@ -15,6 +15,14 @@ coverage/
 *.local
 *.local.*
 
+# .NET build output (deploy/windows/tray)
+deploy/windows/tray/**/bin/
+deploy/windows/tray/**/obj/
+deploy/windows/tray/publish/
+deploy/windows/tray/**/TestResults/
+*.user
+.vs/
+
 # Shadow Assistant runtime state
 .shadow-assistant/
 
