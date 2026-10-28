@@ -240,13 +240,18 @@ It is **skipped** when:
 
 ### The call
 
-- A separate one-shot `query()`, not the device's live query (it must not appear
-  in the conversation): model `CORE_MEMORY_MODEL` (default `haiku`), `tools: []`,
+- Through the provider interface (07 §A1 Components), never a provider SDK
+  directly: `provider.oneShot({ model: CORE_MEMORY_MODEL, system, prompt,
+  schema, maxTokens, signal })`. It is not the device's live session (it must not
+  appear in the conversation). The extractor reads `OneShotResult` (`status`,
+  `json`, token fields, `retryAt`) only.
+- Claude implementation (`ClaudeSdkProvider.oneShot`): a separate one-shot
+  `query()` with model `CORE_MEMORY_MODEL` (default `haiku`), `tools: []`,
   `mcpServers: {}`, `settingSources: []`, `persistSession: false`, small
   `maxTurns` (2), and the same subprocess environment as the agent (no tokens).
   It starts a process, but in the background that does not matter.
-- `outputFormat: { type: "json_schema", schema }`; the answer comes from
-  `result.structured_output`:
+  `outputFormat: { type: "json_schema", schema }`; `json` comes from
+  `result.structured_output` (else the result text parsed as JSON). The schema:
 
   ```json
   { "ops": [
@@ -350,24 +355,27 @@ the live session small.
 1. Run the memory extraction pass for the device now (rate limits apply, except
    the 10-minute spacing). Durable facts go to memory before older turns are
    summarized.
-2. Send `/compact` as a user message on the live query, with Turkish
-   instructions: keep device and room names, the user's preferences and open
-   requests from the conversation; drop tool output details. Wait for the
-   `compact_boundary` system message and its `result`. The process stays warm,
-   the session id stays and continuity (07 A4) is unaffected.
+2. If the provider has `capabilities.compact`: `ProviderSession.compact(instructions)`
+   with Turkish instructions: keep device and room names, the user's preferences
+   and open requests from the conversation; drop tool output details. The
+   session id stays and continuity (07 A4) is unaffected. Otherwise use the
+   Core-side summary below. (Claude: `compact()` would send `/compact` on the
+   live query and wait for `compact_boundary` and its `result`; the capability
+   stays off until that is verified, so the summary path is the default.)
 3. Clear the agent's "entries already sent" set, so relevant memory is sent again
    on the next turn.
 
-### Fallback (if the S1 spike shows `/compact` does not work in this mode)
+### Core-side summary (no `compact` capability)
 
-Summarize and restart:
+Summarize and restart, provider-independent:
 
-1. A one-shot Haiku call (like the extractor) summarizes the conversation from
-   the Core's own log (at most 8000 chars of the newest turns) into at most
-   1500 chars.
-2. The agent closes the query and starts a new one **without** `resume`. Its
-   first input is a `shouldQuery:false` message: `(Önceki konuşmanın özeti: …)`.
-3. The continuity store (07 A4) points to the new session id.
+1. `provider.oneShot` (model `CORE_MEMORY_MODEL`, like the extractor) summarizes
+   the conversation from the Core's own log (at most 8000 chars of the newest
+   turns) into at most 1500 chars.
+2. The registry closes the session and opens a new one **without** `resume`,
+   seeded with the summary: `appendNote("(Önceki konuşmanın özeti: …)")` when
+   `capabilities.notes`, else the summary is put in front of the next prompt.
+3. The continuity store (07 A4) points to the new `{ provider, sessionId }`.
 
 This costs one cold start, in idle time.
 

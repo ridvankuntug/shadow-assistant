@@ -47,8 +47,8 @@ Installed: `@anthropic-ai/claude-agent-sdk` 0.3.311 (`core/node_modules/@anthrop
 | MCP health | `Query.mcpServerStatus()`, `Query.reconnectMcpServer(name)` |
 | Context size | `Query.getContextUsage({ detail: "summary" })` (used by 06 compaction) |
 | Append without a reply | `SDKUserMessage.shouldQuery: false` — "appended to the transcript without triggering an assistant turn. It will be merged into the next user message that does query." |
-| Turn boundary | one `result` message (`SDKResultSuccess` / `SDKResultError`) per user message |
-| Usage | `result.usage` is per turn in streaming-input sessions; `total_cost_usd` and `modelUsage` are **cumulative** per `query()` call (and a resumed session starts from the saved total). |
+| Turn boundary | one `result` message (`SDKResultSuccess` / `SDKResultError`) per sent user message, also for `shouldQuery: false` (spike Q2, Q7). The answer itself ends earlier, at the top-level `message_stop` after `stop_reason: "end_turn"` (spike Q12). |
+| Usage | `result.usage` is per turn in streaming-input sessions; `total_cost_usd` and `modelUsage` are **cumulative** per `query()` call, across models (and a resumed session starts from the saved total). |
 | Usage limit | `SDKRateLimitEvent` (`rate_limit_info.status: "allowed" \| "allowed_warning" \| "rejected"`, `resetsAt`), `SDKAssistantMessageError` `"rate_limit"`, exported `USAGE_LIMIT_ERROR_PREFIXES` (`@alpha`) |
 | Session check | `getSessionInfo(sessionId, options)` |
 | System prompt | `systemPrompt: { type: "custom", prompt, snapshot: false }` renders the prompt passed at **query start** on every request. It is not a live setter: a running query keeps the prompt it was started with. |
@@ -81,24 +81,48 @@ no fork.
 
 ```
 server.ts ── Session (per socket) ──┐
-                                    ├─ DeviceRegistry (per Core) ── DeviceAgent (per device) ── query() + Claude Code process
-server.ts ── Session (per socket) ──┘         │                          (HA MCP SSE stays connected)
-                                              └─ ContinuityStore (A4, sessions/devices.json)
+                                    ├─ DeviceRegistry (per Core) ── ProviderSession (per device) ── ModelProvider
+server.ts ── Session (per socket) ──┘         │                      = DeviceAgent                  = ClaudeSdkProvider
+                                              │                      (query() + Claude Code process, HA MCP SSE stays connected)
+                                              └─ ContinuityStore (A4, sessions/devices.json: { provider, sessionId })
 ```
 
-- **`DeviceAgent`** (new `core/src/device-agent.ts`) owns one `Query`:
+- **Provider interface** (`core/src/model-provider.ts`). Every model call goes
+  through the Core, and the Core talks to a model only through this interface,
+  so the provider can be swapped (a fallback provider is T7.z). `ModelProvider`
+  has `id`, `capabilities { setModel, compact, notes, resume }`,
+  `openSession({ device, model, resume?, onSessionId?, onDead?, onIdleClose? })`
+  → `ProviderSession`, and `oneShot({ model, system?, prompt, schema?, maxTokens,
+  signal })` for background passes (memory extraction, Core-side summary, 06).
+  `ProviderSession` has `provider`, `sessionId`, `model`, `busy`, `ready()`,
+  `runAttempt`, `appendNote`, `setModel`, `interrupt`, optional `compact()`
+  (only with the capability) and `close()`. Attempt request/outcome
+  (`AttemptStatus` incl. `usage_limit` + `retryAt`, token and cost fields) and
+  the permission callback are provider-neutral types. The registry, `Session`,
+  continuity (A4) and memory (06) code use only these types; sentence streaming
+  (A2), continuity, extraction and compaction live in the Core above the
+  interface. The tool permission gate stays as it is: `Session.gate()` is passed
+  per attempt as a neutral `PermissionCallback`, which each provider adapts.
+- **`ClaudeSdkProvider`** (`core/src/device-agent.ts`) is the Claude Agent SDK
+  implementation: `openSession` creates a `DeviceAgent`; `oneShot` runs a
+  separate one-shot `query()` (options from an injected builder: no tools, no
+  MCP, no persisted session); `compact` is off until `/compact` on a live
+  streaming query is verified.
+- **`DeviceAgent`** (`core/src/device-agent.ts`, the `ProviderSession`) owns one `Query`:
   - an input queue (an `AsyncIterable<SDKUserMessage>` that never ends while the
     agent lives) and one output pump that reads the `Query` for its whole life;
-  - `runAttempt({ text, model, sink })` sends one user message (with a fresh
-    `uuid`) and resolves at the next `result`, not at the end of the iterator
-    (today `runTurn` waits for the iterator to end). Only **one outstanding attempt**
-    is allowed per device;
+  - `runAttempt({ text, model, canUseTool, callbacks, signal })` sends one user
+    message (with a fresh `uuid`) and returns two promises: `done` (the visible
+    end, see *Turn boundaries*) and `settled` (the next `result`), instead of
+    waiting for the iterator to end as `runTurn` does. Only **one attempt before
+    its visible end** is allowed per device (`DeviceAgentBusyError`);
+    `appendNote(text)` sends a `shouldQuery: false` message;
   - calls `setModel(model)` before the attempt when the model differs from the
     current one;
   - `interrupt()` for barge-in, `close()` for idle close and shutdown;
   - an idle timer, a dead flag and usage diffing (below).
 - **`DeviceRegistry`** (new `core/src/device-registry.ts`) maps device →
-  `DeviceAgent`. It creates agents lazily, prewarms on `hello`, closes idle ones and
+  `ProviderSession` (via `ModelProvider.openSession`). It creates sessions lazily, prewarms on `hello`, closes idle ones and
   starts replacements after a crash.
 - **`Session`** (per socket) keeps what it does today: routing, tier 0, permission
   gate, confirmations, buffering of tier-1 text, conversation log. Instead of
@@ -120,7 +144,8 @@ Same as `SdkAgentRunner.buildOptions` today, except:
 | `canUseTool` | one dispatcher per agent (below) | fixed at query start |
 | `resume` | session id from the continuity store (A4), if valid | |
 | `forkSession` | never | |
-| `maxTurns` | depends on the spike | see S1 Q4 |
+| `maxTurns` | `12` | counts per user message in streaming-input mode (spike Q4), so today's meaning is kept |
+| `env` | `subprocessEnv(process.env)` | with `CORE_AGENT_SKIP_TURN_SUMMARY=1`: also `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` (see *Turn boundaries*) |
 | `abortController` | owned by the agent | only `close()` paths abort |
 
 ### Tier switching and escalation
@@ -137,7 +162,8 @@ Per user turn (tiers 1-3; tier 0 is unchanged and does not touch the agent):
    ```
 
 3. `DeviceAgent.runAttempt` awaits `setModel(tierModel)` if needed, installs the
-   turn's sink and gate context, sends the envelope and resolves at `result`.
+   turn's sink and gate context, sends the envelope and resolves `done` at the
+   visible end (`settled` at `result`).
 4. Tier-1 text stays **buffered** in `Session.callModel` exactly as today. The
    marker `[[ESCALATE]]` is never shown or spoken.
 5. On escalation: `setModel(tier2Model)` and a second attempt with
@@ -176,62 +202,115 @@ per-turn closure today. The agent therefore passes one dispatcher:
 
 ### Turn boundaries, cancel, timeouts
 
-- **Boundary:** an attempt ends at its `result`. `TurnStream` (agent.ts) is reused
-  per attempt. The pump routes every message between send and `result` to the
-  attempt's sink.
+- **Boundary (spike Q2, Q7, Q12):** every sent user message, also a
+  `shouldQuery: false` note, yields exactly one `result`. Messages are sent
+  strictly one at a time: the next one only after the previous `result`, so a
+  `result` always belongs to the single message in flight and nothing is folded
+  into a running turn. Messages that arrive with nothing in flight (a stray
+  `user` echo after a `result`) are ignored. `TurnStream` (agent.ts) is reused
+  per attempt; the pump routes every message between send and `result` to it.
+- **Visible end vs `result` (spike Q12):** from the second message of a session
+  on, the CLI runs an end-of-turn summary classifier for about 2 to 2.5 s between
+  the last `message_stop` and `result`. Therefore an attempt has two ends:
+  - `done`: the top-level `message_stop` whose `message_delta` carried
+    `stop_reason: "end_turn"` (or the `result`, if that comes first, e.g. on an
+    error or cancel). `Session` sends `assistant_done` here. A `tool_use` stop
+    does not end the turn.
+  - `settled`: the `result`. Usage, `costUsd` and `sdkDurationMs` are final only
+    here; `Session` records usage when it arrives.
+  - A new attempt may be submitted after `done`. It is queued and sent after the
+    previous `result` (`busy` is only reported before `done`). Escalation uses
+    the same path: the tier-2 attempt waits for the tier-1 `result`.
+  - Opt-in `CORE_AGENT_SKIP_TURN_SUMMARY=1` sets `CLAUDE_CODE_CLASSIFIER_SUMMARY=0`
+    in the subprocess environment, which shortens the gap itself (spike: `result`
+    at about 0.7 s). The variable is undocumented in the CLI and may change or
+    disappear with an SDK update, so it is off by default; the bench catches a
+    regression. The legacy runner (`CORE_AGENT_PERSISTENT=off`) still ends a turn
+    at the end of the iterator and pays the gap on resumed sessions.
 - **Cancel (barge-in):** `Session` cancels confirmations as today
-  (`broker.cancelAll`), then `DeviceAgent.interrupt()` → `Query.interrupt()`. The
-  attempt resolves at the `result` that follows the interrupt (the spike checks
-  that one arrives). The next attempt is not sent until the interrupted one has
-  drained. The client already waits for `state: idle` before its next turn
-  ([03 §How the app uses it](03-platform-adapter.md#how-the-app-uses-it)). An
-  interrupted write is **never replayed**.
+  (`broker.cancelAll`), then `DeviceAgent.interrupt()` (or aborts the attempt's
+  `signal`) → `Query.interrupt()`. The `result` follows within about 10 ms as
+  `subtype: "error_during_execution"` (spike Q5); after a host-side stop it maps
+  to status `cancelled` (no `model_error`, no usage-limit check). The next
+  attempt is not sent until the interrupted one has drained. An attempt that is
+  cancelled while still queued is never sent. A cancel after `done` does nothing
+  (the answer is already out). The client already waits for `state: idle` before
+  its next turn ([03 §How the app uses it](03-platform-adapter.md#how-the-app-uses-it)).
+  An interrupted write is **never replayed**.
 - **Socket close:** same as today: it cancels the running turn and denies pending
   confirmations. The `DeviceAgent` stays alive until its idle timeout, so a
   reconnect is fast.
-- **Turn timeout (new):** `CORE_TURN_TIMEOUT_MS` (default 120000). On expiry the
-  agent calls `interrupt()` and the session sends `error model_error`. This also
-  guards against a CLI that waits silently for a usage-limit reset.
-- **Tool loop guard:** a host-side cap of 12 tool calls per attempt, counted from
-  `tool_use` blocks; past it the agent calls `interrupt()`. This replaces
-  `maxTurns: 12` if the spike shows that `maxTurns` counts per query rather than
-  per user message.
+- **Turn timeout (new):** `CORE_TURN_TIMEOUT_MS` (default 120000), from send. On
+  expiry the agent calls `interrupt()`, the attempt ends with status `timeout`
+  and the session sends `error model_error`. This also guards against a CLI that
+  waits silently for a usage-limit reset. After `done` the timer is restarted
+  once for the tail up to `result`, so a stuck `result` cannot block the queue.
+- **Interrupt watchdog:** if no `result` follows an `interrupt()` within 5 s, the
+  agent is closed and marked dead. It never fired in the spike; it stays as a
+  safety net. A `shouldQuery: false` note without a `result` within 10 s is
+  handled the same way.
+- **Tool loop guard:** `maxTurns: 12` counts per user message (spike Q4), so it
+  stays the main limit. A host-side cap of 12 top-level tool calls per attempt,
+  counted from `tool_use` blocks, stays as defence in depth (one model turn can
+  call several tools); past it the agent calls `interrupt()` and the attempt ends
+  with status `tool_cap`.
 
 ### Idle close, prewarm, process death
 
 - **Prewarm:** when a device authenticates (`hello`), `Session` calls
   `registry.prewarm(device)`, which starts the query (with `resume` from A4)
   unless one is already running. When the user speaks, the process and the HA
-  MCP connection are usually already up. `CORE_AGENT_PREWARM=off` disables this.
+  MCP connection are usually already up (process + MCP connect take about 3.5 to
+  4 s, spike Q1). Readiness is `Query.initializationResult()` resolved
+  (`DeviceAgent.ready()`); `system/init` is not a readiness signal, because it is
+  sent only with the first user message and then again on every turn.
+  `startup()`/`prewarm()` are not used. `CORE_AGENT_PREWARM=off` disables this.
 - **Idle close:** after `CORE_AGENT_IDLE_MIN` minutes (default 10) without an
   attempt, and only when no attempt or confirmation is pending, the agent calls
   `close()`. The next turn starts a new query with `resume` (cold path, but the
   conversation continues, see A4). Each warm agent holds roughly 250 MB.
 - **MCP freshness:** before an attempt, if the last attempt was more than 5 minutes
-  ago, the agent calls `mcpServerStatus()` (a local control call). If Home
+  ago, the agent calls `mcpServerStatus()` (a local control call, about 3 ms;
+  after 15 idle minutes HA was still `connected` in the spike, Q11). If Home
   Assistant is not `connected`, it calls `reconnectMcpServer("home-assistant")`,
   bounded by the service timeout. A failed reconnect does not block the turn: the
   model sees the tool error, as today.
 - **Process death:** if the pump ends or throws outside `close()`, the agent is
-  marked dead. The running attempt resolves with an error (`model_error`; partial
-  text is kept as today). The next turn creates a new agent with `resume`. A dead
-  agent is never restarted in a loop: replacements back off by 30 s after two
+  marked dead. The running attempt resolves with status `dead` (`model_error`;
+  partial text is kept as today) and queued work is dropped. The next turn creates
+  a new agent with `resume` = the dead agent's last `sessionId` (the session id
+  stays the same across `resume`, spike Q8). A dead agent is never restarted in a
+  loop: `RestartBackoff` (device-agent.ts) blocks replacements for 30 s after two
   deaths within 5 minutes; in that window turns use the legacy runner.
 
 ### Usage records and the conversation log
 
 - `inputTokens`, `outputTokens` and cache tokens come from the per-turn
-  `result.usage`, so `TurnStream` stays as it is.
+  `result.usage`, so `TurnStream` stays as it is. They are known at `settled`,
+  not at `done` (see *Turn boundaries*).
 - `costUsd` is the difference between this `result.total_cost_usd` and the
-  previous one in the same query. The first result after a `resume` has no
-  baseline (it already contains earlier turns), so `costUsd` is left out for that
-  turn. The token fields are still exact.
+  previous `result` of the same query (the results of `shouldQuery: false` notes
+  move the baseline too; their cost does not change). A fresh query starts from
+  0. The first result after a `resume` has no baseline (it already contains
+  earlier turns), so `costUsd` is left out for that turn; so is a result whose
+  total is lower than the baseline (a crash result may carry zeroed totals). The
+  token fields are still exact.
+- The model of a turn is read from its top-level `assistant` messages
+  (`message.model`), falling back to the requested model. `modelUsage` is
+  cumulative across models in one query (spike Q3) and is not used per turn.
 - Tier-0 exchanges: today `Session.directNotes` (in memory, per socket) is put in
-  front of the next model prompt. In persistent mode the exchange is sent right
-  away as a `shouldQuery: false` user message ("(Bilgi: bu kısa komutu sistem
-  modelsiz yanıtladı.) Kullanıcı: … / Shadow: …"). It then lives in the SDK
-  transcript, survives reconnects and needs no buffer. If the spike shows that
-  `shouldQuery: false` is unusable, keep `directNotes`, moved to `DeviceAgent`.
+  front of the next model prompt. Records are always wrapped in `<bilgi>` …
+  `</bilgi>` lines (agent.ts `wrapDirectNotes`, or `buildTurnEnvelope({ notes })`)
+  so that a question in the same message is still answered (`system.md`); S6
+  replaces the `DIRECT_NOTES_HEADER` prefix in `Session.withDirectNotes()` with
+  this. In persistent mode the exchange is sent as a `shouldQuery: false` user
+  message (the wrapped "Kullanıcı: … / Shadow: …" record) through
+  `ProviderSession.appendNote` when `capabilities.notes`. It
+  then lives in the SDK transcript, survives reconnects and needs no buffer
+  (spike Q7: the content reaches the next turn, also after a resume). The note
+  gets its own `result` (`success`, `num_turns: 0`, about 70 ms); it is queued
+  like an attempt, and the next attempt is sent only after that `result`.
+  `system.md` tells the model not to answer these notes.
 - New conversation-log kind `timing` (per model turn):
   `{kind:"timing", id, tier, warm, queryAgeMs, routeMs, firstDeltaMs, doneMs, sdkDurationMs, firstSpeechMs?}`.
   All values are ms from receiving the frame (for voice: from the transcript).
@@ -247,8 +326,10 @@ generic failure:
   of `USAGE_LIMIT_ERROR_PREFIXES`; `SDKAssistantMessageError` `"rate_limit"`
   together with a recent `rate_limit_event` with `status: "rejected"`. A
   `rate_limit_event` with status `allowed_warning` is only logged.
-- Effect: `error` frame with the new code `usage_limit` and optional `retryAt`
-  (epoch ms, from `rate_limit_info.resetsAt` when present). No escalation, no
+- Effect: attempt status `usage_limit`; the limit text is not emitted as answer
+  text. `error` frame with the new code `usage_limit` and optional `retryAt`
+  (epoch ms, from `rate_limit_info.resetsAt`, which the CLI reports in epoch
+  seconds; values below 1e12 are multiplied by 1000). No escalation, no
   agent restart, no retry. The memory extraction pass (06) is suspended until
   `retryAt` (or one hour if unknown).
 - Clients must already treat unknown codes as generic errors
@@ -272,6 +353,7 @@ socket). The frames of a turn go to the socket that started it.
 | `CORE_AGENT_IDLE_MIN` | `10` | close a device's process after this many idle minutes |
 | `CORE_AGENT_PREWARM` | `on` | start the device's query on `hello` |
 | `CORE_TURN_TIMEOUT_MS` | `120000` | host-side limit per model turn |
+| `CORE_AGENT_SKIP_TURN_SUMMARY` | off | `1`: `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` for the SDK subprocess (undocumented CLI variable, see *Turn boundaries*); read by `subprocessEnv` |
 | `CORE_CONTINUITY_MIN` | `30` | A4 window |
 
 ## A2. Sentence-by-sentence speech
@@ -461,12 +543,39 @@ target.
 
 ### Results
 
+`t_done` (s, client-measured):
+
 | Scenario | Before p50 / p95 | After p50 / p95 |
 |---|---|---|
-| 1 | – | – |
-| 2 | – | – |
-| 3 | – | – |
-| 4 | – | – |
+| 1 | 7.32 / 9.34 | – |
+| 2 | 9.04 / 9.39 | – |
+| 3 | 6.80 / 8.83 | – |
+| 4 | 5.98 / 9.74 | – |
+
+**Before (baseline), 2026-10-28**, code before S6 (the fresh-`query()`-per-turn
+runner; the T7.8 router change was in the working tree but does not touch tier
+1-3). A separate Core from source on its own port and data dir, `CORE_READ_ONLY=1`,
+`DEVICE_TOKEN_BENCH`; `npm run bench` (in `core/`) with 5 runs per scenario (not 10, to
+save subscription usage) after one warm-up turn. Every turn was routed to tier 1
+(Haiku, rule `default`), none escalated, none fell into tier 0. Scenario 2 called
+`GetLiveContext` (read-only) each time.
+
+| Scenario | t_first p50 / p95 | t_done p50 / p95 | t_speech p50 / p95 | SDK `duration_ms` (log) |
+|---|---|---|---|---|
+| 1 simple text, warm | 7.32 / 9.34 | 7.32 / 9.34 | 7.87 / 9.61 | 1.3 to 5.0 s |
+| 2 HA read, warm | 9.04 / 9.38 | 9.04 / 9.39 | 9.75 / 9.82 | 3.5 to 5.1 s |
+| 3 first turn after `hello` | 6.80 / 8.83 | 6.80 / 8.83 | 7.29 / 9.34 | 1.2 to 4.4 s |
+| 4 first turn after a Core restart | 5.98 / 9.74 | 5.98 / 9.74 | 6.36 / 10.07 | 0.8 to 5.5 s |
+
+- `t_first` equals `t_done` because tier-1 text is buffered (escalation) and
+  arrives as one delta.
+- `t_speech` is the pre-A2 path: `speak` with the whole answer after
+  `assistant_done`; synthesis of these short answers adds 0.3 to 0.6 s.
+- Before A4, scenarios 3 and 4 start a new conversation (no `resume`), so they
+  are not slower than the warm scenarios; scenario 1 resumes a growing session.
+- Extra data point (not a baseline row): scenario 1 with
+  `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` in the SDK subprocess environment gave
+  p50 6.39 s / p95 7.84 s (5 runs), see [Spike results](#spike-results) Q12.
 
 ## Failure modes
 
@@ -525,12 +634,12 @@ Parallel lanes: {S1, S2, S3, P1, S9, S11} can start at once. S4 and S5 run in
 parallel after S1. S7 needs only S3. S6, S8 and S10 are serialized on
 `session.ts`/`device-registry.ts`.
 
-- [ ] **S1 — SDK spike.** A throwaway script against the real CLI (own `cwd`) that answers the questions in [S1 spike questions](#s1-spike-questions); results go into §Spike results. Acceptance: every question answered with an observed result; the design is updated where an answer contradicts it.
-- [ ] **S2 — Bench client and baseline.** As in [Measurement](#measurement). Acceptance: before numbers for scenarios 1-4 are recorded in §Results.
+- [x] **S1 — SDK spike.** A throwaway script against the real CLI (own `cwd`) that answers the questions in [S1 spike questions](#s1-spike-questions); results go into §Spike results. Acceptance: every question answered with an observed result; the design is updated where an answer contradicts it. — answers recorded; design sections updated (Turn boundaries, Cancel, timeouts, tool-call cap, prewarm readiness, usage records, usage limit), see §Spike results → Design impact.
+- [x] **S2 — Bench client and baseline.** As in [Measurement](#measurement). Acceptance: before numbers for scenarios 1-4 are recorded in §Results. — baseline 2026-10-28, 5 runs per scenario.
 - [ ] **S3 — Atomic file helper.** `writeFileAtomic(path, data)` (temp + fsync + rename, Windows retry), `readJsonOrQuarantine(path, validate)` (returns `undefined` and renames corrupt files, keeps 3). Acceptance: unit tests for a crash between write and rename (the old file stays intact), a corrupt file being quarantined, and the retry path (mocked `EPERM`).
 - [ ] **P1 — Protocol additions (shared with 06).** Types, parsing and docs for: `welcome.features`; client `speech_prefs`, `memory_list`, `memory_delete`; server `speech_chunk`, `memory`; error codes `usage_limit` (+ optional `retryAt`). Frame shapes for memory: [06 §Protocol](06-memory.md#protocol). Acceptance: parser tests for every new frame (valid, invalid, unknown fields ignored); docs/02 tables updated; old frames unchanged.
-- [ ] **S4 — DeviceAgent.** Input queue, output pump, `runAttempt` resolving at `result`, `setModel` only on change, `interrupt` with drain, the 5 s interrupt watchdog, idle timer, dead detection, `costUsd` diffing, usage-limit detection (with the fallback prefix copy), tool-call cap, gate dispatcher with attempt capture. Tested with a fake `Query` (an async generator plus spies for the control methods). Acceptance: tests for two sequential attempts on one query, a model switch, interrupt then next attempt, death mid-attempt, a stale gate call denied, usage-limit mapping and the cost diff.
-- [ ] **S5 — Static prompt and options.** `tier1.md` conditional on `[mod:hizli]`; one system prompt for all tiers; `buildOptions` for the persistent mode (streaming prompt, no per-turn `resume`/`forkSession`, gate dispatcher); `SdkAgentRunner` kept for the legacy mode. Acceptance: existing agent tests pass; a new test checks that the options of the persistent mode do not depend on the tier.
+- [x] **S4 — DeviceAgent.** Input queue, output pump, `runAttempt` resolving at `result`, `setModel` only on change, `interrupt` with drain, the 5 s interrupt watchdog, idle timer, dead detection, `costUsd` diffing, usage-limit detection (with the fallback prefix copy), tool-call cap, gate dispatcher with attempt capture. Tested with a fake `Query` (an async generator plus spies for the control methods). Acceptance: tests for two sequential attempts on one query, a model switch, interrupt then next attempt, death mid-attempt, a stale gate call denied, usage-limit mapping and the cost diff. — done 2026-10-28: `core/src/device-agent.ts` (`DeviceAgent`, `RestartBackoff`), 20 tests in `core/test/device-agent.test.ts` (fake `Query`), also visible end before `result`, `shouldQuery:false` notes, idle close, turn timeout, watchdog, MCP freshness; one Haiku smoke run. Independent review/test pending (team lead). Follow-up 2026-10-28 (provider interface + review fixes): `core/src/model-provider.ts` (neutral `ModelProvider`/`ProviderSession`), `ClaudeSdkProvider` with `oneShot`, `DeviceAgent implements ProviderSession` (+ `setModel()`); limit text streamed as deltas is held back and ends as `usage_limit` (also after a visible end); `setModel` bounded by `setModelTimeoutMs` (die on expiry); throwing callbacks cannot leave an attempt pending; a zeroed result no longer lowers the cost baseline; 28 tests.
+- [x] **S5 — Static prompt and options.** `tier1.md` conditional on `[mod:hizli]`; one system prompt for all tiers; `buildOptions` for the persistent mode (streaming prompt, no per-turn `resume`/`forkSession`, gate dispatcher); `SdkAgentRunner` kept for the legacy mode. Acceptance: existing agent tests pass; a new test checks that the options of the persistent mode do not depend on the tier. — done 2026-10-28: `buildPersistentOptions`, `persistentSystemPrompt`, `buildTurnEnvelope`/`TIER1_MARKER`, `CORE_AGENT_SKIP_TURN_SUMMARY` in `subprocessEnv`; the legacy runner prefixes escalatable prompts with the marker so the conditional `tier1.md` keeps working before S6. Watch in S6: in the one smoke run Haiku answered a marked `Merhaba, bugün nasılsın?` (fresh session) with `[[ESCALATE]]`; check the escalation rate with the bench. Follow-up 2026-10-28: `tier1.md` rewritten (greetings, small talk and thanks are never escalated; only clearly multi-step/multi-device/plan/comparison/long-explanation requests; vague requests get a short question; no "emin değilsen"); tier-0 records are delimited (`DIRECT_NOTES_START/END`, `wrapDirectNotes`, `buildTurnEnvelope({ notes })`) and `system.md` says to answer the request after `</bilgi>`. S6 must switch `Session.withDirectNotes()` (and `appendNote` texts) to `wrapDirectNotes`.
 - [ ] **S6 — Registry and session wiring.** `DeviceRegistry` (lazy create, prewarm on hello, idle close, crash backoff, legacy fallback); `Session` uses it; escalation in-session; tier-0 exchanges as `shouldQuery:false` (or `directNotes` moved to the agent, per S1); per-tier service gate; `usage_limit` error frames; `timing` log kind; config variables; `docs/04-router.md` escalation and caching sections rewritten; `.env.example`. Acceptance: all session tests pass with a mocked registry; manual check of scenario 1 at p50 ≤ 2.5 s; cancel, confirm (button and voice) and escalation work end to end; `CORE_AGENT_PERSISTENT=off` behaves exactly as before.
 - [ ] **S7 — Continuity store.** `devices.json` load/lookup/write/expiry/quarantine on top of S3. Acceptance: unit tests for expiry, corruption, an unknown version, serialized writes, and the missing-transcript check (injected `getSessionInfo`).
 - [ ] **S8 — Continuity wiring.** The registry resumes from the store when it starts an agent, updates the store after each model turn and flushes on shutdown. Acceptance: manual: a turn, Core restart, reconnect within 30 min, and the model remembers the previous turn; after 30 min it does not.
@@ -568,4 +677,54 @@ parallel after S1. S7 needs only S3. S6, S8 and S10 are serialized on
 
 ### Spike results
 
-(filled in by S1)
+Run 2026-10-28 with `core/scripts/spike-agent-sdk.ts` (`npm run spike:sdk -- <phases>` in `core/`)
+against SDK 0.3.311 and its bundled CLI, Haiku, own temp `cwd`, the real Home
+Assistant MCP server over SSE (`alwaysLoad: true`, as the Core builds it). The
+permission callback allowed only `GetLiveContext`. About 35 short model turns
+in total (one ~73k-token message for Q10); no usage limit was hit
+(`rate_limit_event` stayed `allowed` / `allowed_warning`).
+
+| # | Answer | Evidence |
+|---|---|---|
+| 1 | **Yes.** `query()` with a streaming prompt starts the process at once and connects MCP before any user message: `initializationResult()` resolved 2.4 s after the call (3.7 s after `query()`), then `mcpServerStatus()` returned `home-assistant: connected` (6 ms). The `system/init` **message** is not sent until the first user message, and is sent again at the start of **every** turn (it is not a once-per-query event). `startup()` resolved after 3.8 s; the first turn on it had its first delta at 0.68 s and its result at 1.1 s. Starting the streaming `query()` early (prewarm on `hello`) gives the same effect, so `startup()` is not needed. | phases `main`, `startup` |
+| 2 | **Yes.** Exactly one `result` per user message (11 messages incl. model switches and two interrupts), and `session_id` never changed. Note: also a `shouldQuery: false` message gets its own `result` (Q7). Between attempts the pump can see stray messages (a `user` message after a `result` was seen twice); they must be ignored. | `main` |
+| 3 | **Yes.** `setModel("sonnet")` resolves in 3 to 5 ms; the next turn's `assistant.message.model` is the Sonnet model and the next `system/init` reports it. `modelUsage` is cumulative, so it then has both keys; the per-turn model must be read from the `assistant` messages, not from `modelUsage`. `setModel` with the current model is a 3 ms no-op. | `main` |
+| 4 | **Per user message.** With `maxTurns: 2`, three messages in one query all ended `success` with `num_turns: 1`. `maxTurns: 12` keeps today's meaning; the host-side tool-call cap is not needed as a replacement (it may stay as defence in depth). | `maxturns` |
+| 5 | **Result arrives, fast.** During streaming text: `interrupt()` resolved in 4 ms with `{still_queued: []}`, the `result` followed 10 ms after the call, as **`subtype: "error_during_execution"`, `is_error: true`** (with an internal `[ede_diagnostic] …` error string). During a pending `canUseTool`: the callback's `signal` was aborted at once, the same error result came 9 ms after `interrupt()`. In both cases the next message worked normally on the same query. The 5 s watchdog never fired. | `main` |
+| 6 | **Yes.** The one `canUseTool` given at query start is called for tools in every later turn (called in two different turns). Each call gets its own `signal`, and it is aborted on `interrupt()`. The dispatcher-with-captured-attempt design works. | `main` |
+| 7 | **Usable, with one difference.** The message is added without a model call and its content reached the next turn (the model recalled a code word given only in it, also after a resume). But it **does** produce a `result` of its own: `success`, `num_turns: 0`, `total_cost_usd` unchanged, no `assistant` message, ~70 ms. | `main`, `noquery` |
+| 8 | **Yes.** After `close()`, a new query with `resume` had the full context (recalled the code word), and the `session_id` stayed the **same**. | `resume` |
+| 9 | `getSessionInfo(id, { dir: <agent cwd> })` finds it (5 ms; `cwd` in the result matches). Without options it also finds it (searches all projects); with another `dir` and for an unknown id it returns `undefined`. Option name: `dir`. | `getinfo` |
+| 10 | **Supported.** `compact` is in `supportedCommands()` and in `system/init.slash_commands`. Sending `/compact` as a user message emits `system/compact_boundary` (`trigger: "manual"`, `pre_tokens`, `post_tokens`, `duration_ms`) followed by a `result` (`success`, `num_turns: 0`), and the next turn works. Measured on a **73k-token** session (the filler was larger than planned): 6.4 s, 72.8k → 1.0k tokens. A 30k session should be faster. `getContextUsage({detail:"summary"})` reports the categories before/after. | `compact` |
+| 11 | After 15 idle minutes `mcpServerStatus()` still reported `connected`, and a `GetLiveContext` call worked. The 5-minute freshness check stays as designed (cheap, 3 ms). | `idle` |
+| 12 | **Warm turn in one query, with defaults: first delta 1.3 to 1.7 s, `result` 3.7 to 4.5 s, `duration_ms` ≈ the same.** From the second message of a session on, the CLI runs an end-of-turn LLM classifier and emits `system/post_turn_summary` right before `result`; this adds about **2 to 2.5 s between `message_stop` and `result`**. With `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` in the subprocess environment (an undocumented CLI variable, found in the bundled CLI; it switches the summary to a heuristic), the same warm turns took **first delta 0.5 to 0.7 s, `result` 0.67 to 0.69 s**. | `trace` with and without the variable |
+
+#### Design impact (where a fallback or change is needed)
+
+- **Turn end vs `result` (Q12): changed.** Waiting for `result` costs ~2 s per
+  warm turn with default settings; this alone would miss the 2.5 s target. Options
+  were (a) `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` in `subprocessEnv` (undocumented,
+  may change with a CLI update) and (b) ending the user-facing turn at the
+  top-level `message_stop` with `stop_reason: "end_turn"`, keeping `result` as the
+  internal attempt boundary. **Decision (team lead): (b) by default, (a) as opt-in**
+  `CORE_AGENT_SKIP_TURN_SUMMARY=1`. Implemented in S4/S5, see
+  [Turn boundaries](#turn-boundaries-cancel-timeouts). The legacy runner pays the
+  same delay on resumed sessions. S4/S5 smoke test (Haiku, two turns, no MCP):
+  `done` at 1.5 s, `settled` at 4.1 to 4.3 s.
+- **Interrupt result (Q5):** the `result` after our own `interrupt()` is
+  `error_during_execution`. `DeviceAgent` must map it to "cancelled" (no
+  `model_error`, no usage-limit check). The interrupt-and-drain plan works as
+  designed; the 5 s watchdog stays as a safety net.
+- **`shouldQuery: false` (Q7):** usable, so `directNotes` is not needed. But it
+  yields its own `result`: `DeviceAgent` must count one `result` per sent message
+  (including non-querying ones) and must not take that `result` as the end of a
+  following attempt. Simplest: send the note as its own queued item and wait for
+  its `result` before sending the next attempt.
+- **`maxTurns` (Q4):** no fallback needed; keep `maxTurns: 12`.
+- **`system/init` (Q1):** repeats per turn; do not use it as "query started".
+  Readiness for prewarm = `initializationResult()` resolved.
+- **Per-turn model (Q3):** `modelUsage` is cumulative across models; take the
+  model of a turn from its `assistant` messages (or the requested tier model).
+- **Cold start (Q1):** process + MCP connect take about 3.5 to 4 s; prewarm on
+  `hello` hides this. `startup()`/`prewarm()` are not needed.
+- No fallback needed for Q2, Q6, Q8, Q9 (`dir`), Q10, Q11.

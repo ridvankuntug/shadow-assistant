@@ -1,11 +1,21 @@
 /** Agent SDK bridge tests — no subprocess, no model call. */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
+import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  buildTurnEnvelope,
+  DENIED_BUILTIN_TOOLS,
+  DIRECT_NOTES_END,
+  DIRECT_NOTES_START,
+  SdkAgentRunner,
+  subprocessEnv,
+  TIER1_MARKER,
+  TurnStream,
+  wrapDirectNotes,
+} from "../src/agent.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-agent-test-"));
 after(() => rmSync(base, { recursive: true, force: true }));
@@ -117,4 +127,81 @@ test("TurnStream: no partials → final text; error results surface", () => {
   const a = new TurnStream({ onDelta: () => {} });
   a.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s4", error: "authentication_failed", message: { content: [] } }));
   assert.match(a.result(0).error ?? "", /authentication_failed/);
+});
+
+test("persistent options: one static prompt with tier1.md, all MCP servers, no tier/fork inputs", () => {
+  const runner = new SdkAgentRunner({
+    systemPrompt: "sys",
+    escalationPrompt: "esc",
+    mcpServers: () => ({ a: { type: "sse", url: "http://localhost:1/a" }, b: { type: "sse", url: "http://localhost:1/b" } }),
+    cwd: join(base, "cwd"),
+  });
+  const gate: CanUseTool = async () => ({ behavior: "deny", message: "" });
+  const ac = new AbortController();
+  const a = runner.buildPersistentOptions({ model: "haiku", canUseTool: gate, abortController: ac });
+  const b = runner.buildPersistentOptions({ model: "haiku", canUseTool: gate, abortController: ac });
+  assert.deepEqual({ ...a, env: undefined }, { ...b, env: undefined }, "nothing per-turn in the options");
+  assert.deepEqual(a.systemPrompt, { type: "custom", prompt: "sys\n\nesc", snapshot: false });
+  assert.deepEqual(Object.keys(a.mcpServers ?? {}), ["a", "b"]);
+  assert.equal(a.forkSession, undefined);
+  assert.equal("resume" in a, false);
+  assert.equal(a.canUseTool, gate);
+  assert.equal(a.abortController, ac);
+  assert.equal(a.maxTurns, 12);
+  assert.deepEqual(a.tools, []);
+  assert.deepEqual(a.settingSources, []);
+  assert.equal(a.strictMcpConfig, true);
+  assert.equal(a.includePartialMessages, true);
+  assert.equal(a.allowedTools, undefined);
+  const resumed = runner.buildPersistentOptions({ model: "haiku", resume: "s9", canUseTool: gate, abortController: ac, memoryBrief: "mem" });
+  assert.equal(resumed.resume, "s9");
+  assert.deepEqual(resumed.systemPrompt, { type: "custom", prompt: "sys\n\nesc\n\nmem", snapshot: false });
+});
+
+test("turn envelope: tier-1 marker line, optional memory block, user text", () => {
+  assert.equal(buildTurnEnvelope({ text: "merhaba" }), "merhaba");
+  assert.equal(buildTurnEnvelope({ text: "merhaba", escalatable: true }), `${TIER1_MARKER}\nmerhaba`);
+  assert.equal(buildTurnEnvelope({ text: "merhaba", escalatable: true, memoryBlock: " <hafıza> \n" }), `${TIER1_MARKER}\n<hafıza>\nmerhaba`);
+  assert.equal(TIER1_MARKER, "[mod:hizli]");
+});
+
+test("prompts: tier1.md is conditional on the marker; system.md hides control lines", () => {
+  const dir = join(import.meta.dirname, "..", "prompts");
+  const tier1 = readFileSync(join(dir, "tier1.md"), "utf8");
+  assert.ok(tier1.includes(`\`${TIER1_MARKER}\``), "tier1.md names the marker");
+  assert.ok(tier1.includes("[[ESCALATE]]"));
+  assert.ok(readFileSync(join(dir, "system.md"), "utf8").includes(TIER1_MARKER));
+});
+
+test("prompts: greetings are never escalated; vague requests get a question; no 'emin değilsen' escalation", () => {
+  const tier1 = readFileSync(join(import.meta.dirname, "..", "prompts", "tier1.md"), "utf8");
+  assert.match(tier1, /Selamlaşma[^\n]*asla yükseltme/);
+  assert.match(tier1, /belirsiz[^\n]*kısa bir soruyla netleştir/);
+  assert.doesNotMatch(tier1, /emin değilsen/i);
+});
+
+test("direct notes: delimited records before the request; system.md names both delimiters", () => {
+  assert.equal(wrapDirectNotes([]), "");
+  assert.equal(wrapDirectNotes(["Kullanıcı: ışığı aç\nShadow: Açtım.", " "]), `${DIRECT_NOTES_START}\nKullanıcı: ışığı aç\nShadow: Açtım.\n${DIRECT_NOTES_END}`);
+  assert.equal(
+    buildTurnEnvelope({ text: "hava nasıl?", escalatable: true, notes: ["Kullanıcı: a\nShadow: b"] }),
+    `${TIER1_MARKER}\n${DIRECT_NOTES_START}\nKullanıcı: a\nShadow: b\n${DIRECT_NOTES_END}\nhava nasıl?`,
+  );
+  const system = readFileSync(join(import.meta.dirname, "..", "prompts", "system.md"), "utf8");
+  assert.ok(system.includes(DIRECT_NOTES_START) && system.includes(DIRECT_NOTES_END));
+  assert.match(system, /sonra gelen kullanıcı isteğini her zamanki gibi cevapla/);
+});
+
+test("subprocessEnv: CORE_AGENT_SKIP_TURN_SUMMARY=1 switches the CLI turn summary off (opt-in)", () => {
+  assert.equal(subprocessEnv({}).CLAUDE_CODE_CLASSIFIER_SUMMARY, undefined);
+  assert.equal(subprocessEnv({ CORE_AGENT_SKIP_TURN_SUMMARY: "0" }).CLAUDE_CODE_CLASSIFIER_SUMMARY, undefined);
+  assert.equal(subprocessEnv({ CORE_AGENT_SKIP_TURN_SUMMARY: "1" }).CLAUDE_CODE_CLASSIFIER_SUMMARY, "0");
+});
+
+test("TurnStream.result({fallbackText:false}) does not emit the final text", () => {
+  const deltas: string[] = [];
+  const s = new TurnStream({ onDelta: (t) => deltas.push(t) });
+  s.consume(msg({ type: "result", subtype: "success", is_error: false, result: "Merhaba!", session_id: "s2", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  assert.equal(s.result(0, { fallbackText: false }).text, "");
+  assert.deepEqual(deltas, []);
 });

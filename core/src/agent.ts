@@ -95,9 +95,50 @@ export const DENIED_BUILTIN_TOOLS = [
   "ReadMcpResourceTool",
 ];
 
+/**
+ * First line of an escalatable tier-1 user message. `prompts/tier1.md` is
+ * written conditionally on it, so one static system prompt serves every tier
+ * (persistent mode) and the escalation rule applies only to marked messages.
+ */
+export const TIER1_MARKER = "[mod:hizli]";
+
+/**
+ * Delimiters of the tier-0 exchange records the model did not see
+ * (`system.md`: never answer what is between them; answer the request after
+ * them). They keep the records apart from a question in the same message.
+ */
+export const DIRECT_NOTES_START = "<bilgi>";
+export const DIRECT_NOTES_END = "</bilgi>";
+
+/** Wraps tier-0 exchange records (`Kullanıcı: … / Shadow: …`) in the delimiters; "" when there are none. */
+export function wrapDirectNotes(notes: readonly string[]): string {
+  const body = notes.map((n) => n.trim()).filter((n) => n !== "");
+  if (body.length === 0) return "";
+  return [DIRECT_NOTES_START, ...body, DIRECT_NOTES_END].join("\n");
+}
+
+/**
+ * The user message of one model turn ("turn envelope", docs/07 §Tier switching):
+ * the tier-1 marker line (escalatable turns only), delimited tier-0 records,
+ * an optional memory block (docs/06), then the user's text.
+ */
+export function buildTurnEnvelope(e: { text: string; escalatable?: boolean; notes?: readonly string[]; memoryBlock?: string }): string {
+  const parts: string[] = [];
+  if (e.escalatable) parts.push(TIER1_MARKER);
+  const notes = wrapDirectNotes(e.notes ?? []);
+  if (notes) parts.push(notes);
+  if (e.memoryBlock?.trim()) parts.push(e.memoryBlock.trim());
+  parts.push(e.text);
+  return parts.join("\n");
+}
+
 export interface SdkAgentOptions {
   systemPrompt: string;
-  /** Appended to the system prompt for escalatable (tier 1) turns. */
+  /**
+   * prompts/tier1.md. Legacy mode: appended to the system prompt for
+   * escalatable (tier 1) turns. Persistent mode: always part of the one static
+   * system prompt (the rule is conditional on `TIER1_MARKER`).
+   */
   escalationPrompt?: string;
   /** Built per turn: in-process MCP server instances cannot be shared between queries. */
   mcpServers: () => Record<string, McpServerConfig>;
@@ -109,7 +150,29 @@ export interface SdkAgentOptions {
   stderr?: (line: string) => void;
 }
 
-/** Environment for the SDK subprocess: drop device tokens, HA token and empty API keys. */
+/** Fixed per persistent query: no per-turn tier, resume or fork (docs/07 §Query options). */
+export interface PersistentOptionsRequest {
+  /** Initial model (tier 1); other tiers switch with `Query.setModel()`. */
+  model: string;
+  /** Session id to continue (A4 continuity), if any. */
+  resume?: string;
+  /** The DeviceAgent's gate dispatcher; fixed for the life of the query. */
+  canUseTool: CanUseTool;
+  /** Owned by the DeviceAgent; aborted only on close. */
+  abortController: AbortController;
+  /** Memory brief (docs/06), appended to the static system prompt when present. */
+  memoryBrief?: string;
+}
+
+/**
+ * Environment for the SDK subprocess: drop device tokens, HA token and empty API keys.
+ *
+ * `CORE_AGENT_SKIP_TURN_SUMMARY=1` (opt-in) sets `CLAUDE_CODE_CLASSIFIER_SUMMARY=0`:
+ * the CLI then skips the end-of-turn LLM summary classifier that delays `result`
+ * by ~2 to 2.5 s on warm turns (docs/07 §Spike results Q12). The variable is
+ * undocumented in the CLI and may change or disappear with an SDK update; the
+ * bench is the regression check. Off by default.
+ */
 export function subprocessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
@@ -117,10 +180,16 @@ export function subprocessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (k === "ANTHROPIC_API_KEY" && !v) continue;
     out[k] = v;
   }
+  if (env.CORE_AGENT_SKIP_TURN_SUMMARY === "1") out.CLAUDE_CODE_CLASSIFIER_SUMMARY = "0";
   out.CLAUDE_AGENT_SDK_CLIENT_APP = "shadow-assistant-core/0.1";
   return out;
 }
 
+/**
+ * Legacy mode (`CORE_AGENT_PERSISTENT=off`, and the one-turn fallback when a
+ * DeviceAgent cannot start): a fresh `query()` per turn. `buildPersistentOptions`
+ * provides the options of the persistent per-device query (docs/07 §A1).
+ */
 export class SdkAgentRunner implements AgentRunner {
   constructor(private readonly opts: SdkAgentOptions) {
     mkdirSync(opts.cwd, { recursive: true });
@@ -160,6 +229,39 @@ export class SdkAgentRunner implements AgentRunner {
     };
   }
 
+  /** One static system prompt for all tiers (same bytes every turn, so each model keeps its cache prefix). */
+  persistentSystemPrompt(memoryBrief?: string): string {
+    const parts = [this.opts.systemPrompt];
+    if (this.opts.escalationPrompt) parts.push(this.opts.escalationPrompt);
+    if (memoryBrief?.trim()) parts.push(memoryBrief.trim());
+    return parts.join("\n\n");
+  }
+
+  /** Options of a persistent streaming-input query; independent of the tier by design. */
+  buildPersistentOptions(p: PersistentOptionsRequest): Omit<Options, "prompt"> {
+    return {
+      model: p.model,
+      systemPrompt: { type: "custom", prompt: this.persistentSystemPrompt(p.memoryBrief), snapshot: false },
+      tools: [],
+      disallowedTools: DENIED_BUILTIN_TOOLS,
+      settingSources: [],
+      strictMcpConfig: true,
+      // All enabled services: the tool list stays stable for the whole session;
+      // per-tier service limits are enforced by the gate (docs/07 §Tier switching).
+      mcpServers: this.opts.mcpServers(),
+      canUseTool: p.canUseTool,
+      permissionMode: "default",
+      includePartialMessages: true,
+      abortController: p.abortController,
+      ...(p.resume ? { resume: p.resume } : {}),
+      cwd: this.opts.cwd,
+      // Counts per user message in streaming-input mode (spike Q4).
+      maxTurns: this.opts.maxTurns ?? 12,
+      env: this.opts.env ?? subprocessEnv(process.env),
+      stderr: this.opts.stderr,
+    };
+  }
+
   async runTurn(req: TurnRequest, cb: TurnCallbacks): Promise<TurnResult> {
     const abortController = new AbortController();
     const onAbort = () => abortController.abort();
@@ -168,7 +270,9 @@ export class SdkAgentRunner implements AgentRunner {
     const started = Date.now();
     const stream = new TurnStream(cb);
     try {
-      const q = query({ prompt: req.prompt, options: this.buildOptions(req, abortController) });
+      // tier1.md is conditional on the marker line, so escalatable turns carry it.
+      const prompt = req.escalatable && this.opts.escalationPrompt ? buildTurnEnvelope({ text: req.prompt, escalatable: true }) : req.prompt;
+      const q = query({ prompt, options: this.buildOptions(req, abortController) });
       for await (const msg of q) stream.consume(msg);
     } catch (err) {
       if (!req.signal.aborted) stream.fail((err as Error).message || "agent error");
@@ -270,9 +374,19 @@ export class TurnStream {
     this.error ??= message;
   }
 
-  result(elapsedMs: number): TurnResult {
+  /** Text streamed so far (the DeviceAgent reads it at the visible turn end). */
+  get streamedText(): string {
+    return this.text;
+  }
+
+  /**
+   * `fallbackText: false` skips emitting the final `result` text when nothing
+   * was streamed (used when the turn already ended visibly, or for a usage-limit
+   * message that is reported as an error frame instead).
+   */
+  result(elapsedMs: number, o: { fallbackText?: boolean } = {}): TurnResult {
     // Without partial messages (or if streaming produced nothing) fall back to the final text.
-    if (this.text === "" && this.finalText) this.emit(this.finalText);
+    if (o.fallbackText !== false && this.text === "" && this.finalText) this.emit(this.finalText);
     return {
       text: this.text,
       sessionId: this.sessionId,

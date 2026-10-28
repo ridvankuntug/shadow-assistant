@@ -89,6 +89,9 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
   - [ ] T7.7 — Hız A2, cümle cümle TTS: Core cevabı cümlelere böler, telaffuz sözlüğünü uygular, isteyen istemciye sıralı `speech_chunk` gönderir; arayüzde çalma kuyruğu; eski istemciler değişmez — `docs/07-speed.md` (A2; S9–S11)
   - [ ] T7.8 — Hız A3, katman-0 yönlendiricinin Türkçe düzeltmesi (ayrı geliştirici yürütüyor; `router-config.ts`, `turkish.ts`, `direct.ts`)
   - [ ] T7.9 — Hız A4, süreklilik: aynı cihaz 30 dk içinde (Core yeniden başlasa da) son konuşmasına devam eder; `sessions/devices.json` — `docs/07-speed.md` (A4; S3, S7, S8)
+  - Not: model çağrıları Core'daki sağlayıcı arayüzünden geçer (`core/src/model-provider.ts`; Claude Agent SDK bir uygulama) — `docs/07-speed.md` §A1 Components. Sıradaki:
+  - [ ] T7.y — Core MCP ağ geçidi (HA + vault araçları Core'un kendi MCP sunucusunda, izin/onay kapısı içeride, modeller HA kimlik bilgisi görmez)
+  - [ ] T7.z — Yedek sağlayıcı (Claude limiti dolunca Codex, isteğe bağlı Ollama)
 - **T8 — Çalıştırma (ana PC)** — Durum: Başlandı
   - [x] T8.1 — Core Windows'ta yerel Node servisi olarak (Claude Code girişi kullanıcı profilinde olduğu için Docker'da değil); açılışta başlar
   - [x] T8.2 — whisper-svc ve tts-svc Docker Desktop'ta, `deploy/` compose
