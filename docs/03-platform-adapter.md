@@ -62,9 +62,9 @@ type Utterance = { mime: string; data: string; durationMs: number };
   `cancelled`, `unknown`. The UI shows a Turkish message for each, except
   `cancelled` (the host abandoned a pending request, see §4.2): that one only
   ends the capture, silently.
-- `capture_aborted`: the host cut a running recording because the app (Android
-  `onPause`) or the browser tab went to the background, and this is the
-  `stop()` that follows; no audio is returned or sent (§4.5). The UI ends the
+- `capture_aborted`: the host cut a running recording because the app went to
+  the background (Android `onPause`; the web adapter never does this, see
+  §4.5), and this is the `stop()` that follows; no audio is returned or sent (§4.5). The UI ends the
   capture with a short note ("recording stopped, nothing sent"), not as a
   microphone failure. `not_recording` stays for a `stop()` with no recording
   at all.
@@ -119,7 +119,8 @@ The bridge must therefore be injected **before the page loads**
   `audio/webm;codecs=opus`, `audio/webm`, `audio/ogg;codecs=opus`, `audio/mp4`).
   The stream is opened per utterance and released afterwards, so the browser's
   recording indicator is only on while talking. An `AnalyserNode` provides
-  `level()`. A recording never continues in a hidden tab (§4.5).
+  `level()`. A recording keeps running when the tab is hidden and its audio is
+  sent normally (§4.5).
 - `getUserMedia` exists only in secure contexts: **https or `localhost`**. A
   phone opening the UI over plain `http://<lan-address>` cannot record; it gets
   `not_supported` and can still type. (The Android shell uses native capture
@@ -265,17 +266,15 @@ recommended so the WebView throttles timers.
    for any other reason (e.g. slow mic start, user pressed Home), release it
    and answer `capture_aborted`.
 
-   Web (browser tab, for comparison): the web adapter does the same itself.
-   When `document.visibilityState` becomes `hidden` it stops a running
-   `MediaRecorder` and the mic tracks and drops the recorded data; the next
-   `mic.stop()` rejects with `capture_aborted`, so no `audio` reaches the
-   Core — whether the user was holding the button or had latched recording on
-   with a tap. A `getUserMedia` that completes while the tab is hidden is
-   released at once and `mic.start()` rejects with `capture_aborted`. A
-   `mic.stop()` already in progress when the tab is hidden still returns its
-   (foreground) audio. When the tab is visible again the controller closes a
-   recording that was cut, so the user sees the note at once instead of a
-   recording that only looks active.
+   Web (browser tab, for comparison): the web adapter does **not** cut a
+   recording when `document.visibilityState` becomes `hidden`. A running
+   `MediaRecorder` keeps recording and its audio is sent on the next
+   `mic.stop()` as usual — whether the user was holding the button or had
+   latched recording on with a tap; the latched 60 s auto-stop also sends its
+   audio while the tab is hidden. A `getUserMedia` that completes while the
+   tab is hidden records normally. Visibility only pauses 3D rendering and
+   triggers the reconnect on return; it never touches the microphone, and the
+   web adapter never reports `capture_aborted`.
 4. `onResume`: send `visibility {visible:true}`; the UI reconnects to the Core
    at once if the socket dropped.
 5. `onDestroy`: release `MediaRecorder`, `MediaPlayer`/`AudioTrack` and

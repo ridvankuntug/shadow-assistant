@@ -157,17 +157,6 @@ export class AssistantController {
     this.client?.reconnectNow();
   }
 
-  /**
-   * Called when the app returns to the foreground (after resume()). On the web
-   * the adapter has cut a recording when the tab was hidden; close it now so a
-   * latched recording does not keep looking active (stop() then reports
-   * capture_aborted and nothing is sent). Not on Android: there the shell
-   * decides, and the permission dialog also passes through the background.
-   */
-  foreground(): void {
-    if (this.adapter.kind === "web" && this.state.capture === "recording") void this.stopTalk();
-  }
-
   dispose(): void {
     this.disconnect();
     this.cancelTalk();

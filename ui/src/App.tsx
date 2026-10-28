@@ -48,15 +48,13 @@ export default function App({ adapter, controller }: Props) {
     controller.setVoiceReplies(voiceReplies);
   }, [controller, voiceReplies]);
 
-  // Back in the foreground: skip the remaining reconnect backoff and close a
-  // recording the web adapter cut while the tab was hidden. Going to the
-  // background does not touch a recording here: the web adapter cuts it itself,
-  // and on Android the permission dialog pauses the activity too, so stopping a
-  // recording on pause is the shell's job.
+  // Back in the foreground: skip the remaining reconnect backoff. Visibility
+  // never touches a recording here: in a browser tab it keeps running while
+  // hidden, and on Android the permission dialog pauses the activity too, so
+  // stopping a recording on pause is the shell's job.
   useEffect(() => {
     if (!visible) return;
     controller.resume();
-    controller.foreground();
   }, [controller, visible]);
 
   useEffect(() => () => controller.dispose(), [controller]);

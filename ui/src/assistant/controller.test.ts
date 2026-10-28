@@ -490,15 +490,6 @@ describe("AssistantController", () => {
     expect(t.controller.getState().confirms).toHaveLength(1);
   });
 
-  it("foreground() does not stop a recording on Android (the shell decides; the permission dialog pauses too)", async () => {
-    const t = setup();
-    (t.adapter as { kind: string }).kind = "android";
-    await t.controller.startTalk();
-    t.controller.foreground();
-    expect(t.adapter.mic.stop).not.toHaveBeenCalled();
-    expect(t.controller.getState().capture).toBe("recording");
-  });
-
   it("refuses to send while disconnected", () => {
     const t = setup();
     t.drop();

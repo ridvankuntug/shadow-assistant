@@ -1,7 +1,7 @@
 /**
- * Web adapter privacy rule: a recording never continues in a hidden tab
- * (docs/03-platform-adapter.md §4.5). Browser APIs are replaced by small fakes
- * (the test environment is node, no DOM).
+ * Web adapter rule: a recording keeps running when the tab is hidden and its
+ * audio is sent normally (docs/03-platform-adapter.md §4.5). Browser APIs are
+ * replaced by small fakes (the test environment is node, no DOM).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AssistantController, MAX_UTTERANCE_MS, type CoreClientLike } from "../assistant/controller.ts";
@@ -74,8 +74,6 @@ function installBrowser(): Env {
   return { streams, getUserMedia, hide: () => set("hidden"), show: () => set("visible") };
 }
 
-const flush = () => new Promise((r) => setTimeout(r, 0));
-
 async function codeOf(p: Promise<unknown>): Promise<string> {
   try {
     await p;
@@ -104,17 +102,16 @@ describe("web adapter microphone", () => {
     expect(env.streams[0].tracks[0].stopped).toBe(true);
   });
 
-  it("tab hidden while recording: recorder and tracks stop, data is dropped, stop() reports capture_aborted once", async () => {
+  it("tab hidden while recording: the recording keeps running and stop() returns its audio", async () => {
     const a = createWebAdapter();
     await a.mic.start();
     const rec = FakeRecorder.instances[0];
     env.hide();
-    expect(rec.state).toBe("inactive");
+    expect(rec.state).toBe("recording");
+    expect(env.streams[0].tracks[0].stopped).toBe(false);
+    const u = await a.mic.stop();
+    expect(u.data.length).toBeGreaterThan(0);
     expect(env.streams[0].tracks[0].stopped).toBe(true);
-    expect(rec.ondataavailable).toBeNull();
-    expect(rec.onstop).toBeNull();
-    expect(a.mic.level()).toBe(0);
-    expect(await codeOf(a.mic.stop())).toBe("capture_aborted");
     expect(await codeOf(a.mic.stop())).toBe("not_recording");
   });
 
@@ -124,7 +121,7 @@ describe("web adapter microphone", () => {
     expect(await codeOf(a.mic.stop())).toBe("not_recording");
   });
 
-  it("a getUserMedia that completes while the tab is hidden records nothing", async () => {
+  it("a getUserMedia that completes while the tab is hidden records normally", async () => {
     const a = createWebAdapter();
     let open!: (s: FakeStream) => void;
     env.getUserMedia.mockImplementationOnce(
@@ -139,40 +136,33 @@ describe("web adapter microphone", () => {
     const starting = a.mic.start();
     env.hide();
     open(new FakeStream());
-    expect(await codeOf(starting)).toBe("capture_aborted");
-    expect(env.streams[0].tracks[0].stopped).toBe(true);
+    await starting;
+    expect(FakeRecorder.instances[0].state).toBe("recording");
+    expect(env.streams[0].tracks[0].stopped).toBe(false);
+    const u = await a.mic.stop();
+    expect(u.data.length).toBeGreaterThan(0);
   });
 
-  it("cancel() after an abort forgets it: the next stop() is not_recording", async () => {
+  it("a start while the tab is hidden records normally", async () => {
+    const a = createWebAdapter();
+    env.hide();
+    await a.mic.start();
+    const u = await a.mic.stop();
+    expect(u.data.length).toBeGreaterThan(0);
+  });
+
+  it("cancel() while hidden drops the recording and releases the mic", async () => {
     const a = createWebAdapter();
     await a.mic.start();
     env.hide();
     a.mic.cancel();
-    expect(await codeOf(a.mic.stop())).toBe("not_recording");
-  });
-
-  it("a stop() already in progress when the tab is hidden still returns its foreground audio", async () => {
-    const a = createWebAdapter();
-    await a.mic.start();
-    const stopping = a.mic.stop();
-    env.hide(); // before the recorder's async stop event
-    const u = await stopping;
-    expect(u.data.length).toBeGreaterThan(0);
+    expect(FakeRecorder.instances[0].state).toBe("inactive");
     expect(env.streams[0].tracks[0].stopped).toBe(true);
-  });
-
-  it("a new recording after an abort works normally", async () => {
-    const a = createWebAdapter();
-    await a.mic.start();
-    env.hide();
-    env.show();
-    await a.mic.start(); // the abort is forgotten without a stop() in between
-    const u = await a.mic.stop();
-    expect(u.data.length).toBeGreaterThan(0);
+    expect(await codeOf(a.mic.stop())).toBe("not_recording");
   });
 });
 
-// --- controller + real web adapter: nothing reaches the Core ----------------
+// --- controller + real web adapter: the audio reaches the Core ----------------
 
 function setupController() {
   const adapter = createWebAdapter();
@@ -204,59 +194,62 @@ function setupController() {
 }
 
 describe("tab hidden during push-to-talk (web)", () => {
-  it("hold mode: releasing after the tab was hidden sends no audio and shows the short note", async () => {
+  // Fake timers also fake performance.now(), so the utterance is long enough
+  // (MIN_UTTERANCE_MS) to be sent.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  it("hold mode: releasing while the tab is hidden sends the audio", async () => {
     const t = setupController();
     await t.controller.startTalk();
     expect(t.state().capture).toBe("recording");
     env.hide();
-    expect(env.streams[0].tracks[0].stopped).toBe(true);
-    env.show();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(t.state().capture).toBe("recording");
     await t.controller.stopTalk(); // finger released
-    await flush();
-    expect(t.sent.map((m) => m.type)).not.toContain("audio");
-    expect(t.state().capture).toBe("off");
-    expect(t.state().notice?.code).toBe("mic_capture_aborted");
-  });
-
-  it("latched mode: the 60 s auto-stop after the tab was hidden sends no audio", async () => {
-    vi.useFakeTimers();
-    const t = setupController();
-    await t.controller.startTalk(); // tap: recording stays on until the next tap
-    env.hide();
-    expect(FakeRecorder.instances[0].state).toBe("inactive");
-    expect(env.streams[0].tracks[0].stopped).toBe(true);
-    await vi.advanceTimersByTimeAsync(MAX_UTTERANCE_MS);
-    expect(t.sent.map((m) => m.type)).not.toContain("audio");
-    expect(t.state().capture).toBe("off");
-    expect(t.state().notice?.code).toBe("mic_capture_aborted");
-  });
-
-  it("latched mode: coming back closes the cut recording at once with the note (foreground)", async () => {
-    const t = setupController();
-    await t.controller.startTalk();
-    env.hide();
-    env.show();
-    t.controller.foreground(); // App calls this when visible again
-    await flush();
-    expect(t.state().capture).toBe("off");
-    expect(t.state().notice?.code).toBe("mic_capture_aborted");
-    expect(t.sent).toEqual([]);
-  });
-
-  it("foreground() does nothing while idle", async () => {
-    const t = setupController();
-    t.controller.foreground(); // idle: nothing to do
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.sent.map((m) => m.type)).toEqual(["audio"]);
     expect(t.state().capture).toBe("off");
     expect(t.state().notice).toBeNull();
   });
 
-  it("latched mode: the second tap after coming back sends no audio", async () => {
+  it("hold mode: hidden and back again, releasing sends the audio", async () => {
     const t = setupController();
     await t.controller.startTalk();
     env.hide();
+    await vi.advanceTimersByTimeAsync(1500);
     env.show();
-    await t.controller.stopTalk(); // second tap
+    await t.controller.stopTalk();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.sent.map((m) => m.type)).toEqual(["audio"]);
+    expect(t.state().notice).toBeNull();
+  });
+
+  it("latched mode: the 60 s auto-stop while the tab is hidden sends the audio", async () => {
+    const t = setupController();
+    await t.controller.startTalk(); // tap: recording stays on until the next tap
+    env.hide();
+    expect(FakeRecorder.instances[0].state).toBe("recording");
+    await vi.advanceTimersByTimeAsync(MAX_UTTERANCE_MS);
+    expect(t.sent.map((m) => m.type)).toEqual(["audio"]);
+    expect(t.state().capture).toBe("off");
+    expect(t.state().notice).toBeNull();
+    expect(env.streams[0].tracks[0].stopped).toBe(true);
+  });
+
+  it("latched mode: coming back leaves the recording running; the second tap sends the audio", async () => {
+    const t = setupController();
+    await t.controller.startTalk();
+    env.hide();
+    await vi.advanceTimersByTimeAsync(1500);
+    env.show();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.state().capture).toBe("recording");
     expect(t.sent).toEqual([]);
-    expect(t.state().notice?.code).toBe("mic_capture_aborted");
+    await t.controller.stopTalk(); // second tap
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.sent.map((m) => m.type)).toEqual(["audio"]);
+    expect(t.state().notice).toBeNull();
   });
 });

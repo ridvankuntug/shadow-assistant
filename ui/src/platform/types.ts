@@ -15,7 +15,7 @@ export type PlatformErrorCode =
   | "not_supported" // capability missing on this host
   | "busy" // e.g. capture already running / mic in use by another app
   | "not_recording" // stop() without a running capture
-  | "capture_aborted" // stop() after the host cut the recording (app/tab went to the background); nothing is sent
+  | "capture_aborted" // stop() after the host cut the recording (Android app went to the background); nothing is sent
   | "playback_failed" // audio could not be decoded or played
   | "timeout" // the host did not answer in time (Android bridge)
   | "cancelled" // the host abandoned a pending request (cancelCapture); not shown to the user

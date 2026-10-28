@@ -93,20 +93,13 @@ type Capture = {
   buf: Uint8Array<ArrayBuffer> | null;
 };
 
-type WebMicrophone = MicrophoneCapability & {
-  /**
-   * Cuts a running recording without encoding it (the page went to the
-   * background). The next stop() rejects with `capture_aborted`.
-   */
-  abort(): void;
-};
-
-/** `pageHidden` is read when a start completes: a page hidden by then does not record. */
-function createMicrophone(pageHidden: () => boolean): WebMicrophone {
+/**
+ * A recording keeps running while the tab is hidden; only stop()/cancel() end
+ * it (docs/03-platform-adapter.md §4.5).
+ */
+function createMicrophone(): MicrophoneCapability {
   let capture: Capture | null = null;
   let starting = false;
-  /** The last recording was cut by abort() and its stop() has not been called yet. */
-  let aborted = false;
 
   const release = (c: Capture) => {
     c.source?.disconnect();
@@ -134,7 +127,6 @@ function createMicrophone(pageHidden: () => boolean): WebMicrophone {
         throw new PlatformError("not_supported", "Microphone capture needs https or localhost");
       }
       starting = true;
-      aborted = false;
       try {
         let stream: MediaStream;
         try {
@@ -165,11 +157,6 @@ function createMicrophone(pageHidden: () => boolean): WebMicrophone {
         } catch {
           // Metering is cosmetic; recording still works without it.
         }
-        if (pageHidden()) {
-          // Hidden while the browser was opening the mic: never record in the background.
-          release(c);
-          throw new PlatformError("capture_aborted", "Page went to the background");
-        }
         recorder.start();
         c.startedAt = performance.now();
         capture = c;
@@ -180,11 +167,7 @@ function createMicrophone(pageHidden: () => boolean): WebMicrophone {
 
     stop() {
       const c = capture;
-      if (!c) {
-        const code = aborted ? "capture_aborted" : "not_recording";
-        aborted = false;
-        return Promise.reject(new PlatformError(code));
-      }
+      if (!c) return Promise.reject(new PlatformError("not_recording"));
       capture = null;
       return new Promise<Utterance>((resolve, reject) => {
         c.recorder.onstop = async () => {
@@ -210,16 +193,7 @@ function createMicrophone(pageHidden: () => boolean): WebMicrophone {
     cancel() {
       const c = capture;
       capture = null;
-      aborted = false;
       if (c) discard(c);
-    },
-
-    abort() {
-      const c = capture;
-      if (!c) return;
-      capture = null;
-      aborted = true;
-      discard(c);
     },
 
     level() {
@@ -357,17 +331,10 @@ const matches = (query: string): boolean =>
 
 export function createWebAdapter(): PlatformAdapter {
   const hidden = () => document.visibilityState === "hidden";
-  const mic = createMicrophone(hidden);
-  // Privacy: a recording never continues in a hidden tab. It is cut here and
-  // its audio dropped; the controller learns it from stop() (capture_aborted).
-  // Lives as long as the page, like the adapter itself.
-  document.addEventListener("visibilitychange", () => {
-    if (hidden()) mic.abort();
-  });
   return {
     kind: "web",
     clientKind: "web",
-    mic,
+    mic: createMicrophone(),
     playback: createPlayback(),
     tts: { mode: "core" },
     storage: createStorage(),
