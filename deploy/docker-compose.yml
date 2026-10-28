@@ -1,21 +1,96 @@
-# Placeholder compose file for Shadow Assistant.
-# Services are added as components get container images:
+# Speech services for Shadow Assistant (see ../docs/05-deploy.md).
 #
-#   core         Node + TypeScript Core (WebSocket API)
-#   ui           static build of ui/ served over HTTP
-#   whisper-svc  speech-to-text (faster-whisper)       - T4
-#   tts-svc      text-to-speech (Piper)                 - T5
+# The Core is NOT in this file: it runs natively on Windows as a scheduled task
+# (deploy/windows/), because the Claude Agent SDK uses the Claude Code login in
+# the user's profile.
 #
-# Secrets and addresses are read from ../.env (see ../.env.example).
+# Run from this directory, reading settings from the repo-root .env:
 #
-# Example shape (not active):
+#   docker compose --env-file ../.env up -d --build
+#   docker compose --env-file ../.env ps
+#   docker compose --env-file ../.env down        # keeps the model/voice volumes
 #
-# services:
-#   core:
-#     build: ../core
-#     env_file: ../.env
-#     ports:
-#       - "${CORE_PORT}:${CORE_PORT}"
-#     restart: unless-stopped
+# Only the variables listed under `environment:` reach the containers; the rest
+# of .env (Home Assistant token, device tokens) is never passed in. Every value
+# has a default, so `--env-file` may be omitted.
+#
+# Ports are published on the host loopback only. The Core calls the services at
+# WHISPER_SVC_URL / TTS_SVC_URL (defaults http://127.0.0.1:8701 / :8702).
 
-services: {}
+name: shadow-assistant
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  whisper-svc:
+    build:
+      context: ../services/whisper-svc
+    image: shadow-whisper-svc:latest
+    # "no" (default) = start only when asked. Set SHADOW_RESTART=unless-stopped
+    # in .env to have Docker Desktop bring the services back after a reboot.
+    restart: "${SHADOW_RESTART:-no}"
+    ports:
+      - "${SHADOW_SERVICES_BIND:-127.0.0.1}:8701:8701"
+    environment:
+      WHISPER_MODEL: "${WHISPER_MODEL:-large-v3}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE:-float16}"
+      WHISPER_BEAM_SIZE: "${WHISPER_BEAM_SIZE:-1}"
+      WHISPER_VAD: "${WHISPER_VAD:-1}"
+      # 1 = never contact Hugging Face; the model must already be in the volume.
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+    volumes:
+      # Named volume, not a Windows bind mount: loading the 3 GB model through
+      # the Windows file share took 27-31 s instead of 8 s (whisper-svc README).
+      - whisper-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8701/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Covers the first start, which downloads the ~2.9 GiB model.
+      start_period: 300s
+      start_interval: 5s
+    logging: *default-logging
+
+  tts-svc:
+    build:
+      context: ../services/tts-svc
+    image: shadow-tts-svc:latest
+    restart: "${SHADOW_RESTART:-no}"
+    ports:
+      - "${SHADOW_SERVICES_BIND:-127.0.0.1}:8702:8702"
+    environment:
+      TTS_VOICE: "${TTS_VOICE:-tr_TR-dfki-medium}"
+      TTS_VOICES: "${TTS_VOICES:-}"
+      TTS_AUTO_DOWNLOAD: "${TTS_AUTO_DOWNLOAD:-1}"
+    volumes:
+      # Voices are downloaded (SHA-256 verified) on first start and kept here.
+      - tts-voices:/voices
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8702/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Covers the first-start voice download (~63 MB per voice).
+      start_period: 180s
+      start_interval: 5s
+    logging: *default-logging
+
+volumes:
+  # Fixed names (no project prefix) so the `docker run` examples in the service
+  # READMEs and this file share the same model cache.
+  whisper-models:
+    name: whisper-models
+  tts-voices:
+    name: tts-voices
