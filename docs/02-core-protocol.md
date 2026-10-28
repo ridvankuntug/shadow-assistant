@@ -38,7 +38,8 @@ refuses to start.
 | `{"type":"user_text","id":"t1","text":"…"}` | Start a turn with typed text. |
 | `{"type":"audio","id":"t2","mime":"audio/webm","data":"<base64>"}` | One complete utterance (push-to-talk). See *Voice input*. |
 | `{"type":"confirm_response","requestId":"c1","approved":true}` | Answer a confirmation with the on-screen button. |
-| `{"type":"speak","id":"t1","text":"…"}` | Ask the Core to synthesize speech via tts-svc (web adapter). |
+| `{"type":"speak","id":"t1","text":"…","voice"?:"tr_TR-dfki-medium"}` | Ask the Core to synthesize speech via tts-svc (web adapter). `voice` is optional; see *Voices*. The text is spoken through the *Pronunciation lexicon*. |
+| `{"type":"voices","id":"v1"}` | List the selectable tts-svc voices; answered by `voices` or `error tts_unavailable` (with the same `id`). See *Voices*. |
 | `{"type":"cancel","id":"t1"}` | Barge-in: stop turn `t1`. |
 | `{"type":"history_request","limit":20}` | Recent conversation items (default 20, max 100). |
 | `{"type":"ping"}` | Keep-alive; answered with `pong`. |
@@ -56,13 +57,14 @@ refuses to start.
 | `{"type":"confirm_request","requestId":"c1","id":"t1","tool":"<tool>","summary":"…","expiresAt":<epoch ms>}` | The turn is paused until the user confirms. |
 | `{"type":"confirm_resolved","requestId":"c1","approved":true\|false,"by":"button"\|"voice"\|"timeout"}` | Sent exactly once per `confirm_request`. |
 | `{"type":"speech","id":"t1","mime":"audio/wav","data":"<base64>"}` | Synthesized audio for a `speak` request. |
+| `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…"}` | See *Errors*. |
 | `{"type":"services","items":[{"name":"whisper-svc","status":"ok"\|"loading"\|"down"\|"disabled","checkedAt":<epoch ms>,"detail"?:"timeout"}]}` | Service health; see *Service health*. Added in protocol 1 without a version bump. |
 | `{"type":"pong"}` | Reply to `ping`. |
 
-Clients must ignore frame types they do not know (that is how `services` was
-added without a version bump).
+Clients must ignore frame types they do not know (that is how `services` and
+`voices` were added without a version bump).
 
 Tool names in `tool` and `confirm_request` frames are the service's own tool
 names (e.g. `homeassistant__GetLiveContext`, `intent__HassTurnOff`), without the
@@ -75,12 +77,64 @@ Agent SDK's `mcp__<service>__` prefix.
 | `unauthorized` | Bad/missing hello or token (socket is closed with 4401). |
 | `bad_request` | Malformed frame, invalid base64/empty audio, audio > 25 MB, no speech recognized, speech service rejected the input, unsupported protocol. |
 | `stt_unavailable` | whisper-svc not configured, unreachable, loading (503) or timed out. |
-| `tts_unavailable` | tts-svc not configured, unreachable, loading or timed out. |
+| `tts_unavailable` | tts-svc not configured, unreachable, loading or timed out; also a selected voice that is still being downloaded/loaded (retry shortly) or failed to load, and a `voices` request while tts-svc is not ready. |
 | `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
 | `busy` | A turn is already running (one turn per session at a time). |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
+
+## Voices
+
+`{"type":"voices","id":"v1"}` returns the voices tts-svc can speak with:
+
+```json
+{"type":"voices","id":"v1","default":"tr_TR-dfki-medium",
+ "voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"},
+           {"id":"tr_TR-fahrettin-medium","label":"Fahrettin (orta kalite)","quality":"medium"},
+           {"id":"tr_TR-fettah-medium","label":"Fettah (orta kalite)","quality":"medium"}]}
+```
+
+- `default` is tts-svc's default voice (`TTS_VOICE`); it is always the first entry of `voices`.
+- `voices` lists loaded voices and voices tts-svc can download on first use
+  (tts-svc `/health` `available`). `label` is a human-readable Turkish name built
+  from the id; `quality` is Piper's quality (`x_low`, `low`, `medium`, `high`) and
+  is absent for ids outside Piper's `<lang>-<name>-<quality>` scheme.
+- The list comes from tts-svc's `GET /health` and is cached for 30 s. If tts-svc is
+  not configured, unreachable or not ready, the reply is
+  `{"type":"error","id":"v1","code":"tts_unavailable","message":"…"}`.
+
+`speak.voice` selects a voice by `id`. It is optional: absent, `null`, empty or
+unknown ids (not in the current list) use the default voice — never an error. A
+non-string `voice` is a `bad_request`. The choice is per `speak` frame; the Core
+stores no per-client voice.
+
+The first `speak` with a voice that tts-svc has not loaded yet makes tts-svc
+download (~63 MB, SHA-256 verified) and load it. tts-svc waits up to
+`TTS_VOICE_LOAD_WAIT_S` (default 20 s, below the Core's 30 s tts-svc timeout)
+and then answers "still loading"; the Core reports that as
+`error tts_unavailable` ("… still loading voice …; try again shortly") while the
+download continues, so a later `speak` succeeds. A voice already on disk loads
+in a few seconds and normally succeeds on the first request. Clients may fall
+back to the default voice (omit `voice`) when this happens.
+
+## Pronunciation lexicon
+
+Before synthesis the Core passes `speak.text` through a pronunciation lexicon,
+so the Turkish voices say e.g. "Shadow" as "Şadov". Only the text sent to
+tts-svc changes; the client's displayed text, transcripts and conversation
+records keep the original. The lexicon is the repo-root `pronunciations.yaml`
+(path override: `SHADOW_PRONUNCIATIONS_FILE`), a flat `word or phrase: spelling`
+mapping read once at Core start. A missing file means no rewriting; an invalid
+file is ignored with a warning (the Core still starts).
+
+Matching: whole words only (Unicode letters, digits and `_` are word
+characters, so `Shadowlar` is untouched unless listed itself); case-insensitive
+including Turkish I/ı/İ/i, the replacement inserted as written (`SHADOW` →
+`Şadov`); a suffix after `'` or `’` is kept (`Shadow'u` → `Şadov'u`); multi-word
+keys allowed, longest key first. The matching code (`core/src/pronunciation.ts`)
+has no I/O, so the same entries could later be offered to clients that speak
+with on-device TTS; today only Core-side `speak` uses it.
 
 ## Service health
 
@@ -91,7 +145,7 @@ only after the previous one finished, so checks never overlap.
 
 | Kind | Check | `ok` / `loading` |
 |---|---|---|
-| `http` | `GET <url><health>` | 200 → `ok`; 503 `{"status":"loading"}` → `loading`; anything else → `down` |
+| `http` | `GET <url><health>` | 200 → `ok`; 200 `{"status":"idle"}` → `ok` with detail `idle`; 503 `{"status":"loading"}` → `loading`; anything else → `down` |
 | `mcp` (SSE, e.g. Home Assistant) | `GET <url>` with the bearer token, `Accept: text/event-stream`; the stream is closed right after the response headers — no MCP message is sent, no tool is listed or called | 200 `text/event-stream` → `ok` |
 | `mcp` (streamable HTTP) | same GET | any non-auth answer below 500 except 404 → `ok` |
 | `vault` | the vault folder exists | → `ok` |
@@ -110,7 +164,8 @@ never a URL, host or token; a value outside this table is sent as `error`:
 | `timeout` | No answer within `CORE_HEALTH_TIMEOUT_MS`. |
 | `unreachable` | Connection refused / DNS / network error. |
 | `unauthorized` | 401/403 (wrong or expired token). |
-| `error` | The service reports `{"status":"error"}`. |
+| `error` | The service reports `{"status":"error"}` (or a 200 with an unknown `status`). |
+| `idle` | `ok`: the service's model is unloaded to save memory and reloads on the next request (whisper-svc idle unload); the first request after idle is slower. |
 | `bad_response` | 200 but not an event stream (e.g. a proxy page). |
 | `http_<status>` | Any other HTTP status. |
 | `not_found` | The vault folder is missing. |

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ServiceHealth } from "../protocol/types.ts";
-import { issuesSummary, serviceIssues, serviceLabel, serviceReason } from "./serviceHealth.ts";
+import { issuesSummary, serviceIssues, serviceLabel, serviceReason, sttBlocked, sttStatus } from "./serviceHealth.ts";
+import { sttNote } from "./strings.ts";
 
 const item = (name: string, status: ServiceHealth["status"], detail?: string): ServiceHealth =>
   detail === undefined ? { name, status, checkedAt: 1 } : { name, status, checkedAt: 1, detail };
@@ -49,5 +50,57 @@ describe("serviceReason", () => {
     expect(issues && issuesSummary(issues)).toBe(
       "Ses tanıma: yanıt vermiyor (zaman aşımı); Ses çıkışı: hazırlanıyor",
     );
+  });
+});
+
+describe("sttStatus (mic availability)", () => {
+  it("is unknown before the first services frame or when whisper-svc is not listed", () => {
+    expect(sttStatus([])).toBe("unknown");
+    expect(sttStatus([item("tts-svc", "down")])).toBe("unknown");
+    expect(sttBlocked("unknown")).toBe(false);
+    expect(sttNote("unknown")).toBeNull();
+  });
+
+  it("ok keeps the mic usable without a note", () => {
+    expect(sttStatus([item("whisper-svc", "ok")])).toBe("ready");
+    expect(sttStatus([item("whisper-svc", "ok", "warm")])).toBe("ready");
+    expect(sttBlocked("ready")).toBe(false);
+    expect(sttNote("ready")).toBeNull();
+  });
+
+  it("ok + idle (model unloaded) keeps the mic usable with a soft hint", () => {
+    const s = sttStatus([item("tts-svc", "down"), item("whisper-svc", "ok", "idle")]);
+    expect(s).toBe("idle");
+    expect(sttBlocked(s)).toBe(false);
+    expect(sttNote(s)).toEqual({ text: expect.stringContaining("birkaç saniye"), soft: true });
+  });
+
+  it("down, disabled (e.g. stopped by the host) and loading block the mic with a note", () => {
+    for (const st of [
+      sttStatus([item("whisper-svc", "down", "unreachable")]),
+      sttStatus([item("whisper-svc", "down", "timeout")]),
+      sttStatus([item("whisper-svc", "down", "http_500")]),
+      sttStatus([item("whisper-svc", "down")]),
+      sttStatus([item("whisper-svc", "disabled", "off")]),
+      sttStatus([item("whisper-svc", "disabled", "error")]), // only down+error is retryable
+    ]) {
+      expect(st).toBe("off");
+      expect(sttBlocked(st)).toBe(true);
+      expect(sttNote(st)).toEqual({ text: "Ses tanıma şu an kapalı — yazarak devam edebilirsin.", soft: false });
+    }
+    const loading = sttStatus([item("whisper-svc", "loading")]);
+    expect(loading).toBe("loading");
+    expect(sttBlocked(loading)).toBe(true);
+    expect(sttNote(loading)?.soft).toBe(false);
+  });
+
+  it("down + error (model load failed, service reachable) keeps the mic usable so the user can retry", () => {
+    const s = sttStatus([item("whisper-svc", "down", "error")]);
+    expect(s).toBe("failed");
+    expect(sttBlocked(s)).toBe(false);
+    expect(sttNote(s)).toEqual({
+      text: "Ses tanıma modeli yüklenemedi — tekrar denemek için basabilirsin.",
+      soft: false,
+    });
   });
 });

@@ -19,6 +19,8 @@ export const MAX_FRAME_BYTES = 36 * 1024 * 1024;
 export const MAX_TEXT_CHARS = 4000;
 /** Max length of a client-generated id. */
 export const MAX_ID_CHARS = 128;
+/** Max length of a `speak.voice` id; longer values are ignored (default voice). */
+export const MAX_VOICE_ID_CHARS = 128;
 
 // ---------------------------------------------------------------- client → core
 
@@ -54,6 +56,14 @@ export interface SpeakFrame {
   type: "speak";
   id: string;
   text: string;
+  /** tts-svc voice id from a `voices` reply; absent or unknown → default voice. */
+  voice?: string;
+}
+
+/** Asks for the selectable tts-svc voices; answered by `voices` or `error tts_unavailable`. */
+export interface VoicesRequestFrame {
+  type: "voices";
+  id: string;
 }
 
 export interface CancelFrame {
@@ -76,6 +86,7 @@ export type ClientFrame =
   | AudioFrame
   | ConfirmResponseFrame
   | SpeakFrame
+  | VoicesRequestFrame
   | CancelFrame
   | HistoryRequestFrame
   | PingFrame;
@@ -113,9 +124,20 @@ export interface ServiceHealth {
   /**
    * Short machine-readable reason, never a URL, host or token:
    * `timeout`, `unreachable`, `unauthorized`, `error`, `bad_response`,
-   * `http_<status>`, `not_found`, `not_configured`, `off`.
+   * `http_<status>`, `not_found`, `not_configured`, `off`, `idle` (status `ok`:
+   * model unloaded, reloads on the next request).
    */
   detail?: string;
+}
+
+/** One entry of a `voices` reply. */
+export interface VoiceInfo {
+  /** tts-svc voice id, e.g. `tr_TR-dfki-medium`; send it back as `speak.voice`. */
+  id: string;
+  /** Human-readable (Turkish) name, e.g. `DFKI (orta kalite)`. */
+  label: string;
+  /** Piper quality (`x_low` | `low` | `medium` | `high`); absent for ids not in Piper's naming scheme. */
+  quality?: string;
 }
 
 export type ServerFrame =
@@ -138,6 +160,7 @@ export type ServerFrame =
   | { type: "history"; items: HistoryItem[] }
   | { type: "error"; id?: string; code: ErrorCode; message: string }
   | { type: "services"; items: ServiceHealth[] }
+  | { type: "voices"; id: string; default: string; voices: VoiceInfo[] }
   | { type: "pong" };
 
 // ---------------------------------------------------------------- validation
@@ -213,10 +236,21 @@ export function parseClientFrame(raw: string): ParseResult {
         ok: true,
         frame: { type: "confirm_response", requestId: data.requestId, approved: data.approved },
       };
-    case "speak":
+    case "speak": {
       if (!isId(data.id)) return bad("speak.id must be a non-empty string");
       if (!isText(data.text)) return bad(`speak.text must be 1..${MAX_TEXT_CHARS} chars`);
-      return { ok: true, frame: { type: "speak", id: data.id, text: data.text } };
+      const voice = data.voice;
+      if (voice !== undefined && voice !== null && typeof voice !== "string") return bad("speak.voice must be a string");
+      // Empty or over-long ids cannot name a voice: treated as absent (default voice), not as an error.
+      const usable = typeof voice === "string" && voice.length > 0 && voice.length <= MAX_VOICE_ID_CHARS;
+      return {
+        ok: true,
+        frame: usable ? { type: "speak", id: data.id, text: data.text, voice } : { type: "speak", id: data.id, text: data.text },
+      };
+    }
+    case "voices":
+      if (!isId(data.id)) return bad("voices.id must be a non-empty string");
+      return { ok: true, frame: { type: "voices", id: data.id } };
     case "cancel":
       if (!isId(data.id)) return bad("cancel.id must be a non-empty string");
       return { ok: true, frame: { type: "cancel", id: data.id } };

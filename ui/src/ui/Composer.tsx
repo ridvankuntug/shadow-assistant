@@ -1,5 +1,7 @@
 import { useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from "react";
 import type { CaptureState, Phase } from "../assistant/state.ts";
+import { sttBlocked, type SttStatus } from "./serviceHealth.ts";
+import { sttNote } from "./strings.ts";
 
 /** A press shorter than this latches recording on (tap to start, tap to send). */
 const TAP_MS = 300;
@@ -10,6 +12,8 @@ type Props = {
   connected: boolean;
   /** Show "Durdur" (see canStop in assistant/state.ts). */
   canStop: boolean;
+  /** Speech-to-text health (whisper-svc via the Core). */
+  stt: SttStatus;
   onSendText: (text: string) => boolean;
   onTalkStart: () => void;
   onTalkStop: () => void;
@@ -21,7 +25,7 @@ type Props = {
  * to start and tap again to send. Starting to talk while Shadow is speaking or
  * thinking interrupts it (barge-in, handled by the controller).
  */
-export function Composer({ phase, capture, connected, canStop, onSendText, onTalkStart, onTalkStop, onStop }: Props) {
+export function Composer({ phase, capture, connected, canStop, stt, onSendText, onTalkStart, onTalkStop, onStop }: Props) {
   const [text, setText] = useState("");
   const [latched, setLatched] = useState(false);
   const pressedAt = useRef(0);
@@ -29,6 +33,10 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
 
   const recording = capture === "starting" || capture === "recording";
   const busy = capture === "sending";
+  // Speech-to-text is down: no new recording (a running one can still be
+  // sent or released; the Core answers stt_unavailable for it). Typing works.
+  const sttOff = sttBlocked(stt);
+  const note = connected && !recording ? sttNote(stt) : null;
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -45,7 +53,7 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
       onTalkStop();
       return;
     }
-    if (recording) return;
+    if (recording || sttOff) return;
     ignoreNextUp.current = false;
     pressedAt.current = performance.now();
     setLatched(false);
@@ -57,7 +65,7 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
       ignoreNextUp.current = false;
       return;
     }
-    if (!recording && capture !== "off") return;
+    if (!recording && (capture !== "off" || sttOff)) return;
     if (performance.now() - pressedAt.current < TAP_MS) {
       setLatched(true); // quick tap: keep listening until the next tap
       return;
@@ -71,7 +79,7 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
     if (recording) {
       setLatched(false);
       onTalkStop();
-    } else if (!busy) {
+    } else if (!busy && !sttOff) {
       setLatched(true);
       onTalkStart();
     }
@@ -83,9 +91,11 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
       : "Bırakınca gönderilir"
     : busy
       ? "Gönderiliyor…"
-      : phase === "speaking" || phase === "thinking"
-        ? "Sözünü kes ve konuş"
-        : "Konuşmak için basılı tut";
+      : sttOff
+        ? "Ses tanıma kapalı"
+        : phase === "speaking" || phase === "thinking"
+          ? "Sözünü kes ve konuş"
+          : "Konuşmak için basılı tut";
 
   return (
     <div className="composer">
@@ -119,7 +129,8 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
           className={`talk${recording ? " talk-active" : ""}`}
           aria-pressed={recording}
           aria-label={talkLabel}
-          disabled={!connected || busy}
+          disabled={!connected || busy || (sttOff && !recording)}
+          aria-describedby={note ? "stt-note" : undefined}
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
@@ -134,6 +145,11 @@ export function Composer({ phase, capture, connected, canStop, onSendText, onTal
           {talkLabel}
         </span>
       </div>
+      {note && (
+        <p id="stt-note" className={`stt-note${note.soft ? " stt-note-soft" : ""}`} role="status">
+          {note.text}
+        </p>
+      )}
     </div>
   );
 }

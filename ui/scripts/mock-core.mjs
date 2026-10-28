@@ -5,10 +5,11 @@
 //   node scripts/mock-core.mjs
 //   MOCK_PORT=8700 MOCK_HOST=127.0.0.1 MOCK_TOKEN=dev-token node scripts/mock-core.mjs
 // Optional env: MOCK_TRANSCRIPT (fixed STT text), MOCK_CONFIRM_MS (default 60000),
-//               MOCK_TTS_FAIL=1 (speak always fails with tts_unavailable),
+//               MOCK_TTS_FAIL=1 (speak and voices always fail with tts_unavailable),
 //               MOCK_SERVICES_DOWN=whisper-svc,home-assistant (reported `down`, detail `unreachable`),
 //               MOCK_SERVICES_LOADING=whisper-svc (reported `loading`),
-//               MOCK_SERVICES_FLAP_MS=10000 (the DOWN list toggles down <-> ok every N ms and is broadcast).
+//               MOCK_SERVICES_FLAP_MS=10000 (the DOWN list toggles down <-> ok every N ms and is broadcast),
+//               MOCK_STT_IDLE=1 (whisper-svc reported `ok` with detail `idle`).
 import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 
@@ -39,6 +40,7 @@ function serviceItems() {
   return SERVICE_NAMES.map((name) => {
     if (SERVICES_DOWN.has(name) && servicesDownNow) return { name, status: "down", checkedAt, detail: "unreachable" };
     if (SERVICES_LOADING.has(name)) return { name, status: "loading", checkedAt };
+    if (name === "whisper-svc" && process.env.MOCK_STT_IDLE === "1") return { name, status: "ok", checkedAt, detail: "idle" };
     return { name, status: "ok", checkedAt };
   });
 }
@@ -255,9 +257,24 @@ function handleAudio(ctx, msg) {
   });
 }
 
+const MOCK_VOICES = [
+  { id: "tr_TR-dfki-medium", label: "DFKI (kadın)", quality: "medium" },
+  { id: "tr_TR-fahrettin-medium", label: "Fahrettin (erkek)", quality: "medium" },
+];
+
+function handleVoices(ctx, msg) {
+  later(ctx, 200, () => {
+    if (process.env.MOCK_TTS_FAIL === "1") {
+      return sendError(ctx.ws, "tts_unavailable", "Sahte TTS hatası", msg.id);
+    }
+    send(ctx.ws, { type: "voices", id: msg.id, default: MOCK_VOICES[0].id, voices: MOCK_VOICES });
+  });
+}
+
 function handleSpeak(ctx, msg) {
   const text = typeof msg.text === "string" ? msg.text : "";
   if (!text.trim()) return sendError(ctx.ws, "bad_request", "Metin boş", msg.id);
+  console.log(`[mock-core] speak voice: ${typeof msg.voice === "string" ? msg.voice : "(default)"}`);
   later(ctx, 300, () => {
     if (process.env.MOCK_TTS_FAIL === "1") {
       return sendError(ctx.ws, "tts_unavailable", "Sahte TTS hatası", msg.id);
@@ -295,6 +312,8 @@ function handleFrame(ctx, msg) {
       return void resolveConfirm(ctx, msg.approved === true, "button");
     case "speak":
       return handleSpeak(ctx, msg);
+    case "voices":
+      return handleVoices(ctx, msg);
     case "cancel":
       return handleCancel(ctx, msg);
     case "history_request": {

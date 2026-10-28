@@ -77,6 +77,7 @@ Docker base image `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`.
 | `WHISPER_COMPUTE_TYPE` | `float16` | CTranslate2 compute type; `int8_float16` saves ~2 GB VRAM |
 | `WHISPER_BEAM_SIZE` | `1` | Beam size (>= 1) |
 | `WHISPER_VAD` | `1` | Silero VAD filter (`1/0`, `true/false`, `yes/no`, `on/off`) |
+| `WHISPER_IDLE_UNLOAD_MIN` | `10` | Unload the model from the GPU after this many whole minutes without transcription requests; the next request reloads it. `0` = never unload (see "Idle unload") |
 | `HF_HOME` | HF default (`/models` in Docker) | Hugging Face cache root |
 | `HF_HUB_OFFLINE` | unset | `1` = never contact the Hub (model must be cached) |
 
@@ -85,8 +86,15 @@ Docker base image `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`.
 ### `GET /health`
 
 - `200 {"status":"ok","service":"whisper-svc","version":"0.1.0","model":"large-v3","device":"cuda","compute_type":"float16"}`
-- `503 {"status":"loading"}` while the model loads (the HTTP server is up immediately).
+- `200 {"status":"idle", ...same fields as "ok"}` while the model is unloaded after
+  `WHISPER_IDLE_UNLOAD_MIN` minutes without requests, **and** while a request is reloading
+  it. The service is healthy: the next `/transcribe` reloads the model and waits for it.
+- `503 {"status":"loading"}` while the model loads **at startup** (the HTTP server is up immediately).
 - `503 {"status":"error","error":"..."}` if loading failed (e.g. no GPU, model not cached while offline).
+  After a failed startup load this is final (restart the service); after a failed reload
+  following an idle unload, the next `/transcribe` tries to load again.
+
+Clients should treat any `200` (`ok` or `idle`) as "up".
 
 ### `POST /transcribe?language=tr`
 
@@ -105,12 +113,49 @@ curl -s -F file=@clip.webm "http://127.0.0.1:8701/transcribe?language=tr"
 | 200 | `{"text":"Oturma odası ışığını kapat.","language":"tr","duration_ms":2020,"processing_ms":478}` |
 | 400 | `{"error":"bad_audio","detail":...}` undecodable/empty audio or bad multipart; `{"error":"bad_language",...}` unknown language |
 | 413 | `{"error":"too_large",...}` body > 25 MB (checked while streaming, also without `Content-Length`) |
-| 503 | model not ready (same body as `/health`) |
+| 503 | model not ready: startup load still running or a load failed (same body as `/health`) |
 
 `duration_ms` is the decoded audio length; `processing_ms` is server time for the
 request. `text` can be empty (silence only). Requests are processed one at a time
 on the GPU (single-user push-to-talk; avoids out-of-memory on 8 GB cards).
 Transcripts are not logged.
+
+## Idle unload
+
+To give the GPU back to other applications (games, other models), the service unloads
+the model after `WHISPER_IDLE_UNLOAD_MIN` minutes (default 10) without `/transcribe`
+requests and reloads it on the next request; that request waits for the reload, so the
+first command after a quiet period is slower by the model load time (~3-4 s for `small`
+from a bind mount in the measurement below; for `large-v3` expect roughly the
+"Ready" times in "Measurements", i.e. ~5-8 s from a named volume with the files in the
+OS page cache). `/health` keeps answering `200 {"status":"idle"}` throughout. An unload
+never happens while a request is running; requests arriving during a reload queue
+behind it (one reload, not several). `WHISPER_IDLE_UNLOAD_MIN=0` keeps the model loaded
+forever (lowest latency, GPU memory permanently in use).
+
+Unloading drops the faster-whisper model (CTranslate2 `unload_model()` + releasing the
+last reference + `gc.collect()`). That destroys CTranslate2's worker threads and with them
+their per-thread CUDA caching allocator and cuBLAS/cuDNN handles, so the weights *and*
+the cached work memory go back to the driver. Only the process's CUDA context remains.
+
+Measured in Docker (WSL2, RTX 3060 Ti) with the `small` model, `float16`,
+`WHISPER_IDLE_UNLOAD_MIN=1`, a second whisper-svc instance on the same GPU. Windows does
+not report per-process VRAM for WSL containers, so values are whole-GPU `nvidia-smi`
+(median of 7 samples) minus the baseline taken before the test container started:
+
+| Point | GPU used vs. baseline |
+|---|---|
+| Container started, model loaded + 1 transcription | +756 MiB |
+| After idle unload | +58 MiB |
+| After reload + 1 transcription | +689 MiB |
+| After second idle unload | +93 MiB |
+| After second reload + 1 transcription | +802 MiB |
+| Container stopped | +11 MiB (noise) |
+
+So ~90 % of the service's VRAM is released; the remaining ~60-90 MiB is the CUDA context,
+which only goes away when the process exits (desktop noise is about +/-30 MiB). The
+weights' share is larger for `large-v3` (~3.9 GB loaded), so the relative saving is
+bigger there.
 
 ## Measurements
 

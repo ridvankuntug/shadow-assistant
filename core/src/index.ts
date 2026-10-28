@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
-import { loadConfig, loadDotEnv, type CoreConfig } from "./config.js";
+import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
 import { ConversationLog } from "./conversation-log.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { PermissionPolicy } from "./permissions.js";
@@ -93,6 +93,9 @@ export async function main(): Promise<void> {
   const tierServices = cfg.router?.tierServices;
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
+  const lexicon = loadPronunciationsFile(cfg.pronunciationsFile);
+  for (const w of lexicon.warnings) logger.warn(`[shadow-core] pronunciations.yaml: ${w}`);
+  const pronunciations = lexicon.lexicon;
 
   // Built after the vault check above so a missing vault dir reads as disabled.
   const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, { vaultDir: cfg.vaultDir }), {
@@ -106,7 +109,19 @@ export async function main(): Promise<void> {
     logger,
     createSession: (info, send) =>
       new Session(
-        { agent, policy, router, stt, tts, log, logger, confirmTimeoutMs: cfg.confirmTimeoutMs, direct, tierServices },
+        {
+          agent,
+          policy,
+          router,
+          stt,
+          tts,
+          log,
+          logger,
+          confirmTimeoutMs: cfg.confirmTimeoutMs,
+          direct,
+          tierServices,
+          pronunciations,
+        },
         info,
         send,
       ),
@@ -124,6 +139,9 @@ export async function main(): Promise<void> {
     `[shadow-core] router=${cfg.router ? "tiered" : "off"} models=1:${cfg.models[1]},2:${cfg.models[2]},3:${cfg.models[3]}`,
   );
   logger.info(`[shadow-core] model=${cfg.model} readOnly=${cfg.readOnly} devices=${[...tokens.digests.keys()].join(",")}`);
+  logger.info(
+    `[shadow-core] pronunciations: ${lexicon.found ? `${pronunciations.entries.length} entries` : "file not found (none)"}`,
+  );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
   logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);

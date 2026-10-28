@@ -56,3 +56,21 @@ test("rejection message never echoes the token", () => {
   const r = bad({ type: "hello", protocol: "x", token: "SECRET-TOKEN-VALUE" });
   assert.ok(!r.message.includes("SECRET"));
 });
+
+test("speak.voice is optional; voices request needs an id", () => {
+  assert.deepEqual(ok({ type: "speak", id: "t1", text: "selam", voice: "tr_TR-fettah-medium" }), {
+    type: "speak",
+    id: "t1",
+    text: "selam",
+    voice: "tr_TR-fettah-medium",
+  });
+  // null / empty / over-long voice → absent (default voice), not an error.
+  for (const voice of [null, "", "x".repeat(129)]) {
+    assert.deepEqual(ok({ type: "speak", id: "t1", text: "selam", voice }), { type: "speak", id: "t1", text: "selam" });
+  }
+  assert.equal(bad({ type: "speak", id: "t1", text: "selam", voice: 5 }).id, "t1");
+  bad({ type: "speak", id: "t1", text: "selam", voice: { id: "x" } });
+  assert.deepEqual(ok({ type: "voices", id: "v1" }), { type: "voices", id: "v1" });
+  bad({ type: "voices" });
+  bad({ type: "voices", id: "" });
+});

@@ -13,6 +13,7 @@ import type {
   ServerState,
   ServiceHealth,
   ToolStatus,
+  Voice,
 } from "../protocol/types.ts";
 
 export type Phase = "idle" | "listening" | "thinking" | "speaking" | "awaiting_confirm";
@@ -59,6 +60,23 @@ export type ActiveTurn = {
   seen: boolean;
 };
 
+/**
+ * The tts-svc voice list (settings picker, core TTS mode only). `unavailable`
+ * covers `error tts_unavailable`, any other error for the request and a Core
+ * that never answers (older Core without `voices`).
+ */
+export type VoiceCatalog = {
+  status: "idle" | "loading" | "ready" | "unavailable";
+  /** Id of the `voices` request in flight (or last answered). */
+  requestId: string | null;
+  /** The Core's default voice id (used when the user chose none). */
+  defaultVoice: string | null;
+  voices: Voice[];
+};
+
+/** A "Dene" voice sample: a `speak` that belongs to no turn. */
+export type VoicePreview = { id: string; failed: boolean };
+
 export type AssistantState = {
   connection: StatusEvent;
   sessionId: string | null;
@@ -92,6 +110,8 @@ export type AssistantState = {
   notice: Notice | null;
   /** Latest `services` frame from the Core (empty until the first one). */
   services: ServiceHealth[];
+  voices: VoiceCatalog;
+  voicePreview: VoicePreview | null;
 };
 
 export type Action =
@@ -110,7 +130,10 @@ export type Action =
   | { type: "confirm_sent"; requestId: string }
   | { type: "notice"; notice: Notice }
   | { type: "dismiss_notice" }
-  | { type: "reset_conversation" };
+  | { type: "reset_conversation" }
+  | { type: "voices_requested"; id: string }
+  | { type: "voices_timeout"; id: string }
+  | { type: "voice_preview_requested"; id: string };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
@@ -133,6 +156,8 @@ export const initialState: AssistantState = {
   cancelled: [],
   notice: null,
   services: [],
+  voices: { status: "idle", requestId: null, defaultVoice: null, voices: [] },
+  voicePreview: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +208,24 @@ export function bargeInTarget(s: AssistantState): string | null {
 export function canStop(s: AssistantState): boolean {
   if (s.capture === "starting" || s.capture === "recording") return false;
   return bargeInTarget(s) !== null;
+}
+
+/**
+ * A voice sample may be played: nothing of a turn is in flight (a sample would
+ * otherwise become the barge-in target instead of the turn), no confirm is
+ * pending and the mic is off. A reply that is only being spoken is fine; the
+ * sample replaces it.
+ */
+export function canPreviewVoice(s: AssistantState): boolean {
+  return (
+    s.connection.status === "connected" &&
+    s.capture === "off" &&
+    !confirmPending(s) &&
+    s.serverState === "idle" &&
+    s.activeTurn === null &&
+    s.queuedTurn === null &&
+    s.voiceAnswer === null
+  );
 }
 
 /** A confirmation is pending (an utterance now is a possible voice answer). */
@@ -258,6 +301,7 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
       const messages = s.queuedTurn ? failTurn(s.messages, s.queuedTurn) : s.messages;
       return {
         ...next,
+        voices: s.voices.status === "loading" ? initialState.voices : s.voices,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -340,6 +384,17 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
     case "reset_conversation":
       return { ...s, messages: [], cancelled: [] };
 
+    case "voices_requested":
+      return { ...s, voices: { ...s.voices, status: "loading", requestId: a.id } };
+
+    case "voices_timeout":
+      return s.voices.status === "loading" && s.voices.requestId === a.id
+        ? { ...s, voices: { ...s.voices, status: "unavailable" } }
+        : s;
+
+    case "voice_preview_requested":
+      return { ...s, voicePreview: { id: a.id, failed: false }, awaitingSpeech: a.id };
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -359,6 +414,9 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         confirms: [],
         // A (possibly different) Core sends its own list right after welcome.
         services: [],
+        // Its voices may differ too; the settings panel asks again.
+        voices: initialState.voices,
+        voicePreview: null,
       };
 
     case "state": {
@@ -455,6 +513,17 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       return { ...s, history: msg.items, historyLoaded: true };
 
     case "error": {
+      // Errors of the voice picker stay in the picker, not in the chat.
+      if (msg.id !== undefined && msg.id === s.voices.requestId) {
+        return s.voices.status === "loading" ? { ...s, voices: { ...s.voices, status: "unavailable" } } : s;
+      }
+      if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
+        return {
+          ...s,
+          voicePreview: { id: msg.id, failed: true },
+          awaitingSpeech: s.awaitingSpeech === msg.id ? null : s.awaitingSpeech,
+        };
+      }
       if (msg.code === "unauthorized") return { ...s, notice: { code: msg.code, message: msg.message } };
       const id = msg.id;
       // `busy` for a voice answer: it was not a yes/no and the paused turn is
@@ -475,6 +544,12 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
 
     case "services":
       return { ...s, services: msg.items };
+
+    case "voices":
+      // Only the answer to the latest request; it still counts after the
+      // local timeout (a slow tts-svc), but never replaces a ready list.
+      if (msg.id !== s.voices.requestId || s.voices.status === "ready") return s;
+      return { ...s, voices: { status: "ready", requestId: msg.id, defaultVoice: msg.default, voices: msg.voices } };
 
     case "pong":
       return s;

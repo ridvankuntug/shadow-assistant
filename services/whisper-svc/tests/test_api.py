@@ -38,6 +38,9 @@ class FakeTranscriber:
         if self.fail_load:
             raise RuntimeError("boom")
 
+    def unload(self) -> None:
+        pass
+
     def validate_language(self, language: str) -> None:
         if language not in {"tr", "en"}:
             raise UnsupportedLanguageError(f"unsupported language code: {language!r}")
@@ -257,6 +260,7 @@ def test_settings_from_env():
         Settings.from_env({"WHISPER_BEAM_SIZE": "0"})
     with pytest.raises(ValueError):
         Settings.from_env({"WHISPER_VAD": "maybe"})
+    assert d.idle_unload_seconds == 600.0  # WHISPER_IDLE_UNLOAD_MIN default 10
 
 
 def test_transcribe_multipart_with_language(client):

@@ -1,13 +1,16 @@
 """HTTP API (shared contract §3, whisper-svc).
 
 GET  /health      -> 200 {"status":"ok","service","version","model","device","compute_type"}
-                     503 {"status":"loading"} while the model loads
+                     200 {"status":"idle", same fields} model unloaded after WHISPER_IDLE_UNLOAD_MIN
+                         without requests, or being reloaded by a request
+                     503 {"status":"loading"} while the model loads at startup
                      503 {"status":"error","error":"..."} if loading failed
 POST /transcribe  -> raw audio body or multipart/form-data field ``file``; query ``language`` (default tr)
                      200 {"text","language","duration_ms","processing_ms"}
                      400 undecodable / empty audio, bad multipart, unsupported language
                      413 body > 25 MB
                      503 model not ready
+A request that arrives while the model is unloaded ("idle") reloads it and waits.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from . import SERVICE_NAME, __version__
 from .config import Settings
+from .lifecycle import ModelLifecycle, ModelUnavailable
 from .transcriber import (
     AudioDecodeError,
     Transcriber,
@@ -38,12 +42,6 @@ log = logging.getLogger("whisper_svc")
 
 class PayloadTooLarge(Exception):
     pass
-
-
-class _State:
-    def __init__(self) -> None:
-        self.status = "loading"  # loading | ok | error
-        self.error: str | None = None
 
 
 def _error(status: int, code: str, detail: str) -> JSONResponse:
@@ -88,42 +86,43 @@ def create_app(
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     transcriber = transcriber or WhisperTranscriber(settings)
-    state = _State()
-
-    def _load() -> None:
-        started = time.perf_counter()
-        try:
-            transcriber.load()
-        except Exception as exc:  # report through /health instead of crashing the server
-            log.exception("model load failed")
-            state.error = f"{type(exc).__name__}: {exc}"
-            state.status = "error"
-            return
-        state.status = "ok"
-        log.info("model ready in %.1f s", time.perf_counter() - started)
+    lifecycle = ModelLifecycle(transcriber, settings.idle_unload_seconds)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if load_in_background:
             # Load in a thread so /health can answer 503 "loading" meanwhile.
-            threading.Thread(target=_load, name="whisper-load", daemon=True).start()
+            threading.Thread(target=lifecycle.initial_load, name="whisper-load", daemon=True).start()
         else:
-            _load()
-        yield
+            lifecycle.initial_load()
+        lifecycle.start_timer()
+        try:
+            yield
+        finally:
+            lifecycle.stop_timer()
 
     app = FastAPI(title=SERVICE_NAME, version=__version__, lifespan=lifespan)
-    app.state.svc_state = state
+    app.state.lifecycle = lifecycle
 
     def _not_ready() -> JSONResponse:
-        if state.status == "error":
-            return JSONResponse(status_code=503, content={"status": "error", "error": state.error})
+        if lifecycle.status == "error":
+            return JSONResponse(status_code=503, content={"status": "error", "error": lifecycle.error})
         return JSONResponse(status_code=503, content={"status": "loading"})
 
     @app.get("/health")
     async def health():
-        if state.status != "ok":
+        status = lifecycle.status
+        if status not in ("ok", "idle"):
             return _not_ready()
-        return {"status": "ok", "service": SERVICE_NAME, "version": __version__, **transcriber.info()}
+        # "idle" (unloaded or reloading) is still healthy: the next request reloads the model.
+        return {"status": status, "service": SERVICE_NAME, "version": __version__, **transcriber.info()}
+
+    def _transcribe_sync(audio: bytes, lang: str):
+        lifecycle.begin()  # may reload the model after an idle unload (blocks meanwhile)
+        try:
+            return transcriber.transcribe(audio, lang)
+        finally:
+            lifecycle.end()
 
     @app.post(
         "/transcribe",
@@ -145,7 +144,7 @@ def create_app(
     )
     async def transcribe(request: Request, language: str = Query("tr")):
         started = time.perf_counter()
-        if state.status != "ok":
+        if not lifecycle.can_serve():
             return _not_ready()
 
         lang = language.strip().lower()
@@ -169,7 +168,9 @@ def create_app(
                 audio = body
             if not audio:
                 raise AudioDecodeError("empty audio")
-            result = await run_in_threadpool(transcriber.transcribe, audio, lang)
+            result = await run_in_threadpool(_transcribe_sync, audio, lang)
+        except ModelUnavailable:
+            return _not_ready()
         except UnsupportedLanguageError as exc:
             return _error(400, "bad_language", str(exc))
         except AudioDecodeError as exc:

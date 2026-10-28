@@ -6,6 +6,8 @@
 # The voice model is NOT baked into the image: it is downloaded (SHA-256 verified)
 # into the /voices volume on first start. To pre-fetch instead:
 #   docker run --rm -v tts-voices:/voices shadow-tts-svc python -m tts_svc.voices
+# Other known voices (python -m tts_svc.voices --list) are downloaded into /voices
+# on demand, the first time a /synthesize request selects them.
 #
 # License note: the image contains piper-tts (GPL-3.0-or-later) and espeak-ng data
 # (GPL-3.0). Distributing a built image means distributing GPL software; see README.

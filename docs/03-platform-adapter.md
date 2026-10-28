@@ -77,6 +77,7 @@ type Utterance = { mime: string; data: string; durationMs: number };
 | `shadow.deviceToken` | Device token for `hello` (secret — see below) |
 | `shadow.quality` | `high` / `medium` / `low` (absent = device default) |
 | `shadow.voiceReplies` | `1` / `0` (absent = on) |
+| `shadow.ttsVoice` | tts-svc voice id sent with Core speak (absent = the Core's default). Core TTS mode only; unused on Android (native TTS). |
 
 ### How the app uses it
 
@@ -92,7 +93,9 @@ type Utterance = { mime: string; data: string; durationMs: number };
 - **Replies.** On `assistant_done`, if voice replies are on:
   `tts.mode === "core"` → the app sends `speak` and plays the returned
   `speech` clip with `playback.play`; `tts.mode === "native"` → `tts.speak(text)`.
-  "Speaking" is shown while that promise is pending.
+  "Speaking" is shown while that promise is pending. In core mode the `speak`
+  frame carries the voice chosen in Settings → Ses (`voice`, omitted for the
+  default).
 - **Lifecycle.** While `isVisible()` is false the 3D render loop stops. Coming
   back to the foreground triggers an immediate reconnect attempt if the socket
   dropped.

@@ -22,7 +22,8 @@ import type { ClientFrame, ErrorCode, ServerFrame } from "./protocol.js";
 import type { DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
-import { SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
+import type { Lexicon } from "./pronunciation.js";
+import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -64,6 +65,8 @@ export interface SessionDeps {
   direct?: DirectToolClient;
   /** MCP servers loaded per model tier (router.yaml `tierN.services`); absent = all. */
   tierServices?: Partial<Record<ModelTier, readonly string[]>>;
+  /** pronunciations.yaml: applied to `speak` text sent to tts-svc only; absent = none. */
+  pronunciations?: Lexicon;
 }
 
 export interface SessionInfo {
@@ -149,7 +152,10 @@ export class Session {
         this.broker.resolve(frame.requestId, frame.approved, "button");
         return;
       case "speak":
-        await this.handleSpeak(frame.id, frame.text);
+        await this.handleSpeak(frame.id, frame.text, frame.voice);
+        return;
+      case "voices":
+        await this.handleVoices(frame.id);
         return;
       case "cancel":
         // An utterance still being transcribed must never become a turn.
@@ -232,9 +238,22 @@ export class Session {
     return done;
   }
 
-  private async handleSpeak(id: string, text: string): Promise<void> {
+  private async handleVoices(id: string): Promise<void> {
     try {
-      const { mime, data } = await this.deps.tts.synthesize(text, this.side.signal);
+      const catalog = await this.deps.tts.voices();
+      this.emit({ type: "voices", id, default: catalog.default, voices: catalog.voices.map(describeVoice) });
+    } catch (err) {
+      this.error("tts_unavailable", err instanceof Error ? err.message : "voice list unavailable", id);
+    }
+  }
+
+  private async handleSpeak(id: string, text: string, voice?: string): Promise<void> {
+    try {
+      // Spoken form only ("Shadow" → "Şadov"); the client keeps displaying its own text.
+      // Clip after the lexicon (it can lengthen the text; the Core also accepts
+      // longer speak texts than tts-svc), or tts-svc answers 413 and nothing is spoken.
+      const spoken = clipForTts(this.deps.pronunciations?.apply(text) ?? text);
+      const { mime, data } = await this.deps.tts.synthesize(spoken, this.side.signal, voice);
       this.emit({ type: "speech", id, mime, data: data.toString("base64") });
     } catch (err) {
       const code = err instanceof SpeechServiceError ? err.code : "tts_unavailable";

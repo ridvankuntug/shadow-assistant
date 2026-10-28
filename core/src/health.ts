@@ -3,8 +3,10 @@
  * tells subscribers (the WebSocket server) when a status changes.
  *
  * Checks per kind (all read-only, bounded by one timeout):
- *   http  - `GET <url><health>`; 200 → ok, 503 `{"status":"loading"}` → loading,
- *           anything else → down (the services' /health contract).
+ *   http  - `GET <url><health>`; 200 → ok, 200 `{"status":"idle"}` → ok with
+ *           detail `idle` (model unloaded, reloads on the next request),
+ *           503 `{"status":"loading"}` → loading, anything else → down
+ *           (the services' /health contract).
  *   mcp   - MCP endpoint handshake: `GET <url>` with the bearer token and
  *           `Accept: text/event-stream`. For SSE (Home Assistant) a 200 event
  *           stream means the endpoint, the token and HA's MCP Server
@@ -58,6 +60,7 @@ const DETAIL_CODES = new Set([
   "unreachable",
   "unauthorized",
   "error",
+  "idle",
   "bad_response",
   "not_found",
   "not_configured",
@@ -124,7 +127,12 @@ export function httpHealthCheck(url: string, fetchFn: FetchFn = fetch): HealthCh
     }
     const reported = isObj(body) && typeof body.status === "string" ? body.status : undefined;
     if (reported === "loading" && (res.ok || res.status === 503)) return { status: "loading" };
-    if (res.ok) return reported === undefined || reported === "ok" ? { status: "ok" } : { status: "down", detail: "error" };
+    if (res.ok) {
+      if (reported === undefined || reported === "ok") return { status: "ok" };
+      // Idle-unload contract (whisper-svc): the model is unloaded and reloads on the next request.
+      if (reported === "idle") return { status: "ok", detail: "idle" };
+      return { status: "down", detail: "error" };
+    }
     if (res.status === 503 && reported === "error") return { status: "down", detail: "error" };
     return { status: "down", detail: `http_${res.status}` };
   };

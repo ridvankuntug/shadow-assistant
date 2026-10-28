@@ -28,6 +28,9 @@ speech-to-text result, e.g. `evet` to answer a confirmation by voice),
 `MOCK_CONFIRM_MS`, `MOCK_TTS_FAIL=1`. Service health indicator:
 `MOCK_SERVICES_DOWN=whisper-svc,home-assistant` (reported `down`),
 `MOCK_SERVICES_LOADING=tts-svc` (reported `loading`),
-`MOCK_SERVICES_FLAP_MS=10000` (the down list toggles down/ok every N ms).
+`MOCK_SERVICES_FLAP_MS=10000` (the down list toggles down/ok every N ms),
+`MOCK_STT_IDLE=1` (whisper-svc `ok` with detail `idle`). The mock answers
+`voices` with two sample voices (`MOCK_TTS_FAIL=1` makes it fail too) and logs
+the `voice` of each `speak`.
 
 The microphone needs a secure context: `localhost` or https.

@@ -115,4 +115,6 @@ export const STORAGE_KEYS = {
   token: "shadow.deviceToken",
   quality: "shadow.quality",
   voiceReplies: "shadow.voiceReplies",
+  /** tts-svc voice id for Core `speak` (absent = the Core's default). Core TTS mode only. */
+  ttsVoice: "shadow.ttsVoice",
 } as const;

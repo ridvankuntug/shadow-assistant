@@ -4,22 +4,28 @@ using System.Drawing.Imaging;
 
 namespace ShadowTray;
 
-/// <summary>Coloured circle icons drawn at start-up (no icon files in the repo).</summary>
+/// <summary>
+/// Coloured circle icons drawn at start-up (no icon files in the repo); each
+/// colour also with a dark pause mark for game mode (whisper-svc paused).
+/// </summary>
 public sealed class TrayIcons : IDisposable
 {
-    private readonly Dictionary<TrayColour, Icon> _icons = new();
+    private readonly Dictionary<(TrayColour, bool), Icon> _icons = new();
 
     public TrayIcons(int size)
     {
-        _icons[TrayColour.Green] = Circle(size, Color.FromArgb(46, 194, 96));
-        _icons[TrayColour.Yellow] = Circle(size, Color.FromArgb(245, 190, 30));
-        _icons[TrayColour.Red] = Circle(size, Color.FromArgb(220, 50, 50));
-        _icons[TrayColour.Blue] = Circle(size, Color.FromArgb(50, 130, 220));
+        foreach (var gameMode in new[] { false, true })
+        {
+            _icons[(TrayColour.Green, gameMode)] = Circle(size, Color.FromArgb(46, 194, 96), gameMode);
+            _icons[(TrayColour.Yellow, gameMode)] = Circle(size, Color.FromArgb(245, 190, 30), gameMode);
+            _icons[(TrayColour.Red, gameMode)] = Circle(size, Color.FromArgb(220, 50, 50), gameMode);
+            _icons[(TrayColour.Blue, gameMode)] = Circle(size, Color.FromArgb(50, 130, 220), gameMode);
+        }
     }
 
-    public Icon this[TrayColour colour] => _icons[colour];
+    public Icon this[TrayColour colour, bool gameMode = false] => _icons[(colour, gameMode)];
 
-    private static Icon Circle(int size, Color fill)
+    private static Icon Circle(int size, Color fill, bool pauseMark)
     {
         using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bmp))
@@ -32,6 +38,16 @@ public sealed class TrayIcons : IDisposable
             g.FillEllipse(brush, rect);
             using var pen = new Pen(Color.FromArgb(160, 0, 0, 0), Math.Max(1f, size / 16f));
             g.DrawEllipse(pen, rect);
+            if (pauseMark)
+            {
+                // Two vertical bars ("paused"), dark so they show on every colour.
+                using var bars = new SolidBrush(Color.FromArgb(220, 20, 20, 20));
+                var w = Math.Max(2f, size * 0.14f);
+                var h = size * 0.46f;
+                var top = (size - h) / 2f;
+                g.FillRectangle(bars, size / 2f - w * 1.5f, top, w, h);
+                g.FillRectangle(bars, size / 2f + w * 0.5f, top, w, h);
+            }
         }
         var handle = bmp.GetHicon();
         try

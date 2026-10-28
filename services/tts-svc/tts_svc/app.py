@@ -1,8 +1,16 @@
 """HTTP API (shared contract §3):
 
-- ``GET /health``      -> 200 ok + voice info | 503 ``{"status":"loading"}`` (or ``"error"``)
+- ``GET /health``      -> 200 ok + voice info (``voices`` = loaded, ``available`` = selectable)
+  | 503 ``{"status":"loading"}`` (or ``"error"``)
 - ``POST /synthesize`` -> JSON ``{"text": "...", "voice": "<optional id>"}`` -> 200 ``audio/wav``;
   400 empty text / bad body / unknown voice, 413 text > 2000 chars, 503 while loading.
+
+A voice that is available but not loaded yet is downloaded (if needed) and
+loaded on the first request that selects it, in a background thread, one voice
+at a time. The request waits up to ``TTS_VOICE_LOAD_WAIT_S`` for it and then
+answers 503 ``voice_loading``; the load keeps going, so a later request
+succeeds. A failed load answers 503 ``voice_unavailable`` and is not retried
+for ``VOICE_RETRY_AFTER_S`` (no download loop on a broken network).
 """
 
 from __future__ import annotations
@@ -22,10 +30,14 @@ from pydantic import BaseModel
 from . import SERVICE_NAME, __version__
 from .config import MAX_TEXT_CHARS, Settings
 from .engine import Engine, PiperEngine
+from .voices import available_voice_ids
 
 _LOGGER = logging.getLogger(__name__)
 
 EngineLoader = Callable[[Settings], Engine]
+
+# After a failed on-demand load, requests for that voice fail fast for this long.
+VOICE_RETRY_AFTER_S = 60.0
 
 
 class SynthesizeRequest(BaseModel):
@@ -42,12 +54,71 @@ class _State:
         self.error: Optional[str] = None
 
 
+class _VoiceLoader:
+    """Loads available-but-not-loaded voices in background threads, one at a time.
+
+    Concurrent requests for the same voice share one load (one ``Event``);
+    loads of different voices queue on ``_serial`` so two ~63 MB downloads and
+    model loads never run in parallel.
+    """
+
+    def __init__(self, retry_after_s: float = VOICE_RETRY_AFTER_S) -> None:
+        self._guard = threading.Lock()  # protects _pending and _errors
+        self._serial = threading.Lock()  # one download/load at a time
+        self._pending: dict[str, threading.Event] = {}
+        self._errors: dict[str, tuple[str, float]] = {}
+        self._retry_after_s = retry_after_s
+
+    def recent_error(self, voice_id: str) -> Optional[str]:
+        """The last load error of ``voice_id`` if it failed less than ``retry_after_s`` ago."""
+        with self._guard:
+            entry = self._errors.get(voice_id)
+        if entry is None or time.monotonic() - entry[1] >= self._retry_after_s:
+            return None
+        return entry[0]
+
+    def request(self, engine: Engine, voice_id: str) -> threading.Event:
+        """Start loading ``voice_id`` unless already in progress; the event is set when the attempt ends."""
+        with self._guard:
+            done = self._pending.get(voice_id)
+            if done is None:
+                done = threading.Event()
+                self._pending[voice_id] = done
+                threading.Thread(
+                    target=self._run, args=(engine, voice_id, done), name=f"tts-voice-load-{voice_id}", daemon=True
+                ).start()
+            return done
+
+    def _run(self, engine: Engine, voice_id: str, done: threading.Event) -> None:
+        error: Optional[str] = None
+        try:
+            with self._serial:
+                started = time.perf_counter()
+                engine.load_voice(voice_id)
+                _LOGGER.info("Voice %s ready on demand in %.1f s", voice_id, time.perf_counter() - started)
+        except Exception as exc:
+            _LOGGER.exception("Loading voice %s on demand failed", voice_id)
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            with self._guard:
+                self._pending.pop(voice_id, None)
+                if error is None:
+                    self._errors.pop(voice_id, None)
+                else:
+                    self._errors[voice_id] = (error, time.monotonic())
+            done.set()
+
+
 def _error(status_code: int, code: str, detail: str, **extra: object) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": code, "detail": detail, **extra})
 
 
 def create_app(settings: Settings, engine_loader: EngineLoader = PiperEngine.load) -> FastAPI:
     state = _State()
+    loader = _VoiceLoader()
+
+    def _available(engine: Engine) -> list[str]:
+        return available_voice_ids(settings.voice_dir, allow_download=settings.auto_download, loaded=engine.voices)
 
     def _load() -> None:
         started = time.perf_counter()
@@ -94,11 +165,30 @@ def create_app(settings: Settings, engine_loader: EngineLoader = PiperEngine.loa
                 "service": SERVICE_NAME,
                 "version": __version__,
                 "voice": engine.default_voice,
-                "voices": engine.voices,
+                "voices": engine.voices,  # loaded now
+                "available": _available(engine),  # selectable via "voice" (loaded + downloadable/local)
                 "sample_rate": engine.sample_rate(engine.default_voice),
                 "device": "cpu",
             }
         )
+
+    def _ensure_loaded(engine: Engine, voice: str) -> Optional[JSONResponse]:
+        """Load an available voice on demand (blocking up to the wait limit); None once it is loaded."""
+        available = _available(engine)
+        if voice not in available:
+            return _error(400, "unknown_voice", f"voice {voice!r} is not available",
+                          voices=engine.voices, available=available)
+        failed = loader.recent_error(voice)
+        if failed is not None:
+            return _error(503, "voice_unavailable", f"loading voice {voice!r} failed: {failed}", voice=voice)
+        done = loader.request(engine, voice)
+        if not done.wait(settings.voice_load_wait_s):
+            return _error(503, "voice_loading", f"voice {voice!r} is being downloaded/loaded; retry shortly",
+                          status="loading", voice=voice)
+        if voice not in engine.voices:
+            failed = loader.recent_error(voice) or "unknown error"
+            return _error(503, "voice_unavailable", f"loading voice {voice!r} failed: {failed}", voice=voice)
+        return None
 
     # Plain ``def``: FastAPI runs it in a worker thread, so CPU-bound synthesis
     # never blocks the event loop (and /health stays responsive).
@@ -113,7 +203,9 @@ def create_app(settings: Settings, engine_loader: EngineLoader = PiperEngine.loa
             return _not_ready()
         voice = req.voice or engine.default_voice
         if voice not in engine.voices:
-            return _error(400, "unknown_voice", f"voice {voice!r} is not loaded", voices=engine.voices)
+            unavailable = _ensure_loaded(engine, voice)
+            if unavailable is not None:
+                return unavailable
         started = time.perf_counter()
         try:
             wav = engine.synthesize(req.text, voice)

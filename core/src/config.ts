@@ -2,11 +2,12 @@
  * Runtime configuration: repo-root `.env` + environment + services.yaml.
  * No personal path or address is ever hard-coded; everything comes from env.
  */
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_HEALTH_TIMEOUT_MS } from "./health.js";
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from "./permissions.js";
+import { EMPTY_LEXICON, parsePronunciations, type Lexicon } from "./pronunciation.js";
 import { loadRouterFile, type CompiledRouterConfig } from "./router-config.js";
 import type { TierModels } from "./router.js";
 import { findService, loadServicesFile, type ServiceDef, type ServicesConfig } from "./services.js";
@@ -38,6 +39,8 @@ export interface CoreConfig {
   whisper?: ServiceDef;
   tts?: ServiceDef;
   systemPromptFile: string;
+  /** TTS pronunciation lexicon: SHADOW_PRONUNCIATIONS_FILE or repo-root pronunciations.yaml. */
+  pronunciationsFile: string;
 }
 
 /**
@@ -108,5 +111,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     whisper: findService(services, "whisper-svc"),
     tts: findService(services, "tts-svc"),
     systemPromptFile: join(CORE_ROOT, "prompts", "system.md"),
+    pronunciationsFile: env.SHADOW_PRONUNCIATIONS_FILE || join(REPO_ROOT, "pronunciations.yaml"),
   };
+}
+
+/**
+ * Loads the TTS pronunciation lexicon. Never throws: a missing file is an
+ * empty lexicon (no warning); an unreadable or invalid file is an empty
+ * lexicon plus a warning; bad single entries are dropped with a warning.
+ */
+export function loadPronunciationsFile(path: string): { lexicon: Lexicon; warnings: string[]; found: boolean } {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { lexicon: EMPTY_LEXICON, warnings: [], found: false };
+    return { lexicon: EMPTY_LEXICON, warnings: [`cannot read ${path}: ${code ?? "error"}; lexicon disabled`], found: false };
+  }
+  try {
+    return { ...parsePronunciations(text), found: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "invalid file";
+    return { lexicon: EMPTY_LEXICON, warnings: [`${msg}; lexicon disabled`], found: true };
+  }
 }

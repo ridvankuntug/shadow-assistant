@@ -43,6 +43,9 @@ Assistant Core` scheduled task starts it at sign-in
 | red | Core stopped, given up after repeated crashes, or cannot start (see the menu) |
 | blue | A Core started outside the tray runs; the tray only watches it. Blue whatever its services report (their problems are in the tooltip and menu): the point of the colour is "not supervised by the tray, it cannot restart it" |
 
+With **Oyun modu** on, the icon of every colour carries a dark pause mark
+and the tooltip starts with "Shadow Assistant (oyun modu):".
+
 The tooltip has a one-line summary. Menu (right click):
 
 - status lines: Core, then every service the Core reports (home-assistant,
@@ -50,8 +53,11 @@ The tooltip has a one-line summary. Menu (right click):
   `GET /health` (polled every 5 s while a Core runs, the tray's own or an
   external one); the Core itself checks the services (T8.4). When the Core
   sends a short `detail` code it follows the status, e.g. "whisper-svc:
-  kapalı (timeout)" (older Cores send none). While no Core runs they read
-  "bilinmiyor".
+  kapalı (timeout)" (older Cores send none). Known codes get a Turkish
+  label: `ok` + `idle` (whisper-svc unloaded its model from the GPU after
+  being unused; it loads it again on the next request) is green and reads
+  "whisper-svc: hazır (boşta, model kaldırıldı)". While no Core runs they
+  read "bilinmiyor".
 - **Arayüzü aç** (also double click): opens the web UI. Nothing else serves
   `ui\dist`, and the UI does not work from `file://` (module scripts, and the
   microphone needs a secure context), so the tray serves `ui\dist` itself at
@@ -75,6 +81,26 @@ The tooltip has a one-line summary. Menu (right click):
   / `down` in `deploy\` (docker.exe started directly; output goes to
   `core.log`). Disabled when docker.exe is not found (PATH, else Docker
   Desktop's default folder).
+- **Oyun modu** (checkable): frees the GPU for a game. On runs
+  `docker compose --env-file ..\.env stop whisper-svc`, off runs
+  `... up -d whisper-svc` (`up -d`, not `start`: it also recreates the
+  container if `down` removed it meanwhile, and does nothing to a running
+  one). Same docker.exe and env-file handling as above; one docker command at
+  a time. The check only moves when docker succeeded; on failure a balloon
+  says so (details in `core.log`) and nothing changes. While game mode is on,
+  whisper-svc being down is expected: its line reads "whisper-svc: oyun
+  modu" and it never turns the icon yellow (other services still do). If it
+  runs anyway (e.g. started with "Konuşma servisleri → Başlat"), the line
+  reads "...; oyun modu açık".
+  The setting is kept in `%LOCALAPPDATA%\ShadowAssistant	ray-state.json`
+  (`{"gameMode": true}`; missing or unreadable = off, logged). A tray started
+  with game mode on shows a balloon, the pause mark and the menu check, and
+  runs `stop whisper-svc` once more in case the container was started in
+  between (by hand, or by `SHADOW_RESTART=always`); a stopped container makes
+  this a no-op, and a failure (Docker Desktop not up yet at sign-in) is only
+  logged and leaves game mode on. With the default `SHADOW_RESTART=no` or
+  `unless-stopped` Docker does not restart a container stopped this way.
+  Turning game mode off without docker.exe only clears the setting.
 - **Logları aç**: the log folder (`core.log`, `backup.log`).
 - **Çıkış**: stops the Core cleanly, then exits.
 

@@ -46,7 +46,8 @@ public enum TrayColour
 }
 
 /// <summary>What the tray shows: icon colour, tooltip and the status lines of the menu.</summary>
-public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList<string> Lines);
+/// <param name="GameMode">Game mode is on: the icon gets a pause mark (<see cref="TrayIcons"/>).</param>
+public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList<string> Lines, bool GameMode = false);
 
 /// <summary>
 /// Maps supervisor state + Core health to what the tray shows. Pure: no
@@ -61,6 +62,11 @@ public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList
 ///   blue   - a Core started outside the tray answers /health (the tray
 ///            watches it but cannot restart it); problems of its services are
 ///            in the tooltip and menu, not in the colour.
+///
+/// Game mode (<see cref="GameModeController"/>): whisper-svc is stopped on
+/// purpose, so it is never a problem (no yellow); its line reads "oyun modu",
+/// the tooltip starts with "Shadow Assistant (oyun modu): " and the icon has
+/// a pause mark. The colour is decided by everything else as usual.
 /// </summary>
 public static class TrayStatusEvaluator
 {
@@ -71,19 +77,24 @@ public static class TrayStatusEvaluator
     public static readonly IReadOnlyList<string> DefaultServices = ["home-assistant", "whisper-svc", "tts-svc"];
 
     private const string Prefix = "Shadow Assistant: ";
+    private const string GameModePrefix = "Shadow Assistant (oyun modu): ";
 
-    public static TrayStatus Evaluate(SupervisorSnapshot s, CoreHealth? health, DateTimeOffset now)
+    /// <summary>Menu line of the game-mode service while it is (meant to be) stopped.</summary>
+    public const string GameModeText = "oyun modu";
+
+    public static TrayStatus Evaluate(SupervisorSnapshot s, CoreHealth? health, DateTimeOffset now, bool gameMode = false)
     {
         var lines = new List<string> { "Core: " + CoreLine(s, health, now) };
         var reachable = s.State is CoreRunState.Running or CoreRunState.External && health is { Reachable: true };
 
         if (reachable && health!.Services.Count > 0)
         {
-            foreach (var svc in health.Services) lines.Add($"{svc.Name}: {ServiceText(svc)}");
+            foreach (var svc in health.Services) lines.Add($"{svc.Name}: {ServiceText(svc, gameMode)}");
         }
         else
         {
-            foreach (var name in DefaultServices) lines.Add($"{name}: bilinmiyor");
+            foreach (var name in DefaultServices)
+                lines.Add($"{name}: {(gameMode && name == GameModeController.Service ? GameModeText : "bilinmiyor")}");
         }
 
         TrayColour colour;
@@ -95,13 +106,14 @@ public static class TrayStatusEvaluator
                 summary = "Core başlıyor / yanıt vermiyor";
                 break;
             case CoreRunState.Running:
-                colour = health!.Services.Any(IsProblem) ? TrayColour.Yellow : TrayColour.Green;
-                summary = ProblemSummary(health) ?? "her şey çalışıyor";
+                colour = health!.Services.Any(x => IsProblem(x, gameMode)) ? TrayColour.Yellow : TrayColour.Green;
+                summary = ProblemSummary(health, gameMode)
+                          ?? (gameMode && health.Services.Any(IsHeldByGameMode) ? GameModeController.Service + " kapalı, gerisi çalışıyor" : "her şey çalışıyor");
                 break;
             case CoreRunState.External:
                 colour = TrayColour.Blue;
                 summary = "Core dışarıda çalışıyor"
-                          + (reachable && ProblemSummary(health!) is { } problems ? "; " + problems : "");
+                          + (reachable && ProblemSummary(health!, gameMode) is { } problems ? "; " + problems : "");
                 break;
             case CoreRunState.WaitingRestart:
                 colour = TrayColour.Yellow;
@@ -125,15 +137,19 @@ public static class TrayStatusEvaluator
                 break;
         }
 
-        return new TrayStatus(colour, Truncate(Prefix + summary, MaxTooltipLength), lines);
+        return new TrayStatus(colour, Truncate((gameMode ? GameModePrefix : Prefix) + summary, MaxTooltipLength), lines, gameMode);
     }
 
     /// <summary>"sorun: whisper-svc kapalı (timeout), …" or null when no enabled service has a problem.</summary>
-    private static string? ProblemSummary(CoreHealth health)
+    private static string? ProblemSummary(CoreHealth health, bool gameMode)
     {
-        var bad = health.Services.Where(IsProblem).ToList();
-        return bad.Count == 0 ? null : "sorun: " + string.Join(", ", bad.Select(b => $"{b.Name} {ServiceText(b)}"));
+        var bad = health.Services.Where(x => IsProblem(x, gameMode)).ToList();
+        return bad.Count == 0 ? null : "sorun: " + string.Join(", ", bad.Select(b => $"{b.Name} {ServiceText(b, gameMode)}"));
     }
+
+    /// <summary>The game-mode service, enabled and not ok: stopped by game mode, not broken.</summary>
+    private static bool IsHeldByGameMode(ServiceHealth s) =>
+        s.Name == GameModeController.Service && s.Enabled && s.Status != "ok" && s.Status != "disabled";
 
     /// <summary>
     /// The health reading that belongs to the current run (own or external
@@ -146,12 +162,30 @@ public static class TrayStatusEvaluator
             ? reading.Health
             : null;
 
-    /// <summary>An enabled service that is not ok makes the icon yellow; disabled ones never do.</summary>
-    public static bool IsProblem(ServiceHealth s) => s.Enabled && s.Status != "ok" && s.Status != "disabled";
+    /// <summary>
+    /// An enabled service that is not ok makes the icon yellow; disabled ones
+    /// never do, and neither does whisper-svc stopped by game mode.
+    /// </summary>
+    public static bool IsProblem(ServiceHealth s, bool gameMode = false) =>
+        s.Enabled && s.Status != "ok" && s.Status != "disabled" && !(gameMode && IsHeldByGameMode(s));
 
-    /// <summary>Turkish status, with the Core's detail code in brackets when it sent one: "kapalı (timeout)".</summary>
-    public static string ServiceText(ServiceHealth s)
+    /// <summary>
+    /// Turkish status, with the Core's detail code in brackets when it sent one: "kapalı (timeout)".
+    /// Known codes get a Turkish label: ok + idle (whisper-svc unloaded its
+    /// model from the GPU and loads it again on the next request) is
+    /// "hazır (boşta, model kaldırıldı)". In game mode whisper-svc reads
+    /// "oyun modu" when not ok, and "…; oyun modu açık" if it runs anyway.
+    /// </summary>
+    public static string ServiceText(ServiceHealth s, bool gameMode = false)
     {
+        if (gameMode && IsHeldByGameMode(s)) return GameModeText;
+        var text = BaseServiceText(s);
+        return gameMode && s.Name == GameModeController.Service && s.Enabled && s.Status == "ok" ? text + "; oyun modu açık" : text;
+    }
+
+    private static string BaseServiceText(ServiceHealth s)
+    {
+        if (s.Status == "ok" && s.Detail == "idle") return "hazır (boşta, model kaldırıldı)";
         var text = s.Status switch
         {
             "ok" => "çalışıyor",

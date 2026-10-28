@@ -10,6 +10,9 @@ CLI::
     python -m tts_svc.voices                         # download the configured voices (TTS_VOICE + TTS_VOICES)
     python -m tts_svc.voices tr_TR-fahrettin-medium  # download specific voices
     python -m tts_svc.voices --list                  # list known voices
+
+The service also downloads a known voice on demand, the first time a
+``/synthesize`` request selects it (see app.py).
 """
 
 from __future__ import annotations
@@ -183,6 +186,30 @@ def ensure_voice(voice_dir: Path, voice_id: str, *, allow_download: bool) -> tup
     for path in missing:
         _download(known.model if path == model else known.config, path)
     return model, config
+
+
+def local_voice_ids(voice_dir: Path) -> list[str]:
+    """Voice ids whose two files (``<id>.onnx`` + ``<id>.onnx.json``) are in ``voice_dir``, sorted."""
+    try:
+        names = {p.name for p in voice_dir.iterdir() if p.is_file()}
+    except OSError:  # missing / unreadable directory: nothing local
+        return []
+    ids = []
+    for name in names:
+        if not name.endswith(".onnx"):
+            continue
+        voice_id = name[: -len(".onnx")]
+        if VOICE_ID_RE.match(voice_id) and f"{name}.json" in names:
+            ids.append(voice_id)
+    return sorted(ids)
+
+
+def available_voice_ids(voice_dir: Path, *, allow_download: bool, loaded: list[str]) -> list[str]:
+    """Voices a request may select: loaded ones first, then known voices (downloadable,
+    or already on disk when downloads are off), then any other complete local voice."""
+    local = local_voice_ids(voice_dir)
+    known = [v for v in KNOWN_VOICES if allow_download or v in local]
+    return list(dict.fromkeys([*loaded, *known, *local]))
 
 
 def verify_voice(voice_dir: Path, voice_id: str) -> bool:

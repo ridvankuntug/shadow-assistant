@@ -28,7 +28,10 @@ export type ConfirmResponseMessage = {
   requestId: string;
   approved: boolean;
 };
-export type SpeakMessage = { type: "speak"; id: string; text: string };
+/** `voice`: a tts-svc voice id from `voices`; absent or unknown -> the Core's default voice. */
+export type SpeakMessage = { type: "speak"; id: string; text: string; voice?: string };
+/** Asks for the tts-svc voice list (answered by `voices` or `error tts_unavailable`). */
+export type VoicesRequestMessage = { type: "voices"; id: string };
 export type CancelMessage = { type: "cancel"; id: string };
 export type HistoryRequestMessage = { type: "history_request"; limit: number };
 export type PingMessage = { type: "ping" };
@@ -39,6 +42,7 @@ export type ClientMessage =
   | AudioMessage
   | ConfirmResponseMessage
   | SpeakMessage
+  | VoicesRequestMessage
   | CancelMessage
   | HistoryRequestMessage
   | PingMessage;
@@ -93,6 +97,9 @@ export type ServiceHealth = {
   detail?: string;
 };
 export type ServicesMessage = { type: "services"; items: ServiceHealth[] };
+/** One tts-svc voice. `quality` is free text (e.g. `medium`) and optional. */
+export type Voice = { id: string; label: string; quality?: string };
+export type VoicesMessage = { type: "voices"; id: string; default: string; voices: Voice[] };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -107,6 +114,7 @@ export type ServerMessage =
   | HistoryMessage
   | ErrorMessage
   | ServicesMessage
+  | VoicesMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -153,6 +161,33 @@ function toServiceHealth(v: unknown): ServiceHealth | null {
 }
 
 /**
+ * One `voices` item, or null when malformed. A missing/empty label falls back
+ * to the id; strings are cut so a bad list cannot flood the picker.
+ */
+function toVoice(v: unknown): Voice | null {
+  if (!isObj(v) || !str(v, "id") || !(v.id as string)) return null;
+  const id = (v.id as string).slice(0, 128);
+  const label = typeof v.label === "string" && v.label.trim() ? v.label.trim().slice(0, 80) : id;
+  const voice: Voice = { id, label };
+  if (typeof v.quality === "string" && v.quality) voice.quality = v.quality.slice(0, 32);
+  return voice;
+}
+
+/** Valid voices, first occurrence of each id kept, at most 200. */
+function uniqueVoices(items: unknown[]): Voice[] {
+  const seen = new Set<string>();
+  const out: Voice[] = [];
+  for (const raw of items) {
+    const v = toVoice(raw);
+    if (!v || seen.has(v.id)) continue;
+    seen.add(v.id);
+    out.push(v);
+    if (out.length >= 200) break;
+  }
+  return out;
+}
+
+/**
  * Parses one raw text frame. Returns null for anything that is not a valid,
  * known v1 server message (unknown types are ignored for forward
  * compatibility).
@@ -195,6 +230,15 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "services":
       return Array.isArray(o.items)
         ? { type: "services", items: o.items.map(toServiceHealth).filter((i): i is ServiceHealth => i !== null) }
+        : null;
+    case "voices":
+      return str(o, "id") && str(o, "default") && Array.isArray(o.voices)
+        ? {
+            type: "voices",
+            id: o.id as string,
+            default: o.default as string,
+            voices: uniqueVoices(o.voices),
+          }
         : null;
     case "error":
       return str(o, "code") && (o.id === undefined || str(o, "id")) ? (o as ErrorMessage) : null;

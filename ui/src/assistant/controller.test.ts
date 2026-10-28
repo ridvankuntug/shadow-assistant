@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CoreClientOptions, StatusEvent } from "../protocol/client.ts";
 import type { ClientMessage, ServerMessage } from "../protocol/types.ts";
 import { PlatformError, type PlatformAdapter, type TtsCapability, type Utterance } from "../platform/types.ts";
-import { AssistantController, CANCEL_SETTLE_MS, MAX_UTTERANCE_MS, clipForSpeech, type CoreClientLike } from "./controller.ts";
+import {
+  AssistantController,
+  CANCEL_SETTLE_MS,
+  MAX_UTTERANCE_MS,
+  VOICES_TIMEOUT_MS,
+  VOICE_SAMPLE_TEXT,
+  clipForSpeech,
+  type CoreClientLike,
+} from "./controller.ts";
 import { derivePhase } from "./state.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -508,6 +516,165 @@ describe("AssistantController", () => {
     await t.controller.startTalk(); // barge-in
     expect(stop).toHaveBeenCalled();
     expect(t.sent).toContainEqual({ type: "cancel", id: "t1" });
+  });
+});
+
+describe("voice picker (T5.3)", () => {
+  const VOICES = [
+    { id: "tr_TR-dfki-medium", label: "DFKI", quality: "medium" },
+    { id: "tr_TR-b", label: "B" },
+  ];
+
+  it("requests the voice list and stores the answer", () => {
+    const t = setup();
+    t.controller.requestVoices();
+    expect(t.sent).toEqual([{ type: "voices", id: "t1" }]);
+    expect(t.controller.getState().voices.status).toBe("loading");
+    t.controller.requestVoices(); // already in flight: no second frame
+    expect(t.sent).toHaveLength(1);
+    t.receive({ type: "voices", id: "t1", default: "tr_TR-dfki-medium", voices: VOICES });
+    expect(t.controller.getState().voices).toEqual({
+      status: "ready",
+      requestId: "t1",
+      defaultVoice: "tr_TR-dfki-medium",
+      voices: VOICES,
+    });
+  });
+
+  it("ignores a voices frame for another request", () => {
+    const t = setup();
+    t.controller.requestVoices();
+    t.receive({ type: "voices", id: "other", default: "x", voices: [] });
+    expect(t.controller.getState().voices.status).toBe("loading");
+  });
+
+  it("tts_unavailable for the list marks it unavailable without a chat notice", () => {
+    const t = setup();
+    t.controller.requestVoices();
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(t.controller.getState().voices.status).toBe("unavailable");
+    expect(t.controller.getState().notice).toBeNull();
+    // Asking again (panel reopened / "Yeniden dene") works.
+    t.controller.requestVoices();
+    expect(t.sent[t.sent.length - 1]).toEqual({ type: "voices", id: "t2" });
+  });
+
+  it("does not ask while disconnected or on a native-TTS host (Android)", () => {
+    const native = setup({ mode: "native", speak: vi.fn(async () => {}), stop: vi.fn() });
+    native.controller.requestVoices();
+    expect(native.sent).toEqual([]);
+    const t = setup();
+    t.drop();
+    t.controller.requestVoices();
+    expect(t.sent).toEqual([]);
+    expect(t.controller.getState().voices.status).toBe("idle");
+  });
+
+  it("a dropped socket or a new welcome resets the list", () => {
+    const t = setup();
+    t.controller.requestVoices();
+    t.drop();
+    expect(t.controller.getState().voices.status).toBe("idle");
+    t.connect();
+    t.controller.requestVoices();
+    const id = (t.sent[t.sent.length - 1] as { id: string }).id;
+    t.receive({ type: "voices", id, default: "a", voices: [] });
+    expect(t.controller.getState().voices.status).toBe("ready");
+    t.receive({ type: "welcome", protocol: 1, sessionId: "s2", device: "browser" });
+    expect(t.controller.getState().voices.status).toBe("idle");
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("no answer (e.g. an older Core) -> unavailable; a late answer still fills the list", () => {
+      const t = setup();
+      t.controller.requestVoices();
+      vi.advanceTimersByTime(VOICES_TIMEOUT_MS - 1);
+      expect(t.controller.getState().voices.status).toBe("loading");
+      vi.advanceTimersByTime(1);
+      expect(t.controller.getState().voices.status).toBe("unavailable");
+      t.receive({ type: "voices", id: "t1", default: "a", voices: VOICES });
+      expect(t.controller.getState().voices.status).toBe("ready");
+    });
+
+    it("an answer in time cancels the timeout", () => {
+      const t = setup();
+      t.controller.requestVoices();
+      t.receive({ type: "voices", id: "t1", default: "a", voices: VOICES });
+      vi.advanceTimersByTime(VOICES_TIMEOUT_MS * 2);
+      expect(t.controller.getState().voices.status).toBe("ready");
+    });
+  });
+
+  it("every speak carries the chosen voice; none -> no voice field", () => {
+    const t = setup();
+    t.controller.setVoice("tr_TR-b");
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    expect(t.sent[t.sent.length - 1]).toEqual({ type: "speak", id: "t1", text: "Merhaba", voice: "tr_TR-b" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "speech", id: "t1", mime: "audio/wav", data: "UklGRg==" });
+    t.finishPlayback();
+
+    t.controller.setVoice(null);
+    t.controller.sendText("tekrar");
+    t.receive({ type: "assistant_done", id: "t2", text: "Tamam" });
+    expect(t.sent[t.sent.length - 1]).toEqual({ type: "speak", id: "t2", text: "Tamam" });
+  });
+
+  it("Dene: speaks the sample with the selected voice and plays it", async () => {
+    const t = setup();
+    expect(t.controller.previewVoice("tr_TR-b")).toBe(true);
+    expect(t.sent).toEqual([{ type: "speak", id: "t1", text: VOICE_SAMPLE_TEXT, voice: "tr_TR-b" }]);
+    expect(t.controller.getState().voicePreview).toEqual({ id: "t1", failed: false });
+    t.receive({ type: "speech", id: "t1", mime: "audio/wav", data: "UklGRg==" });
+    expect(t.calls).toContain("play:audio/wav");
+    expect(t.phase()).toBe("speaking");
+    t.finishPlayback();
+    await flush();
+    expect(t.phase()).toBe("idle");
+    // Default voice: no voice field.
+    t.controller.previewVoice(null);
+    expect(t.sent[t.sent.length - 1]).toEqual({ type: "speak", id: "t2", text: VOICE_SAMPLE_TEXT });
+  });
+
+  it("Dene is refused while a turn is in flight or a confirm is pending, and on Android", () => {
+    const t = setup();
+    t.controller.sendText("selam");
+    expect(t.controller.previewVoice(null)).toBe(false);
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "confirm_request", requestId: "c1", id: "t1", tool: "x", summary: "s", expiresAt: Date.now() + 60_000 });
+    expect(t.controller.previewVoice(null)).toBe(false);
+    expect(t.sentTypes()).toEqual(["user_text"]);
+
+    const native = setup({ mode: "native", speak: vi.fn(async () => {}), stop: vi.fn() });
+    expect(native.controller.previewVoice(null)).toBe(false);
+    expect(native.sent).toEqual([]);
+  });
+
+  it("Dene stops a reply that is being spoken first", () => {
+    const t = setup();
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "speech", id: "t1", mime: "audio/wav", data: "UklGRg==" });
+    expect(t.phase()).toBe("speaking");
+    expect(t.controller.previewVoice(null)).toBe(true);
+    expect(t.calls).toContain("playback.stop");
+    expect(t.controller.getState().awaitingSpeech).toBe("t2");
+  });
+
+  it("a failed sample is reported in the picker, not as a chat notice", () => {
+    const t = setup();
+    t.controller.previewVoice("tr_TR-b");
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    const s = t.controller.getState();
+    expect(s.voicePreview).toEqual({ id: "t1", failed: true });
+    expect(s.notice).toBeNull();
+    expect(s.awaitingSpeech).toBeNull();
+    expect(t.phase()).toBe("idle");
   });
 });
 

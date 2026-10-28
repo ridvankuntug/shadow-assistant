@@ -54,6 +54,8 @@ before(async () => {
   };
   routes.set("/ok/health", json(200, { status: "ok", model: "x" }));
   routes.set("/loading/health", json(503, { status: "loading" }));
+  routes.set("/idle/health", json(200, { status: "idle", model: "x" }));
+  routes.set("/weird/health", json(200, { status: "degraded" }));
   routes.set("/error/health", json(503, { status: "error" }));
   routes.set("/boom/health", json(500, { oops: true }));
   routes.set("/slow/health", (_req, res) => {
@@ -93,6 +95,12 @@ test("http check: ok / loading / error / other status", async () => {
   assert.deepEqual(await httpHealthCheck(`${base}/error/health`)(sig()), { status: "down", detail: "error" });
   assert.deepEqual(await httpHealthCheck(`${base}/boom/health`)(sig()), { status: "down", detail: "http_500" });
   assert.deepEqual(await httpHealthCheck(`${base}/missing/health`)(sig()), { status: "down", detail: "http_404" });
+});
+
+test("http check: 200 idle (model unloaded) is ok with detail idle; other 200 statuses stay down", async () => {
+  assert.deepEqual(await httpHealthCheck(`${base}/idle/health`)(sig()), { status: "ok", detail: "idle" });
+  assert.deepEqual(await httpHealthCheck(`${base}/weird/health`)(sig()), { status: "down", detail: "error" });
+  assert.equal(safeDetail("idle"), "idle");
 });
 
 test("mcp sse check: handshake with token ok, wrong token unauthorized, wrong content-type down", async () => {

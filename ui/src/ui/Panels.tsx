@@ -76,6 +76,7 @@ export function SettingsPanel({
   voiceReplies,
   reducedMotion,
   coreUrl,
+  voicePicker,
   onQuality,
   onVoiceReplies,
   onChangeConnection,
@@ -85,6 +86,8 @@ export function SettingsPanel({
   voiceReplies: boolean;
   reducedMotion: boolean;
   coreUrl: string;
+  /** "Ses" picker; absent where replies are spoken natively (Android). */
+  voicePicker?: ReactNode;
   onQuality: (q: Quality) => void;
   onVoiceReplies: (v: boolean) => void;
   onChangeConnection: () => void;
@@ -117,6 +120,7 @@ export function SettingsPanel({
         <input type="checkbox" checked={voiceReplies} onChange={(e) => onVoiceReplies(e.target.checked)} />
         <span>Cevapları sesli oku</span>
       </label>
+      {voicePicker}
       <div className="field">
         <p className="hint">Çekirdek: {coreUrl || "ayarlanmadı"}</p>
         <button type="button" className="btn btn-ghost" onClick={onChangeConnection}>

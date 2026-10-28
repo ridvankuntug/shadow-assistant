@@ -204,4 +204,106 @@ public class TrayStatusTests
         Assert.Null(TrayStatusEvaluator.CurrentHealth(new SupervisorSnapshot(CoreRunState.Stopped), fresh));
         Assert.Null(TrayStatusEvaluator.CurrentHealth(snap, null));
     }
+
+    // --- T8.6a idle, T8.6c game mode ---
+
+    [Fact]
+    public void Idle_whisper_is_healthy_with_a_turkish_label()
+    {
+        var h = new CoreHealth(true,
+        [
+            new ServiceHealth("home-assistant", true, "ok"),
+            new ServiceHealth("whisper-svc", true, "ok", "idle"),
+            new ServiceHealth("tts-svc", true, "ok"),
+        ]);
+        var s = TrayStatusEvaluator.Evaluate(Running(), h, Now);
+        Assert.Equal(TrayColour.Green, s.Colour);
+        Assert.Equal("Shadow Assistant: her şey çalışıyor", s.Tooltip);
+        Assert.Contains("whisper-svc: hazır (boşta, model kaldırıldı)", s.Lines);
+        // Other details keep the free-text rendering.
+        Assert.Equal("kapalı (idle)", TrayStatusEvaluator.ServiceText(new ServiceHealth("x", true, "down", "idle")));
+    }
+
+    [Theory]
+    [InlineData("down")]
+    [InlineData("loading")]
+    [InlineData("unknown")]
+    public void Game_mode_whisper_down_is_not_a_problem(string status)
+    {
+        var h = new CoreHealth(true,
+        [
+            new ServiceHealth("home-assistant", true, "ok"),
+            new ServiceHealth("whisper-svc", true, status, "unreachable"),
+            new ServiceHealth("tts-svc", true, "ok"),
+        ]);
+        var s = TrayStatusEvaluator.Evaluate(Running(), h, Now, gameMode: true);
+        Assert.Equal(TrayColour.Green, s.Colour);
+        Assert.True(s.GameMode);
+        Assert.Equal("Shadow Assistant (oyun modu): whisper-svc kapalı, gerisi çalışıyor", s.Tooltip);
+        Assert.Equal(["home-assistant: çalışıyor", "whisper-svc: oyun modu", "tts-svc: çalışıyor"], s.Lines.Skip(1));
+
+        // The same reading without game mode is a problem.
+        Assert.Equal(TrayColour.Yellow, TrayStatusEvaluator.Evaluate(Running(), h, Now).Colour);
+    }
+
+    [Fact]
+    public void Game_mode_still_reports_other_problems()
+    {
+        var h = Health(("whisper-svc", true, "down"), ("tts-svc", true, "down"));
+        var s = TrayStatusEvaluator.Evaluate(Running(), h, Now, gameMode: true);
+        Assert.Equal(TrayColour.Yellow, s.Colour);
+        Assert.Equal("Shadow Assistant (oyun modu): sorun: tts-svc kapalı", s.Tooltip);
+    }
+
+    [Fact]
+    public void Game_mode_with_whisper_running_anyway_says_so()
+    {
+        var s = TrayStatusEvaluator.Evaluate(Running(), AllOk, Now, gameMode: true);
+        Assert.Equal(TrayColour.Green, s.Colour);
+        Assert.Equal("Shadow Assistant (oyun modu): her şey çalışıyor", s.Tooltip);
+        Assert.Contains("whisper-svc: çalışıyor; oyun modu açık", s.Lines);
+    }
+
+    [Fact]
+    public void Game_mode_is_visible_while_the_core_is_not_answering_or_stopped()
+    {
+        var starting = TrayStatusEvaluator.Evaluate(Running(), null, Now, gameMode: true);
+        Assert.Equal(TrayColour.Yellow, starting.Colour);
+        Assert.Equal(["home-assistant: bilinmiyor", "whisper-svc: oyun modu", "tts-svc: bilinmiyor"], starting.Lines.Skip(1));
+        Assert.StartsWith("Shadow Assistant (oyun modu): ", starting.Tooltip);
+
+        var stopped = TrayStatusEvaluator.Evaluate(SupervisorSnapshot.Initial, null, Now, gameMode: true);
+        Assert.Equal(TrayColour.Red, stopped.Colour);
+        Assert.True(stopped.GameMode);
+        Assert.Equal("Shadow Assistant (oyun modu): Core durduruldu", stopped.Tooltip);
+    }
+
+    [Fact]
+    public void Game_mode_keeps_external_core_blue_without_whisper_problem()
+    {
+        var h = Health(("home-assistant", true, "ok"), ("whisper-svc", true, "down"));
+        var s = TrayStatusEvaluator.Evaluate(External(), h, Now, gameMode: true);
+        Assert.Equal(TrayColour.Blue, s.Colour);
+        Assert.Equal("Shadow Assistant (oyun modu): Core dışarıda çalışıyor", s.Tooltip);
+    }
+
+    [Fact]
+    public void Disabled_whisper_reads_disabled_in_game_mode()
+    {
+        var s = TrayStatusEvaluator.Evaluate(Running(), Health(("whisper-svc", false, "disabled")), Now, gameMode: true);
+        Assert.Contains("whisper-svc: devre dışı", s.Lines);
+    }
+
+    [Fact]
+    public void Game_mode_tooltip_never_exceeds_127_characters()
+    {
+        var many = Enumerable.Range(0, 20).Select(i => ($"a-rather-long-service-name-{i}", true, "down")).ToArray();
+        Assert.Equal(TrayStatusEvaluator.MaxTooltipLength, TrayStatusEvaluator.Evaluate(Running(), Health(many), Now, gameMode: true).Tooltip.Length);
+        foreach (var state in Enum.GetValues<CoreRunState>())
+        {
+            var snap = new SupervisorSnapshot(state, RunningSince: Now, NextRestartAt: Now, Failures: 99, MaxFailures: 100,
+                LastExitCode: int.MinValue, Problem: new string('x', 500));
+            Assert.True(TrayStatusEvaluator.Evaluate(snap, null, Now, gameMode: true).Tooltip.Length <= 127, state.ToString());
+        }
+    }
 }

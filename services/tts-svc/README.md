@@ -8,7 +8,7 @@ Only the Core calls it (URL via `TTS_SVC_URL`, default `http://127.0.0.1:8702`).
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/health` | – | `200 {"status":"ok","service":"tts-svc","version":"0.1.0","voice":"tr_TR-dfki-medium","voices":[...],"sample_rate":22050,"device":"cpu"}`<br>`503 {"status":"loading"}` while the voice loads (first start also downloads it)<br>`503 {"status":"error","detail":"..."}` if loading failed (see the log) |
+| `GET` | `/health` | – | `200 {"status":"ok","service":"tts-svc","version":"0.1.0","voice":"tr_TR-dfki-medium","voices":[...],"available":[...],"sample_rate":22050,"device":"cpu"}`<br>`voices` = loaded now; `available` = selectable via `voice` (loaded first, then known voices that can be downloaded, then other complete voices in `TTS_VOICE_DIR`)<br>`503 {"status":"loading"}` while the voice loads (first start also downloads it)<br>`503 {"status":"error","detail":"..."}` if loading failed (see the log) |
 | `POST` | `/synthesize` | JSON `{"text":"...","voice":"<optional voice id>"}` | `200 audio/wav` (16-bit PCM, mono, 22.05 kHz for the bundled voices) |
 
 `/synthesize` errors (JSON `{"error":"<code>","detail":"..."}`):
@@ -17,10 +17,12 @@ Only the Core calls it (URL via `TTS_SVC_URL`, default `http://127.0.0.1:8702`).
 |---|---|---|
 | 400 | `empty_text` | `text` is empty or whitespace only |
 | 400 | `bad_request` | body is not JSON / `text` missing or not a string / `voice` not a string |
-| 400 | `unknown_voice` | `voice` is not one of the loaded voices (response lists `voices`) |
+| 400 | `unknown_voice` | `voice` is not in `available` (response lists `voices` and `available`) |
 | 413 | `text_too_long` | `text` longer than 2000 characters |
 | 500 | `synthesis_failed` | engine error (details in the service log) |
-| 503 | – | voices still loading (`{"status":"loading"}`) or failed to load |
+| 503 | – | startup voices still loading (`{"status":"loading"}`) or failed to load |
+| 503 | `voice_loading` | the selected voice is being downloaded/loaded on demand and did not finish within `TTS_VOICE_LOAD_WAIT_S`; the load continues, retry shortly (body also has `"status":"loading"`, `"voice"`) |
+| 503 | `voice_unavailable` | loading the selected voice failed (download/hash/model error, see the log); retried no sooner than 60 s later |
 
 Omitted, `null` or empty `voice` uses the default voice. Text that produces no
 speech (e.g. only punctuation) returns a valid, zero-length WAV. Responses carry
@@ -39,9 +41,18 @@ so a 2000-character text (~2 min of audio) takes ~5 s.
 | `TTS_VOICE` | `tr_TR-dfki-medium` | default voice, loaded at startup |
 | `TTS_VOICES` | – | optional comma-separated extra voices to load at startup (selectable via `voice`) |
 | `TTS_VOICE_DIR` | `services/tts-svc/voices` (git-ignored) | where voice files are stored / downloaded |
-| `TTS_AUTO_DOWNLOAD` | `1` | download a missing known voice at startup; `0` = fail instead |
+| `TTS_AUTO_DOWNLOAD` | `1` | download a missing known voice (at startup or on demand); `0` = only voices already in `TTS_VOICE_DIR` |
+| `TTS_VOICE_LOAD_WAIT_S` | `20` | how long `/synthesize` waits for an on-demand voice load before answering 503 `voice_loading` (0-600); keep it below the caller's timeout (the Core uses 30 s) |
 
-Each voice is loaded once at startup (~3-5 s each) and stays in memory.
+The configured voices are loaded at startup (~3-5 s each). Any other voice in
+`available` is loaded on demand: the first `/synthesize` that selects it
+downloads it if needed (~63 MB, SHA-256 verified) and loads it in a background
+thread, one voice at a time; concurrent requests for the same voice share that
+load. A voice already on disk is ready within a few seconds (first request
+succeeds); a download usually takes longer than the wait limit, so the first
+request gets 503 `voice_loading` and a later one succeeds. Loaded voices stay
+in memory (roughly the model size plus runtime overhead each) until the service restarts; `/health` stays 200
+for the default voice throughout.
 
 ## Voices
 
@@ -54,6 +65,11 @@ pinned SHA-256 (`tts_svc/voices.py`); a mismatch aborts. Each voice is ~63 MB.
 | `tr_TR-dfki-medium` (default) | official `rhasspy/piper-voices` | **CC BY-NC-SA 4.0** (non-commercial) |
 | `tr_TR-fahrettin-medium` | third-party mirror `csukuangfj/vits-piper-tr_TR-fahrettin-medium` | CC0 |
 | `tr_TR-fettah-medium` | third-party mirror `csukuangfj/vits-piper-tr_TR-fettah-medium` | CC0 |
+
+All three are selectable per request (`voice`) and through the Core's `voices`
+frame; see [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) for the exact
+source URLs and licenses. Checked 2026-10-28: `rhasspy/piper-voices` contains
+only `tr/tr_TR/dfki/medium` for Turkish.
 
 Why `dfki` is the default: it is the only Turkish voice published in the official
 Piper voice repository, so its provenance is verifiable. The other two are

@@ -29,10 +29,11 @@ public sealed class TrayApp : ApplicationContext
     private readonly HttpCoreHealthProbe _probe;
     private readonly HealthPoller _poller;
     private readonly DockerCompose _docker;
+    private readonly GameModeController _gameMode;
     private readonly TrayIcons _icons;
     private readonly NotifyIcon _notify;
     private readonly ContextMenuStrip _menu;
-    private readonly ToolStripMenuItem _startItem, _stopItem, _restartItem, _dockerUpItem, _dockerDownItem, _uiItem;
+    private readonly ToolStripMenuItem _startItem, _stopItem, _restartItem, _dockerUpItem, _dockerDownItem, _gameModeItem, _uiItem;
     private readonly ToolStripSeparator _statusEnd;
     private readonly System.Windows.Forms.Timer _timer;
     private UiServer? _uiServer;
@@ -57,6 +58,7 @@ public sealed class TrayApp : ApplicationContext
             settings.StartProblems, _probe);
         _poller = new HealthPoller(_probe, () => _supervisor.Snapshot.State is CoreRunState.Running or CoreRunState.External);
         _docker = new DockerCompose(DockerCompose.Find(Environment.GetEnvironmentVariable), settings.DeployDir, settings.EnvFile, _log);
+        _gameMode = new GameModeController(_docker, new TrayStateStore(TrayStateStore.DefaultPath()), _log.Info);
         _icons = new TrayIcons(SystemInformation.SmallIconSize.Width);
 
         _menu = new ContextMenuStrip { ShowImageMargin = false };
@@ -70,6 +72,9 @@ public sealed class TrayApp : ApplicationContext
         var docker = new ToolStripMenuItem("Konuşma servisleri (Docker)");
         docker.DropDownItems.AddRange([_dockerUpItem, _dockerDownItem]);
         if (!_docker.Available) docker.Enabled = false;
+        // Checked state comes from the controller (Refresh), never from the click:
+        // a failed docker command must leave it where it was.
+        _gameModeItem = new ToolStripMenuItem("Oyun modu (whisper-svc durur, GPU boşalır)", null, async (_, _) => await ToggleGameMode());
         _menu.Items.AddRange([
             _statusEnd,
             _uiItem,
@@ -78,6 +83,7 @@ public sealed class TrayApp : ApplicationContext
             _stopItem,
             _startItem,
             docker,
+            _gameModeItem,
             new ToolStripSeparator(),
             new ToolStripMenuItem("Logları aç", null, (_, _) => OpenLogs()),
             new ToolStripSeparator(),
@@ -104,6 +110,14 @@ public sealed class TrayApp : ApplicationContext
         _timer.Start();
         Refresh(force: true);
 
+        if (_gameMode.On)
+        {
+            // Saved on: say so instead of silently keeping whisper-svc down, and
+            // stop it again in case it was started meanwhile (see ReapplyAsync).
+            _notify.ShowBalloonTip(5000, "Shadow Assistant", "Oyun modu açık: whisper-svc kapalı tutuluyor. Kapatmak için menü → Oyun modu.", ToolTipIcon.Info);
+            _ = RunDockerExclusive(() => Task.Run(_gameMode.ReapplyAsync));
+        }
+
         SystemEvents.SessionEnded += OnSessionEnded;
     }
 
@@ -111,7 +125,7 @@ public sealed class TrayApp : ApplicationContext
     {
         var snap = _supervisor.Snapshot;
         var health = TrayStatusEvaluator.CurrentHealth(snap, _poller.Latest);
-        var status = TrayStatusEvaluator.Evaluate(snap, health, DateTimeOffset.UtcNow);
+        var status = TrayStatusEvaluator.Evaluate(snap, health, DateTimeOffset.UtcNow, _gameMode.On);
 
         if (snap.State != _lastState)
         {
@@ -130,11 +144,16 @@ public sealed class TrayApp : ApplicationContext
         _stopItem.Enabled = !busy && snap.State is CoreRunState.Running or CoreRunState.WaitingRestart;
         _restartItem.Enabled = !busy && !external;
         _dockerUpItem.Enabled = _dockerDownItem.Enabled = !_dockerBusy && !_exiting;
+        _gameModeItem.Checked = _gameMode.On;
+        // Turning it off stays possible without docker (it then only clears the flag).
+        _gameModeItem.Enabled = !_dockerBusy && !_exiting && (_docker.Available || _gameMode.On);
 
-        if (!force && !_menu.Visible && _shown is not null && _shown.Colour == status.Colour && _shown.Tooltip == status.Tooltip)
+        if (!force && !_menu.Visible && _shown is not null && _shown.Colour == status.Colour && _shown.GameMode == status.GameMode
+            && _shown.Tooltip == status.Tooltip)
             return;
 
-        if (_shown is null || _shown.Colour != status.Colour) _notify.Icon = _icons[status.Colour];
+        if (_shown is null || _shown.Colour != status.Colour || _shown.GameMode != status.GameMode)
+            _notify.Icon = _icons[status.Colour, status.GameMode];
         if (_shown is null || _shown.Tooltip != status.Tooltip) _notify.Text = status.Tooltip;
         if (_shown is null || force || _menu.Visible) RebuildStatusLines(status.Lines);
         _shown = status;
@@ -229,21 +248,48 @@ public sealed class TrayApp : ApplicationContext
 
     private async Task RunDocker(string verb)
     {
-        if (_dockerBusy) return;
-        _dockerBusy = true;
-        Refresh(force: false);
-        try
+        await RunDockerExclusive(async () =>
         {
             var code = await Task.Run(() => _docker.RunAsync(verb));
             var what = verb == "up" ? "başlatma" : "durdurma";
             _notify.ShowBalloonTip(5000, "Shadow Assistant",
                 code == 0 ? $"Konuşma servisleri: {what} tamam." : $"Konuşma servisleri: {what} başarısız (kod {code}); core.log'a bakın.",
                 code == 0 ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        });
+    }
+
+    private async Task ToggleGameMode()
+    {
+        await RunDockerExclusive(async () =>
+        {
+            var on = !_gameMode.On;
+            var result = await Task.Run(() => _gameMode.SetAsync(on));
+            _notify.ShowBalloonTip(5000, "Shadow Assistant", result.Message, result.Ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        });
+    }
+
+    /// <summary>
+    /// One docker command at a time (compose up/down and game mode share it).
+    /// <paramref name="action"/> runs docker through Task.Run (off the UI
+    /// thread); its code after that await (balloons) is back on the UI thread.
+    /// </summary>
+    private async Task RunDockerExclusive(Func<Task> action)
+    {
+        if (_dockerBusy) return;
+        _dockerBusy = true;
+        Refresh(force: false);
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _log.Info("error: " + ex.Message);
         }
         finally
         {
             _dockerBusy = false;
-            Refresh(force: false);
+            Refresh(force: true);
         }
     }
 

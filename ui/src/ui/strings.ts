@@ -2,6 +2,7 @@
 import type { Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
 import type { Quality } from "../scene/quality.ts";
+import type { SttStatus } from "./serviceHealth.ts";
 
 export const PHASE_LABEL: Record<Phase, string> = {
   idle: "Hazır",
@@ -49,6 +50,26 @@ const NOTICE_TEXT: Record<string, string> = {
   playback_failed: "Ses çalınamadı.",
   tts_failed: "Cevap seslendirilemedi.",
 };
+
+/**
+ * Note under the mic button for the speech-to-text health (null = none).
+ * `off`/`loading` come with a disabled mic; `failed` keeps the mic usable so
+ * the user can retry the model load; `idle` is only a soft hint.
+ */
+export function sttNote(status: SttStatus): { text: string; soft: boolean } | null {
+  switch (status) {
+    case "off":
+      return { text: "Ses tanıma şu an kapalı — yazarak devam edebilirsin.", soft: false };
+    case "loading":
+      return { text: "Ses tanıma hazırlanıyor — şimdilik yazarak devam edebilirsin.", soft: false };
+    case "failed":
+      return { text: "Ses tanıma modeli yüklenemedi — tekrar denemek için basabilirsin.", soft: false };
+    case "idle":
+      return { text: "İlk sesli mesajın çözülmesi birkaç saniye sürebilir.", soft: true };
+    default:
+      return null;
+  }
+}
 
 export function noticeText(code: string, message?: string): string {
   return NOTICE_TEXT[code] ?? (message ? `Hata: ${message}` : `Beklenmeyen hata (${code}).`);

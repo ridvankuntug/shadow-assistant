@@ -205,7 +205,10 @@ function harness(opts: { ha?: MockHa; agent?: MockAgent; readOnly?: boolean; yam
       policy: new PermissionPolicy(services, { readOnly: opts.readOnly }),
       router,
       stt: { transcribe: async () => ({ text: "" }) },
-      tts: { synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }) },
+      tts: {
+        synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }),
+        voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+      },
       log: new ConversationLog(dataDir),
       logger: { info: () => {}, warn: () => {} },
       confirmTimeoutMs: 5_000,

@@ -1,0 +1,24 @@
+# Shadow Assistant TTS pronunciation lexicon (read by the Core at startup;
+# restart the Core after editing). Override the path with
+# SHADOW_PRONUNCIATIONS_FILE.
+#
+# Turkish Piper voices read some words wrongly (e.g. "Shadow"). Each entry maps
+# a word or phrase as written to a spelling the voice reads correctly:
+#
+#   Written word or phrase: Spoken spelling
+#
+# Only the text sent to tts-svc for synthesis is rewritten; what the user sees,
+# the conversation log and the transcript keep the original text.
+#
+# Matching (see docs/02-core-protocol.md, "Pronunciation lexicon"):
+#   - whole words only, case-insensitive (Turkish I/ı/İ/i included); the
+#     replacement is used as written: "SHADOW" -> "Şadov";
+#   - a suffix after an apostrophe (' or ’) is kept: "Shadow'u" -> "Şadov'u";
+#   - a suffix WITHOUT an apostrophe is not matched: "Shadowlar" stays as is
+#     unless "Shadowlar" has its own entry;
+#   - multi-word keys are allowed; the longest key wins at the same position.
+#
+# A missing file means no rewriting. An invalid file is ignored with a
+# warning in the Core log (the Core still starts).
+
+Shadow: Şadov

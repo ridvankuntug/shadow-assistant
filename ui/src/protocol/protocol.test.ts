@@ -45,6 +45,16 @@ const VALID: ServerMessage[] = [
       { name: "tts-svc", status: "ok", checkedAt: 1 },
     ],
   },
+  {
+    type: "voices",
+    id: "v1",
+    default: "tr_TR-dfki-medium",
+    voices: [
+      { id: "tr_TR-dfki-medium", label: "DFKI", quality: "medium" },
+      { id: "tr_TR-other", label: "Diğer" },
+    ],
+  },
+  { type: "voices", id: "v2", default: "x", voices: [] },
   { type: "pong" },
 ];
 
@@ -66,6 +76,9 @@ describe("parseServerMessage", () => {
     ["history not array", '{"type":"history","items":{}}'],
     ["error id not string", '{"type":"error","id":5,"code":"x"}'],
     ["services not array", '{"type":"services","items":{}}'],
+    ["voices without id", '{"type":"voices","default":"a","voices":[]}'],
+    ["voices without default", '{"type":"voices","id":"v","voices":[]}'],
+    ["voices not array", '{"type":"voices","id":"v","default":"a","voices":{}}'],
   ])("rejects %s", (_name, raw) => {
     expect(parseServerMessage(raw)).toBeNull();
   });
@@ -96,6 +109,39 @@ describe("parseServerMessage", () => {
         { name: "a", status: "ok", checkedAt: 1 },
         { name: "b", status: "down", checkedAt: 2 },
         { name: "e", status: "down", checkedAt: 4, detail: "x".repeat(64) },
+      ],
+    });
+  });
+});
+
+describe("parseServerMessage voices", () => {
+  it("drops malformed voices, falls back to the id as label, drops duplicates and cuts long text", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({
+        type: "voices",
+        id: "v1",
+        default: "a",
+        voices: [
+          { id: "a", label: "  A ses  ", quality: "medium", extra: 1 },
+          { id: "b" },
+          { id: "c", label: "", quality: 3 },
+          { label: "no id" },
+          { id: "" },
+          "x",
+          { id: "a", label: "duplicate" },
+          { id: "d", label: "L".repeat(200) },
+        ],
+      }),
+    );
+    expect(msg).toEqual({
+      type: "voices",
+      id: "v1",
+      default: "a",
+      voices: [
+        { id: "a", label: "A ses", quality: "medium" },
+        { id: "b", label: "b" },
+        { id: "c", label: "c" },
+        { id: "d", label: "L".repeat(80) },
       ],
     });
   });

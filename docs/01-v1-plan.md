@@ -68,9 +68,10 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
   - [ ] T4.1 — `faster-whisper` large-v3, ana PC GPU'su; Docker GPU (WSL2) ya da yerel Python — ölçüp seç
   - [ ] T4.2 — HTTP uç noktası: ses parçası → Türkçe metin; gecikme hedefi < 1.5 sn (kısa komut)
   - [ ] T4.3 — `GET /health`, `services.yaml` kaydı
-- **T5 — Ses çıkışı (TTS)** — Durum: Başlanmadı
-  - [ ] T5.1 — `tts-svc`: Piper Türkçe ses, ana PC
+- **T5 — Ses çıkışı (TTS)** — Durum: Başlandı
+  - [x] T5.1 — `tts-svc`: Piper Türkçe ses, ana PC
   - [ ] T5.2 — Android'de yerel TTS adaptörü (T6 ile)
+  - [x] T5.3 — Ses seçimi: tts-svc Türkçe Piper sesleri (dfki varsayılan, fahrettin, fettah; ilk kullanımda indirilir), Core `voices`/`speak.voice`, arayüzde "Ses" seçici + "Dene"; telaffuz sözlüğü (`pronunciations.yaml`, ör. Shadow → Şadov)
 - **T6 — Android kabuk** — Durum: Başlanmadı
   - [ ] T6.1 — Kotlin proje; WebView arayüzü yükler; JS köprüsü (mikrofon, TTS, titreşim, token)
   - [ ] T6.2 — Mikrofon kaydı → Core'a akış; uyandırma kelimesi yok
@@ -84,12 +85,14 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
   - [ ] T7.3 — Katman 1 Haiku (sınıflandırma, kısa cevap) → gerekirse katman 2 Sonnet; Opus yalnız plan/derin analiz
   - [ ] T7.4 — Her çağrı için JSONL kayıt (model, token, servis, süre); mevcut token kullanım raporu ile birleşir
   - [ ] T7.5 — Prompt caching; araçlar ihtiyaç anında yüklenir
-- **T8 — Çalıştırma (ana PC)** — Durum: Bitti
+- **T8 — Çalıştırma (ana PC)** — Durum: Başlandı
   - [x] T8.1 — Core Windows'ta yerel Node servisi olarak (Claude Code girişi kullanıcı profilinde olduğu için Docker'da değil); açılışta başlar
   - [x] T8.2 — whisper-svc ve tts-svc Docker Desktop'ta, `deploy/` compose
   - [x] T8.3 — `.shadow-assistant/` klasörünün ana PC'den Drive'a şifreli yedeği (rclone) (isteğe bağlı günlük görev hariç)
   - [x] T8.4 — Sağlık kontrolü: servislerden biri düşerse arayüzde görünür
   - [x] T8.5 — Windows tepsi uygulaması (`deploy/windows/tray`, .NET 10): Core'u doğrudan node ile başlatır/denetler, durum simgesi, menü; logon görevi artık tepsi exe'sini çalıştırır
+  - [x] T8.6 — Kaynak tasarrufu: whisper-svc boştayken modeli GPU'dan kaldırır (`WHISPER_IDLE_UNLOAD_MIN`, varsayılan 10) ve sağlık "idle" olarak sağlıklı görünür; tepsi "Oyun modu" whisper-svc'yi durdurur; arayüz mikrofon notu
+  - [ ] T8.7 — Uyandırma sözcüğü ("Hey Shadow"/"Merhaba Shadow"), tepsiye gömülü openWakeWord
 - **T9 — Uçtan uca doğrulama** — Durum: Başlanmadı
   - [ ] T9.1 — Kabul senaryoları 1–6, telefonda ve ana PC tarayıcısında
   - [ ] T9.2 — Türkçe tanıma ve ses kalitesi değerlendirmesi; gerekirse ElevenLabs kararı

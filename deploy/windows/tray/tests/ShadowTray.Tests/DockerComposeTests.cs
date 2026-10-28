@@ -20,6 +20,22 @@ public class DockerComposeTests
     }
 
     [Fact]
+    public void Game_mode_commands_use_the_same_env_file_handling()
+    {
+        var env = Path.GetTempFileName();
+        try
+        {
+            Assert.Equal(["compose", "--env-file", env, "stop", "whisper-svc"], DockerCompose.Arguments(GameModeController.StopCommand, env));
+            Assert.Equal(["compose", "--env-file", env, "up", "-d", "whisper-svc"], DockerCompose.Arguments(GameModeController.StartCommand, env));
+        }
+        finally
+        {
+            File.Delete(env);
+        }
+        Assert.Equal(["compose", "stop", "whisper-svc"], DockerCompose.Arguments(GameModeController.StopCommand, null));
+    }
+
+    [Fact]
     public void Missing_env_file_is_left_out()
     {
         Assert.Equal(["compose", "up", "-d"], DockerCompose.Arguments("up", Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"))));

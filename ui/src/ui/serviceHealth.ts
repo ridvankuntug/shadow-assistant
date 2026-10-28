@@ -58,3 +58,40 @@ export function serviceIssues(services: readonly ServiceHealth[]): ServiceIssues
 export function issuesSummary(issues: ServiceIssues): string {
   return issues.items.map((s) => `${serviceLabel(s.name)}: ${serviceReason(s)}`).join("; ");
 }
+
+/** The services.yaml name of the speech-to-text service. */
+export const STT_SERVICE = "whisper-svc";
+
+/**
+ * Whether push-to-talk can work, from the Core's health list (both adapters
+ * send their audio to the Core, which uses whisper-svc):
+ * - `unknown`: no health item yet (before the first `services` frame, or the
+ *   Core does not list whisper-svc) — the mic stays usable;
+ * - `ready`: `ok`;
+ * - `idle`: `ok` with detail `idle` — the model is unloaded and reloads on the
+ *   next request, so the mic stays usable but the first answer is slower;
+ * - `loading`: starting up;
+ * - `failed`: `down` with detail `error` — the service answers but its model
+ *   failed to load (e.g. an idle reload ran out of GPU memory). whisper-svc only
+ *   retries the load on the next request, so the mic stays usable: pressing it
+ *   is the user's way to retry (the Core answers `stt_unavailable` if it fails
+ *   again);
+ * - `off`: any other `down` (unreachable, timeout, …), `disabled` (incl. game
+ *   mode) or a status this client does not know (e.g. the container was stopped
+ *   on the host).
+ */
+export type SttStatus = "unknown" | "ready" | "idle" | "loading" | "failed" | "off";
+
+export function sttStatus(services: readonly ServiceHealth[]): SttStatus {
+  const item = services.find((s) => s.name === STT_SERVICE);
+  if (!item) return "unknown";
+  if (item.status === "ok") return item.detail === "idle" ? "idle" : "ready";
+  if (item.status === "loading") return "loading";
+  if (item.status === "down" && item.detail === "error") return "failed";
+  return "off";
+}
+
+/** The mic button is disabled for these (the Core would answer `stt_unavailable`). */
+export function sttBlocked(status: SttStatus): boolean {
+  return status === "off" || status === "loading";
+}

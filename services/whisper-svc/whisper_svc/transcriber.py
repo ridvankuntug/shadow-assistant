@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import os
@@ -39,6 +40,8 @@ class Transcriber(Protocol):
     def info(self) -> dict: ...
 
     def load(self) -> None: ...
+
+    def unload(self) -> None: ...
 
     def validate_language(self, language: str) -> None: ...
 
@@ -97,6 +100,7 @@ class WhisperTranscriber:
         self._model = None
         self._lock = threading.Lock()
         self._languages: frozenset[str] = frozenset()
+        self._dll_dirs_added = False
 
     def info(self) -> dict:
         return {
@@ -106,17 +110,59 @@ class WhisperTranscriber:
         }
 
     def load(self) -> None:
-        dirs = add_nvidia_dll_dirs()
-        if dirs:
-            log.info("added %d NVIDIA DLL directories", len(dirs))
+        if not self._dll_dirs_added:  # once per process: a reload must not grow PATH again
+            dirs = add_nvidia_dll_dirs()
+            if dirs:
+                log.info("added %d NVIDIA DLL directories", len(dirs))
+            self._dll_dirs_added = True
         from faster_whisper import WhisperModel
         from faster_whisper.tokenizer import _LANGUAGE_CODES
 
+        # Release any model still held (e.g. a previous load whose cleanup failed)
+        # before building a new one: two models on an 8 GB card means OOM.
+        self.unload()
         s = self._settings
         log.info("loading model=%s device=%s compute_type=%s", s.model, s.device, s.compute_type)
         self._model = WhisperModel(s.model, device=s.device, compute_type=s.compute_type)
         self._languages = frozenset(_LANGUAGE_CODES)
-        self._warmup()
+        try:
+            self._warmup()
+        except BaseException:
+            # A failed warm-up (typically CUDA OOM) must not leave the half-loaded model
+            # holding GPU memory, or every retry would OOM as well.
+            try:
+                self.unload()
+            except Exception:
+                log.warning("releasing model after failed warm-up failed", exc_info=True)
+            raise
+
+    def unload(self) -> None:
+        """Free the model's GPU memory. ``load()`` brings it back.
+
+        Steps, each needed for the memory to actually go back to the driver:
+
+        1. Detach the model under the inference lock (never mid-inference).
+        2. ``unload_model()`` on the CTranslate2 model frees the weights on the device
+           right away, even if a stray reference to the Python object survives.
+        3. Drop the last reference (+ ``gc.collect()`` for reference cycles inside
+           faster-whisper): the CTranslate2 model is destroyed and its worker threads
+           exit. CTranslate2's CUDA caching allocator and cuBLAS/cuDNN handles are
+           per worker thread, so they are released only now.
+
+        What stays is the process's CUDA context (driver-owned; it cannot be released
+        without ending the process) - see README "Idle unload" for measured numbers.
+        The supported-language set is kept so language validation works while idle.
+        """
+        with self._lock:
+            model, self._model = self._model, None
+        if model is None:
+            return
+        try:
+            model.model.unload_model()
+        except Exception:  # still drop the reference below
+            log.warning("ctranslate2 unload_model() failed", exc_info=True)
+        del model
+        gc.collect()
 
     def _warmup(self) -> None:
         """Run one inference so CUDA kernels/cuBLAS handles are initialised before traffic."""

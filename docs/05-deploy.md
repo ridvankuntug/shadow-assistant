@@ -59,6 +59,59 @@ docker compose --env-file ../.env down            # stop; model/voice volumes ar
   curl.exe -s http://127.0.0.1:8702/health
   ```
 
+### Voices
+
+tts-svc offers `tr_TR-dfki-medium` (default, CC BY-NC-SA 4.0: non-commercial
+use only), `tr_TR-fahrettin-medium` and `tr_TR-fettah-medium` (both CC0). The
+others are downloaded into the `tts-voices` volume on first use (~63 MB each).
+The first request for a new voice may answer `tts_unavailable` while it
+downloads (`TTS_VOICE_LOAD_WAIT_S`, default 20 s). To fetch them ahead of time,
+from `deploy/`:
+
+```powershell
+docker compose run --rm tts-svc python -m tts_svc.voices tr_TR-fahrettin-medium tr_TR-fettah-medium
+```
+
+The choice is per device in the UI (Ayarlar → Ses, "Dene" plays a sample).
+Licences are listed in `THIRD_PARTY_NOTICES.md`.
+
+### Pronunciation
+
+`pronunciations.yaml` in the repo root maps written words to how they should be
+spoken (e.g. `Shadow: Şadov`). The Core applies it only to text sent to
+tts-svc, never to what is shown. Matching is whole word and case-insensitive,
+and a suffix after an apostrophe is kept. Edit the file and restart the Core.
+
+### Idle GPU release (whisper-svc)
+
+After `WHISPER_IDLE_UNLOAD_MIN` minutes (default 10) without transcription
+requests, whisper-svc unloads its model and returns ~90 % of its VRAM (only the
+CUDA context, ~60-90 MiB, stays; measured with the small model). The first
+voice command afterwards reloads the model and waits for it (a few seconds).
+Meanwhile `/health` answers `200 {"status":"idle",...}`, so the service still
+counts as up (Core detail `idle`, tray "hazır (boşta, model kaldırıldı)", UI
+hint). `0` keeps the model loaded. After a failed reload `/health` returns
+`503 error`; the next request tries again.
+
+### Oyun modu (tray)
+
+Tray menu → *Oyun modu* stops the whisper-svc container
+(`docker compose --env-file ..\.env stop whisper-svc` in `deploy\`) to free the
+GPU; unchecking runs `docker compose --env-file ..\.env up -d whisper-svc`.
+While on, the tray icon shows a pause mark, the tooltip starts with
+"(oyun modu)", and whisper-svc reads "oyun modu" instead of turning the icon
+yellow. The setting survives restarts
+(`%LOCALAPPDATA%\ShadowAssistant\tray-state.json`); a tray started with game
+mode on says so (balloon) and stops whisper-svc again. If a docker command
+fails, the check does not move (see `core.log`). The web UI disables the mic
+with a note while whisper-svc is down; typing still works.
+
+### Redeploy after this change
+
+From `deploy/`: `docker compose --env-file ../.env up -d --build tts-svc whisper-svc`
+(rebuilds both images). Then rebuild the Core (`core/dist`) and restart it,
+rebuild `ui`, and re-publish the tray app.
+
 ## 3. Core: tray app started by a scheduled task
 
 ### Why a task in your own session

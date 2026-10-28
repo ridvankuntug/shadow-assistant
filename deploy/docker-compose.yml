@@ -40,6 +40,8 @@ services:
       WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE:-float16}"
       WHISPER_BEAM_SIZE: "${WHISPER_BEAM_SIZE:-1}"
       WHISPER_VAD: "${WHISPER_VAD:-1}"
+      # Free the GPU after this many minutes without requests (0 = never).
+      WHISPER_IDLE_UNLOAD_MIN: "${WHISPER_IDLE_UNLOAD_MIN:-10}"
       # 1 = never contact Hugging Face; the model must already be in the volume.
       HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
     volumes:
@@ -74,6 +76,7 @@ services:
       TTS_VOICE: "${TTS_VOICE:-tr_TR-dfki-medium}"
       TTS_VOICES: "${TTS_VOICES:-}"
       TTS_AUTO_DOWNLOAD: "${TTS_AUTO_DOWNLOAD:-1}"
+      TTS_VOICE_LOAD_WAIT_S: "${TTS_VOICE_LOAD_WAIT_S:-20}"
     volumes:
       # Voices are downloaded (SHA-256 verified) on first start and kept here.
       - tts-voices:/voices

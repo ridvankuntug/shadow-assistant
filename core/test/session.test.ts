@@ -12,11 +12,12 @@ import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
 import { ConversationLog } from "../src/conversation-log.js";
 import { PermissionPolicy } from "../src/permissions.js";
+import { compileLexicon, type Lexicon } from "../src/pronunciation.js";
 import type { ClientFrame, ServerFrame } from "../src/protocol.js";
 import type { UsageRecord } from "../src/router.js";
 import { parseServices } from "../src/services.js";
 import { Session } from "../src/session.js";
-import { SpeechServiceError, type SttClient, type TtsClient } from "../src/speech.js";
+import { SpeechServiceError, TTS_MAX_TEXT_CHARS, type SttClient, type TtsClient } from "../src/speech.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-session-test-"));
 const open: Session[] = [];
@@ -77,7 +78,13 @@ interface Harness {
 let counter = 0;
 function harness(
   script: Script,
-  opts: { readOnly?: boolean; stt?: SttClient; tts?: TtsClient; confirmTimeoutMs?: number } = {},
+  opts: {
+    readOnly?: boolean;
+    stt?: SttClient;
+    tts?: TtsClient;
+    confirmTimeoutMs?: number;
+    pronunciations?: Lexicon;
+  } = {},
 ): Harness {
   const frames: ServerFrame[] = [];
   const waiters: Array<() => void> = [];
@@ -90,10 +97,14 @@ function harness(
       policy: new PermissionPolicy(services, { readOnly: opts.readOnly }),
       router: { route: () => ({ model: "test-model" }), onUsage: (u) => usage.push(u) },
       stt: opts.stt ?? { transcribe: async () => ({ text: "" }) },
-      tts: opts.tts ?? { synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }) },
+      tts: opts.tts ?? {
+        synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }),
+        voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+      },
       log,
       logger: { info: () => {}, warn: () => {} },
       confirmTimeoutMs: opts.confirmTimeoutMs ?? 5_000,
+      pronunciations: opts.pronunciations,
     },
     { sessionId: `s${counter}`, device: "browser" },
     (f) => {
@@ -399,6 +410,9 @@ test("speak → speech or tts_unavailable", async () => {
       synthesize: async () => {
         throw new SpeechServiceError("tts_unavailable", "tts-svc: service unreachable");
       },
+      voices: async () => {
+        throw new SpeechServiceError("tts_unavailable", "tts-svc: service unreachable");
+      },
     },
   });
   await h2.send({ type: "speak", id: "t1", text: "merhaba" });
@@ -522,4 +536,138 @@ test("close() while transcribing: the utterance never becomes a turn", async () 
   await voice;
   assert.equal(h.agent.calls.length, 0);
   assert.equal(sessionLines(h).map((l) => l.kind).at(-1), "session_end");
+});
+
+test("speak passes the requested voice to the tts client", async () => {
+  const seen: Array<string | undefined> = [];
+  const h = harness(async () => {}, {
+    tts: {
+      synthesize: async (_text, _signal, voice) => {
+        seen.push(voice);
+        return { mime: "audio/wav", data: Buffer.from("RIFF") };
+      },
+      voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+    },
+  });
+  await h.send({ type: "speak", id: "t1", text: "merhaba", voice: "tr_TR-fettah-medium" });
+  await h.send({ type: "speak", id: "t2", text: "merhaba" });
+  assert.deepEqual(seen, ["tr_TR-fettah-medium", undefined]);
+  assert.equal(h.of("speech").length, 2);
+});
+
+test("speak sends the lexicon-rewritten text to tts-svc; turns, frames and logs keep the original", async () => {
+  const spoken: string[] = [];
+  const pronunciations = compileLexicon([{ from: "Shadow", to: "Şadov" }]).lexicon;
+  const h = harness(async (_req, cb) => {
+    cb.onDelta("Ben Shadow.");
+    return { text: "Ben Shadow." };
+  }, {
+    pronunciations,
+    tts: {
+      synthesize: async (text) => {
+        spoken.push(text);
+        return { mime: "audio/wav", data: Buffer.from("RIFF") };
+      },
+      voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+    },
+  });
+  await h.send({ type: "speak", id: "t1", text: "Merhaba, ben Shadow. Shadow'a sor, SHADOW’u dinle; Shadowlar değil." });
+  await h.send({ type: "speak", id: "t2", text: "merhaba" });
+  assert.deepEqual(spoken, ["Merhaba, ben Şadov. Şadov'a sor, Şadov’u dinle; Shadowlar değil.", "merhaba"]);
+  assert.deepEqual(
+    h.of("speech").map((f) => f.id),
+    ["t1", "t2"],
+  );
+
+  // A turn mentioning Shadow is untouched: the model gets and the client sees "Shadow".
+  await h.send({ type: "user_text", id: "u1", text: "Shadow'a merhaba" });
+  await h.waitFor((f) => f.type === "state" && f.state === "idle");
+  assert.ok(h.agent.calls[0]?.prompt.includes("Shadow'a merhaba"));
+  await h.session.close("test");
+  const lines = sessionLines(h);
+  const logged = JSON.stringify(lines);
+  assert.ok(logged.includes("Shadow'a merhaba"));
+  assert.ok(!logged.includes("Şadov"));
+  assert.ok(!JSON.stringify(h.frames).includes("Şadov"));
+});
+
+test("speak without a lexicon sends the text unchanged", async () => {
+  const spoken: string[] = [];
+  const h = harness(async () => {}, {
+    tts: {
+      synthesize: async (text) => {
+        spoken.push(text);
+        return { mime: "audio/wav", data: Buffer.from("RIFF") };
+      },
+      voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+    },
+  });
+  await h.send({ type: "speak", id: "t1", text: "Ben Shadow." });
+  assert.deepEqual(spoken, ["Ben Shadow."]);
+});
+
+test("speak clips the lexicon-lengthened text to tts-svc's limit at a sentence boundary", async () => {
+  const spoken: string[] = [];
+  const pronunciations = compileLexicon([{ from: "Shadow", to: "Şadov Şadov Şadov" }]).lexicon;
+  const h = harness(async () => {}, {
+    pronunciations,
+    tts: {
+      synthesize: async (text) => {
+        spoken.push(text);
+        return { mime: "audio/wav", data: Buffer.from("RIFF") };
+      },
+      voices: async () => ({ default: "tr_TR-dfki-medium", voices: ["tr_TR-dfki-medium"] }),
+    },
+  });
+  // 1980 chars as clipped by the client; the lexicon pushes it past 2000.
+  const sentence = "Ben Shadow, merhaba. "; // 21 chars
+  const text = sentence.repeat(94).trim() + " Shadow"; // 1980 chars
+  assert.equal(text.length, 1980);
+  await h.send({ type: "speak", id: "t1", text });
+  // Longer than tts-svc's max even before the lexicon (Core accepts up to 4000).
+  await h.send({ type: "speak", id: "t2", text: "a ".repeat(1999) + "b" });
+  assert.equal(spoken.length, 2);
+  assert.ok(spoken[0]!.length <= TTS_MAX_TEXT_CHARS);
+  assert.ok(spoken[0]!.endsWith("merhaba."), "cut at a sentence end");
+  assert.ok(spoken[0]!.startsWith("Ben Şadov Şadov Şadov, merhaba."));
+  assert.ok(spoken[1]!.length <= TTS_MAX_TEXT_CHARS && spoken[1]!.endsWith("a"));
+  assert.deepEqual(
+    h.of("speech").map((f) => f.id),
+    ["t1", "t2"],
+  );
+  assert.equal(h.of("error").length, 0);
+});
+
+test("voices → voices frame with labels, or error tts_unavailable with the id", async () => {
+  const h = harness(async () => {}, {
+    tts: {
+      synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }),
+      voices: async () => ({
+        default: "tr_TR-dfki-medium",
+        voices: ["tr_TR-dfki-medium", "tr_TR-fahrettin-medium", "tr_TR-fettah-medium"],
+      }),
+    },
+  });
+  await h.send({ type: "voices", id: "v1" });
+  assert.deepEqual(h.of("voices")[0], {
+    type: "voices",
+    id: "v1",
+    default: "tr_TR-dfki-medium",
+    voices: [
+      { id: "tr_TR-dfki-medium", label: "DFKI (orta kalite)", quality: "medium" },
+      { id: "tr_TR-fahrettin-medium", label: "Fahrettin (orta kalite)", quality: "medium" },
+      { id: "tr_TR-fettah-medium", label: "Fettah (orta kalite)", quality: "medium" },
+    ],
+  });
+  const h2 = harness(async () => {}, {
+    tts: {
+      synthesize: async () => ({ mime: "audio/wav", data: Buffer.from("RIFF") }),
+      voices: async () => {
+        throw new SpeechServiceError("tts_unavailable", "tts-svc is not ready (503)");
+      },
+    },
+  });
+  await h2.send({ type: "voices", id: "v2" });
+  assert.deepEqual(h2.of("error")[0], { type: "error", id: "v2", code: "tts_unavailable", message: "tts-svc is not ready (503)" });
+  assert.equal(h2.of("voices").length, 0);
 });

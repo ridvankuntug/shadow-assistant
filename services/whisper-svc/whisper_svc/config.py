@@ -45,6 +45,10 @@ class Settings:
     beam_size: int = 1
     vad_filter: bool = True
     max_upload_bytes: int = MAX_UPLOAD_BYTES
+    # Unload the model from the GPU after this many seconds without transcription
+    # requests and reload it on the next one; 0 = never. Set via WHISPER_IDLE_UNLOAD_MIN
+    # (whole minutes, default 10); seconds here only so tests can use short timeouts.
+    idle_unload_seconds: float = 600.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -53,6 +57,9 @@ class Settings:
         beam = _env_int(e.get("WHISPER_BEAM_SIZE"), d.beam_size, "WHISPER_BEAM_SIZE")
         if beam < 1:
             raise ValueError("WHISPER_BEAM_SIZE must be >= 1")
+        idle_min = _env_int(e.get("WHISPER_IDLE_UNLOAD_MIN"), 10, "WHISPER_IDLE_UNLOAD_MIN")
+        if idle_min < 0:
+            raise ValueError("WHISPER_IDLE_UNLOAD_MIN must be >= 0 (0 = never unload)")
         return cls(
             host=e.get("HOST") or d.host,
             port=_env_int(e.get("PORT"), d.port, "PORT"),
@@ -61,4 +68,5 @@ class Settings:
             compute_type=e.get("WHISPER_COMPUTE_TYPE") or d.compute_type,
             beam_size=beam,
             vad_filter=_env_bool(e.get("WHISPER_VAD"), d.vad_filter),
+            idle_unload_seconds=idle_min * 60.0,
         )

@@ -11,6 +11,7 @@ import type { ClientMessage, ServerMessage } from "../protocol/types.ts";
 import { toPlatformError, type PlatformAdapter } from "../platform/types.ts";
 import {
   bargeInTarget,
+  canPreviewVoice,
   confirmPending,
   currentConfirm,
   initialState,
@@ -34,6 +35,14 @@ export const HISTORY_LIMIT = 20;
  * answers `busy` to a new turn until the old one has wound down.
  */
 export const CANCEL_SETTLE_MS = 2_000;
+/**
+ * A `voices` request without an answer after this long is shown as
+ * unavailable (e.g. an older Core that does not know the frame). A late answer
+ * still fills the list.
+ */
+export const VOICES_TIMEOUT_MS = 8_000;
+/** Spoken by the "Dene" button in the voice picker. */
+export const VOICE_SAMPLE_TEXT = "Merhaba, ben Shadow. Sesim kulağına nasıl geliyor?";
 
 type TurnFrame = Extract<ClientMessage, { type: "user_text" } | { type: "audio" }>;
 
@@ -93,6 +102,9 @@ export class AssistantController {
   private cancelling = false;
   private queuedTurn: TurnFrame | null = null;
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** tts-svc voice for `speak` (user setting); null = the Core's default. */
+  private voice: string | null = null;
+  private voicesTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: ControllerDeps) {
     this.deps = deps;
@@ -161,6 +173,7 @@ export class AssistantController {
     this.disconnect();
     this.cancelTalk();
     this.resetCancelling();
+    this.clearVoicesTimer();
     this.stopLocalAudio();
   }
 
@@ -301,6 +314,46 @@ export class AssistantController {
     this.voiceReplies = enabled;
   }
 
+  /** Voice id sent with every `speak`; null or "" = the Core's default. */
+  setVoice(voice: string | null): void {
+    this.voice = voice || null;
+  }
+
+  /**
+   * Asks the Core for the tts-svc voice list (core TTS mode only). Does
+   * nothing while not connected or while a request is already in flight.
+   */
+  requestVoices(): void {
+    if (this.adapter.tts.mode !== "core" || !this.connected) return;
+    if (this.state.voices.status === "loading") return;
+    const id = this.newId();
+    if (!this.client?.send({ type: "voices", id })) return;
+    this.dispatch({ type: "voices_requested", id });
+    this.clearVoicesTimer();
+    this.voicesTimer = setTimeout(() => {
+      this.voicesTimer = null;
+      this.dispatch({ type: "voices_timeout", id });
+    }, VOICES_TIMEOUT_MS);
+  }
+
+  /**
+   * "Dene": speaks a short sample with `voice` (null = the Core's default)
+   * and plays it like a reply. Only while no turn is in flight
+   * (canPreviewVoice); a reply being spoken is stopped first.
+   */
+  previewVoice(voice: string | null): boolean {
+    if (this.adapter.tts.mode !== "core" || !canPreviewVoice(this.state)) return false;
+    this.adapter.playback.unlock();
+    this.stopSpeaking();
+    const id = this.newId();
+    const frame = voice
+      ? { type: "speak" as const, id, text: VOICE_SAMPLE_TEXT, voice }
+      : { type: "speak" as const, id, text: VOICE_SAMPLE_TEXT };
+    if (!this.send(frame)) return false;
+    this.dispatch({ type: "voice_preview_requested", id });
+    return true;
+  }
+
   dismissNotice(): void {
     this.dispatch({ type: "dismiss_notice" });
   }
@@ -377,6 +430,11 @@ export class AssistantController {
     this.dispatch({ type: "notice", notice: { code: `mic_${e.code}`, message: e.message } });
   }
 
+  private clearVoicesTimer(): void {
+    if (this.voicesTimer !== null) clearTimeout(this.voicesTimer);
+    this.voicesTimer = null;
+  }
+
   private clearMaxTimer(): void {
     if (this.maxTimer !== null) clearTimeout(this.maxTimer);
     this.maxTimer = null;
@@ -386,7 +444,11 @@ export class AssistantController {
     this.dispatch({ type: "server", msg });
     switch (msg.type) {
       case "welcome":
+        this.clearVoicesTimer(); // the reducer reset the voice list
         this.requestHistory();
+        break;
+      case "voices":
+        if (msg.id === this.state.voices.requestId) this.clearVoicesTimer();
         break;
       case "state":
         if (msg.state === "idle" && this.cancelling) this.flushQueuedTurn();
@@ -413,7 +475,8 @@ export class AssistantController {
     const clipped = clipForSpeech(text);
     const tts = this.adapter.tts;
     if (tts.mode === "core") {
-      if (this.client?.send({ type: "speak", id, text: clipped })) {
+      const frame = this.voice ? { type: "speak" as const, id, text: clipped, voice: this.voice } : { type: "speak" as const, id, text: clipped };
+      if (this.client?.send(frame)) {
         this.dispatch({ type: "speech_requested", id });
       }
       return;
