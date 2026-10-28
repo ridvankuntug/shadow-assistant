@@ -4,30 +4,27 @@ namespace ShadowTray;
 public sealed record HealthReading(CoreHealth Health, DateTimeOffset At);
 
 /// <summary>
-/// Polls the Core's <c>GET /health</c> (unauthenticated; names, enabled flags
-/// and statuses only — see docs/02-core-protocol.md). The Core itself checks
-/// home-assistant, whisper-svc and tts-svc every CORE_HEALTH_INTERVAL_MS, so
-/// the tray never talks to those services directly.
+/// Polls the Core's <c>GET /health</c> for the UI (see <see cref="HttpCoreHealthProbe"/>).
+/// The Core itself checks home-assistant, whisper-svc and tts-svc every
+/// CORE_HEALTH_INTERVAL_MS, so the tray never talks to those services directly.
 /// </summary>
 public sealed class HealthPoller : IDisposable
 {
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(5);
 
-    private readonly HttpClient _http;
-    private readonly Uri _healthUrl;
+    private readonly ICoreHealthProbe _probe;
     private readonly Func<bool> _shouldPoll;
     private readonly CancellationTokenSource _cts = new();
     private HealthReading? _latest;
 
-    /// <param name="shouldPoll">Polls only while this is true (the Core is running).</param>
-    public HealthPoller(Uri coreBaseUrl, Func<bool> shouldPoll)
+    /// <param name="shouldPoll">Polls only while this is true (a Core is running: the tray's own or an external one).</param>
+    public HealthPoller(ICoreHealthProbe probe, Func<bool> shouldPoll)
     {
-        _healthUrl = new Uri(coreBaseUrl, "/health");
+        _probe = probe;
         _shouldPoll = shouldPoll;
-        _http = new HttpClient(new SocketsHttpHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(2) };
     }
 
-    /// <summary>Latest result; null while the Core is not running or before the first poll.</summary>
+    /// <summary>Latest result; null while no Core is running or before the first poll.</summary>
     public HealthReading? Latest => Volatile.Read(ref _latest);
 
     public void Start() => _ = Task.Run(LoopAsync);
@@ -43,18 +40,11 @@ public sealed class HealthPoller : IDisposable
             {
                 try
                 {
-                    using var res = await _http.GetAsync(_healthUrl, _cts.Token).ConfigureAwait(false);
-                    result = res.IsSuccessStatusCode
-                        ? CoreHealth.Parse(await res.Content.ReadAsStringAsync(_cts.Token).ConfigureAwait(false))
-                        : CoreHealth.Unreachable;
+                    result = await _probe.CheckAsync(_cts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (_cts.IsCancellationRequested)
                 {
                     return;
-                }
-                catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
-                {
-                    result = CoreHealth.Unreachable;
                 }
             }
             Volatile.Write(ref _latest, result is null ? null : new HealthReading(result, startedAt));
@@ -74,9 +64,6 @@ public sealed class HealthPoller : IDisposable
         }
     }
 
-    public void Dispose()
-    {
-        _cts.Cancel();
-        _http.Dispose();
-    }
+    /// <summary>Does not dispose the probe (the owner does).</summary>
+    public void Dispose() => _cts.Cancel();
 }

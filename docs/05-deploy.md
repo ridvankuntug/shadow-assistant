@@ -84,18 +84,28 @@ The task starts the tray app `deploy/windows/tray/publish/ShadowTray.exe`
 - does not restart after a clean exit (code 0);
 - writes the Core's output to `%LOCALAPPDATA%\ShadowAssistant\logs\core.log`,
   rotated at 10 MB, keeping 5 old files (`core.1.log` ...);
-- allows only one instance per session;
+- allows only one instance per session (a second start says "Shadow Tray
+  zaten çalışıyor" and exits);
+- does not start a second Core when one started by hand already answers
+  `GET /health`: it shows "Core dışarıda çalışıyor" (blue icon), watches it,
+  and starts and supervises its own Core once that one has stopped answering
+  for about 10 s;
 - keeps the Core in a job object, so the Core ends when the tray app ends;
-- shows a green / yellow / red icon in the notification area with a menu:
-  status of the Core and of each service (from the Core's `GET /health`),
+- shows a green / yellow / red (blue: external Core) icon in the notification
+  area with a menu: status of the Core and of each service (from the Core's
+  `GET /health`, with its short `detail` code such as "kapalı (timeout)"),
   **Arayüzü aç** (serves `ui/dist` at `http://localhost:8703/`, port
-  `SHADOW_UI_PORT`), **Yeniden başlat / Durdur / Başlat**, start/stop of the
-  speech containers (`docker compose up -d` / `down`), **Logları aç** and
-  **Çıkış**.
+  `SHADOW_UI_PORT`; the browser is opened through explorer.exe so that it is
+  not killed with the task's job), **Yeniden başlat / Durdur / Başlat**,
+  start/stop of the speech containers (`docker compose up -d` / `down`),
+  **Logları aç** and **Çıkış**.
 
 Stopping (menu or Çıkış) is graceful: the tray sends the Core Ctrl+C, which
 the Core handles like SIGINT (closes connections, flushes logs, exits 0); after
-10 s it is killed.
+10 s it is killed. A Core started moments ago is first given up to 5 s from
+its start to answer `/health` (its handler is in place by then). Ctrl+C
+rather than Ctrl+Break (SIGBREAK) because it stops older Core builds cleanly
+too; details in the tray README.
 
 The task itself has no time limit, ignores a second start while running, and
 has Task Scheduler's own "restart on failure" (3 times, every 5 min) as a
@@ -104,9 +114,11 @@ second line of defence for when the tray app itself fails.
 Paths are not hard-coded: the repo root defaults to the first folder above
 the exe that contains `core\` and `services.yaml`, `node` comes from PATH.
 Override with `--repo-root`, `--node-path`, `--log-dir` or the environment
-variables `SHADOW_REPO_ROOT`, `SHADOW_NODE_PATH`, `SHADOW_CORE_LOG_DIR`. The
-installer writes the resolved repo root and node path into the task's
-arguments, so the task does not depend on those variables later.
+variables `SHADOW_REPO_ROOT`, `SHADOW_NODE_PATH`, `SHADOW_CORE_LOG_DIR` (real
+environment only, not `.env`). The installer writes the resolved repo root
+and node path into the task's arguments, so the task does not depend on
+those variables later. An unknown argument is logged as a warning and
+ignored.
 
 `deploy/windows/run-core.ps1` (the PowerShell supervisor the task used before)
 stays as a **manual fallback**, e.g. when the .NET runtime is missing:
@@ -277,7 +289,8 @@ Without the scripts, the same remote can be defined in plain rclone:
 | --- | --- |
 | `install-core-task.ps1`: "Access is denied" | Some managed PCs block per-user task creation. Run the installer once from an elevated PowerShell; the task still runs as you, not elevated. |
 | Tray icon red, menu says "vazgeçildi" | `core.log`: a config error (e.g. no device tokens) makes the Core exit; after 20 quick failures the tray gives up. Fix the cause, then **Başlat** in the tray menu. |
-| No tray icon after sign-in | Task last result in Task Scheduler; `ShadowTray.exe` missing (publish it) or the .NET 10 runtime missing. Start it by hand to see. A second instance exits silently while one (or `run-core.ps1`) is running. |
+| No tray icon after sign-in | Task last result in Task Scheduler; `ShadowTray.exe` missing (publish it) or the .NET 10 runtime missing. Start it by hand to see. While one (or `run-core.ps1`) is running, a second start shows "Shadow Tray zaten çalışıyor" and exits. |
+| Tray icon blue, "Core dışarıda çalışıyor" | A Core the tray did not start answers on `CORE_PORT` (started by hand or `npm run dev`). The tray starts its own about 10 s after that one stops. |
 | Tray menu: "Arayüz: port 8703 kullanılamıyor" | Another program uses the port: set `SHADOW_UI_PORT` in `.env`, then restart the tray app. |
 | "Core derlenmemiş" in the tray menu, or `run-core.ps1 -DryRun` warns "Core is not built" | `npm ci` and `npm run build` in `core/`, then **Başlat**. |
 | Core answers "not logged in" / auth errors | Sign in to Claude Code as the same Windows user (`claude` in a terminal), then restart the task. |

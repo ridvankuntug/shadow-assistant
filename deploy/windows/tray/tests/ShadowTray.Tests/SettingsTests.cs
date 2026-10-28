@@ -80,13 +80,26 @@ public sealed class SettingsTests : IDisposable
     }
 
     [Fact]
-    public void Invalid_repo_root_and_unknown_arguments_are_problems()
+    public void Invalid_repo_root_and_missing_values_are_problems()
     {
-        var s = TraySettings.Resolve(["--repo-root", Path.Combine(_root, "core"), "--bogus"], Env(), _root);
+        var s = TraySettings.Resolve(["--repo-root", Path.Combine(_root, "core")], Env(), _root);
         Assert.Contains(s.Problems, p => p.Contains("Repo kökü geçersiz"));
-        Assert.Contains(s.Problems, p => p.Contains("--bogus"));
         var s2 = TraySettings.Resolve(["--node-path"], Env(), _root);
         Assert.Contains(s2.Problems, p => p.Contains("değer eksik"));
+    }
+
+    [Fact]
+    public void Unknown_arguments_are_warnings_and_do_not_block_the_start()
+    {
+        var s = TraySettings.Resolve(["--bogus", "--repo-root", _root, "--Extra"], Env(), _root);
+        Assert.Empty(s.Problems);
+        Assert.Empty(s.StartProblems());
+        Assert.Equal(_root, s.RepoRoot);
+        Assert.Equal(2, s.Warnings.Count);
+        Assert.Contains(s.Warnings, w => w.Contains("--bogus"));
+        Assert.Contains(s.Warnings, w => w.Contains("--Extra"));
+
+        Assert.Empty(TraySettings.Resolve(["--repo-root", _root], Env(), _root).Warnings);
     }
 
     [Fact]

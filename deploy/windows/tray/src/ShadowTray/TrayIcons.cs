@@ -14,6 +14,7 @@ public sealed class TrayIcons : IDisposable
         _icons[TrayColour.Green] = Circle(size, Color.FromArgb(46, 194, 96));
         _icons[TrayColour.Yellow] = Circle(size, Color.FromArgb(245, 190, 30));
         _icons[TrayColour.Red] = Circle(size, Color.FromArgb(220, 50, 50));
+        _icons[TrayColour.Blue] = Circle(size, Color.FromArgb(50, 130, 220));
     }
 
     public Icon this[TrayColour colour] => _icons[colour];

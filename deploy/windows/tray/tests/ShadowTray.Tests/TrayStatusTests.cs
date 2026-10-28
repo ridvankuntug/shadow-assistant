@@ -134,6 +134,66 @@ public class TrayStatusTests
     }
 
     [Fact]
+    public void Detail_is_shown_after_the_status_and_its_absence_is_tolerated()
+    {
+        var h = new CoreHealth(true,
+        [
+            new ServiceHealth("home-assistant", true, "ok"),
+            new ServiceHealth("whisper-svc", true, "down", "timeout"),
+            new ServiceHealth("tts-svc", true, "down"),
+        ]);
+        var s = TrayStatusEvaluator.Evaluate(Running(), h, Now);
+        Assert.Equal(TrayColour.Yellow, s.Colour);
+        Assert.Equal(["home-assistant: çalışıyor", "whisper-svc: kapalı (timeout)", "tts-svc: kapalı"], s.Lines.Skip(1));
+        Assert.Equal("Shadow Assistant: sorun: whisper-svc kapalı (timeout), tts-svc kapalı", s.Tooltip);
+    }
+
+    private static SupervisorSnapshot External(TimeSpan? since = null) =>
+        new(CoreRunState.External, RunningSince: Now - (since ?? TimeSpan.FromMinutes(1)));
+
+    [Fact]
+    public void External_core_is_blue_with_its_services()
+    {
+        var s = TrayStatusEvaluator.Evaluate(External(), AllOk, Now);
+        Assert.Equal(TrayColour.Blue, s.Colour);
+        Assert.Equal("Shadow Assistant: Core dışarıda çalışıyor", s.Tooltip);
+        Assert.Equal(
+            ["Core: dışarıda çalışıyor", "home-assistant: çalışıyor", "shadow-vault: devre dışı", "whisper-svc: çalışıyor", "tts-svc: çalışıyor"],
+            s.Lines);
+    }
+
+    [Fact]
+    public void External_core_problems_are_in_the_tooltip_but_it_stays_blue()
+    {
+        var h = Health(("home-assistant", true, "ok"), ("whisper-svc", true, "down"));
+        var s = TrayStatusEvaluator.Evaluate(External(), h, Now);
+        Assert.Equal(TrayColour.Blue, s.Colour);
+        Assert.Equal("Shadow Assistant: Core dışarıda çalışıyor; sorun: whisper-svc kapalı", s.Tooltip);
+    }
+
+    [Fact]
+    public void External_core_without_a_reading_or_not_answering()
+    {
+        var waiting = TrayStatusEvaluator.Evaluate(External(), null, Now);
+        Assert.Equal(TrayColour.Blue, waiting.Colour);
+        Assert.Equal("Core: dışarıda çalışıyor", waiting.Lines[0]);
+        Assert.Equal(["home-assistant: bilinmiyor", "whisper-svc: bilinmiyor", "tts-svc: bilinmiyor"], waiting.Lines.Skip(1));
+
+        var gone = TrayStatusEvaluator.Evaluate(External(), CoreHealth.Unreachable, Now);
+        Assert.Equal(TrayColour.Blue, gone.Colour);
+        Assert.Equal("Core: dışarıda çalışıyor (yanıt vermiyor)", gone.Lines[0]);
+        Assert.Equal("Shadow Assistant: Core dışarıda çalışıyor", gone.Tooltip);
+    }
+
+    [Fact]
+    public void Health_of_an_external_core_counts_from_when_it_was_seen()
+    {
+        var snap = External(TimeSpan.FromSeconds(3));
+        Assert.Null(TrayStatusEvaluator.CurrentHealth(snap, new HealthReading(AllOk, Now.AddSeconds(-4))));
+        Assert.Same(AllOk, TrayStatusEvaluator.CurrentHealth(snap, new HealthReading(AllOk, Now.AddSeconds(-1))));
+    }
+
+    [Fact]
     public void Health_from_before_the_current_run_is_ignored()
     {
         var snap = Running(TimeSpan.FromSeconds(3));

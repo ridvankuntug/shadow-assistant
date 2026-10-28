@@ -20,13 +20,18 @@ public sealed record TraySettings
     public required int UiPort { get; init; }
     /// <summary>Things that keep the Core from starting (shown in the menu and log).</summary>
     public required IReadOnlyList<string> Problems { get; init; }
+    /// <summary>Logged only; the Core still starts (e.g. an unknown command-line argument, which is ignored).</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = [];
 
     public string? CoreEntry => RepoRoot is null ? null : Path.Combine(RepoRoot, "core", "dist", "index.js");
     public string? UiDist => RepoRoot is null ? null : Path.Combine(RepoRoot, "ui", "dist");
     public string? DeployDir => RepoRoot is null ? null : Path.Combine(RepoRoot, "deploy");
     public string? EnvFile { get; init; }
 
-    /// <param name="args">Command line: --repo-root, --node-path, --log-dir (each followed by a value).</param>
+    /// <param name="args">
+    /// Command line: --repo-root, --node-path, --log-dir (each followed by a
+    /// value). Anything else is ignored with a warning; a missing value is a problem.
+    /// </param>
     /// <param name="getEnv">Environment lookup (Environment.GetEnvironmentVariable in production).</param>
     /// <param name="exeDir">Folder of the running exe, start of the repo-root search.</param>
     public static TraySettings Resolve(IReadOnlyList<string> args, Func<string, string?> getEnv, string exeDir)
@@ -78,6 +83,7 @@ public sealed record TraySettings
             CoreBaseUrl = new UriBuilder("http", coreHost, corePort).Uri,
             UiPort = uiPort,
             Problems = problems,
+            Warnings = parsed.Warnings,
             EnvFile = envFile,
         };
     }
@@ -142,7 +148,7 @@ public sealed record TraySettings
     private static string? FirstNonEmpty(params string?[] values) =>
         values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))?.Trim();
 
-    private sealed record ParsedArgs(Dictionary<string, string> Values, List<string> Errors)
+    private sealed record ParsedArgs(Dictionary<string, string> Values, List<string> Errors, List<string> Warnings)
     {
         public string? Get(string name) => Values.GetValueOrDefault(name);
     }
@@ -152,13 +158,15 @@ public sealed record TraySettings
         var known = new[] { "--repo-root", "--node-path", "--log-dir" };
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
+        var warnings = new List<string>();
         for (var i = 0; i < args.Count; i++)
         {
             var a = args[i];
             var name = known.FirstOrDefault(k => string.Equals(k, a, StringComparison.OrdinalIgnoreCase));
             if (name is null)
             {
-                errors.Add($"Bilinmeyen argüman: {a}");
+                // Ignored, not fatal: a typo or a newer task's argument must not keep the Core down.
+                warnings.Add($"unknown command-line argument ignored: {a}");
                 continue;
             }
             if (i + 1 >= args.Count)
@@ -168,6 +176,6 @@ public sealed record TraySettings
             }
             values[name] = args[++i];
         }
-        return new ParsedArgs(values, errors);
+        return new ParsedArgs(values, errors, warnings);
     }
 }

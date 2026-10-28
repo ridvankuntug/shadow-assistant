@@ -16,6 +16,11 @@ public enum CoreRunState
     GaveUp,
     /// <summary>Cannot start (node or core\dist missing, bad arguments).</summary>
     Failed,
+    /// <summary>
+    /// A Core the tray did not start already answers /health; the tray starts
+    /// none and watches it (<see cref="SupervisorSnapshot.RunningSince"/> = when it was seen).
+    /// </summary>
+    External,
 }
 
 /// <summary>Thread-safe copy of the supervisor's state.</summary>
@@ -36,6 +41,8 @@ public enum TrayColour
     Green,
     Yellow,
     Red,
+    /// <summary>A Core started outside the tray runs; the tray only watches it.</summary>
+    Blue,
 }
 
 /// <summary>What the tray shows: icon colour, tooltip and the status lines of the menu.</summary>
@@ -50,7 +57,10 @@ public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList
 ///   yellow - Core running but /health not (yet) answering or an enabled
 ///            service is not ok (down / loading / unknown), or the Core is
 ///            waiting to be restarted / stopping;
-///   red    - Core stopped, given up or cannot start.
+///   red    - Core stopped, given up or cannot start;
+///   blue   - a Core started outside the tray answers /health (the tray
+///            watches it but cannot restart it); problems of its services are
+///            in the tooltip and menu, not in the colour.
 /// </summary>
 public static class TrayStatusEvaluator
 {
@@ -65,7 +75,7 @@ public static class TrayStatusEvaluator
     public static TrayStatus Evaluate(SupervisorSnapshot s, CoreHealth? health, DateTimeOffset now)
     {
         var lines = new List<string> { "Core: " + CoreLine(s, health, now) };
-        var reachable = s.State == CoreRunState.Running && health is { Reachable: true };
+        var reachable = s.State is CoreRunState.Running or CoreRunState.External && health is { Reachable: true };
 
         if (reachable && health!.Services.Count > 0)
         {
@@ -85,11 +95,13 @@ public static class TrayStatusEvaluator
                 summary = "Core başlıyor / yanıt vermiyor";
                 break;
             case CoreRunState.Running:
-                var bad = health!.Services.Where(IsProblem).ToList();
-                colour = bad.Count == 0 ? TrayColour.Green : TrayColour.Yellow;
-                summary = bad.Count == 0
-                    ? "her şey çalışıyor"
-                    : "sorun: " + string.Join(", ", bad.Select(b => $"{b.Name} {ServiceText(b)}"));
+                colour = health!.Services.Any(IsProblem) ? TrayColour.Yellow : TrayColour.Green;
+                summary = ProblemSummary(health) ?? "her şey çalışıyor";
+                break;
+            case CoreRunState.External:
+                colour = TrayColour.Blue;
+                summary = "Core dışarıda çalışıyor"
+                          + (reachable && ProblemSummary(health!) is { } problems ? "; " + problems : "");
                 break;
             case CoreRunState.WaitingRestart:
                 colour = TrayColour.Yellow;
@@ -116,26 +128,40 @@ public static class TrayStatusEvaluator
         return new TrayStatus(colour, Truncate(Prefix + summary, MaxTooltipLength), lines);
     }
 
+    /// <summary>"sorun: whisper-svc kapalı (timeout), …" or null when no enabled service has a problem.</summary>
+    private static string? ProblemSummary(CoreHealth health)
+    {
+        var bad = health.Services.Where(IsProblem).ToList();
+        return bad.Count == 0 ? null : "sorun: " + string.Join(", ", bad.Select(b => $"{b.Name} {ServiceText(b)}"));
+    }
+
     /// <summary>
-    /// The health reading that belongs to the current run: a reading taken
-    /// before the Core was (re)started describes an earlier process and is ignored.
+    /// The health reading that belongs to the current run (own or external
+    /// Core): a reading taken before the Core was (re)started or seen
+    /// describes an earlier process and is ignored.
     /// </summary>
     public static CoreHealth? CurrentHealth(SupervisorSnapshot s, HealthReading? reading) =>
-        reading is not null && s.State == CoreRunState.Running && s.RunningSince is { } since && reading.At >= since
+        reading is not null && s.State is CoreRunState.Running or CoreRunState.External
+                            && s.RunningSince is { } since && reading.At >= since
             ? reading.Health
             : null;
 
     /// <summary>An enabled service that is not ok makes the icon yellow; disabled ones never do.</summary>
     public static bool IsProblem(ServiceHealth s) => s.Enabled && s.Status != "ok" && s.Status != "disabled";
 
-    public static string ServiceText(ServiceHealth s) => s.Status switch
+    /// <summary>Turkish status, with the Core's detail code in brackets when it sent one: "kapalı (timeout)".</summary>
+    public static string ServiceText(ServiceHealth s)
     {
-        "ok" => "çalışıyor",
-        "loading" => "yükleniyor",
-        "down" => "kapalı",
-        "disabled" => "devre dışı",
-        _ => s.Enabled ? "bilinmiyor" : "devre dışı",
-    };
+        var text = s.Status switch
+        {
+            "ok" => "çalışıyor",
+            "loading" => "yükleniyor",
+            "down" => "kapalı",
+            "disabled" => "devre dışı",
+            _ => s.Enabled ? "bilinmiyor" : "devre dışı",
+        };
+        return string.IsNullOrEmpty(s.Detail) ? text : $"{text} ({s.Detail})";
+    }
 
     public static string CoreLine(SupervisorSnapshot s, CoreHealth? health, DateTimeOffset now) => s.State switch
     {
@@ -147,6 +173,8 @@ public static class TrayStatusEvaluator
         CoreRunState.Stopping => "durduruluyor",
         CoreRunState.GaveUp => string.Create(CultureInfo.InvariantCulture, $"vazgeçildi ({s.Failures} hata, son kod {s.LastExitCode})"),
         CoreRunState.Failed => "başlatılamıyor: " + (s.Problem ?? "bilinmeyen hata"),
+        // No reading yet (null) right after it was seen: it did answer then.
+        CoreRunState.External => health is { Reachable: false } ? "dışarıda çalışıyor (yanıt vermiyor)" : "dışarıda çalışıyor",
         _ => s.LastExitCode is { } code
             ? string.Create(CultureInfo.InvariantCulture, $"durduruldu (çıkış kodu {code})")
             : "durduruldu",

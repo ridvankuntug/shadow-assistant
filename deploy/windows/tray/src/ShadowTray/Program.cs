@@ -28,9 +28,13 @@ internal static class Program
             // The previous owner died without releasing it; we own it now.
             owned = true;
         }
-        // Another tray or run-core.ps1 already supervises the Core: exit quietly
-        // (a second start from the logon task or a double click must not start a second Core).
-        if (!owned) return 0;
+        // Another tray or run-core.ps1 already supervises the Core: say so and
+        // exit (a second start from a double click must not start a second Core).
+        if (!owned)
+        {
+            ShowAlreadyRunning();
+            return 0;
+        }
 
         try
         {
@@ -44,5 +48,19 @@ internal static class Program
         {
             mutex.ReleaseMutex();
         }
+    }
+
+    internal const string AlreadyRunningText =
+        "Shadow Tray zaten çalışıyor.\n\nCore'u bu oturumda başka bir Shadow Tray (bildirim alanındaki simge) veya run-core.ps1 yönetiyor.";
+
+    /// <summary>
+    /// A message box, not a balloon: this process has no tray icon of its own,
+    /// and a balloon from a short-lived temporary icon is easily lost (Focus
+    /// Assist / notification settings can drop it). The box needs one click.
+    /// </summary>
+    private static void ShowAlreadyRunning()
+    {
+        ApplicationConfiguration.Initialize();
+        MessageBox.Show(AlreadyRunningText, "Shadow Assistant", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 }

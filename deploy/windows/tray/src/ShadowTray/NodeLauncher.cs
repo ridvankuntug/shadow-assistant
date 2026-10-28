@@ -132,12 +132,15 @@ public sealed class NodeLauncher : ICoreLauncher, IDisposable
 
         public void Kill()
         {
+            // The job is shared by every run of this launcher: once this run is
+            // over (exited and drained, or disposed) terminating it could only
+            // hit a newer Core. Leftovers of this run are killed by Dispose.
+            if (_disposed || exited.IsCompleted) return;
             if (job is not null)
             {
                 job.Terminate();
                 return;
             }
-            if (_disposed) return;
             try { process.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { /* already exited */ }
             catch (Win32Exception) { /* access denied / exiting */ }

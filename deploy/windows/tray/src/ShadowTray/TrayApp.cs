@@ -14,11 +14,19 @@ public sealed class TrayApp : ApplicationContext
     private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
     /// <summary>Shorter grace at sign-out / shutdown, where Windows itself is waiting.</summary>
     private static readonly TimeSpan SessionEndGrace = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// Whole stop at sign-out / shutdown (wait for /health, Ctrl+C helper,
+    /// <see cref="SessionEndGrace"/>, kill): the supervisor kills the Core by then.
+    /// </summary>
+    private static readonly TimeSpan SessionEndBudget = TimeSpan.FromSeconds(6);
+    /// <summary>How long the UI thread blocks for that stop: the budget plus slack for thread scheduling.</summary>
+    private static readonly TimeSpan SessionEndWait = SessionEndBudget + TimeSpan.FromSeconds(1);
 
     private readonly TraySettings _settings;
     private readonly RotatingLog _log;
     private readonly NodeLauncher? _launcher;
     private readonly CoreSupervisor _supervisor;
+    private readonly HttpCoreHealthProbe _probe;
     private readonly HealthPoller _poller;
     private readonly DockerCompose _docker;
     private readonly TrayIcons _icons;
@@ -39,13 +47,15 @@ public sealed class TrayApp : ApplicationContext
         _settings = settings;
         _log = new RotatingLog(settings.LogDir);
         _log.Info("tray started");
+        foreach (var w in settings.Warnings) _log.Info("warning: " + w);
         foreach (var p in settings.Problems) _log.Info("error: " + p);
 
         if (settings.NodePath is not null && settings.CoreEntry is not null && settings.RepoRoot is not null)
             _launcher = new NodeLauncher(settings.NodePath, settings.CoreEntry, settings.RepoRoot, _log.Info);
+        _probe = new HttpCoreHealthProbe(settings.CoreBaseUrl);
         _supervisor = new CoreSupervisor(_launcher ?? (ICoreLauncher)new MissingLauncher(), RestartPolicy.Default, _log,
-            settings.StartProblems);
-        _poller = new HealthPoller(settings.CoreBaseUrl, () => _supervisor.Snapshot.State == CoreRunState.Running);
+            settings.StartProblems, _probe);
+        _poller = new HealthPoller(_probe, () => _supervisor.Snapshot.State is CoreRunState.Running or CoreRunState.External);
         _docker = new DockerCompose(DockerCompose.Find(Environment.GetEnvironmentVariable), settings.DeployDir, settings.EnvFile, _log);
         _icons = new TrayIcons(SystemInformation.SmallIconSize.Width);
 
@@ -113,9 +123,12 @@ public sealed class TrayApp : ApplicationContext
         }
 
         var busy = snap.State == CoreRunState.Stopping || _exiting;
-        _startItem.Enabled = !busy && snap.State is not CoreRunState.Running;
+        // An external Core is not the tray's to start, stop or restart; the
+        // supervisor starts its own once that one stops answering.
+        var external = snap.State == CoreRunState.External;
+        _startItem.Enabled = !busy && !external && snap.State is not CoreRunState.Running;
         _stopItem.Enabled = !busy && snap.State is CoreRunState.Running or CoreRunState.WaitingRestart;
-        _restartItem.Enabled = !busy;
+        _restartItem.Enabled = !busy && !external;
         _dockerUpItem.Enabled = _dockerDownItem.Enabled = !_dockerBusy && !_exiting;
 
         if (!force && !_menu.Visible && _shown is not null && _shown.Colour == status.Colour && _shown.Tooltip == status.Tooltip)
@@ -179,7 +192,18 @@ public sealed class TrayApp : ApplicationContext
             _notify.ShowBalloonTip(5000, "Shadow Assistant", "Arayüz açılamıyor: " + (_uiError ?? "bilinmeyen hata"), ToolTipIcon.Warning);
             return;
         }
-        Launch(new ProcessStartInfo(_uiServer.Url.ToString()) { UseShellExecute = true });
+        var url = _uiServer.Url.ToString();
+        try
+        {
+            // Through explorer.exe, so the browser is not in the tray's (Task
+            // Scheduler) job and survives the task ending (see ShellLauncher).
+            ShellLauncher.Open(url);
+        }
+        catch (Exception ex)
+        {
+            _log.Info("warning: could not open the UI through the shell (" + ex.Message + "); starting the browser from the tray instead");
+            Launch(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
     }
 
     private void OpenLogs()
@@ -260,7 +284,7 @@ public sealed class TrayApp : ApplicationContext
         _exiting = true;
         try
         {
-            _supervisor.StopAsync(SessionEndGrace).Wait(SessionEndGrace + TimeSpan.FromSeconds(2));
+            _supervisor.StopAsync(SessionEndGrace, SessionEndBudget).Wait(SessionEndWait);
         }
         catch (AggregateException) { }
     }
@@ -270,7 +294,7 @@ public sealed class TrayApp : ApplicationContext
         if (!_exiting)
         {
             _exiting = true;
-            try { _supervisor.StopAsync(SessionEndGrace).Wait(SessionEndGrace + TimeSpan.FromSeconds(2)); }
+            try { _supervisor.StopAsync(SessionEndGrace, SessionEndBudget).Wait(SessionEndWait); }
             catch (AggregateException) { }
         }
         _log.Info("tray exiting");
@@ -293,6 +317,7 @@ public sealed class TrayApp : ApplicationContext
             // closing the job kills a Core that is somehow still running.
             _supervisor.Dispose();
             _launcher?.Dispose();
+            _probe.Dispose();
             _log.Dispose();
         }
         base.Dispose(disposing);

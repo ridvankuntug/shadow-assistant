@@ -59,8 +59,10 @@ public sealed class KillOnCloseJob : IDisposable
 /// on that console, the sender included, asynchronously. The sender therefore
 /// has to ignore Ctrl+C, and that "ignore" flag is inherited by the processes
 /// it starts. The tray does none of this itself: it runs its own exe again as
-/// a short-lived helper (<c>ShadowTray.exe --send-ctrl-c &lt;pid&gt;</c>,
-/// <see cref="RunHelper"/>) that attaches, ignores, raises the event and exits.
+/// a short-lived helper (<c>ShadowTray.exe --send-ctrl-c &lt;pid&gt;</c>, or
+/// <c>dotnet ShadowTray.dll --send-ctrl-c &lt;pid&gt;</c> when the tray itself
+/// runs under dotnet.exe; <see cref="RunHelper"/>) that attaches, ignores,
+/// raises the event and exits.
 /// A late event can only reach the helper, never the tray, and the tray's own
 /// flag is never touched, so a Core started right afterwards still gets Ctrl+C
 /// handled normally.
@@ -80,6 +82,23 @@ public static class ConsoleCtrl
     /// </summary>
     public static string? HelperPath { get; set; } = Environment.ProcessPath;
 
+    /// <summary>ShadowTray.dll, passed to dotnet.exe when <see cref="HelperPath"/> is the dotnet host.</summary>
+    public static string? HelperAssemblyPath { get; set; } = typeof(ConsoleCtrl).Assembly.Location;
+
+    /// <summary>
+    /// File and leading arguments that run this app again as the helper. When
+    /// the tray runs as <c>dotnet ShadowTray.dll</c>, the process path is
+    /// dotnet.exe, so the helper is <c>dotnet.exe ShadowTray.dll</c>.
+    /// Null when that cannot be built.
+    /// </summary>
+    public static (string File, IReadOnlyList<string> LeadingArgs)? HelperCommand(string? processPath, string? assemblyPath)
+    {
+        if (string.IsNullOrEmpty(processPath)) return null;
+        if (!string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet", StringComparison.OrdinalIgnoreCase))
+            return (processPath, []);
+        return string.IsNullOrEmpty(assemblyPath) ? null : (processPath, [assemblyPath]);
+    }
+
     /// <summary>
     /// Clears an "ignore Ctrl+C" flag inherited from whoever started the tray,
     /// so the Core does not inherit it. Call once at start-up: the tray never
@@ -90,13 +109,13 @@ public static class ConsoleCtrl
     /// <returns>false when the event could not be sent (helper missing or failed, process gone).</returns>
     public static bool SendCtrlC(int processId, Action<string>? warn = null)
     {
-        var helper = HelperPath;
-        if (string.IsNullOrEmpty(helper))
+        if (HelperCommand(HelperPath, HelperAssemblyPath) is not { } helper)
         {
             warn?.Invoke("warning: cannot send Ctrl+C: path of the tray exe unknown");
             return false;
         }
-        var psi = new ProcessStartInfo(helper) { UseShellExecute = false, CreateNoWindow = true };
+        var psi = new ProcessStartInfo(helper.File) { UseShellExecute = false, CreateNoWindow = true };
+        foreach (var a in helper.LeadingArgs) psi.ArgumentList.Add(a);
         psi.ArgumentList.Add(HelperSwitch);
         psi.ArgumentList.Add(processId.ToString(CultureInfo.InvariantCulture));
         try
@@ -146,7 +165,6 @@ internal static class Native
 
     public delegate bool ConsoleCtrlHandler(uint ctrlType);
 
-    // Only ever called with a null handler (set / clear "ignore Ctrl+C").
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr CreateJobObjectW(IntPtr securityAttributes, string? name);
 
@@ -174,6 +192,7 @@ internal static class Native
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);
 
+    // Only ever called with a null handler (set / clear "ignore Ctrl+C").
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler? handler, [MarshalAs(UnmanagedType.Bool)] bool add);

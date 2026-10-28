@@ -28,6 +28,41 @@ public class CoreHealthTests
     }
 
     [Fact]
+    public void Parses_the_optional_detail_and_tolerates_its_absence()
+    {
+        var h = CoreHealth.Parse("""
+            {"status":"ok","services":[
+              {"name":"whisper-svc","enabled":true,"status":"down","detail":"timeout"},
+              {"name":"tts-svc","enabled":true,"status":"down","detail":"http_503"},
+              {"name":"home-assistant","enabled":true,"status":"ok"},
+              {"name":"a","enabled":true,"status":"down","detail":""},
+              {"name":"b","enabled":true,"status":"down","detail":7},
+              {"name":"c","enabled":true,"status":"down","detail":null}]}
+            """);
+        Assert.Equal(
+            [
+                new ServiceHealth("whisper-svc", true, "down", "timeout"),
+                new ServiceHealth("tts-svc", true, "down", "http_503"),
+                new ServiceHealth("home-assistant", true, "ok"),
+                new ServiceHealth("a", true, "down"),
+                new ServiceHealth("b", true, "down"),
+                new ServiceHealth("c", true, "down"),
+            ],
+            h.Services);
+    }
+
+    [Fact]
+    public void Detail_is_cleaned_for_the_menu()
+    {
+        Assert.Null(CoreHealth.CleanDetail(null));
+        Assert.Null(CoreHealth.CleanDetail("  \r\n "));
+        Assert.Equal("timeout", CoreHealth.CleanDetail(" time\nout\t"));
+        var longDetail = CoreHealth.CleanDetail(new string('x', 100))!;
+        Assert.Equal(CoreHealth.MaxDetailLength, longDetail.Length);
+        Assert.EndsWith("…", longDetail);
+    }
+
+    [Fact]
     public void Missing_services_list_is_reachable_with_no_services()
     {
         var h = CoreHealth.Parse("""{"status":"ok","service":"core"}""");

@@ -84,11 +84,12 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
   - [ ] T7.3 — Katman 1 Haiku (sınıflandırma, kısa cevap) → gerekirse katman 2 Sonnet; Opus yalnız plan/derin analiz
   - [ ] T7.4 — Her çağrı için JSONL kayıt (model, token, servis, süre); mevcut token kullanım raporu ile birleşir
   - [ ] T7.5 — Prompt caching; araçlar ihtiyaç anında yüklenir
-- **T8 — Çalıştırma (ana PC)** — Durum: Başlanmadı
-  - [ ] T8.1 — Core Windows'ta yerel Node servisi olarak (Claude Code girişi kullanıcı profilinde olduğu için Docker'da değil); açılışta başlar
-  - [ ] T8.2 — whisper-svc ve tts-svc Docker Desktop'ta, `deploy/` compose
-  - [ ] T8.3 — `.shadow-assistant/` klasörünün ana PC'den Drive'a şifreli yedeği (rclone)
-  - [ ] T8.4 — Sağlık kontrolü: servislerden biri düşerse arayüzde görünür
+- **T8 — Çalıştırma (ana PC)** — Durum: Bitti
+  - [x] T8.1 — Core Windows'ta yerel Node servisi olarak (Claude Code girişi kullanıcı profilinde olduğu için Docker'da değil); açılışta başlar
+  - [x] T8.2 — whisper-svc ve tts-svc Docker Desktop'ta, `deploy/` compose
+  - [x] T8.3 — `.shadow-assistant/` klasörünün ana PC'den Drive'a şifreli yedeği (rclone) (isteğe bağlı günlük görev hariç)
+  - [x] T8.4 — Sağlık kontrolü: servislerden biri düşerse arayüzde görünür
+  - [x] T8.5 — Windows tepsi uygulaması (`deploy/windows/tray`, .NET 10): Core'u doğrudan node ile başlatır/denetler, durum simgesi, menü; logon görevi artık tepsi exe'sini çalıştırır
 - **T9 — Uçtan uca doğrulama** — Durum: Başlanmadı
   - [ ] T9.1 — Kabul senaryoları 1–6, telefonda ve ana PC tarayıcısında
   - [ ] T9.2 — Türkçe tanıma ve ses kalitesi değerlendirmesi; gerekirse ElevenLabs kararı
