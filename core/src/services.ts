@@ -10,7 +10,7 @@ import { parse as parseYaml } from "yaml";
 export type PermissionLevel = "read" | "write" | "confirm";
 export const PERMISSION_LEVELS: readonly PermissionLevel[] = ["read", "write", "confirm"];
 
-export type ServiceKind = "mcp" | "http" | "vault";
+export type ServiceKind = "mcp" | "http" | "vault" | "memory";
 export type McpTransport = "sse" | "http";
 
 export interface ToolRule {
@@ -138,9 +138,16 @@ export function parseServices(text: string, env: NodeJS.ProcessEnv = process.env
     }
 
     const kind = raw.kind;
-    if (kind !== "mcp" && kind !== "http" && kind !== "vault") {
-      problems.push(`${at}: kind must be one of mcp | http | vault`);
+    if (kind !== "mcp" && kind !== "http" && kind !== "vault" && kind !== "memory") {
+      problems.push(`${at}: kind must be one of mcp | http | vault | memory`);
       return;
+    }
+    // memory: the in-process `shadow-memory` server over one store (docs/06-memory.md M5).
+    if (kind === "memory") {
+      if (services.some((s) => s.kind === "memory")) problems.push(`${at}: only one service may have kind memory`);
+      for (const key of ["url", "transport", "token_env", "health", "timeout_ms", "allow", "max_bytes"]) {
+        if (raw[key] !== undefined) problems.push(`${at}: '${key}' is not allowed for kind memory`);
+      }
     }
 
     let enabled = raw.enabled === undefined ? true : raw.enabled;
@@ -240,8 +247,7 @@ export function parseServices(text: string, env: NodeJS.ProcessEnv = process.env
       if (raw.url === undefined) problems.push(`${at}: url is required for kind mcp`);
     } else if (kind === "http") {
       if (raw.url === undefined) problems.push(`${at}: url is required for kind http`);
-    } else {
-      // vault
+    } else if (kind === "vault") {
       const allow = raw.allow ?? [];
       if (!Array.isArray(allow) || !allow.every((a) => typeof a === "string" && a.length > 0)) {
         problems.push(`${at}: allow must be a list of glob strings`);

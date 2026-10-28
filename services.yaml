@@ -67,6 +67,19 @@ services:
       - "knowledge/**"
     max_bytes: 65536
 
+  - name: shadow-memory
+    kind: memory
+    # The assistant's own memory (docs/06-memory.md). Turned off with
+    # CORE_MEMORY=off in `.env`.
+    enabled: true
+    permission: confirm
+    tools:
+      memory_list: read
+      memory_forget: write
+    # "Her şeyi unut" (`all: "true"`) asks first.
+    confirm_inputs:
+      all: ["true"]
+
   - name: whisper-svc
     kind: http
     url: ${WHISPER_SVC_URL:-http://127.0.0.1:8701}

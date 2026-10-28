@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { buildHealthTargets, memoryHealthCheck } from "../src/health.js";
 import { interpolate, loadServicesFile, parseServices, ServicesConfigError } from "../src/services.js";
 
 const REPO_SERVICES = join(fileURLToPath(new URL("../../", import.meta.url)), "services.yaml");
@@ -116,4 +119,51 @@ test("top-level shape is required", () => {
   assert.throws(() => parseServices("foo: 1", {}), ServicesConfigError);
   assert.throws(() => parseServices("services: [", {}), ServicesConfigError);
   assert.throws(() => loadServicesFile("does-not-exist.yaml", {}), ServicesConfigError);
+});
+
+test("kind memory: repo entry, levels, confirm_inputs; no remote keys; only one", () => {
+  const cfg = loadServicesFile(REPO_SERVICES, {});
+  const mem = cfg.services.find((s) => s.kind === "memory");
+  assert.equal(mem?.name, "shadow-memory");
+  assert.equal(mem?.enabled, true, "needs no env var");
+  assert.equal(mem?.permission, "confirm");
+  assert.deepEqual(mem?.tools, [
+    { pattern: "memory_list", level: "read" },
+    { pattern: "memory_forget", level: "write" },
+  ]);
+  assert.deepEqual(mem?.confirmInputs, { all: ["true"] });
+  assert.equal(mem?.url, undefined);
+  assert.equal(mem?.allow, undefined);
+
+  assert.throws(
+    () =>
+      parseServices(
+        ["services:", "  - name: a", "    kind: memory", "    url: http://x", "    allow: ['**']", "  - name: b", "    kind: memory"].join("\n"),
+        {},
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof ServicesConfigError);
+      const all = err.problems.join("\n");
+      for (const needle of ["'url' is not allowed for kind memory", "'allow' is not allowed", "only one service may have kind memory"]) {
+        assert.ok(all.includes(needle), `missing problem: ${needle}\n${all}`);
+      }
+      return true;
+    },
+  );
+});
+
+test("memory health: ok when the folder is (or can be made) writable; not configured without a dir", async () => {
+  const root = mkdtempSync(join(tmpdir(), "shadow-memhealth-"));
+  try {
+    const signal = new AbortController().signal;
+    assert.deepEqual(await memoryHealthCheck(join(root, "data", "memory"))(signal), { status: "ok" });
+    const file = join(root, "a-file");
+    writeFileSync(file, "x");
+    assert.equal((await memoryHealthCheck(join(file, "memory"))(signal)).status, "down");
+    const cfg = parseServices("services:\n  - name: shadow-memory\n    kind: memory\n", {});
+    assert.equal(buildHealthTargets(cfg.services, {})[0]?.disabledDetail, "not_configured");
+    assert.equal(typeof buildHealthTargets(cfg.services, {}, { memoryDir: join(root, "m") })[0]?.check, "function");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

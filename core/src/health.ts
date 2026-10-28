@@ -15,6 +15,7 @@
  *           or called. Streamable-HTTP servers may refuse the GET (400/405);
  *           any non-auth answer below 500 counts as reachable there.
  *   vault - the vault folder still exists.
+ *   memory - the memory folder exists (created if missing) and is writable.
  * Services that are disabled (in the file or by missing env) are reported as
  * `disabled` and never checked.
  *
@@ -27,7 +28,7 @@
  * `detail` is a short code from a fixed vocabulary; error messages (which can
  * contain URLs) are never copied into it.
  */
-import { stat } from "node:fs/promises";
+import { access, constants, mkdir, stat } from "node:fs/promises";
 import type { ServiceHealth, ServiceHealthStatus } from "./protocol.js";
 import type { ServiceDef } from "./services.js";
 
@@ -172,13 +173,32 @@ export function vaultHealthCheck(dir: string): HealthCheck {
 }
 
 /**
+ * Memory folder check: created if missing (the store would create it on the
+ * first write anyway), then tested for write access. Never reads or writes a
+ * memory file.
+ */
+export function memoryHealthCheck(dir: string): HealthCheck {
+  return async () => {
+    try {
+      await mkdir(dir, { recursive: true });
+      if (!(await stat(dir)).isDirectory()) return { status: "down", detail: "not_found" };
+      await access(dir, constants.W_OK);
+      return { status: "ok" };
+    } catch {
+      return { status: "down", detail: "error" };
+    }
+  };
+}
+
+/**
  * One target per service, in services.yaml order. `vaultDir` is the resolved
- * SHADOW_VAULT_DIR (index.ts disables the vault service without it).
+ * SHADOW_VAULT_DIR (index.ts disables the vault service without it);
+ * `memoryDir` is `<SHADOW_DATA_DIR>/memory` when memory is enabled.
  */
 export function buildHealthTargets(
   services: readonly ServiceDef[],
   env: NodeJS.ProcessEnv,
-  opts: { vaultDir?: string; fetchFn?: FetchFn } = {},
+  opts: { vaultDir?: string; memoryDir?: string; fetchFn?: FetchFn } = {},
 ): HealthTarget[] {
   const fetchFn = opts.fetchFn ?? fetch;
   return services.map((s): HealthTarget => {
@@ -193,6 +213,7 @@ export function buildHealthTargets(
       return { name: s.name, check: mcpHealthCheck(s.url, s.transport ?? "sse", token, fetchFn) };
     }
     if (s.kind === "vault" && opts.vaultDir) return { name: s.name, check: vaultHealthCheck(opts.vaultDir) };
+    if (s.kind === "memory" && opts.memoryDir) return { name: s.name, check: memoryHealthCheck(opts.memoryDir) };
     return { name: s.name, disabledDetail: "not_configured" };
   });
 }
