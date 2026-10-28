@@ -9,10 +9,13 @@
  * Switch rules first read the live context (a `read` tool) to resolve the
  * spoken name to exactly one exposed entity of an allowed domain, then call
  * HassTurnOn/Off with that entity's real `name` and its `domain` (so
- * `confirm_inputs: domain: [lock, …]` still applies). Sensor rules read the
- * live context and summarise it with a template.
+ * `confirm_inputs: domain: [lock, …]` still applies). A name that matches
+ * nothing is retried with its `direct.area_aliases` synonyms ("salon" →
+ * "oturma odası"). Light-set rules resolve the same way and call
+ * HassLightSet with `brightness`. Sensor rules read the live context and
+ * summarise it with a template.
  */
-import { LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
+import { LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import {
   fillTemplate,
   findReadings,
@@ -20,7 +23,10 @@ import {
   LiveContextError,
   parseLiveContext,
   resolveDevice,
+  type LiveEntity,
+  type Resolution,
 } from "./live-context.js";
+import { aliasVariants } from "./turkish.js";
 import type { DirectToolResult } from "./mcp-direct.js";
 
 export type DenyReason = "read_only" | "declined" | "timeout" | "cancelled" | "builtin";
@@ -83,13 +89,37 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
 
   // 2b) switch: resolve the name, then call the intent
   if (plan.name === undefined) return failOr("no_name", m.not_found);
-  const res = resolveDevice(entities, plan.name, { domains: plan.domains, keywords: plan.keywords });
+  const res = resolveWithAliases(entities, plan);
   if (res.status === "none") return failOr("name_not_found", m.not_found);
   if (res.status === "ambiguous") return failOr("name_ambiguous", m.ambiguous);
+  if (plan.tool === LIGHT_SET_TOOL && plan.brightness === undefined) return failOr("no_brightness", m.failed);
 
-  const act = await call(plan.tool, { name: res.callName, ...(res.area ? { area: res.area } : {}), domain: [res.entity.domain] });
+  const act = await call(plan.tool, {
+    name: res.callName,
+    ...(res.area ? { area: res.area } : {}),
+    domain: [res.entity.domain],
+    ...(plan.tool === LIGHT_SET_TOOL ? { brightness: plan.brightness } : {}),
+  });
   if (act.status === "denied") return denied(act.reason);
   if (act.status === "unavailable") return { kind: "reply", text: m.unavailable, status: "error" };
   if (act.result.isError) return failOr("tool_error", m.failed);
-  return { kind: "reply", text: fillTemplate(plan.reply, { ad: res.label }), status: "done" };
+  const vars: Record<string, string> = { ad: res.label };
+  if (plan.brightness !== undefined) vars.seviye = String(plan.brightness);
+  return { kind: "reply", text: fillTemplate(plan.reply, vars), status: "done" };
+}
+
+/**
+ * Resolves the spoken name; only when it matches nothing at all are its
+ * synonyms (`direct.area_aliases`) tried, in order — an ambiguous name stays
+ * ambiguous (the model asks back), it is never "fixed" by a synonym.
+ */
+export function resolveWithAliases(entities: readonly LiveEntity[], plan: DirectPlan): Resolution {
+  const opts = { domains: plan.domains, keywords: plan.keywords };
+  const first = resolveDevice(entities, plan.name ?? "", opts);
+  if (first.status !== "none" || plan.name === undefined) return first;
+  for (const alt of aliasVariants(plan.name, plan.areaAliases)) {
+    const res = resolveDevice(entities, alt, opts);
+    if (res.status !== "none") return res;
+  }
+  return first;
 }

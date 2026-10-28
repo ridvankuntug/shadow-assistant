@@ -16,7 +16,12 @@
 # "ışığını aç" = "ISIGINI AC" — and the filler words below):
 #   word      literal word          word*     word prefix ("plan*")
 #   {a|b c}   alternatives          {a|}      optional
+#   {@name}   the list `groups.name` (mixable: {@open|@light-up|çalıştır})
 #   <ad>      the device/place name *         any words (also none)
+#   <sayi>    a number, 1..3 digits ("%50", "yüzde 50", "50'ye" → "yüzde 50"
+#             / "50"); light-set rules only, values over 100 do not match
+# A pattern is the whole utterance: questions ("açık mı", "açtın mı"), negative
+# commands ("açma") and several sentences never match and go to the model.
 #
 # The permission gate applies to tier 0 exactly as to the model: levels come
 # from services.yaml (read / write / confirm, confirm_inputs, CORE_READ_ONLY).
@@ -26,6 +31,26 @@ version: 1
 
 # Removed before matching (whole words only).
 fillers: [lütfen, hadi, acaba, bakalım, şimdi]
+
+# Named word lists for patterns ({@name}). Polite and indirect forms of a
+# command ("yakar mısın", "yakmayı dener misin") are just more alternatives:
+# the whole utterance must still be a command.
+groups:
+  light-word: [ışığını, ışığı, ışıklarını, ışıkları, ışık, lambayı, lambasını, lambası, lambalarını, lambaları, lamba]
+  # Genitive ("ışığın seviyesini", "lambanın parlaklığını").
+  light-gen: [ışığın, ışığının, ışıkların, ışıklarının, lambanın, lambasının, lambaların, lambalarının, ışık]
+  open: [aç, açar mısın, açar mısınız, açabilir misin, açabilir misiniz, açın, açsana, açmayı dener misin, açmayı deneyebilir misin]
+  light-up: [yak, yakar mısın, yakar mısınız, yakabilir misin, yakabilir misiniz, yakın, yaksana, yakmayı dener misin, yakmayı deneyebilir misin]
+  close: [kapat, kapatır mısın, kapatır mısınız, kapatabilir misin, kapatabilir misiniz, kapatın, kapatsana, kapatmayı dener misin, kapa]
+  put-out: [söndür, söndürür müsün, söndürür müsünüz, söndürebilir misin, söndürebilir misiniz, söndürün, söndürsene, söndürmeyi dener misin]
+  start: [çalıştır, çalıştırır mısın, çalıştırabilir misin, çalıştırın]
+  stop: [durdur, durdurur musun, durdurabilir misin, durdurun]
+  level-word: [seviyesini, seviyesi, parlaklığını, parlaklığı]
+  # Absolute verbs only. Relative ones (yükselt, artır, indir, düşür, azalt,
+  # çıkar, çek) are left out on purpose: "yüzde 10 yükselt" means "+10", not
+  # "set to 10", and the dative that would tell them apart ("%30'a indir")
+  # is dropped during normalization — such requests go to the model.
+  set-to: [yap, yapar mısın, yapabilir misin, yapın, ayarla, ayarlar mısın, ayarlayabilir misin, ayarlayın, ayarlamayı dener misin, getir, getirir misin, getirebilir misin]
 
 tier1:
   # Longer requests skip tier 1: escalating them would cost a second call.
@@ -49,6 +74,14 @@ direct:
   max_name_words: 4
   # Captured names that never mean a device: such requests go to the model.
   stop_names: [şunu, bunu, onu, şu, bu, o, hepsini, her şeyi, onları, bunları, şunları, ışık, ışığı, ışığını, ışıkları, ışıklarını, lamba, lambayı, lambasını, lambaları, lambalarını]
+  # A captured name holding one of these words is a second clause or a
+  # question, not a name ("ışığı kapat ve mutfağı aç"): go to the model.
+  name_stop_words: [ve, veya, ya, sonra, ama, ile, da, de, ki, mı, mi, mu, mü, ne, neden, nasıl, kim]
+  # Place names that mean the same thing. When the spoken name matches no
+  # entity, its synonyms are tried (each in turn). Generic Turkish vocabulary
+  # only — a home's own room names belong in Home Assistant (names/aliases).
+  area_aliases:
+    - [salon, oturma odası]
   # Max sensors listed in one answer.
   max_items: 4
   messages:
@@ -61,10 +94,14 @@ direct:
 
 rules:
   # ---------------------------------------------------------------- tier 0: lights
+  # Name first ("salonun ışığını yak"), verb first ("yak salonun ışığını") or
+  # name last ("ışığı kapat oturma odasının").
   - id: light-on
     tier: 0
     patterns:
-      - "<ad> {ışığını|ışığı|ışıklarını|ışıkları|lambasını|lambası|lambalarını|lambaları} {aç|açar mısın|açabilir misin|açın|yak|yakar mısın|yakabilir misin}"
+      - "<ad> {@light-word} {@open|@light-up}"
+      - "{@open|@light-up} <ad> {@light-word}"
+      - "{@light-word} {@open|@light-up} <ad>"
     service: home-assistant
     tool: intent__HassTurnOn
     domains: [light, switch]
@@ -74,12 +111,29 @@ rules:
   - id: light-off
     tier: 0
     patterns:
-      - "<ad> {ışığını|ışığı|ışıklarını|ışıkları|lambasını|lambası|lambalarını|lambaları} {kapat|kapatır mısın|kapatabilir misin|kapatın|kapa|söndür|söndürür müsün}"
+      - "<ad> {@light-word} {@close|@put-out}"
+      - "{@close|@put-out} <ad> {@light-word}"
+      - "{@light-word} {@close|@put-out} <ad>"
     service: home-assistant
     tool: intent__HassTurnOff
     domains: [light, switch]
     keywords: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
     reply: "Tamam, {ad} ışığı kapatıldı."
+
+  # "salon ışığını %50 yap", "oturma odasında ışığın seviyesini yüzde 30'a
+  # ayarla", "ışığın seviyesini %50 yap oturma odası". Lights only.
+  - id: light-level
+    tier: 0
+    patterns:
+      - "<ad> {@light-word} {yüzde|} <sayi> {olarak|} {@set-to}"
+      - "<ad> {@light-gen} {@level-word} {yüzde|} <sayi> {olarak|} {@set-to}"
+      - "{@light-gen} {@level-word} {yüzde|} <sayi> {olarak|} {@set-to} <ad>"
+      - "{@light-word} {yüzde|} <sayi> {olarak|} {@set-to} <ad>"
+    service: home-assistant
+    tool: light__HassLightSet
+    domains: [light]
+    keywords: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
+    reply: "Tamam, {ad} ışığı yüzde {seviye} yapıldı."
 
   # ---------------------------------------------------------------- tier 0: other switches
   # "<ad>'ı aç", "<ad>u kapat": the name may carry an accusative suffix with
@@ -88,7 +142,7 @@ rules:
   - id: device-on
     tier: 0
     patterns:
-      - "<ad> {aç|açar mısın|açabilir misin|açın|çalıştır}"
+      - "<ad> {@open|@start}"
     service: home-assistant
     tool: intent__HassTurnOn
     domains: [light, switch, fan]
@@ -97,7 +151,7 @@ rules:
   - id: device-off
     tier: 0
     patterns:
-      - "<ad> {kapat|kapatır mısın|kapatabilir misin|kapatın|kapa|durdur}"
+      - "<ad> {@close|@stop}"
     service: home-assistant
     tool: intent__HassTurnOff
     domains: [light, switch, fan]

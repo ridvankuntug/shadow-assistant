@@ -5,7 +5,7 @@ to a higher tier only when the lower one cannot do the job.
 
 | Tier | Who answers | Used for |
 |---|---|---|
-| 0 | nobody (no model) | Common Turkish home commands matched by a pattern in [`router.yaml`](../router.yaml): lights and switches on/off, temperature and humidity questions. |
+| 0 | nobody (no model) | Common Turkish home commands matched by a pattern in [`router.yaml`](../router.yaml): lights and switches on/off, light brightness, temperature and humidity questions. |
 | 1 | `CORE_MODEL_TIER1` (default `haiku`) | Every request no rule claims: short chat, simple questions, one tool call. |
 | 2 | `CORE_MODEL_TIER2` → `CORE_MODEL` → `sonnet` | Escalations from tier 1, requests longer than `tier1.max_words`, tier-2 rules (compare, summarise …). |
 | 3 | `CORE_MODEL_TIER3` (default `opus`) | Only explicit planning / deep-analysis requests matched by a tier-3 rule. |
@@ -31,6 +31,8 @@ example `rules.2.domains: required for switch rules`.
 ```yaml
 version: 1
 fillers: [lütfen, …]          # whole words dropped before matching
+groups:                       # named alternative lists, used as {@name} in patterns
+  light-up: [yak, yakar mısın, yakmayı dener misin, …]
 tier1: { max_words: 30, services: [..] }   # services: optional MCP allowlist per tier
 tier2: { services: [..] }
 tier3: { services: [..] }
@@ -40,21 +42,24 @@ direct:
   on_tool_error: fallback     # fallback | reply
   max_name_words: 4
   stop_names: [şunu, ışığı, …] # captured "names" that never mean a device
+  name_stop_words: [ve, sonra, mı, …]  # a captured name holding one of these does not match
+  area_aliases:               # place names that mean the same; tried when a name is not found
+    - [salon, oturma odası]
   max_items: 4                # sensors per answer
   messages: { not_found, ambiguous, unavailable, failed, declined, read_only }
 rules:
   - id: light-on              # kebab-case, unique
     tier: 0                   # 0 | 1 | 2 | 3
-    patterns: ["<ad> {ışığını|lambasını} {aç|yak}"]
+    patterns: ["<ad> {@light-word} {@open|@light-up}"]
     # tier 0 only:
     service: home-assistant   # services.yaml MCP service
-    tool: intent__HassTurnOn  # intent__HassTurnOn | intent__HassTurnOff | homeassistant__GetLiveContext
+    tool: intent__HassTurnOn  # intent__HassTurnOn | intent__HassTurnOff | light__HassLightSet | homeassistant__GetLiveContext
     domains: [light, switch]  # switch rules: entity domains that may be touched
     keywords: [ışık, lamba]   # switch rules: device words allowed after the name
     sensor: temperature       # GetLiveContext rules: temperature | humidity
     default_name: ev          # sensor rules without <ad>: preferred sensor name/area
     permission: confirm       # optional; can only RAISE the services.yaml level
-    reply: "Tamam, {ad} ışığı açıldı."     # {ad}, sensors also {deger}
+    reply: "Tamam, {ad} ışığı açıldı."     # {ad}; light-set also {seviye}, sensors also {deger}
     reply_many: "Sıcaklıklar: {liste}."    # sensors, several readings
 ```
 
@@ -72,13 +77,16 @@ first match wins.
 | `word` | literal word |
 | `word*` | word prefix (`analiz*` matches `analizi`, `analizini`) |
 | `{a\|b c}` | alternatives; one may have several words; `{a\|}` = optional |
+| `{@name}` | the list `groups.name`; mixes with literals and other groups (`{@open\|@light-up\|}`) |
 | `<ad>` | the device or place name, 1 to `max_name_words` words (one per pattern) |
+| `<sayi>` | a number of 1 to 3 digits; only in `light__HassLightSet` rules, where values over 100 do not match |
 | `*` | any number of words, including none |
 
 Before matching, both the text and the patterns are normalized:
 
 - lower-cased with Turkish rules (`İ`→`i`, `I`→`ı`);
-- an apostrophe suffix is dropped (`Salon'u`, `Mutfak’taki` → `salon`, `mutfak`);
+- an apostrophe suffix is dropped (`Salon'u`, `Mutfak’taki`, `50'ye` → `salon`, `mutfak`, `50`);
+- a percent sign becomes the spoken word (`%50`, `50%` → `yüzde 50`);
 - other punctuation becomes a space, and repeated whitespace collapses to one space;
 - filler words are removed;
 - Turkish letters are folded to ASCII for comparison (`isigini ac` = `ışığını aç`).
@@ -91,7 +99,8 @@ the name back as the user said it ("yatak odası").
 
 | Rule | Example utterances | Tool |
 |---|---|---|
-| `light-on` / `light-off` | "<ad> ışığını / ışığı / lambasını / ışıklarını aç · yak · açar mısın", "… kapat · söndür · kapatır mısın" | `intent__HassTurnOn` / `Off` |
+| `light-on` / `light-off` | "<ad> ışığını / ışığı / lambasını / ışıklarını aç · yak · açar mısın · yakabilir misin · yakmayı dener misin", "… kapat · söndür · kapatır mısın · söndürür müsün"; also verb first ("yak salonun ışığını") and name last ("ışığı kapat oturma odasının") | `intent__HassTurnOn` / `Off` |
+| `light-level` | "<ad> ışığını %50 yap", "<ad> ışığın seviyesini yüzde 30'a ayarla", "ışığın seviyesini %50 yap <ad>" (yap · ayarla · getir, polite forms too) | `light__HassLightSet` (`brightness`, lights only) |
 | `device-on` / `device-off` | "<ad>'ı aç", "<ad>u kapat", "<ad>i çalıştır", "<ad> durdur" | `intent__HassTurnOn` / `Off` |
 | `temperature-home` | "evde sıcaklık kaç", "ev sıcaklığı nedir", "sıcaklık ne kadar" | `homeassistant__GetLiveContext` |
 | `temperature-place` | "<ad> sıcaklığı kaç", "<ad>da sıcaklık kaç", "<ad> kaç derece" | `homeassistant__GetLiveContext` |
@@ -103,6 +112,19 @@ These go to a model on purpose:
   patterns are anchored and need the imperative.
 - References with no name ("kapat şunu", "şunu kapat", "ışığı aç") do not match
   or hit `stop_names`.
+- Negative commands ("salon ışığını açma") and several sentences in one turn
+  ("Salonun ışığını yak. Sonra …") do not match: a pattern is the whole
+  utterance. A capture that holds a `name_stop_words` word ("ışığı kapat ve
+  mutfağı aç") is not a name.
+- A level over 100 ("150'ye", usually a mis-heard "%50'ye") does not match.
+- Relative level changes do not match: "yüzde 10 yükselt" means +10, not 10,
+  and the dative that would mark a target ("%30'a indir") is dropped during
+  normalization, so `set-to` holds absolute verbs only (yap · ayarla · getir).
+  yükselt · artır · indir · düşür · azalt · çıkar · çek go to the model.
+- A negative level ("-20", "%-20") does not match: the sign is kept as the
+  word "eksi".
+- Texts longer than 200 characters (after normalization) never match a tier-0
+  rule; they are not a short home command.
 - State questions ("<ad> açık mı") are not tier 0 in v1.
 - Locks, covers, alarms and other domains outside a rule's `domains` are never
   handled at tier 0.
@@ -119,16 +141,23 @@ These go to a model on purpose:
 3. **Switch rules: name resolution.** The spoken name is matched against the
    exposed entities of the rule's `domains`. Its last word may carry a case
    suffix without an apostrophe (accusative `salonu`, `lambayı`, `odasını`;
-   genitive `salonun`; locative `salonda`; softening `mutfağı` → `mutfak`), so
-   several stem candidates are compared. Each entity gets a score:
+   genitive `salonun`; locative `salonda`, `odasında`, `salondaki`; softening
+   `mutfağı` → `mutfak`), so several stem candidates are compared. Each entity
+   gets a score:
    - 3: a name or alias equals the spoken name;
    - 2: a name starts with the spoken name and continues only with keywords or
      numbers ("yatak odası" → "Yatak Odası Işık", "… Işık 1");
    - 1: keyword rules only, the entity's area equals the spoken name.
 
    Exactly one entity must hold the best score. Otherwise the request counts as
-   *not found* or *ambiguous*. The intent is then called with the entity's real
-   name and its domain, `{name, domain: [<domain>]}`. Passing the domain keeps
+   *not found* or *ambiguous*. When nothing at all matches, the name's
+   synonyms from `direct.area_aliases` are tried in turn ("salon" →
+   "oturma odası"); an ambiguous name is never replaced by a synonym. Home
+   Assistant's live context lists area names but not area aliases, so the
+   synonyms live in `router.yaml` (generic Turkish words only; a home's own
+   names belong in HA). The intent is then called with the entity's real
+   name and its domain, `{name, domain: [<domain>]}`; `light-level` adds
+   `brightness` (0 to 100). Passing the domain keeps
    `confirm_inputs: domain: [lock, …]` effective even for name-based calls.
 4. **Sensor rules.** Numeric `device_class: temperature|humidity` sensors (and
    `climate` current values) are filtered:

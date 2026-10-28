@@ -9,7 +9,11 @@
  *   word*       word prefix ("plan*" matches "planı", "planla")
  *   {a|b c|}    alternatives; an alternative may hold several words; an empty
  *               alternative makes the group optional
+ *   {@name}     the alternatives listed under `groups.name` (may be mixed
+ *               with literal ones: `{@open|çalıştır|}`)
  *   <ad>        the device / place name: 1..direct.max_name_words words
+ *   <sayi>      a number of 1..3 digits (light-set rules: brightness 0..100;
+ *               "%50" / "yüzde 50" / "50'ye" all normalize to "… 50")
  *   *           any number of words (also none)
  *
  * Rules are tried in file order; the first matching pattern wins.
@@ -21,13 +25,16 @@ import type { PermissionLevel } from "./services.js";
 import { cleanTurkish, fold, type PreparedText } from "./turkish.js";
 
 export const LIVE_CONTEXT_TOOL = "homeassistant__GetLiveContext";
+/** Brightness in percent (`brightness` 0..100); HA exposes it as `light__HassLightSet`. */
+export const LIGHT_SET_TOOL = "light__HassLightSet";
 export const SWITCH_TOOLS = ["intent__HassTurnOn", "intent__HassTurnOff"] as const;
-export const DIRECT_TOOLS = [...SWITCH_TOOLS, LIVE_CONTEXT_TOOL] as const;
+export const DIRECT_TOOLS = [...SWITCH_TOOLS, LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL] as const;
 export type DirectTool = (typeof DIRECT_TOOLS)[number];
 export type SensorKind = "temperature" | "humidity";
 
 const level = z.enum(["read", "write", "confirm"]);
 const nonEmpty = z.string().trim().min(1);
+const kebab = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be lowercase kebab-case");
 
 const messagesSchema = z
   .object({
@@ -42,7 +49,7 @@ const messagesSchema = z
 
 const ruleSchema = z
   .object({
-    id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be lowercase kebab-case"),
+    id: kebab,
     tier: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]),
     patterns: z.array(nonEmpty).min(1),
     // tier 0 only
@@ -66,6 +73,8 @@ export const routerFileSchema = z
   .object({
     version: z.literal(1),
     fillers: z.array(nonEmpty).default([]),
+    /** Named alternative lists, used in patterns as `{@name}` (verb forms, device words …). */
+    groups: z.record(kebab, z.array(nonEmpty).min(1)).default({}),
     tier1: z
       .object({
         /** Longer requests go straight to tier 2 (an escalation would cost a second call). */
@@ -84,6 +93,10 @@ export const routerFileSchema = z
         max_name_words: z.number().int().min(1).max(8).default(4),
         /** Captured names that are never a device ("şunu", "ışığı" …): the rule does not match. */
         stop_names: z.array(nonEmpty).default([]),
+        /** Words that never occur inside a name ("ve", "sonra"): a capture holding one does not match. */
+        name_stop_words: z.array(nonEmpty).default([]),
+        /** Groups of place names that mean the same ("salon" = "oturma odası"); tried when a name is not found. */
+        area_aliases: z.array(z.array(nonEmpty).min(2)).default([]),
         max_items: z.number().int().min(1).max(10).default(4),
         messages: messagesSchema.default(messagesSchema.parse({})),
       })
@@ -93,6 +106,8 @@ export const routerFileSchema = z
         on_tool_error: "fallback",
         max_name_words: 4,
         stop_names: [],
+        name_stop_words: [],
+        area_aliases: [],
         max_items: 4,
         messages: messagesSchema.parse({}),
       }),
@@ -110,6 +125,9 @@ export const routerFileSchema = z
         for (const k of directKeys) {
           if (r[k] !== undefined) ctx.addIssue({ code: "custom", path: at(k), message: "only allowed on tier 0 rules" });
         }
+        r.patterns.forEach((p, j) => {
+          if (p.includes("<sayi>")) ctx.addIssue({ code: "custom", path: ["rules", i, "patterns", j], message: `<sayi> is only allowed with ${LIGHT_SET_TOOL}` });
+        });
         return;
       }
       if (!r.service) ctx.addIssue({ code: "custom", path: at("service"), message: "required for tier 0" });
@@ -125,9 +143,13 @@ export const routerFileSchema = z
       } else if (r.domains || r.keywords) {
         ctx.addIssue({ code: "custom", path: at(r.domains ? "domains" : "keywords"), message: "only allowed on switch rules" });
       }
+      const isLightSet = r.tool === LIGHT_SET_TOOL;
       r.patterns.forEach((p, j) => {
-        const hasName = p.includes("<ad>");
-        if (!isSensor && !hasName) ctx.addIssue({ code: "custom", path: ["rules", i, "patterns", j], message: "switch patterns need <ad>" });
+        const path = ["rules", i, "patterns", j];
+        if (!isSensor && !p.includes("<ad>")) ctx.addIssue({ code: "custom", path, message: "switch patterns need <ad>" });
+        if (isLightSet !== p.includes("<sayi>")) {
+          ctx.addIssue({ code: "custom", path, message: isLightSet ? `${LIGHT_SET_TOOL} patterns need <sayi>` : `<sayi> is only allowed with ${LIGHT_SET_TOOL}` });
+        }
       });
     });
   });
@@ -149,7 +171,11 @@ export interface CompiledPattern {
   source: string;
   regex: RegExp;
   hasName: boolean;
+  hasNumber: boolean;
 }
+
+/** `groups` from router.yaml: name → alternatives (each one or more words). */
+export type PatternGroups = Readonly<Record<string, readonly string[]>>;
 
 function normWord(w: string): string {
   return fold(cleanTurkish(w));
@@ -171,22 +197,36 @@ function wordRe(raw: string): string {
  * Compiles a pattern into a regex over `folded + " "`: every token consumes
  * its trailing space, so optional tokens can simply be wrapped in `(?:…)?`.
  */
-export function compilePattern(source: string, maxNameWords: number): CompiledPattern {
+export function compilePattern(source: string, maxNameWords: number, groups: PatternGroups = {}): CompiledPattern {
   const tokens = source.trim().match(/\{[^}]*\}|<[^>]*>|\S+/g) ?? [];
   if (tokens.length === 0) throw new Error("empty pattern");
   let re = "^";
   let hasName = false;
+  let hasNumber = false;
   for (const tok of tokens) {
     if (tok === "*") {
       re += "(?:\\S+ )*";
+    } else if (tok === "<sayi>") {
+      if (hasNumber) throw new Error("only one <sayi> per pattern");
+      hasNumber = true;
+      re += "(?<sayi>\\d{1,3}) ";
     } else if (tok.startsWith("<")) {
-      if (tok !== "<ad>") throw new Error(`unknown placeholder ${tok} (only <ad>)`);
+      if (tok !== "<ad>") throw new Error(`unknown placeholder ${tok} (only <ad>, <sayi>)`);
       if (hasName) throw new Error("only one <ad> per pattern");
       hasName = true;
       re += `(?<ad>\\S+(?: \\S+){0,${maxNameWords - 1}}?) `;
     } else if (tok.startsWith("{")) {
       if (!tok.endsWith("}")) throw new Error(`unbalanced '{' in ${tok}`);
-      const alts = tok.slice(1, -1).split("|");
+      const alts = tok
+        .slice(1, -1)
+        .split("|")
+        .flatMap((a) => {
+          const t = a.trim();
+          if (!t.startsWith("@")) return [a];
+          const group = groups[t.slice(1)];
+          if (!group) throw new Error(`unknown group ${t}`);
+          return [...group];
+        });
       const optional = alts.some((a) => a.trim() === "");
       const parts = alts
         .filter((a) => a.trim() !== "")
@@ -199,7 +239,7 @@ export function compilePattern(source: string, maxNameWords: number): CompiledPa
       re += `${wordRe(tok)} `;
     }
   }
-  return { source, regex: new RegExp(`${re}$`, "d"), hasName };
+  return { source, regex: new RegExp(`${re}$`, "d"), hasName, hasNumber };
 }
 
 // ---------------------------------------------------------------- compiled config
@@ -210,6 +250,10 @@ export interface DirectPlan {
   tool: DirectTool;
   /** Captured name (display form, Turkish letters kept), if the pattern had <ad>. */
   name?: string;
+  /** Light-set rules: the captured <sayi>, 0..100 (percent). */
+  brightness?: number;
+  /** router.yaml `direct.area_aliases`: other names tried when the spoken name is not found. */
+  areaAliases: string[][];
   domains: string[];
   keywords: string[];
   sensor?: SensorKind;
@@ -231,7 +275,16 @@ export interface CompiledRouterConfig {
   tier1: { maxWords: number };
   tierServices: { 1?: string[]; 2?: string[]; 3?: string[] };
   escalation: { enabled: boolean };
-  direct: { enabled: boolean; onToolError: "fallback" | "reply"; stopNames: Set<string>; maxItems: number; messages: DirectMessages };
+  direct: {
+    enabled: boolean;
+    onToolError: "fallback" | "reply";
+    stopNames: Set<string>;
+    /** Folded `name_stop_words`. */
+    nameStopWords: Set<string>;
+    areaAliases: string[][];
+    maxItems: number;
+    messages: DirectMessages;
+  };
   rules: CompiledRule[];
 }
 
@@ -249,7 +302,7 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
     rule,
     patterns: rule.patterns.flatMap((p, j) => {
       try {
-        return [compilePattern(p, cfg.direct.max_name_words)];
+        return [compilePattern(p, cfg.direct.max_name_words, cfg.groups)];
       } catch (err) {
         problems.push(`rules.${i}.patterns.${j} ('${p}'): ${(err as Error).message}`);
         return [];
@@ -266,6 +319,8 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
       enabled: cfg.direct.enabled,
       onToolError: cfg.direct.on_tool_error,
       stopNames: new Set(cfg.direct.stop_names.map(normWord)),
+      nameStopWords: new Set(cfg.direct.name_stop_words.map(normWord)),
+      areaAliases: cfg.direct.area_aliases,
       maxItems: cfg.direct.max_items,
       messages: cfg.direct.messages,
     },
@@ -313,10 +368,20 @@ export function checkRouterServices(cfg: CompiledRouterConfig, enabledServices: 
 
 export type RuleMatch = { rule: string; tier: 0; plan: DirectPlan } | { rule: string; tier: 1 | 2 | 3 };
 
+/**
+ * Longest (prepared) text a tier-0 rule is tried on. The longest shipped
+ * command is well under 100 characters; anything longer is not a short home
+ * command, so it goes to the model — and the anchored patterns never run on
+ * arbitrarily long input.
+ */
+export const TIER0_MAX_CHARS = 200;
+
 export function matchRules(cfg: CompiledRouterConfig, text: PreparedText): RuleMatch | undefined {
   if (text.folded === "") return undefined;
   const subject = `${text.folded} `;
+  const tier0Allowed = text.folded.length <= TIER0_MAX_CHARS;
   for (const { rule, patterns } of cfg.rules) {
+    if (rule.tier === 0 && !tier0Allowed) continue;
     for (const p of patterns) {
       const m = p.regex.exec(subject);
       if (!m) continue;
@@ -325,7 +390,17 @@ export function matchRules(cfg: CompiledRouterConfig, text: PreparedText): RuleM
       const span = m.indices?.groups?.ad;
       if (span) {
         name = text.display.slice(span[0], span[1]);
-        if (cfg.direct.stopNames.has(fold(name))) continue;
+        const folded = fold(name);
+        if (cfg.direct.stopNames.has(folded)) continue;
+        // "ışığı kapat ve mutfağı aç": the capture spans a second clause, not a name.
+        if (folded.split(" ").some((w) => cfg.direct.nameStopWords.has(w))) continue;
+      }
+      let brightness: number | undefined;
+      const num = m.groups?.sayi;
+      if (num !== undefined) {
+        brightness = Number(num);
+        // "150'ye" is far more often a mis-heard "%50'ye" than a request: leave it to the model.
+        if (brightness > 100) continue;
       }
       return {
         rule: rule.id,
@@ -335,6 +410,8 @@ export function matchRules(cfg: CompiledRouterConfig, text: PreparedText): RuleM
           service: rule.service as string,
           tool: rule.tool as DirectTool,
           ...(name !== undefined ? { name } : {}),
+          ...(brightness !== undefined ? { brightness } : {}),
+          areaAliases: cfg.direct.areaAliases,
           domains: rule.domains ?? [],
           keywords: rule.keywords ?? [],
           sensor: rule.sensor,

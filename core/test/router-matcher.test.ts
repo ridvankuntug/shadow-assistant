@@ -432,7 +432,7 @@ describe("parseRouterConfig validation", () => {
   test("real router.yaml loads with the expected rules", () => {
     assert.deepEqual(
       cfg.rules.map((r) => r.rule.id),
-      ["light-on", "light-off", "device-on", "device-off", "temperature-home", "temperature-place", "humidity-home", "humidity-place", "deep-analysis", "long-form"],
+      ["light-on", "light-off", "light-level", "device-on", "device-off", "temperature-home", "temperature-place", "humidity-home", "humidity-place", "deep-analysis", "long-form"],
     );
   });
 });
