@@ -8,6 +8,7 @@ import {
   derivePhase,
   hasFeature,
   initialState,
+  memoryAvailable,
   reducer,
   shouldPlaySpeech,
   type Action,
@@ -422,7 +423,7 @@ describe("protocol additions (features, speech_chunk, memory, usage_limit)", () 
     expect(hasFeature(older, "speech_stream")).toBe(false);
   });
 
-  it("speech_chunk and memory frames do not change the state", () => {
+  it("speech_chunk frames and unrequested memory frames do not change the state", () => {
     const s = run([{ type: "user_text_sent", id: "t1", text: "x" }]);
     expect(run([srv({ type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "A" })], s)).toBe(s);
     expect(
@@ -496,5 +497,74 @@ describe("usage_limit text", () => {
     [8, 59, "'da"],
   ])("%i:%i -> %s", (h, m, suffix) => {
     expect(timeLocativeSuffix(h, m)).toBe(suffix);
+  });
+});
+
+describe("memory panel (M8)", () => {
+  const welcome = (features?: string[]): ServerMessage =>
+    features
+      ? { type: "welcome", protocol: 1, sessionId: "s", device: "d", features }
+      : { type: "welcome", protocol: 1, sessionId: "s", device: "d" };
+  const frame = (id: string, entries = [{ id: "m-1", text: "Adı Rıdvan." }]): ServerMessage => ({
+    type: "memory",
+    id,
+    brief: { chars: 11, budget: 800, entries },
+    topics: [{ topic: "ev", title: "Ev", chars: 5, entries: [{ id: "m-2", text: "Salon" }] }],
+    warnings: [{ code: "memory_full" }],
+  });
+
+  it("is available only while connected to a Core with the memory feature", () => {
+    expect(memoryAvailable(run([srv(welcome(["memory"]))]))).toBe(true);
+    expect(memoryAvailable(run([srv(welcome(["speech_stream"]))]))).toBe(false);
+    expect(memoryAvailable(run([srv(welcome())]))).toBe(false);
+    const dropped = run([srv(welcome(["memory"])), { type: "status", ev: { status: "reconnecting", attempt: 1 } }]);
+    expect(memoryAvailable(dropped)).toBe(false);
+  });
+
+  it("list: loading, then the answer to that request", () => {
+    const s = run([{ type: "memory_requested", id: "m1" }]);
+    expect(s.memory).toMatchObject({ status: "loading", requestId: "m1", deleting: null });
+    expect(run([srv(frame("other"))], s).memory.status).toBe("loading");
+    const ready = run([srv(frame("m1"))], s);
+    expect(ready.memory.status).toBe("ready");
+    expect(ready.memory.contents?.brief.entries).toEqual([{ id: "m-1", text: "Adı Rıdvan." }]);
+    expect(ready.memory.contents?.topics[0].title).toBe("Ev");
+    expect(ready.memory.contents?.warnings).toEqual([{ code: "memory_full" }]);
+  });
+
+  it("delete: remembers the entry being deleted; the answer replaces the list", () => {
+    const s = run([{ type: "memory_requested", id: "m1" }, srv(frame("m1")), { type: "memory_requested", id: "m2", entryId: "m-1" }]);
+    expect(s.memory).toMatchObject({ status: "loading", deleting: "m-1" });
+    expect(s.memory.contents?.brief.entries).toHaveLength(1); // kept while deleting
+    const done = run([srv(frame("m2", []))], s);
+    expect(done.memory).toMatchObject({ status: "ready", deleting: null });
+    expect(done.memory.contents?.brief.entries).toEqual([]);
+  });
+
+  it("an error for the request stays in the panel (no chat notice) and keeps the contents", () => {
+    const s = run([
+      { type: "memory_requested", id: "m1" },
+      srv(frame("m1")),
+      { type: "memory_requested", id: "m2", entryId: "nope" },
+      srv({ type: "error", id: "m2", code: "bad_request", message: "unknown entryId" }),
+    ]);
+    expect(s.notice).toBeNull();
+    expect(s.memory).toMatchObject({ status: "error", deleting: null, errorCode: "bad_request", errorMessage: "unknown entryId" });
+    expect(s.memory.contents?.brief.entries).toHaveLength(1);
+  });
+
+  it("timeout only for the request still loading; a late answer still fills the panel", () => {
+    const s = run([{ type: "memory_requested", id: "m1" }]);
+    expect(run([{ type: "memory_timeout", id: "old" }], s)).toBe(s);
+    const timedOut = run([{ type: "memory_timeout", id: "m1" }], s);
+    expect(timedOut.memory).toMatchObject({ status: "error", errorCode: "timeout" });
+    expect(run([srv(frame("m1"))], timedOut).memory.status).toBe("ready");
+  });
+
+  it("a dropped connection fails a request in flight; a welcome resets the view", () => {
+    const s = run([{ type: "memory_requested", id: "m1" }, { type: "status", ev: { status: "reconnecting", attempt: 1 } }]);
+    expect(s.memory).toMatchObject({ status: "error", errorCode: "connection" });
+    const ready = run([{ type: "memory_requested", id: "m2" }, srv(frame("m2"))]);
+    expect(run([srv(welcome(["memory"]))], ready).memory).toEqual(initialState.memory);
   });
 });

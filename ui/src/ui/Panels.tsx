@@ -4,7 +4,7 @@ import { QUALITIES, type Quality } from "../scene/quality.ts";
 import { QUALITY_LABEL, formatTime } from "./strings.ts";
 
 /** Slide-in side panel (modal on phones, docked look on wide screens). */
-function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+export function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     closeRef.current?.focus();
@@ -77,6 +77,7 @@ export function SettingsPanel({
   reducedMotion,
   coreUrl,
   voicePicker,
+  onOpenMemory,
   onQuality,
   onVoiceReplies,
   onChangeConnection,
@@ -88,6 +89,8 @@ export function SettingsPanel({
   coreUrl: string;
   /** "Ses" picker; absent where replies are spoken natively (Android). */
   voicePicker?: ReactNode;
+  /** Opens the "Hafıza" panel; absent (section hidden) without the Core feature `memory`. */
+  onOpenMemory?: () => void;
   onQuality: (q: Quality) => void;
   onVoiceReplies: (v: boolean) => void;
   onChangeConnection: () => void;
@@ -121,6 +124,15 @@ export function SettingsPanel({
         <span>Cevapları sesli oku</span>
       </label>
       {voicePicker}
+      {onOpenMemory && (
+        <div className="field">
+          <span className="field-label">Hafıza</span>
+          <p className="hint">Shadow'un konuşmalardan hatırladıkları. Yanlış ya da gereksiz olanları silebilirsin.</p>
+          <button type="button" className="btn btn-ghost" onClick={onOpenMemory}>
+            Hafızayı göster
+          </button>
+        </div>
+      )}
       <div className="field">
         <p className="hint">Çekirdek: {coreUrl || "ayarlanmadı"}</p>
         <button type="button" className="btn btn-ghost" onClick={onChangeConnection}>

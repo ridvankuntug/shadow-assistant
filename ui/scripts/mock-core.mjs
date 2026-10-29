@@ -10,7 +10,9 @@
 //               MOCK_SERVICES_LOADING=whisper-svc (reported `loading`),
 //               MOCK_SERVICES_FLAP_MS=10000 (the DOWN list toggles down <-> ok every N ms and is broadcast),
 //               MOCK_STT_IDLE=1 (whisper-svc reported `ok` with detail `idle`),
-//               MOCK_SPEECH_STREAM=0 (behave like an older Core: no `features`, no speech_chunk).
+//               MOCK_SPEECH_STREAM=0 (behave like an older Core: no `features`, no speech_chunk),
+//               MOCK_MEMORY=0 (no `memory` feature; memory_list/memory_delete get bad_request),
+//               MOCK_MEMORY_SILENT=1 (memory frames are never answered, to see the UI timeout).
 // With speech_stream (default) a client that sent speech_prefs gets one speech_chunk per
 // sentence while the answer streams (a sine tone in audio mode, the sentence in text mode).
 // A message containing "limit" is answered with `error usage_limit` (retryAt in 2 hours).
@@ -23,6 +25,7 @@ const TOKEN = process.env.MOCK_TOKEN ?? "dev-token";
 const CONFIRM_MS = Number(process.env.MOCK_CONFIRM_MS ?? 60000);
 const AUTH_TIMEOUT_MS = 5000;
 const SPEECH_STREAM = process.env.MOCK_SPEECH_STREAM !== "0";
+const MEMORY = process.env.MOCK_MEMORY !== "0";
 // Like the real Core: service tool names without the Agent SDK's mcp__<service>__ prefix.
 const LOCK_TOOL = "intent__HassTurnOff";
 
@@ -310,6 +313,55 @@ function handleAudio(ctx, msg) {
   });
 }
 
+// ------------------------------------------------------------------- memory
+// Shared across connections; deletes last until the mock restarts.
+const memoryDay = Date.now() - 86400000;
+const memoryStore = {
+  brief: [
+    { id: "m-a1b2c3", text: "Kullanıcının adı Rıdvan." },
+    { id: "m-b2c3d4", text: "Kısa ve net cevapları tercih ediyor." },
+  ],
+  topics: [
+    {
+      topic: "ev",
+      title: "Ev ve cihaz adları",
+      entries: [
+        { id: "m-7f3a9c", text: "Otomodos = oturma odası", updatedAt: memoryDay },
+        { id: "m-8e4b1d", text: "Salon ışığı akşam 19:00'da açılıyor.", updatedAt: memoryDay + 3600000 },
+      ],
+    },
+    {
+      topic: "tercihler",
+      title: "Tercihler",
+      entries: [{ id: "m-9c5d2e", text: "Sıcaklığı 21 derecede tutmayı seviyor." }],
+    },
+  ],
+};
+
+function memoryFrame(id) {
+  const chars = (entries) => entries.reduce((n, e) => n + e.text.length, 0);
+  const briefChars = chars(memoryStore.brief);
+  const topics = memoryStore.topics.map((t) => ({ ...t, chars: chars(t.entries) }));
+  const warnings = [{ code: "note_over_budget", topic: "tercihler" }];
+  if (briefChars > 800) warnings.unshift({ code: "brief_over_budget" });
+  return { type: "memory", id, brief: { chars: briefChars, budget: 800, entries: memoryStore.brief }, topics, warnings };
+}
+
+function handleMemory(ctx, msg) {
+  if (!MEMORY) return sendError(ctx.ws, "bad_request", "memory is disabled", msg.id);
+  if (process.env.MOCK_MEMORY_SILENT === "1") return;
+  later(ctx, 300, () => {
+    if (msg.type === "memory_delete") {
+      const lists = [memoryStore.brief, ...memoryStore.topics.map((t) => t.entries)];
+      const list = lists.find((l) => l.some((e) => e.id === msg.entryId));
+      if (!list) return sendError(ctx.ws, "bad_request", "unknown entryId", msg.id);
+      list.splice(list.findIndex((e) => e.id === msg.entryId), 1);
+      console.log(`[mock-core] memory_delete: ${msg.entryId}`);
+    }
+    send(ctx.ws, memoryFrame(msg.id));
+  });
+}
+
 const MOCK_VOICES = [
   { id: "tr_TR-dfki-medium", label: "DFKI (kadın)", quality: "medium" },
   { id: "tr_TR-fahrettin-medium", label: "Fahrettin (erkek)", quality: "medium" },
@@ -369,6 +421,9 @@ function handleFrame(ctx, msg) {
       return handleVoices(ctx, msg);
     case "cancel":
       return handleCancel(ctx, msg);
+    case "memory_list":
+    case "memory_delete":
+      return handleMemory(ctx, msg);
     case "speech_prefs":
       if (!SPEECH_STREAM) return sendError(ws, "bad_request", "Bilinmeyen tür: speech_prefs");
       if (typeof msg.enabled !== "boolean" || (msg.mode !== "audio" && msg.mode !== "text")) {
@@ -411,7 +466,8 @@ function onMessage(ctx, raw) {
     ctx.authed = true;
     clearTimeout(ctx.authTimer);
     const welcome = { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" };
-    if (SPEECH_STREAM) welcome.features = ["speech_stream", "usage_limit"];
+    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : [])];
+    if (features.length > 0) welcome.features = features;
     send(ctx.ws, welcome);
     send(ctx.ws, { type: "state", state: "idle" });
     send(ctx.ws, { type: "services", items: serviceItems() });

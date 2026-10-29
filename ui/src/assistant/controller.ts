@@ -17,6 +17,7 @@ import {
   hasFeature,
   initialState,
   isCancelled,
+  memoryAvailable,
   reducer,
   shouldPlaySpeech,
   type Action,
@@ -42,6 +43,11 @@ export const CANCEL_SETTLE_MS = 2_000;
  * still fills the list.
  */
 export const VOICES_TIMEOUT_MS = 8_000;
+/**
+ * A `memory_list` / `memory_delete` without an answer after this long is
+ * shown as failed in the memory panel. A late answer still fills it.
+ */
+export const MEMORY_TIMEOUT_MS = 8_000;
 /**
  * Streamed speech: after `assistant_done`, a turn whose queue waits for more
  * chunks is closed when no chunk (and no `final`) arrived for this long, so a
@@ -138,6 +144,7 @@ export class AssistantController {
   /** tts-svc voice for `speak` (user setting); null = the Core's default. */
   private voice: string | null = null;
   private voicesTimer: ReturnType<typeof setTimeout> | null = null;
+  private memoryTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The last `speech_prefs` this connection sent, null before the first one
    * (or when the Core lacks `speech_stream`). Its `enabled` decides whether
@@ -222,6 +229,8 @@ export class AssistantController {
   private connectionLost(): void {
     // A queued turn cannot survive a dropped socket; the reducer marks it failed.
     this.resetCancelling();
+    // A memory request in flight is failed by the reducer ("connection").
+    this.clearMemoryTimer();
     // No more chunks can come: play what arrived, then end. The next Core
     // session needs its own speech_prefs; old turn ids are meaningless there.
     this.sentPrefs = null;
@@ -240,6 +249,7 @@ export class AssistantController {
     this.cancelTalk();
     this.resetCancelling();
     this.clearVoicesTimer();
+    this.clearMemoryTimer();
     this.stopLocalAudio();
   }
 
@@ -423,6 +433,33 @@ export class AssistantController {
     return true;
   }
 
+  /**
+   * Asks the Core for the memory contents (`memory_list`). Only with the
+   * `memory` feature, while connected and no memory request is in flight.
+   */
+  requestMemory(): boolean {
+    return this.sendMemory((id) => ({ type: "memory_list", id }));
+  }
+
+  /** Deletes one memory entry; the Core answers with the fresh contents. Same guards as requestMemory. */
+  deleteMemoryEntry(entryId: string): boolean {
+    if (!entryId) return false;
+    return this.sendMemory((id) => ({ type: "memory_delete", id, entryId }), entryId);
+  }
+
+  private sendMemory(frame: (id: string) => Extract<ClientMessage, { type: "memory_list" | "memory_delete" }>, entryId?: string): boolean {
+    if (!memoryAvailable(this.state) || this.state.memory.status === "loading") return false;
+    const id = this.newId();
+    if (!this.client?.send(frame(id))) return false;
+    this.dispatch(entryId === undefined ? { type: "memory_requested", id } : { type: "memory_requested", id, entryId });
+    this.clearMemoryTimer();
+    this.memoryTimer = setTimeout(() => {
+      this.memoryTimer = null;
+      this.dispatch({ type: "memory_timeout", id });
+    }, MEMORY_TIMEOUT_MS);
+    return true;
+  }
+
   dismissNotice(): void {
     this.dispatch({ type: "dismiss_notice" });
   }
@@ -509,6 +546,11 @@ export class AssistantController {
     this.voicesTimer = null;
   }
 
+  private clearMemoryTimer(): void {
+    if (this.memoryTimer !== null) clearTimeout(this.memoryTimer);
+    this.memoryTimer = null;
+  }
+
   private clearMaxTimer(): void {
     if (this.maxTimer !== null) clearTimeout(this.maxTimer);
     this.maxTimer = null;
@@ -519,12 +561,16 @@ export class AssistantController {
     switch (msg.type) {
       case "welcome":
         this.clearVoicesTimer(); // the reducer reset the voice list
+        this.clearMemoryTimer(); // and the memory view
         this.sentPrefs = null; // a new Core session: opt in again
         this.syncSpeechPrefs();
         this.requestHistory();
         break;
       case "voices":
         if (msg.id === this.state.voices.requestId) this.clearVoicesTimer();
+        break;
+      case "memory":
+        if (msg.id === this.state.memory.requestId) this.clearMemoryTimer();
         break;
       case "state":
         if (msg.state === "idle" && this.cancelling) this.flushQueuedTurn();
@@ -543,6 +589,10 @@ export class AssistantController {
         this.onSpeechChunk(msg);
         break;
       case "error":
+        if (msg.id !== undefined && msg.id === this.state.memory.requestId) {
+          this.clearMemoryTimer();
+          break;
+        }
         // A failed turn may never send its `final` chunk. (tts_unavailable is
         // followed by one and does not end the turn.)
         if (msg.id !== undefined && msg.code !== "tts_unavailable" && this.speechStreaming()) this.speechTurnEnded(msg.id);

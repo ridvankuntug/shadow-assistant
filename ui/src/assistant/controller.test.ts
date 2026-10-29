@@ -6,6 +6,7 @@ import {
   AssistantController,
   CANCEL_SETTLE_MS,
   MAX_UTTERANCE_MS,
+  MEMORY_TIMEOUT_MS,
   SPEECH_FINAL_TIMEOUT_MS,
   VOICES_TIMEOUT_MS,
   VOICE_SAMPLE_TEXT,
@@ -1021,6 +1022,82 @@ describe("voice picker (T5.3)", () => {
     expect(s.notice).toBeNull();
     expect(s.awaitingSpeech).toBeNull();
     expect(t.phase()).toBe("idle");
+  });
+});
+
+describe("memory panel (M8)", () => {
+  const frame = (id: string, entries = [{ id: "m-1", text: "Rıdvan" }]): ServerMessage => ({
+    type: "memory",
+    id,
+    brief: { chars: 5, budget: 800, entries },
+    topics: [],
+    warnings: [],
+  });
+
+  it("does nothing without the memory feature (older Core) or while not connected", () => {
+    const t = setup(undefined, ["speech_stream"]);
+    expect(t.controller.requestMemory()).toBe(false);
+    expect(t.controller.deleteMemoryEntry("m-1")).toBe(false);
+    expect(t.sent).toEqual([]);
+    const d = setup(undefined, ["memory"]);
+    d.drop();
+    expect(d.controller.requestMemory()).toBe(false);
+    expect(d.sent).toEqual([]);
+  });
+
+  it("list: sends memory_list and shows the answer", () => {
+    const t = setup(undefined, ["memory"]);
+    expect(t.controller.requestMemory()).toBe(true);
+    expect(t.sent).toEqual([{ type: "memory_list", id: "t1" }]);
+    expect(t.controller.requestMemory()).toBe(false); // one request at a time
+    t.receive(frame("t1"));
+    expect(t.controller.getState().memory.status).toBe("ready");
+    expect(t.controller.getState().memory.contents?.brief.entries[0].id).toBe("m-1");
+  });
+
+  it("delete: sends memory_delete with the entry id; the fresh list replaces the old one", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.requestMemory();
+    t.receive(frame("t1"));
+    expect(t.controller.deleteMemoryEntry("m-1")).toBe(true);
+    expect(t.sent[1]).toEqual({ type: "memory_delete", id: "t2", entryId: "m-1" });
+    expect(t.controller.getState().memory.deleting).toBe("m-1");
+    t.receive(frame("t2", []));
+    expect(t.controller.getState().memory).toMatchObject({ status: "ready", deleting: null });
+    expect(t.controller.getState().memory.contents?.brief.entries).toEqual([]);
+  });
+
+  it("an error for a memory request is shown in the panel, not as a chat notice", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.requestMemory();
+    t.receive({ type: "error", id: "t1", code: "bad_request", message: "memory is disabled" });
+    expect(t.controller.getState().notice).toBeNull();
+    expect(t.controller.getState().memory).toMatchObject({ status: "error", errorCode: "bad_request" });
+    expect(t.controller.requestMemory()).toBe(true); // can retry
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("no answer -> timeout error; a late answer still fills the panel", () => {
+      const t = setup(undefined, ["memory"]);
+      t.controller.requestMemory();
+      vi.advanceTimersByTime(MEMORY_TIMEOUT_MS - 1);
+      expect(t.controller.getState().memory.status).toBe("loading");
+      vi.advanceTimersByTime(1);
+      expect(t.controller.getState().memory).toMatchObject({ status: "error", errorCode: "timeout" });
+      t.receive(frame("t1"));
+      expect(t.controller.getState().memory.status).toBe("ready");
+    });
+
+    it("an answer in time cancels the timeout", () => {
+      const t = setup(undefined, ["memory"]);
+      t.controller.requestMemory();
+      t.receive(frame("t1"));
+      vi.advanceTimersByTime(MEMORY_TIMEOUT_MS * 2);
+      expect(t.controller.getState().memory.status).toBe("ready");
+    });
   });
 });
 

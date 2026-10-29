@@ -10,6 +10,7 @@ import type {
   ConfirmResolvedBy,
   CoreFeature,
   HistoryItem,
+  MemoryMessage,
   ServerMessage,
   ServerState,
   ServiceHealth,
@@ -77,6 +78,25 @@ export type VoiceCatalog = {
   voices: Voice[];
 };
 
+/** The memory contents as the Core last sent them (`memory` frame without type/id). */
+export type MemoryContents = Pick<MemoryMessage, "brief" | "topics" | "warnings">;
+
+/**
+ * The memory settings panel (Core feature `memory`). One request at a time:
+ * `memory_list` (refresh) or `memory_delete` (`deleting` = its entry id).
+ * `error` keeps the last contents; `errorCode` is the Core error code or
+ * `timeout` / `connection` (local).
+ */
+export type MemoryView = {
+  status: "idle" | "loading" | "ready" | "error";
+  /** Id of the request in flight (or last answered). */
+  requestId: string | null;
+  deleting: string | null;
+  contents: MemoryContents | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+};
+
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
 export type VoicePreview = { id: string; failed: boolean };
 
@@ -121,6 +141,7 @@ export type AssistantState = {
   services: ServiceHealth[];
   voices: VoiceCatalog;
   voicePreview: VoicePreview | null;
+  memory: MemoryView;
 };
 
 export type Action =
@@ -142,7 +163,9 @@ export type Action =
   | { type: "reset_conversation" }
   | { type: "voices_requested"; id: string }
   | { type: "voices_timeout"; id: string }
-  | { type: "voice_preview_requested"; id: string };
+  | { type: "voice_preview_requested"; id: string }
+  | { type: "memory_requested"; id: string; entryId?: string }
+  | { type: "memory_timeout"; id: string };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
@@ -168,6 +191,7 @@ export const initialState: AssistantState = {
   services: [],
   voices: { status: "idle", requestId: null, defaultVoice: null, voices: [] },
   voicePreview: null,
+  memory: { status: "idle", requestId: null, deleting: null, contents: null, errorCode: null, errorMessage: null },
 };
 
 // ---------------------------------------------------------------------------
@@ -252,6 +276,16 @@ export function hasFeature(s: AssistantState, feature: CoreFeature): boolean {
   return s.features.includes(feature);
 }
 
+/** The memory panel may be offered: connected to a Core with the `memory` feature. */
+export function memoryAvailable(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "memory");
+}
+
+/** A failed or unanswered memory request (keeps the shown contents). */
+function memoryFailed(m: MemoryView, code: string, message?: string): MemoryView {
+  return { ...m, status: "error", deleting: null, errorCode: code, errorMessage: message ?? null };
+}
+
 /** Should an incoming `speech` clip be played? */
 export function shouldPlaySpeech(s: AssistantState, turnId: string): boolean {
   return s.awaitingSpeech === turnId && !isCancelled(s, turnId);
@@ -317,6 +351,8 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
       return {
         ...next,
         voices: s.voices.status === "loading" ? initialState.voices : s.voices,
+        // Its answer can no longer arrive.
+        memory: s.memory.status === "loading" ? memoryFailed(s.memory, "connection") : s.memory,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -410,6 +446,17 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
     case "voice_preview_requested":
       return { ...s, voicePreview: { id: a.id, failed: false }, awaitingSpeech: a.id };
 
+    case "memory_requested":
+      return {
+        ...s,
+        memory: { ...s.memory, status: "loading", requestId: a.id, deleting: a.entryId ?? null, errorCode: null, errorMessage: null },
+      };
+
+    case "memory_timeout":
+      return s.memory.status === "loading" && s.memory.requestId === a.id
+        ? { ...s, memory: memoryFailed(s.memory, "timeout") }
+        : s;
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -433,6 +480,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         // Its voices may differ too; the settings panel asks again.
         voices: initialState.voices,
         voicePreview: null,
+        // Another Core may have other (or no) memory; the panel asks again.
+        memory: initialState.memory,
       };
 
     case "state": {
@@ -527,8 +576,20 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       return s;
 
     case "memory":
-      // Rendered by the memory panel (M8); nothing to store here yet.
-      return s;
+      // Only the answer to the latest request; it still counts after the
+      // local timeout (a slow Core).
+      if (msg.id !== s.memory.requestId) return s;
+      return {
+        ...s,
+        memory: {
+          status: "ready",
+          requestId: msg.id,
+          deleting: null,
+          contents: { brief: msg.brief, topics: msg.topics, warnings: msg.warnings },
+          errorCode: null,
+          errorMessage: null,
+        },
+      };
 
     case "history":
       return { ...s, history: msg.items, historyLoaded: true };
@@ -537,6 +598,10 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       // Errors of the voice picker stay in the picker, not in the chat.
       if (msg.id !== undefined && msg.id === s.voices.requestId) {
         return s.voices.status === "loading" ? { ...s, voices: { ...s.voices, status: "unavailable" } } : s;
+      }
+      // Errors of the memory panel stay in the panel.
+      if (msg.id !== undefined && msg.id === s.memory.requestId) {
+        return s.memory.status === "loading" ? { ...s, memory: memoryFailed(s.memory, msg.code, msg.message) } : s;
       }
       if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
         return {

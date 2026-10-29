@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { canPreviewVoice, canStop, currentConfirm, derivePhase } from "./assistant/state.ts";
+import { canPreviewVoice, canStop, currentConfirm, derivePhase, hasFeature, memoryAvailable } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
 import { PHASE_COLOR } from "./scene/phaseStyle.ts";
@@ -8,6 +8,7 @@ import { ConfirmCard } from "./ui/ConfirmCard.tsx";
 import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
 import { Conversation } from "./ui/Conversation.tsx";
+import { MemoryPanel } from "./ui/MemoryPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { sttStatus } from "./ui/serviceHealth.ts";
@@ -17,7 +18,7 @@ import { CONNECTION_LABEL, noticeMessage, noticeText, resolvedText } from "./ui/
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "connect";
+type Panel = "none" | "history" | "settings" | "memory" | "connect";
 
 export default function App({ adapter, controller }: Props) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState);
@@ -41,6 +42,7 @@ export default function App({ adapter, controller }: Props) {
   const [voice, setVoice] = useState<string | null>(() => adapter.storage.get(STORAGE_KEYS.ttsVoice) || null);
   const [panel, setPanel] = useState<Panel>("none");
   const closePanel = useCallback(() => setPanel("none"), []);
+  const backToSettings = useCallback(() => setPanel("settings"), []);
 
   // Connect on start when a configuration is stored; reconnect when it changes.
   useEffect(() => {
@@ -64,6 +66,13 @@ export default function App({ adapter, controller }: Props) {
   useEffect(() => {
     if (coreTts && panel === "settings" && connectedNow && voicesStatus === "idle") controller.requestVoices();
   }, [controller, coreTts, panel, connectedNow, voicesStatus]);
+
+  // The memory panel asks for the contents each time it opens, and again
+  // after a reconnect (the welcome resets them).
+  const memoryOn = memoryAvailable(state);
+  useEffect(() => {
+    if (panel === "memory" && memoryOn) controller.requestMemory();
+  }, [controller, panel, memoryOn]);
 
   // Back in the foreground: skip the remaining reconnect backoff. Visibility
   // never touches a recording here: in a browser tab it keeps running while
@@ -243,10 +252,21 @@ export default function App({ adapter, controller }: Props) {
               />
             ) : undefined
           }
+          onOpenMemory={memoryOn ? () => setPanel("memory") : undefined}
           onQuality={changeQuality}
           onVoiceReplies={changeVoiceReplies}
           onChangeConnection={() => setPanel("connect")}
           onClose={closePanel}
+        />
+      )}
+      {panel === "memory" && (
+        <MemoryPanel
+          memory={state.memory}
+          connected={connected}
+          available={hasFeature(state, "memory")}
+          onRefresh={() => controller.requestMemory()}
+          onDelete={(entryId) => controller.deleteMemoryEntry(entryId)}
+          onClose={backToSettings}
         />
       )}
     </div>

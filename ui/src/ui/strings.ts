@@ -1,6 +1,7 @@
 /** User-facing Turkish strings. */
 import type { Notice, Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
+import type { MemoryWarning } from "../protocol/types.ts";
 import type { Quality } from "../scene/quality.ts";
 import type { SttStatus } from "./serviceHealth.ts";
 
@@ -138,4 +139,49 @@ export function formatTime(ts: number): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleString("tr-TR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+// ---------------------------------------------------------------- memory panel
+
+/**
+ * A memory warning for the panel. `topic` (or the older `code:<topic>` form)
+ * is shown with its title when `titles` knows it; unknown codes as free text.
+ */
+export function memoryWarningText(w: MemoryWarning, titles: Record<string, string> = {}): string {
+  const [code, inlineTopic] = w.code.split(":", 2);
+  const topic = w.topic ?? inlineTopic;
+  const name = topic ? `“${titles[topic] ?? topic}”` : "Bir";
+  switch (code) {
+    case "brief_over_budget":
+      return "Kısa özet önerilen boyutu aştı.";
+    case "brief_truncated":
+      return "Kısa özet çok uzun; Shadow yalnızca baş kısmını kullanıyor.";
+    case "note_over_budget":
+      return `${name} notu önerilen boyutu aştı.`;
+    case "note_full":
+      return `${name} notu dolu; bu konuya yeni bilgi eklenmiyor.`;
+    case "memory_full":
+      return "Hafıza dolu; yeni bilgi eklenmiyor. Gereksiz kayıtları silebilirsin.";
+    default:
+      return topic && !inlineTopic ? `Uyarı: ${w.code} (${topic})` : `Uyarı: ${w.code}`;
+  }
+}
+
+/** Why the last memory request failed (`timeout` / `connection` are local codes). */
+export function memoryErrorText(code: string, message?: string | null): string {
+  switch (code) {
+    case "timeout":
+      return "Çekirdek hafıza isteğine yanıt vermedi.";
+    case "connection":
+      return "Bağlantı koptu; hafıza alınamadı.";
+    case "bad_request":
+      return "Çekirdek isteği reddetti: kayıt artık yok ya da hafıza kapalı. Listeyi yenile.";
+    default:
+      return noticeText(code, message ?? undefined);
+  }
+}
+
+/** "412 / 800 karakter" */
+export function memoryCharsText(chars: number, budget?: number): string {
+  return budget ? `${chars} / ${budget} karakter` : `${chars} karakter`;
 }
