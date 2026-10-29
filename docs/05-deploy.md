@@ -224,6 +224,33 @@ Check it: the tray icon, `Get-ScheduledTask -TaskPath \ShadowAssistant\` and
 
 Logs are kept; delete `%LOCALAPPDATA%\ShadowAssistant\logs` by hand if wanted.
 
+### Persistent sessions and memory
+
+All optional, set in `.env` (defaults in `.env.example`; details in
+[07-speed.md](07-speed.md) and [06-memory.md](06-memory.md)):
+
+- Sessions: `CORE_AGENT_PERSISTENT` (one long-lived model session per device),
+  `CORE_AGENT_PREWARM`, `CORE_AGENT_IDLE_MIN` (each open session holds about
+  250 MB), `CORE_TURN_TIMEOUT_MS`, `CORE_CONTINUITY_MIN`.
+- `CORE_AGENT_SKIP_TURN_SUMMARY=1` is opt-in and relies on an undocumented
+  Claude Code CLI variable: an SDK update may silently stop it working. Leave
+  it off unless you measured a gain.
+- Memory: `CORE_MEMORY` (`off` disables it completely), `CORE_MEMORY_MODEL`,
+  `CORE_MEMORY_IDLE_MIN`, `CORE_MEMORY_EVERY_TURNS`, `CORE_MEMORY_MAX_RUNS_DAY`,
+  `CORE_COMPACT_AT_TOKENS`.
+- `SHADOW_PRONUNCIATIONS_FILE`: alternative pronunciation lexicon.
+
+Data lives in `<SHADOW_DATA_DIR>`: `sessions/devices.json`, `memory/brief.md`,
+`memory/notes/*.md`, `memory/index.json`, `memory/state.json`,
+`memory/forget-pending.json`. All of it is inside the encrypted backup (section
+4); nothing extra to configure.
+
+View or delete memory in the UI (Ayarlar → Hafıza), or by voice/text: "neyi
+hatırlıyorsun" lists it, "bunu unut" deletes an entry.
+
+Redeploy: `npm run build` in `core/` (rebuilds `core/dist`), restart the Core
+(tray → Yeniden başlat), then rebuild `ui`.
+
 ## 4. Backups
 
 `deploy/backup/backup-data.ps1` packs the Core's data folder

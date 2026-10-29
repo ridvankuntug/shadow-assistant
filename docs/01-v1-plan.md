@@ -79,16 +79,16 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
   - [ ] T6.4 — Token Keystore'da; `network_security_config` yalnız ev LAN adresine cleartext
   - [ ] T6.5 — Evde LAN, dışarıda Tailscale ile aynı adres (ana PC'nin ev LAN adresi); bağlantı yoksa net hata ekranı
   - [ ] T6.6 — İmzalı APK CI'da üretilir, elle yüklenir (Play yok)
-- **T7 — Yönlendirici ve token kaydı** — Durum: Başlanmadı
+- **T7 — Yönlendirici ve token kaydı** — Durum: Başlandı
   - [ ] T7.1 — `router.yaml`: kalıp → servis/araç + katman + izin
   - [ ] T7.2 — Katman 0: HA'ya doğrudan çağrı, model yok
   - [ ] T7.3 — Katman 1 Haiku (sınıflandırma, kısa cevap) → gerekirse katman 2 Sonnet; Opus yalnız plan/derin analiz
   - [ ] T7.4 — Her çağrı için JSONL kayıt (model, token, servis, süre); mevcut token kullanım raporu ile birleşir
   - [ ] T7.5 — Prompt caching; araçlar ihtiyaç anında yüklenir
-  - [ ] T7.6 — Hız A1, kalıcı oturum: cihaz başına tek uzun ömürlü SDK sorgusu (streaming input), katman değişimi `setModel()` ile, boşta kapanma, kullanım limiti hatası (`usage_limit`); hedef basit metin turu p50 ≤ 2,5 sn — tasarım ve görevler: `docs/07-speed.md` (A1; S1–S6, S12)
-  - [ ] T7.7 — Hız A2, cümle cümle TTS: Core cevabı cümlelere böler, telaffuz sözlüğünü uygular, isteyen istemciye sıralı `speech_chunk` gönderir; arayüzde çalma kuyruğu; eski istemciler değişmez — `docs/07-speed.md` (A2; S9–S11)
-  - [ ] T7.8 — Hız A3, katman-0 yönlendiricinin Türkçe düzeltmesi (ayrı geliştirici yürütüyor; `router-config.ts`, `turkish.ts`, `direct.ts`)
-  - [ ] T7.9 — Hız A4, süreklilik: aynı cihaz 30 dk içinde (Core yeniden başlasa da) son konuşmasına devam eder; `sessions/devices.json` — `docs/07-speed.md` (A4; S3, S7, S8)
+  - [x] T7.6 — Hız A1, kalıcı oturum: cihaz başına tek uzun ömürlü SDK sorgusu (streaming input), katman değişimi `setModel()` ile, boşta kapanma, kullanım limiti hatası (`usage_limit`); hedef basit metin turu p50 ≤ 2,5 sn — tasarım ve görevler: `docs/07-speed.md` (A1; S1–S6, S12)
+  - [x] T7.7 — Hız A2, cümle cümle TTS: Core cevabı cümlelere böler, telaffuz sözlüğünü uygular, isteyen istemciye sıralı `speech_chunk` gönderir; arayüzde çalma kuyruğu; eski istemciler değişmez — `docs/07-speed.md` (A2; S9–S11)
+  - [x] T7.8 — Hız A3, katman-0 yönlendiricinin Türkçe düzeltmesi (ayrı geliştirici yürütüyor; `router-config.ts`, `turkish.ts`, `direct.ts`)
+  - [x] T7.9 — Hız A4, süreklilik: aynı cihaz 30 dk içinde (Core yeniden başlasa da) son konuşmasına devam eder; `sessions/devices.json` — `docs/07-speed.md` (A4; S3, S7, S8)
   - Not: model çağrıları Core'daki sağlayıcı arayüzünden geçer (`core/src/model-provider.ts`; Claude Agent SDK bir uygulama) — `docs/07-speed.md` §A1 Components. Sıradaki:
   - [ ] T7.y — Core MCP ağ geçidi (HA + vault araçları Core'un kendi MCP sunucusunda, izin/onay kapısı içeride, modeller HA kimlik bilgisi görmez)
   - [ ] T7.z — Yedek sağlayıcı (Claude limiti dolunca Codex, isteğe bağlı Ollama)
@@ -103,16 +103,16 @@ Görev kutuları: `[ ]` başlanmadı, `[~]` başlandı, `[x]` bitti.
 - **T9 — Uçtan uca doğrulama** — Durum: Başlanmadı
   - [ ] T9.1 — Kabul senaryoları 1–6, telefonda ve ana PC tarayıcısında
   - [ ] T9.2 — Türkçe tanıma ve ses kalitesi değerlendirmesi; gerekirse ElevenLabs kararı
-- **T10 — Asistan hafızası** (tasarım: `docs/06-memory.md`; T7.6 kalıcı oturumun üstüne gelir) — Durum: Başlanmadı
-  - [ ] T10.1 — Hafıza deposu: `memory/brief.md` (800 karakter bütçe), `memory/notes/<konu>.md`, `index.json`, `state.json`; atomik yazım, kilit (mutex), bütçe uyarıları (M1)
-  - [ ] T10.2 — Filtreler: gizli değerler, kişisel numaralar, sağlık ayrıntıları, vault `Private/`, izin benzeri ve geçici bilgiler (M2)
-  - [ ] T10.3 — Tur başına ilgili notları yükleme: anahtar kelime eşleşmesi, `<hafiza>` bloğu, sorgu başına bir kez (M3)
-  - [ ] T10.4 — Otomatik çıkarım: boşta/N turda bir arka planda Haiku geçişi, birleştirme ve tekrar önleme, hız ve kullanım limiti sınırları (M4)
-  - [ ] T10.5 — "Neyi hatırlıyorsun" / "bunu unut": `shadow-memory` araçları (`memory_list`, `memory_forget`) (M5)
-  - [ ] T10.6 — Core bağlantısı: brief sistem prompt'unda, hafıza çerçeveleri, `features: ["memory"]` (M6)
-  - [ ] T10.7 — Uzun oturumlarda bağlam sıkıştırma: eşik, önce çıkarım, `/compact` ya da özetle yeniden başlat (M7)
-  - [ ] T10.8 — Arayüz: Ayarlar → Hafıza, listele ve sil (M8)
-  - [ ] T10.9 — Belgeler ve uçtan uca doğrulama (M9)
+- **T10 — Asistan hafızası** (tasarım: `docs/06-memory.md`; T7.6 kalıcı oturumun üstüne gelir) — Durum: Başlandı
+  - [x] T10.1 — Hafıza deposu: `memory/brief.md` (800 karakter bütçe), `memory/notes/<konu>.md`, `index.json`, `state.json`; atomik yazım, kilit (mutex), bütçe uyarıları (M1)
+  - [x] T10.2 — Filtreler: gizli değerler, kişisel numaralar, sağlık ayrıntıları, vault `Private/`, izin benzeri ve geçici bilgiler (M2)
+  - [x] T10.3 — Tur başına ilgili notları yükleme: anahtar kelime eşleşmesi, `<hafiza>` bloğu, sorgu başına bir kez (M3)
+  - [x] T10.4 — Otomatik çıkarım: boşta/N turda bir arka planda Haiku geçişi, birleştirme ve tekrar önleme, hız ve kullanım limiti sınırları (M4)
+  - [x] T10.5 — "Neyi hatırlıyorsun" / "bunu unut": `shadow-memory` araçları (`memory_list`, `memory_forget`) (M5)
+  - [x] T10.6 — Core bağlantısı: brief sistem prompt'unda, hafıza çerçeveleri, `features: ["memory"]` (M6)
+  - [x] T10.7 — Uzun oturumlarda bağlam sıkıştırma: eşik, önce çıkarım, `/compact` ya da özetle yeniden başlat (M7)
+  - [x] T10.8 — Arayüz: Ayarlar → Hafıza, listele ve sil (M8)
+  - [~] T10.9 — Belgeler ve uçtan uca doğrulama (M9)
 
 **Sıra:** T0 ve T1 önce (paralel olabilir). T2–T5 T1'den sonra paralel; T6, T3'ün adaptör sözleşmesi (T3.2) netleşince başlar. T7, T2'nin üstüne gelir. T8–T9 en son. T7.6–T7.9 hız işi, görev sırası ve dosya sahipliğiyle `docs/07-speed.md`'de; T10 hafıza işi, T7.6'nın kalıcı oturumu ve ortak görevleri (S3, P1) bittikten sonra, `docs/06-memory.md`'deki sırayla.
 

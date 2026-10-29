@@ -161,7 +161,8 @@ With the feature `memory`. Design: [`docs/06-memory.md`](06-memory.md).
 - `memory_list` is answered with `memory` (same `id`).
 - `memory_delete` deletes one entry (brief or note); the fact is tombstoned so
   it is not learned again. It is answered with a fresh `memory` frame (same
-  `id`). An unknown `entryId` gets `error bad_request` (with `id`).
+  `id`). An unknown (or already deleted) `entryId` gets `error bad_request`
+  (with `id`); a write failure gets `error internal` (with `id`).
 - With memory disabled (`CORE_MEMORY=off`) both requests get `error bad_request`
   ("memory is disabled").
 - `entries[].updatedAt` (epoch ms) is optional. `warnings[].code` is one of

@@ -21,6 +21,7 @@ import {
   type AttemptRequest,
   type DeviceAgentOptions,
 } from "../src/device-agent.js";
+import type { PermissionCallback } from "../src/model-provider.js";
 
 const msg = (m: unknown) => m as SDKMessage;
 const tick = () => new Promise((r) => setImmediate(r));
@@ -160,7 +161,7 @@ class FakeSdk {
   }
 }
 
-const allow: CanUseTool = async (_n, input) => ({ behavior: "allow", updatedInput: input });
+const allow: PermissionCallback = async (_n, input) => ({ behavior: "allow", updatedInput: input });
 
 function makeAgent(f: FakeSdk, o: Partial<DeviceAgentOptions> = {}): DeviceAgent {
   return new DeviceAgent({
@@ -345,7 +346,7 @@ test("gate dispatcher: no attempt → deny; a call that outlives its attempt's c
   const f = new FakeSdk();
   let resolveGate!: () => void;
   const gateCalls: string[] = [];
-  const slowGate: CanUseTool = async (name, input) => {
+  const slowGate: PermissionCallback = async (name, input) => {
     gateCalls.push(name);
     await new Promise<void>((r) => (resolveGate = r)); // e.g. a 60 s confirmation
     return { behavior: "allow", updatedInput: input };

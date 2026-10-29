@@ -119,6 +119,24 @@ processed for that device. When the file is missing or corrupt, each device's
 cursor is set to "now" (no old conversation is re-read) and a warning is
 logged.
 
+Optional fields: `resetAt` is set in that case, and devices without a cursor
+start no earlier than it. `pending` (`device`, `fromTs`, `toTs`) is written just
+before a pass applies its ops and cleared with the cursor move; if it is still
+set on load the pass crashed in between, and that range counts as applied (no
+second model call). The log source scans at most 14 day folders, picked by
+mtime.
+
+### `forget-pending.json`
+
+A forget (voice or UI delete) first writes the ids and hashes to
+`forget-pending.json`, then rewrites the files and the index. A crash in
+between is completed at the next startup; until then the matching lines are
+hidden from every reader. The file holds ids and hashes only.
+
+Hand-edited lines that fail the write filters or budgets are kept in the file
+but ignored (not indexed, not sent to the model); the Core logs how many were
+rejected.
+
 ### Budgets and warnings
 
 | Item | Warn | Hard limit | At the hard limit |
@@ -548,12 +566,12 @@ same no-shared-file rule applies across both documents.
 Parallel lanes: M1, M2 at once (M1 after S3); then M3, M4, M5 in parallel; M8 in
 parallel with the Core lane once P1 and S11 are done; M6 → M7 serialized.
 
-- [ ] **M1 — Memory store.** Files, ids, parsing, budgets and warnings, tombstones, index rebuild, mutex, `mtime` check, atomic writes (S3). Acceptance: unit tests from *Test strategy* (store part) pass; a corrupt index is rebuilt; two concurrent writes are serialized.
-- [ ] **M2 — Filters.** Every row of the *Filters* table, for input (redact) and output (reject). Acceptance: table-driven tests incl. false positives; no filter logs the text.
-- [ ] **M3 — Per-turn matcher.** Keyword scoring with `fold`/`stemCandidates` (import only, no change to `turkish.ts`), 1200-char/8-entry cut, a once-per-query "already sent" set API. Acceptance: tests for inflected Turkish forms and the cut.
-- [ ] **M4 — Extractor.** Triggers and skip rules, log reader, pre-filter, one-shot query with `outputFormat`, op application with merge and dedupe, usage record, usage-limit suspend, cursor rules. Acceptance: tests with a fake runner for each rule; a real run against a sample log produces sensible entries (manual).
-- [ ] **M5 — Memory tools and service kind.** `kind: memory` in `services.ts` (validation, health `ok` when the folder is writable), `shadow-memory` MCP server with `memory_list` and `memory_forget`, `services.yaml` entry with levels and `confirm_inputs`. Acceptance: tool tests; the permission policy returns `read`/`write`/`confirm` as designed.
+- [x] **M1 — Memory store.** Files, ids, parsing, budgets and warnings, tombstones, index rebuild, mutex, `mtime` check, atomic writes (S3). Acceptance: unit tests from *Test strategy* (store part) pass; a corrupt index is rebuilt; two concurrent writes are serialized.
+- [x] **M2 — Filters.** Every row of the *Filters* table, for input (redact) and output (reject). Acceptance: table-driven tests incl. false positives; no filter logs the text.
+- [x] **M3 — Per-turn matcher.** Keyword scoring with `fold`/`stemCandidates` (import only, no change to `turkish.ts`), 1200-char/8-entry cut, a once-per-query "already sent" set API. Acceptance: tests for inflected Turkish forms and the cut.
+- [x] **M4 — Extractor.** Triggers and skip rules, log reader, pre-filter, one-shot query with `outputFormat`, op application with merge and dedupe, usage record, usage-limit suspend, cursor rules. Acceptance: tests with a fake runner for each rule; a real run against a sample log produces sensible entries (manual).
+- [x] **M5 — Memory tools and service kind.** `kind: memory` in `services.ts` (validation, health `ok` when the folder is writable), `shadow-memory` MCP server with `memory_list` and `memory_forget`, `services.yaml` entry with levels and `confirm_inputs`. Acceptance: tool tests; the permission policy returns `read`/`write`/`confirm` as designed.
 - [x] **M6 — Core wiring.** Brief in the system prompt at query start, restart on brief change, `<hafiza>` block in the envelope, extractor notified at turn end and on idle, tools registered, `memory_list`/`memory_delete` frames, `features: ["memory"]`, `system.md` paragraph, configuration. Acceptance: session integration tests; the manual end-to-end steps up to "bunu unut". *Done: tests in `session-memory.test.ts`, `device-registry.test.ts`, `memory-lifecycle.test.ts`; the manual end-to-end steps are open (M9).*
 - [x] **M7 — Compaction.** Threshold, idle scheduling, extraction first, `/compact` with instructions, "already sent" reset, waiting turns, the fallback per S1. Acceptance: tests with a fake query (`compact_boundary` path and fallback path); manual: a long session drops below the threshold and still knows the room names. *Done: both paths tested with fake providers (`memory-lifecycle.test.ts`, `device-registry.test.ts`); Claude keeps `capabilities.compact` off, so the summary path is the live one; the manual check is open (M9).*
-- [ ] **M8 — UI memory panel.** As in *UI*. Acceptance: component/controller tests (list, delete, warnings, hidden without the `memory` feature).
-- [ ] **M9 — Docs and end-to-end check.** docs/05 (what is in the data dir and backup; how to turn memory off), the manual end-to-end list run once and ticked. Acceptance: checklist run and its result recorded here.
+- [x] **M8 — UI memory panel.** As in *UI*. Acceptance: component/controller tests (list, delete, warnings, hidden without the `memory` feature).
+- [~] **M9 — Docs and end-to-end check.** docs/05 (what is in the data dir and backup; how to turn memory off), the manual end-to-end list run once and ticked. Acceptance: checklist run and its result recorded here. *Status: manual end-to-end check pending (main session).*
