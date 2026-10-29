@@ -11,6 +11,10 @@ import type { ConversationLog, SessionLog } from "./conversation-log.js";
 import type { DeviceRegistry } from "./device-registry.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
 import type { DirectToolClient } from "./mcp-direct.js";
+import type { DeviceMaintenance } from "./memory/lifecycle.js";
+import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
+import type { MemorySnapshot, MemoryStore } from "./memory/store.js";
+import { isEntryId, MEMORY_BUDGETS, type MemoryEntry } from "./memory/types.js";
 import {
   SessionBusyError,
   SessionClosedError,
@@ -28,7 +32,7 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import type { ClientFrame, ErrorCode, ServerFrame, SpeechMode } from "./protocol.js";
+import type { ClientFrame, ErrorCode, MemoryFrame, ServerFrame, SpeechMode } from "./protocol.js";
 import type { DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
@@ -74,7 +78,15 @@ export interface Logger {
 export type SessionRegistry = Pick<
   DeviceRegistry,
   "acquire" | "live" | "prewarm" | "beginTurn" | "endTurn" | "fallbackResume" | "turnEnded" | "capabilities"
->;
+> &
+  // Memory and compaction (docs/06); optional so a registry without them still works.
+  Partial<Pick<DeviceRegistry, "sentEntries" | "peekSeedNote" | "seedDelivered" | "isHeld" | "beginActivity" | "waitHold">>;
+
+/** What a session needs from the memory store (docs/06); absent = CORE_MEMORY=off. */
+export type SessionMemory = Pick<MemoryStore, "entries" | "snapshot" | "forget">;
+
+/** Turn notifications for extraction triggers and compaction (memory/lifecycle.ts). */
+export type SessionMaintenance = Pick<DeviceMaintenance, "turnStarted" | "turnEnded" | "modelTurnEnded">;
 
 export interface SessionDeps {
   /** Legacy runner: a fresh query per turn (CORE_AGENT_PERSISTENT=off, and the fallback when a device session cannot start). */
@@ -98,6 +110,10 @@ export interface SessionDeps {
   tierServices?: Partial<Record<ModelTier, readonly string[]>>;
   /** pronunciations.yaml: applied to `speak` text sent to tts-svc only; absent = none. */
   pronunciations?: Lexicon;
+  /** Memory store (CORE_MEMORY on): `<hafiza>` blocks and the `memory_list`/`memory_delete` frames. */
+  memory?: SessionMemory;
+  /** Extraction triggers and compaction; absent = none. */
+  maintenance?: SessionMaintenance;
 }
 
 export interface SessionInfo {
@@ -122,6 +138,8 @@ interface ActiveTurn {
    * session closed): like a cancel, nothing more is spoken.
    */
   cancelled?: boolean;
+  /** Time the turn waited for a running compaction (docs/06), for the `timing` record. */
+  waitedForCompactMs?: number;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -155,6 +173,8 @@ export class Session {
   private readonly speaking = new Map<string, SpeechStream>();
   /** Work that finishes after a turn's visible end (usage at `settled`, timing); close() waits for it, bounded. */
   private readonly tails = new Set<Promise<unknown>>();
+  /** Memory entries already sent in this socket's conversation, when no registry keeps them per device (legacy mode). */
+  private readonly sentHere = new SentEntries();
 
   constructor(
     private readonly deps: SessionDeps,
@@ -237,6 +257,90 @@ export class Session {
         this.emit({ type: "history", items });
         return;
       }
+      case "memory_list":
+        await this.handleMemory(frame.id);
+        return;
+      case "memory_delete":
+        await this.handleMemory(frame.id, frame.entryId);
+        return;
+    }
+  }
+
+  // ------------------------------------------------------------ memory (docs/06)
+
+  /**
+   * `memory_list` (no `deleteId`) and `memory_delete`: answered with a fresh
+   * `memory` frame to this socket only. A deletion tombstones the entry, like
+   * `memory_forget`; an unknown or malformed id is `bad_request`.
+   */
+  private async handleMemory(id: string, deleteId?: string): Promise<void> {
+    const memory = this.deps.memory;
+    if (!memory) {
+      this.error("bad_request", "memory is disabled", id);
+      return;
+    }
+    try {
+      if (deleteId !== undefined) {
+        if (!isEntryId(deleteId)) {
+          this.error("bad_request", "unknown memory entry", id);
+          return;
+        }
+        const r = await memory.forget({ ids: [deleteId] });
+        // `pending`: recorded and hidden already; completed before the next store operation.
+        if (!r.ok && !r.pending) {
+          this.error("internal", "memory could not be written", id);
+          return;
+        }
+        if (r.ok && r.removed.length === 0) {
+          this.error("bad_request", "unknown memory entry", id);
+          return;
+        }
+        this.deps.logger.info(`[shadow-core] memory entry ${deleteId} deleted by device ${this.info.device}`);
+      }
+      this.emit(memoryFrame(id, await memory.snapshot()));
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] memory request failed: ${(err as Error)?.name ?? "error"}`);
+      this.error("internal", "memory is unavailable", id);
+    }
+  }
+
+  /** The device's (or, without a registry, this socket's) "already sent" set. */
+  private sentEntries(): SentEntries {
+    return this.deps.registry?.sentEntries?.(this.info.device) ?? this.sentHere;
+  }
+
+  /**
+   * Memory entries for one model turn, not yet marked as sent: topic entries
+   * relevant to `text` (memory/match.ts), and with `withBrief` (legacy runner,
+   * whose system prompt has no brief) the brief entries first. Only entries not
+   * sent yet in this conversation; `commit()` marks them once the attempt is
+   * accepted. Never throws: memory problems leave the turn without a block.
+   */
+  private async memoryForTurn(text: string, withBrief: boolean): Promise<{ block: string; commit: () => void }> {
+    const none = { block: "", commit: () => {} };
+    const memory = this.deps.memory;
+    if (!memory) return none;
+    try {
+      const sent = this.sentEntries();
+      const fresh = (await memory.entries()).filter((e) => sent.isFresh(e));
+      const brief: MemoryEntry[] = [];
+      let briefChars = 0;
+      // Whole entries in file order within the brief's hard limit, as in the system prompt.
+      for (const e of withBrief ? fresh.filter((x) => x.location === "brief") : []) {
+        if (briefChars + e.text.length > MEMORY_BUDGETS.briefMaxChars) break;
+        brief.push(e);
+        briefChars += e.text.length;
+      }
+      const notes = selectRelevant(
+        text,
+        fresh.filter((e) => e.location !== "brief"),
+      );
+      const picked: MemoryEntry[] = [...brief, ...notes];
+      if (picked.length === 0) return none;
+      return { block: renderMemoryBlock(picked), commit: () => sent.markSent(picked) };
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] memory unavailable for this turn: ${(err as Error)?.name ?? "error"}`);
+      return none;
     }
   }
 
@@ -329,6 +433,9 @@ export class Session {
   private async runTurn(id: string, text: string, source: "text" | "voice"): Promise<void> {
     const turn: ActiveTurn = { id, abort: new AbortController(), text: "", startedAt: Date.now() };
     this.turn = turn;
+    // Any tier, for the whole turn (tier-0 confirmations included): no compaction starts meanwhile.
+    const endActivity = this.deps.registry?.beginActivity?.(this.info.device);
+    this.deps.maintenance?.turnStarted(this.info.device);
     turn.speech = this.openSpeech(turn);
     this.emit({ type: "state", state: "thinking" });
     void this.slog.append({ kind: "user", id, text, source });
@@ -337,6 +444,9 @@ export class Session {
       const decision = await this.deps.router.route({ text, source, device: this.info.device });
       const routeMs = Date.now() - turn.startedAt;
       if (decision.tier === 0 && decision.direct) {
+        // A compaction already running: wait for it, so this exchange's note goes
+        // to the conversation that follows it (model turns wait in acquire).
+        await this.waitHold(turn);
         if (await this.runDirect(turn, text, decision, decision.direct)) return;
         // Fallback: the cheap model takes over (nothing was changed in the home).
         await this.runModel(turn, text, { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule }, routeMs);
@@ -351,6 +461,25 @@ export class Session {
       if (this.turn === turn) this.turn = null;
       this.finishSpeech(turn);
       this.emit({ type: "state", state: "idle" });
+      endActivity?.();
+      this.deps.maintenance?.turnEnded(this.info.device);
+    }
+  }
+
+  /** Waits while maintenance holds the device (docs/06 §Trigger); a cancel stops the wait. */
+  private async waitHold(turn: ActiveTurn): Promise<void> {
+    const signal = turn.abort.signal;
+    const held = this.deps.registry?.isHeld?.(this.info.device) ? this.deps.registry.waitHold?.(this.info.device) : undefined;
+    if (!held || signal.aborted) return;
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<void>((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([held, aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -429,6 +558,7 @@ export class Session {
           doneMs: doneAt - turn.startedAt,
           sdkDurationMs: t.sdkDurationMs,
           ...(firstSpeechAt !== undefined ? { firstSpeechMs: firstSpeechAt - turn.startedAt } : {}),
+          ...(turn.waitedForCompactMs !== undefined ? { waitedForCompactMs: turn.waitedForCompactMs } : {}),
         });
       }),
     );
@@ -443,7 +573,10 @@ export class Session {
     const tools: string[] = [];
     let outcome: DirectOutcome;
     const client = this.deps.direct;
-    if (!client) {
+    if (turn.abort.signal.aborted) {
+      // Cancelled while it waited for a compaction: nothing is run.
+      outcome = { kind: "cancelled" };
+    } else if (!client) {
       outcome = { kind: "fallback", reason: "no_direct_client" };
     } else if (!this.deps.policy.serviceNames.includes(plan.service)) {
       // Service disabled (e.g. token missing): the model path decides what to tell the user.
@@ -543,11 +676,6 @@ export class Session {
     if (this.directNotes.length > MAX_DIRECT_NOTES) this.directNotes.splice(0, this.directNotes.length - MAX_DIRECT_NOTES);
   }
 
-  /** Puts the delimited tier-0 exchanges the model has not seen yet in front of the text, then forgets them. */
-  private withDirectNotes(text: string): string {
-    return buildTurnEnvelope({ text, notes: this.directNotes.splice(0).map((n) => n.text) });
-  }
-
   // ------------------------------------------------------------ tiers 1-3
 
   private async runModel(turn: ActiveTurn, text: string, decision: RouteDecision, routeMs: number): Promise<void> {
@@ -557,29 +685,41 @@ export class Session {
     void this.slog.append({ kind: "route", id, tier, model: decision.model, ...(decision.rule ? { rule: decision.rule } : {}) });
 
     const registry = this.deps.registry;
+    const device = this.info.device;
     if (!registry) {
       const result = await this.runModelLegacy(turn, text, decision, tier, escalateTo, this.sdkSessionId, routeMs);
+      if (!result) return; // cancelled before the call: no model turn
       if (result.sessionId) this.sdkSessionId = result.sessionId;
+      this.deps.maintenance?.modelTurnEnded(device);
       return;
     }
     // One model turn per device across its sockets, also on the legacy fallback
     // (the session's own busy check does not cover a turn that runs beside it).
-    const device = this.info.device;
     if (!registry.beginTurn(device)) {
       this.error("busy", "a turn is already running on this device", id);
       return;
     }
     try {
+      // A compaction in progress makes this turn wait in acquire (docs/06 §Trigger).
+      const waitStart = registry.isHeld?.(device) ? Date.now() : undefined;
       const session = await this.acquire(turn, registry);
+      if (waitStart !== undefined) turn.waitedForCompactMs = Date.now() - waitStart;
       if (session === "cancelled") {
         this.finishCancelledBeforeModel(turn, tier, decision.model);
         return;
       }
-      if (session && (await this.runModelPersistent(turn, text, decision, tier, escalateTo, session, routeMs))) return;
+      // The summary of a compacted conversation that could not be stored as a note;
+      // the registry keeps it until an attempt carrying it is taken (`seedDelivered`).
+      const seed = registry.peekSeedNote?.(device);
+      const delivered = seed === undefined ? () => {} : () => registry.seedDelivered?.(device, seed);
+      if (session && (await this.runModelPersistent(turn, text, decision, tier, escalateTo, session, routeMs, seed, delivered))) return;
       // No session (start failed, restart backoff) or it closed under us: this turn runs on the legacy runner.
       const base = await registry.fallbackResume(device);
-      const result = await this.runModelLegacy(turn, text, decision, tier, escalateTo, base, routeMs);
+      const result = await this.runModelLegacy(turn, text, decision, tier, escalateTo, base, routeMs, seed, delivered);
+      // Cancelled before the call: nothing was sent, so continuity stays where it was.
+      if (!result) return;
       this.track(registry.turnEnded(device, result.sessionId));
+      this.deps.maintenance?.modelTurnEnded(device);
     } finally {
       registry.endTurn(device);
     }
@@ -607,7 +747,10 @@ export class Session {
     this.recordModelUsage(turn, tier, model, { text: "", inputTokens: 0, outputTokens: 0, durationMs: Date.now() - turn.startedAt }, "cancelled");
   }
 
-  /** Legacy runner: a fresh query per turn; tier-1 attempts fork, escalation resumes (behaviour before 07). */
+  /**
+   * Legacy runner: a fresh query per turn; tier-1 attempts fork, escalation resumes (behaviour before 07).
+   * Undefined when the turn was cancelled before the call (nothing was sent).
+   */
   private async runModelLegacy(
     turn: ActiveTurn,
     text: string,
@@ -616,9 +759,21 @@ export class Session {
     escalateTo: RouteDecision["escalateTo"],
     base: string | undefined,
     routeMs: number,
-  ): Promise<TurnResult> {
+    seed?: string,
+    seedDelivered: () => void = () => {},
+  ): Promise<TurnResult | undefined> {
     const id = turn.id;
-    const prompt = this.withDirectNotes(text);
+    // A fresh query per turn: its system prompt has no brief, so the brief goes in the memory block.
+    const memory = await this.memoryForTurn(text, true);
+    if (turn.abort.signal.aborted) {
+      // Cancelled while memory was read: no call, so notes, entries and the seed stay for the next turn.
+      this.finishCancelledBeforeModel(turn, tier, decision.model);
+      return undefined;
+    }
+    const notes = this.directNotes.splice(0).map((n) => n.text);
+    const prompt = buildTurnEnvelope({ text, notes: seed ? [seed, ...notes] : notes, memoryBlock: memory.block });
+    memory.commit();
+    seedDelivered();
 
     let call = await this.callModel(turn, { prompt, model: decision.model, tier, escalatable: escalateTo !== undefined, resume: base });
     let model = decision.model;
@@ -717,12 +872,22 @@ export class Session {
     escalateTo: RouteDecision["escalateTo"],
     session: ProviderSession,
     routeMs: number,
+    seed?: string,
+    seedDelivered: () => void = () => {},
   ): Promise<boolean> {
     const id = turn.id;
     const escalatable = escalateTo !== undefined;
     // Notes buffered while no session was running go in front of the request.
     const notes = this.directNotes.slice();
-    const envelope = buildTurnEnvelope({ text, escalatable, notes: notes.map((n) => n.text) });
+    // The brief is in this session's system prompt; only relevant topic entries go in the envelope.
+    const memory = await this.memoryForTurn(text, false);
+    if (turn.abort.signal.aborted) {
+      // Cancelled while memory was read: no attempt, so notes, entries and the seed stay for the next turn.
+      this.finishCancelledBeforeModel(turn, tier, decision.model);
+      return true;
+    }
+    const noteTexts = notes.map((n) => n.text);
+    const envelope = buildTurnEnvelope({ text, escalatable, notes: seed ? [seed, ...noteTexts] : noteTexts, memoryBlock: memory.block });
     let model = decision.model;
     let callTier: ModelTier = tier;
 
@@ -732,10 +897,20 @@ export class Session {
       this.error("busy", "a turn is already running on this device", id);
       return true;
     }
-    // Remove exactly the notes sent (a refused batch may have been merged in meanwhile).
+    // Remove exactly the notes taken (a refused batch may have been merged in meanwhile).
+    // Taken at once so a tier-0 note batch cannot pick them up while the attempt waits in the queue.
     for (const n of notes) {
       const i = this.directNotes.indexOf(n);
       if (i >= 0) this.directNotes.splice(i, 1);
+    }
+    // Accepted is not sent: the attempt may wait behind a model switch or earlier work and end
+    // unsent (cancelled meanwhile). Only a sent prompt consumes the entries and the seed.
+    const sent = await first.sent;
+    if (sent) {
+      memory.commit();
+      seedDelivered();
+    } else if (notes.length > 0) {
+      this.bufferDirectNotes(notes);
     }
     let call = first;
     let out = await call.done;
@@ -793,7 +968,19 @@ export class Session {
       settled.then((o) => ({ sdkDurationMs: o.durationMs, warm: o.warm, queryAgeMs: o.queryAgeMs })),
     );
     const registry = this.deps.registry;
-    if (registry) this.track(settled.then(() => registry.turnEnded(this.info.device)));
+    const device = this.info.device;
+    // An unsent turn did not move the conversation: no continuity update, no model turn counted.
+    if (!sent) return true;
+    this.track(
+      settled.then(async (o) => {
+        if (registry) await registry.turnEnded(device);
+        // Context size of the live conversation = this turn's input total (docs/06 §Trigger).
+        this.deps.maintenance?.modelTurnEnded(device, {
+          contextTokens: o.inputTokens,
+          ...(o.status === "usage_limit" ? { usageLimited: true, ...(o.retryAt !== undefined ? { retryAt: o.retryAt } : {}) } : {}),
+        });
+      }),
+    );
     return true;
   }
 
@@ -802,7 +989,10 @@ export class Session {
     turn: ActiveTurn,
     session: ProviderSession,
     o: { text: string; model: string; tier: ModelTier; escalatable: boolean },
-  ): { done: Promise<AttemptOutcome>; settled: Promise<AttemptOutcome>; escalate: () => boolean } | "busy" | "closed" {
+  ):
+    | { done: Promise<AttemptOutcome>; settled: Promise<AttemptOutcome>; sent: Promise<boolean>; escalate: () => boolean }
+    | "busy"
+    | "closed" {
     let buffer = "";
     let handle: AttemptHandle;
     try {
@@ -839,7 +1029,7 @@ export class Session {
       }
       return out;
     });
-    return { done, settled: handle.settled, escalate: () => escalate };
+    return { done, settled: handle.settled, sent: handle.sent, escalate: () => escalate };
   }
 
   /** Usage is final only at `settled` (07 §Turn boundaries). `outcome` undefined = from the status. */
@@ -1060,4 +1250,20 @@ export class Session {
     await this.slog.append({ kind: "session_end", reason });
     await this.slog.flush();
   }
+}
+
+/** The `memory` frame (docs/06 §Protocol) from a store snapshot: ids and texts only, no keywords or provenance. */
+export function memoryFrame(id: string, snap: MemorySnapshot): MemoryFrame {
+  return {
+    type: "memory",
+    id,
+    brief: { chars: snap.brief.chars, budget: snap.brief.budget, entries: snap.brief.entries.map((e) => ({ id: e.id, text: e.text })) },
+    topics: snap.topics.map((t) => ({
+      topic: t.topic,
+      title: t.title,
+      chars: t.chars,
+      entries: t.entries.map((e) => ({ id: e.id, text: e.text, updatedAt: e.updatedAt })),
+    })),
+    warnings: snap.warnings.map((w) => (w.topic ? { code: w.code, topic: w.topic } : { code: w.code })),
+  };
 }

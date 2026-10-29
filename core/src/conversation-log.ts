@@ -68,6 +68,8 @@ export type LogEntry =
       doneMs: number;
       sdkDurationMs: number;
       firstSpeechMs?: number;
+      /** The turn waited this long for a context compaction of its device (docs/06). */
+      waitedForCompactMs?: number;
     }
   | { kind: "error"; id?: string; code: string; message: string };
 

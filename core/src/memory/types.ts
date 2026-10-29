@@ -140,6 +140,22 @@ export interface MemoryState {
   day: string;
   runsToday: number;
   usageLimitUntil: number;
+  /** Set when state.json was found missing or corrupt: devices without a cursor start no earlier than this. */
+  resetAt?: number;
+  /**
+   * Written just before a pass applies ops, cleared with the cursor move after
+   * it: still set on load means the pass crashed in between, so the range
+   * `(fromTs, toTs]` of `device` counts as applied (no second model call).
+   */
+  pending?: PendingExtraction;
+}
+
+export interface PendingExtraction {
+  device: string;
+  /** The device's cursor when the pass read its turns. */
+  fromTs: number;
+  /** Newest log entry the pass read (the cursor after it). */
+  toTs: number;
 }
 
 export type MemoryWarningCode =

@@ -13,10 +13,15 @@ import { ConversationLog } from "./conversation-log.js";
 import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
+import { MemoryExtractor } from "./memory/extractor.js";
+import { DeviceMaintenance, formatBrief } from "./memory/lifecycle.js";
+import { MemoryStore } from "./memory/store.js";
+import { createMemoryMcpServer } from "./memory/tools.js";
 import { PermissionPolicy } from "./permissions.js";
 import { McpDirectClient } from "./mcp-direct.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router } from "./router.js";
+import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
 import { Session, type Logger } from "./session.js";
 import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
@@ -29,8 +34,8 @@ const logger: Logger = {
   warn: (m) => console.warn(m),
 };
 
-/** MCP servers handed to the SDK for each turn (only enabled services). */
-export function buildMcpServers(cfg: CoreConfig, env: NodeJS.ProcessEnv): () => Record<string, McpServerConfig> {
+/** MCP servers handed to the SDK for each turn (only enabled services; `shadow-memory` only with a memory store). */
+export function buildMcpServers(cfg: CoreConfig, env: NodeJS.ProcessEnv, memory?: MemoryStore): () => Record<string, McpServerConfig> {
   const remote: Record<string, McpServerConfig> = {};
   for (const svc of cfg.services.services) {
     if (svc.kind !== "mcp" || !svc.enabled || !svc.url) continue;
@@ -46,7 +51,12 @@ export function buildMcpServers(cfg: CoreConfig, env: NodeJS.ProcessEnv): () => 
     vaultSvc && cfg.vaultDir
       ? new VaultReader({ root: cfg.vaultDir, allow: vaultSvc.allow ?? [], maxBytes: vaultSvc.maxBytes })
       : undefined;
-  return () => (reader && vaultSvc ? { ...remote, [vaultSvc.name]: createVaultMcpServer(reader, vaultSvc.name) } : remote);
+  const memorySvc = memory ? cfg.services.services.find((s) => s.kind === "memory" && s.enabled) : undefined;
+  return () => ({
+    ...remote,
+    ...(reader && vaultSvc ? { [vaultSvc.name]: createVaultMcpServer(reader, vaultSvc.name) } : {}),
+    ...(memory && memorySvc ? { [memorySvc.name]: createMemoryMcpServer(memory, memorySvc.name) } : {}),
+  });
 }
 
 /**
@@ -93,6 +103,25 @@ export async function main(): Promise<void> {
     vaultSvc.disabledReason = "SHADOW_VAULT_DIR not set or not a directory";
   }
 
+  // Memory (docs/06): CORE_MEMORY=off turns off the store, its tools, the brief and the frames.
+  const memorySvc = cfg.services.services.find((s) => s.kind === "memory");
+  if (memorySvc && !cfg.memory.enabled) {
+    memorySvc.enabled = false;
+    memorySvc.disabledReason = "CORE_MEMORY=off";
+  }
+  const memoryDir = join(cfg.dataDir, "memory");
+  // Assigned below; the store's change callback restarts idle sessions when the brief changed.
+  let registry: DeviceRegistry | undefined;
+  const memory = cfg.memory.enabled
+    ? new MemoryStore({
+        dir: memoryDir,
+        logger,
+        onChange: (c) => {
+          if (c.briefChanged) registry?.briefChanged();
+        },
+      })
+    : undefined;
+
   const systemPrompt = readFileSync(cfg.systemPromptFile, "utf8");
   const escalationPrompt = readFileSync(join(cfg.systemPromptFile, "..", "tier1.md"), "utf8");
   const log = new ConversationLog(cfg.dataDir);
@@ -104,32 +133,33 @@ export async function main(): Promise<void> {
   const agent = new SdkAgentRunner({
     systemPrompt,
     escalationPrompt,
-    mcpServers: buildMcpServers(cfg, process.env),
+    mcpServers: buildMcpServers(cfg, process.env, memory),
     cwd: agentCwd,
     env: agentEnv,
     stderr: (line) => logger.warn(`[shadow-core] sdk: ${line.trimEnd()}`),
   });
 
+  // The model provider: live sessions (persistent mode) and one-shot background calls (memory).
+  const remoteMcp = cfg.services.services.filter((s) => s.kind === "mcp" && s.enabled && s.url).map((s) => s.name);
+  const provider = new ClaudeSdkProvider({
+    queryFn: query,
+    buildOptions: (p) => agent.buildPersistentOptions(p),
+    buildOneShotOptions: buildOneShotOptions(agentCwd, agentEnv),
+    session: {
+      idleMs: cfg.agent.idleMin * 60_000,
+      turnTimeoutMs: cfg.agent.turnTimeoutMs,
+      mcpFreshness: { servers: remoteMcp },
+      log: (event, detail) => {
+        if (event === "dead" || event === "send_failed" || event === "settle_failed") {
+          logger.warn(`[shadow-core] agent ${event}: ${JSON.stringify(detail ?? {})}`);
+        }
+      },
+    },
+  });
+
   // Persistent per-device model sessions (docs/07 A1) with continuity (A4).
   // CORE_AGENT_PERSISTENT=off: no registry, every turn on the legacy runner.
-  let registry: DeviceRegistry | undefined;
   if (cfg.agent.persistent) {
-    const remoteMcp = cfg.services.services.filter((s) => s.kind === "mcp" && s.enabled && s.url).map((s) => s.name);
-    const provider = new ClaudeSdkProvider({
-      queryFn: query,
-      buildOptions: (p) => agent.buildPersistentOptions(p),
-      buildOneShotOptions: buildOneShotOptions(agentCwd, agentEnv),
-      session: {
-        idleMs: cfg.agent.idleMin * 60_000,
-        turnTimeoutMs: cfg.agent.turnTimeoutMs,
-        mcpFreshness: { servers: remoteMcp },
-        log: (event, detail) => {
-          if (event === "dead" || event === "send_failed" || event === "settle_failed") {
-            logger.warn(`[shadow-core] agent ${event}: ${JSON.stringify(detail ?? {})}`);
-          }
-        },
-      },
-    });
     const store = new ContinuityStore({
       file: continuityFilePath(cfg.dataDir),
       windowMin: cfg.agent.continuityMin,
@@ -144,6 +174,7 @@ export async function main(): Promise<void> {
       continuityMin: cfg.agent.continuityMin,
       restartGuard: () => new RestartBackoff(),
       prewarm: cfg.agent.prewarm,
+      ...(memory ? { systemAppend: async () => formatBrief(await memory.briefForPrompt()) } : {}),
       log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
     });
     if (cfg.router && Object.values(cfg.router.tierServices).some((v) => v !== undefined)) {
@@ -153,6 +184,39 @@ export async function main(): Promise<void> {
     }
   }
   const usageLog = new UsageLog(cfg.dataDir);
+
+  // Background extraction and compaction (docs/06), through the provider interface only.
+  const background = new AbortController();
+  let extractor: MemoryExtractor | undefined;
+  if (memory) {
+    extractor = new MemoryExtractor({
+      store: memory,
+      provider,
+      dataDir: cfg.dataDir,
+      model: cfg.memory.model,
+      maxRunsPerDay: cfg.memory.maxRunsDay,
+      everyTurns: cfg.memory.everyTurns,
+      usage: usageLog,
+      logger,
+      signal: background.signal,
+    });
+    await extractor.init();
+  }
+  const maintenance =
+    registry || extractor
+      ? new DeviceMaintenance({
+          registry,
+          extractor,
+          provider,
+          summaryModel: cfg.memory.model,
+          compactAtTokens: cfg.memory.compactAtTokens,
+          idleExtractMs: cfg.memory.idleMin * 60_000,
+          dataDir: cfg.dataDir,
+          usage: usageLog,
+          log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
+        })
+      : undefined;
+  maintenance?.startup([...tokens.digests.keys()]);
   let router: Router;
   let direct: McpDirectClient | undefined;
   if (cfg.router) {
@@ -172,7 +236,10 @@ export async function main(): Promise<void> {
   const pronunciations = lexicon.lexicon;
 
   // Built after the vault check above so a missing vault dir reads as disabled.
-  const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, { vaultDir: cfg.vaultDir }), {
+  const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, {
+      vaultDir: cfg.vaultDir,
+      ...(memory ? { memoryDir } : {}),
+    }), {
     intervalMs: cfg.healthIntervalMs,
     timeoutMs: cfg.healthTimeoutMs,
     logger,
@@ -196,13 +263,15 @@ export async function main(): Promise<void> {
           direct,
           tierServices,
           pronunciations,
+          memory,
+          maintenance,
         },
         info,
         send,
       ),
     // Name, flag, status and short detail code only: no URL or token leaves through /health.
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
-    features: ["speech_stream", "usage_limit"],
+    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : [])],
     serviceHealth: monitor,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
@@ -221,6 +290,9 @@ export async function main(): Promise<void> {
   logger.info(
     `[shadow-core] pronunciations: ${lexicon.found ? `${pronunciations.entries.length} entries` : "file not found (none)"}`,
   );
+  logger.info(
+    `[shadow-core] memory: ${memory ? `on (model ${cfg.memory.model}, idle ${cfg.memory.idleMin} min, every ${cfg.memory.everyTurns} turns)` : "off"}; compaction: ${cfg.memory.compactAtTokens > 0 && registry ? `at ${cfg.memory.compactAtTokens} tokens` : "off"}`,
+  );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
   logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);
@@ -228,6 +300,8 @@ export async function main(): Promise<void> {
   // SIGBREAK is Windows Ctrl+Break; onShutdownSignal runs the shutdown only once.
   onShutdownSignal(process, SHUTDOWN_SIGNALS, (signal) => {
     logger.info(`[shadow-core] shutting down (${signal})`);
+    maintenance?.close();
+    background.abort();
     void monitor
       .close()
       .then(() => server.close())

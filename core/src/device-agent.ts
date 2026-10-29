@@ -162,8 +162,16 @@ export interface DeviceAgentOptions {
   model: string;
   /** Session to continue (A4). Without a baseline the first result's `costUsd` is omitted. */
   resume?: string;
+  /** Appended to the static system prompt for the life of the query (memory brief, docs/06). */
+  systemAppend?: string;
   /** Builds the query options (agent.ts `SdkAgentRunner.buildPersistentOptions`). */
-  buildOptions: (p: { model: string; resume?: string; canUseTool: CanUseTool; abortController: AbortController }) => Omit<Options, "prompt">;
+  buildOptions: (p: {
+    model: string;
+    resume?: string;
+    canUseTool: CanUseTool;
+    abortController: AbortController;
+    memoryBrief?: string;
+  }) => Omit<Options, "prompt">;
   /** `query` from the SDK; injected by tests. */
   queryFn: QueryFactory;
   /** Close after this long without an attempt (0 = never). Default 10 min. */
@@ -256,6 +264,8 @@ interface Attempt {
   costUsd?: number;
   done: ReturnType<typeof deferred<AttemptOutcome>>;
   settledP: ReturnType<typeof deferred<AttemptOutcome>>;
+  /** `AttemptHandle.sent`: true once the prompt is written, false when it settles unsent. */
+  sentP: ReturnType<typeof deferred<boolean>>;
   visibleOutcome?: AttemptOutcome;
   turnTimer?: NodeJS.Timeout;
   watchdog?: NodeJS.Timeout;
@@ -326,6 +336,7 @@ export class DeviceAgent implements ProviderSession {
       resume: opts.resume,
       canUseTool: this.dispatch,
       abortController: this.abortController,
+      ...(opts.systemAppend ? { memoryBrief: opts.systemAppend } : {}),
     });
     this.q = opts.queryFn({ prompt: this.input, options: { ...options, abortController: this.abortController } as Options });
     // Readiness for prewarm = `initializationResult()` (spike Q1: `system/init`
@@ -400,6 +411,7 @@ export class DeviceAgent implements ProviderSession {
       usageLimitText: false,
       done: deferred<AttemptOutcome>(),
       settledP: deferred<AttemptOutcome>(),
+      sentP: deferred<boolean>(),
     };
     this.active = a;
     this.clearIdle();
@@ -409,7 +421,7 @@ export class DeviceAgent implements ProviderSession {
       else req.signal.addEventListener("abort", a.onAbort, { once: true });
     }
     this.enqueue(a, () => this.sendAttempt(a));
-    return { done: a.done.promise, settled: a.settledP.promise };
+    return { done: a.done.promise, settled: a.settledP.promise, sent: a.sentP.promise };
   }
 
   /**
@@ -506,6 +518,7 @@ export class DeviceAgent implements ProviderSession {
       }, timeout);
     }
     this.input.push(userMessage(a.req.text, true));
+    a.sentP.resolve(true);
     await a.settledP.promise;
   }
 
@@ -759,6 +772,8 @@ export class DeviceAgent implements ProviderSession {
   private settleAttempt(a: Attempt, status: AttemptStatus): void {
     if (a.settled) return;
     a.settled = true;
+    // Before `done`: a caller awaiting `sent` then `done` sees them in that order. No-op once resolved true.
+    a.sentP.resolve(a.sent);
     clearTimeout(a.turnTimer);
     clearTimeout(a.watchdog);
     if (a.onAbort) a.req.signal?.removeEventListener("abort", a.onAbort);

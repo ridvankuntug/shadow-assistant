@@ -43,6 +43,23 @@ export interface CoreConfig {
   pronunciationsFile: string;
   /** Model sessions (docs/07 A1/A4); see .env.example. */
   agent: AgentConfig;
+  /** Assistant memory and context compaction (docs/06); see .env.example. */
+  memory: MemoryConfig;
+}
+
+export interface MemoryConfig {
+  /** CORE_MEMORY (default on); off = no extraction, memory block, brief, tools or frames. */
+  enabled: boolean;
+  /** CORE_MEMORY_MODEL (default haiku): extraction and compaction summary model. */
+  model: string;
+  /** CORE_MEMORY_IDLE_MIN (default 5): idle minutes before an extraction pass. */
+  idleMin: number;
+  /** CORE_MEMORY_EVERY_TURNS (default 10): model turns between passes. */
+  everyTurns: number;
+  /** CORE_MEMORY_MAX_RUNS_DAY (default 30): global daily cap of passes. */
+  maxRunsDay: number;
+  /** CORE_COMPACT_AT_TOKENS (default 50000; `off` = 0 = no compaction): context size that triggers compaction. */
+  compactAtTokens: number;
 }
 
 export interface AgentConfig {
@@ -138,6 +155,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
       idleMin: positiveInt("CORE_AGENT_IDLE_MIN", env.CORE_AGENT_IDLE_MIN, 10),
       turnTimeoutMs: positiveInt("CORE_TURN_TIMEOUT_MS", env.CORE_TURN_TIMEOUT_MS, 120_000),
       continuityMin: positiveInt("CORE_CONTINUITY_MIN", env.CORE_CONTINUITY_MIN, 30),
+    },
+    memory: {
+      enabled: onByDefault(env.CORE_MEMORY),
+      model: env.CORE_MEMORY_MODEL?.trim() || "haiku",
+      idleMin: positiveInt("CORE_MEMORY_IDLE_MIN", env.CORE_MEMORY_IDLE_MIN, 5),
+      everyTurns: positiveInt("CORE_MEMORY_EVERY_TURNS", env.CORE_MEMORY_EVERY_TURNS, 10),
+      maxRunsDay: positiveInt("CORE_MEMORY_MAX_RUNS_DAY", env.CORE_MEMORY_MAX_RUNS_DAY, 30),
+      compactAtTokens: /^(0|off|false|no)$/i.test(env.CORE_COMPACT_AT_TOKENS?.trim() ?? "")
+        ? 0
+        : positiveInt("CORE_COMPACT_AT_TOKENS", env.CORE_COMPACT_AT_TOKENS, 50_000),
     },
   };
 }

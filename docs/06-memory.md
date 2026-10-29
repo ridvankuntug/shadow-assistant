@@ -1,6 +1,6 @@
 # 06 - Assistant memory
 
-Status: design (T10 in [`01-v1-plan.md`](01-v1-plan.md)). This builds on the
+Status: in progress — M6 and M7 implemented, see *Implementation notes* (T10 in [`01-v1-plan.md`](01-v1-plan.md)). This builds on the
 persistent per-device agent session in [`07-speed.md`](07-speed.md) (A1). Read
 that first.
 
@@ -480,6 +480,45 @@ Each item has a default so that implementation can go ahead.
    full effect at the next conversation or compaction. Default: accept.
 6. **Compaction threshold 50k tokens.** Default: 50000.
 
+## Implementation notes (M6, M7)
+
+Where the code differs from or adds to the design above:
+
+- **Provider-neutral wiring.** Memory loading, extraction triggers and compaction
+  live above the provider interface (`core/src/memory/lifecycle.ts`,
+  `device-registry.ts`, `session.ts`); no SDK hooks. The brief reaches a session
+  through a new neutral field `OpenSessionOptions.systemAppend` (the Claude
+  provider appends it to its static system prompt).
+- **"Already sent" set** is kept per device by the registry (not by the
+  `DeviceAgent`), so it is provider-independent. It is cleared when a session
+  starts (also a resumed one) and on compaction. Without a registry
+  (`CORE_AGENT_PERSISTENT=off`) each socket session keeps its own.
+- **Legacy runner turns** (persistent mode off, or the fallback when a session
+  cannot start) have no brief in their system prompt, so the brief entries go
+  first in their `<hafiza>` block, once per conversation.
+- **Brief change.** A generation counter marks running sessions stale. An idle
+  one is closed and restarted in the background (with `resume`; only when
+  prewarm is on, otherwise on the next turn); a busy one after its turn's usage
+  is final, or at the latest when the next turn acquires it.
+- **Compaction order.** Extraction and the Core-side summary run *before* the
+  device is held, so a user turn never waits for them; only the in-place
+  `compact()` or the reseed (new session + note) runs while turns wait. A turn
+  that starts meanwhile cancels the run; it is scheduled again after that turn.
+  The summary input is the device's log of today and yesterday, redacted with
+  the extractor's input filter, newest 8000 chars. Its usage record has
+  `turnId: "compact-summary"`. A failed compaction (summary error, usage limit,
+  reseed failure, `compact()` false or > 60 s) is retried after 10 more model
+  turns. If the new session cannot start, the old one is kept.
+- **Reseed note.** Stored with `appendNote` when `capabilities.notes`; otherwise
+  (or when refused) it is put in front of the next prompt inside `<bilgi>`.
+- `CORE_COMPACT_AT_TOKENS=off` (or `0`) turns compaction off.
+- `memory_delete` with a write failure answers `error internal`; an
+  already-deleted id is `bad_request` like an unknown one.
+- The `timing` record gets `waitedForCompactMs` when a turn waited for a
+  compaction.
+- The extraction pass runs only for devices that have a token
+  (`DEVICE_TOKEN_<NAME>`) at the startup trigger.
+
 ## Related findings (not in scope, need approval)
 
 - Tier 0 could resolve aliases from `ev.md` ("Otomodos ışığını kapat" without a
@@ -514,7 +553,7 @@ parallel with the Core lane once P1 and S11 are done; M6 → M7 serialized.
 - [ ] **M3 — Per-turn matcher.** Keyword scoring with `fold`/`stemCandidates` (import only, no change to `turkish.ts`), 1200-char/8-entry cut, a once-per-query "already sent" set API. Acceptance: tests for inflected Turkish forms and the cut.
 - [ ] **M4 — Extractor.** Triggers and skip rules, log reader, pre-filter, one-shot query with `outputFormat`, op application with merge and dedupe, usage record, usage-limit suspend, cursor rules. Acceptance: tests with a fake runner for each rule; a real run against a sample log produces sensible entries (manual).
 - [ ] **M5 — Memory tools and service kind.** `kind: memory` in `services.ts` (validation, health `ok` when the folder is writable), `shadow-memory` MCP server with `memory_list` and `memory_forget`, `services.yaml` entry with levels and `confirm_inputs`. Acceptance: tool tests; the permission policy returns `read`/`write`/`confirm` as designed.
-- [ ] **M6 — Core wiring.** Brief in the system prompt at query start, restart on brief change, `<hafiza>` block in the envelope, extractor notified at turn end and on idle, tools registered, `memory_list`/`memory_delete` frames, `features: ["memory"]`, `system.md` paragraph, configuration. Acceptance: session integration tests; the manual end-to-end steps up to "bunu unut".
-- [ ] **M7 — Compaction.** Threshold, idle scheduling, extraction first, `/compact` with instructions, "already sent" reset, waiting turns, the fallback per S1. Acceptance: tests with a fake query (`compact_boundary` path and fallback path); manual: a long session drops below the threshold and still knows the room names.
+- [x] **M6 — Core wiring.** Brief in the system prompt at query start, restart on brief change, `<hafiza>` block in the envelope, extractor notified at turn end and on idle, tools registered, `memory_list`/`memory_delete` frames, `features: ["memory"]`, `system.md` paragraph, configuration. Acceptance: session integration tests; the manual end-to-end steps up to "bunu unut". *Done: tests in `session-memory.test.ts`, `device-registry.test.ts`, `memory-lifecycle.test.ts`; the manual end-to-end steps are open (M9).*
+- [x] **M7 — Compaction.** Threshold, idle scheduling, extraction first, `/compact` with instructions, "already sent" reset, waiting turns, the fallback per S1. Acceptance: tests with a fake query (`compact_boundary` path and fallback path); manual: a long session drops below the threshold and still knows the room names. *Done: both paths tested with fake providers (`memory-lifecycle.test.ts`, `device-registry.test.ts`); Claude keeps `capabilities.compact` off, so the summary path is the live one; the manual check is open (M9).*
 - [ ] **M8 — UI memory panel.** As in *UI*. Acceptance: component/controller tests (list, delete, warnings, hidden without the `memory` feature).
 - [ ] **M9 — Docs and end-to-end check.** docs/05 (what is in the data dir and backup; how to turn memory off), the manual end-to-end list run once and ticked. Acceptance: checklist run and its result recorded here.

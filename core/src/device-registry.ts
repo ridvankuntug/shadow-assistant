@@ -22,11 +22,23 @@
  *   whether it runs on the session or on the legacy fallback, so two sockets
  *   of one device never write the same conversation concurrently. `prewarm()`
  *   skips a locked device.
+ * - Memory (docs/06): a session starts with the memory brief appended to its
+ *   system prompt (`systemAppend`). `briefChanged()` makes every running
+ *   session stale; an idle one is replaced at once (with `resume`, so the
+ *   conversation stays), a busy one after its turn. Each device keeps the
+ *   "memory entries already sent" set of its conversation; it is cleared when a
+ *   session starts or the conversation is compacted.
+ * - Maintenance (06 §Context compression): `hold()` runs work while the
+ *   device's turns wait in `acquire()` (tier-0 turns in `waitHold()`);
+ *   `reseed()` replaces the session with a new conversation seeded with a
+ *   summary. `beginActivity()` marks a turn of any tier (tier 0 and its
+ *   confirmations included) so maintenance sees the device as busy.
  *
  * Provider-neutral: this module knows only `ModelProvider` / `ProviderSession`
  * (model-provider.ts) and never imports a provider SDK.
  */
 import { DEFAULT_CONTINUITY_MIN, type ContinuityStore } from "./continuity.js";
+import { SentEntries } from "./memory/match.js";
 import type { ModelProvider, ProviderCapabilities, ProviderSession } from "./model-provider.js";
 
 /** What continuity stores per device: which provider's conversation, and its id. */
@@ -68,6 +80,8 @@ export interface DeviceRegistryOptions {
   continuityMin?: number;
   /** `prewarm()` does nothing when false (CORE_AGENT_PREWARM=off). Default true. */
   prewarm?: boolean;
+  /** Text appended to the system prompt of every new session (memory brief); read at each start. */
+  systemAppend?: () => Promise<string>;
   log?: RegistryLog;
   now?: () => number;
 }
@@ -82,9 +96,19 @@ interface Entry {
   lastTurnAt?: number;
   /** A model turn of this device is running (any socket, session or legacy fallback). */
   turnBusy?: boolean;
+  /** Turns of any tier in progress (tier 0 and its confirmations included): maintenance treats the device as busy. */
+  active: number;
   /** The continuity port was asked once for this device (only the first start after a Core start needs it). */
   looked?: boolean;
   guard?: RestartGuard;
+  /** Memory entries already sent in this device's conversation (docs/06 §Relevant note entries). */
+  sent: SentEntries;
+  /** `briefGen` the running session started with. */
+  gen?: number;
+  /** Maintenance in progress (compaction): `acquire()` waits for it. */
+  hold?: Promise<void>;
+  /** Seed of a reseeded conversation that could not be stored as a note: goes in front of the next prompt. */
+  seed?: string;
 }
 
 export const DEFAULT_START_TIMEOUT_MS = 30_000;
@@ -95,6 +119,8 @@ export class DeviceRegistry {
   private readonly now: () => number;
   private readonly windowMs: number;
   private closed = false;
+  /** Incremented on every brief change; a session started with an older value is stale. */
+  private briefGen = 0;
   /** Aborted by close(): sessions still starting stop waiting for `ready`. */
   private readonly closing = new AbortController();
 
@@ -116,7 +142,7 @@ export class DeviceRegistry {
   private entry(device: string): Entry {
     let e = this.entries.get(device);
     if (!e) {
-      e = { guard: this.o.restartGuard?.() };
+      e = { guard: this.o.restartGuard?.(), sent: new SentEntries(), active: 0 };
       this.entries.set(device, e);
     }
     return e;
@@ -136,15 +162,31 @@ export class DeviceRegistry {
   async acquire(device: string): Promise<ProviderSession | undefined> {
     if (this.closed) return undefined;
     const e = this.entry(device);
-    // A start in progress (e.g. prewarm) already set `e.session` but is not
-    // ready yet: wait for it, so a failed start yields the legacy fallback.
-    if (e.starting) return e.starting;
-    const running = this.live(device);
-    if (running) return running;
-    e.starting ??= this.start(device, e).finally(() => {
-      e.starting = undefined;
-    });
-    return e.starting;
+    for (;;) {
+      // Compaction in progress: the turn waits for it (the client sees `thinking`).
+      while (e.hold) await e.hold;
+      if (this.closed) return undefined;
+      // A start in progress (e.g. prewarm) already set `e.session` but is not
+      // ready yet: wait for it, so a failed start yields the legacy fallback.
+      if (e.starting) {
+        const started = await e.starting;
+        // A failed start is not retried here (the turn uses the legacy runner).
+        if (!started || this.closed) return started;
+        // Another waiter already replaces it (see below): wait for that start.
+        // (The cast re-reads the field: TypeScript keeps the narrowing across the await.)
+        if ((e.starting as Entry["starting"] | undefined) !== undefined) continue;
+        // The brief changed while it started: loop, so the stale-and-idle check below replaces it.
+        if (this.isStale(e) && started === this.live(device)) continue;
+        return started;
+      }
+      const running = this.live(device);
+      if (running && !(this.isStale(e) && !running.busy)) return running;
+      // The brief changed since this session started: continue the conversation in a new one.
+      if (running) this.retire(device, e);
+      e.starting = this.start(device, e).finally(() => {
+        e.starting = undefined;
+      });
+    }
   }
 
   /**
@@ -154,7 +196,8 @@ export class DeviceRegistry {
    */
   prewarm(device: string): void {
     if (this.o.prewarm === false || this.closed) return;
-    if (this.entries.get(device)?.turnBusy) return;
+    const e = this.entries.get(device);
+    if (e?.turnBusy || e?.hold) return;
     void this.acquire(device).catch(() => {});
   }
 
@@ -195,8 +238,150 @@ export class DeviceRegistry {
     e.lastSessionId = sid;
     e.lastTurnAt = this.now();
     e.looked = true; // a newer pointer exists; the stored one is no longer of interest
+    // A session made stale by a brief change during this turn is replaced once the device is idle.
+    this.restartIfIdle(device, e);
     if (!this.o.continuity) return Promise.resolve();
     return this.o.continuity.record(device, { provider: this.o.provider.id, sessionId: sid }, this.now()).catch(() => {});
+  }
+
+  // --- memory and maintenance (docs/06) ---------------------------------------
+
+  /** The device's "memory entries already sent" set for its current conversation. */
+  sentEntries(device: string): SentEntries {
+    return this.entry(device).sent;
+  }
+
+  /**
+   * The memory brief changed (an identity fact was learned, or a brief entry
+   * was deleted): every running session is stale. Idle ones are replaced now
+   * (with `resume`); busy ones after their turn, or at the latest when the
+   * next turn acquires them.
+   */
+  briefChanged(): void {
+    this.briefGen++;
+    for (const [device, e] of this.entries) this.restartIfIdle(device, e);
+  }
+
+  /**
+   * The device is not idle for maintenance: a model turn holds the turn lock,
+   * or a turn of any tier (tier 0 with a pending confirmation included) is in
+   * progress (`beginActivity`).
+   */
+  isTurnBusy(device: string): boolean {
+    const e = this.entries.get(device);
+    return e !== undefined && (e.turnBusy === true || e.active > 0);
+  }
+
+  /**
+   * A turn of the device (any tier, any socket) starts. Not exclusive, unlike
+   * `beginTurn`; compaction only waits until none is in progress. Returns the
+   * release (idempotent).
+   */
+  beginActivity(device: string): () => void {
+    const e = this.entry(device);
+    e.active++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      e.active--;
+    };
+  }
+
+  /** Resolves once no maintenance of the device runs (tier-0 turns wait here; model turns wait in `acquire`). */
+  async waitHold(device: string): Promise<void> {
+    const e = this.entries.get(device);
+    while (e?.hold) await e.hold;
+  }
+
+  /** Maintenance of the device is running (its turns wait for it). */
+  isHeld(device: string): boolean {
+    return this.entries.get(device)?.hold !== undefined;
+  }
+
+  /**
+   * Runs `fn` while the device's turns wait in `acquire()` (compaction). The
+   * caller checks first that no turn is running; `fn` must not call `acquire()`.
+   */
+  async hold<T>(device: string, fn: () => Promise<T>): Promise<T> {
+    const e = this.entry(device);
+    while (e.hold) await e.hold;
+    let release!: () => void;
+    e.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      return await fn();
+    } finally {
+      e.hold = undefined;
+      release();
+    }
+  }
+
+  /**
+   * Compaction without `capabilities.compact` (06 §Core-side summary): opens a
+   * new conversation (no `resume`), stores `note` in it (`appendNote`; when
+   * notes are not supported or the note is refused, it goes in front of the
+   * next prompt, see `peekSeedNote`), then replaces the running session. The
+   * persisted continuity pointer moves to the new conversation only once it
+   * holds the summary: at once for a stored note, otherwise at the end of the
+   * first model turn that delivered the seed (`turnEnded`). A Core restart
+   * before that resumes the old, uncompacted conversation, never an empty one.
+   * On failure the running session is kept and false is returned.
+   */
+  async reseed(device: string, note: string): Promise<boolean> {
+    if (this.closed) return false;
+    const e = this.entry(device);
+    const gen = this.briefGen;
+    const systemAppend = await this.readSystemAppend(device);
+    let fresh: ProviderSession;
+    try {
+      fresh = this.openFor(device, e, undefined, systemAppend, true);
+    } catch (err) {
+      this.log("warn", `[shadow-core] compaction: new session for ${device} could not start: ${(err as Error)?.message ?? String(err)}`);
+      return false;
+    }
+    const ready = await this.waitReady(fresh);
+    if (ready !== true || this.closed) {
+      fresh.close();
+      if (ready !== "closed") this.log("warn", `[shadow-core] compaction: new session for ${device} not ready (${ready}); keeping the old one`);
+      return false;
+    }
+    const stored = this.capabilities.notes ? await fresh.appendNote(note).catch(() => false) : false;
+    if (fresh.isClosed || this.closed) {
+      fresh.close();
+      return false;
+    }
+    const old = e.session;
+    e.session = fresh;
+    e.gen = gen;
+    e.sent.clear();
+    e.seed = stored ? undefined : note;
+    e.lastSessionId = fresh.sessionId;
+    // The new conversation carries the summary; the continuity window counts from now.
+    e.lastTurnAt = this.now();
+    e.looked = true;
+    old?.close();
+    if (stored && fresh.sessionId && this.o.continuity) {
+      await this.o.continuity.record(device, { provider: this.o.provider.id, sessionId: fresh.sessionId }, this.now()).catch(() => {});
+    }
+    return true;
+  }
+
+  /**
+   * The seed note of a reseeded conversation not stored yet. The caller puts
+   * it in front of the prompt and calls `seedDelivered` once the attempt
+   * carrying it was taken; until then it stays (a turn cancelled before its
+   * attempt, or a refused attempt, leaves it for the next turn).
+   */
+  peekSeedNote(device: string): string | undefined {
+    return this.entries.get(device)?.seed;
+  }
+
+  /** `seed` reached the conversation; a newer seed (another reseed meanwhile) is kept. */
+  seedDelivered(device: string, seed: string): void {
+    const e = this.entries.get(device);
+    if (e?.seed === seed) e.seed = undefined;
   }
 
   /**
@@ -218,6 +403,40 @@ export class DeviceRegistry {
   }
 
   // --- internals -------------------------------------------------------------
+
+  private isStale(e: Entry): boolean {
+    return e.gen !== undefined && e.gen !== this.briefGen;
+  }
+
+  /** Closes the device's session but keeps its conversation id, so the next start resumes it. */
+  private retire(device: string, e: Entry): void {
+    const s = e.session;
+    if (!s) return;
+    if (s.sessionId) e.lastSessionId = s.sessionId;
+    e.session = undefined;
+    s.close();
+    this.log("info", `[shadow-core] agent for ${device} restarts: memory brief changed`);
+  }
+
+  /** Replaces a stale session when the device is idle; it starts again in the background when prewarm is on. */
+  private restartIfIdle(device: string, e: Entry): void {
+    if (this.closed || e.turnBusy || e.hold || e.starting) return;
+    const s = this.live(device);
+    if (!s || s.busy || !this.isStale(e)) return;
+    this.retire(device, e);
+    if (this.o.prewarm !== false) void this.acquire(device).catch(() => {});
+  }
+
+  /** The text appended to a new session's system prompt; "" when there is none or it cannot be read. */
+  private async readSystemAppend(device: string): Promise<string> {
+    if (!this.o.systemAppend) return "";
+    try {
+      return await this.o.systemAppend();
+    } catch (err) {
+      this.log("warn", `[shadow-core] memory brief unavailable for ${device}: ${(err as Error)?.message ?? String(err)}`);
+      return "";
+    }
+  }
 
   /** Forgets the device's last conversation id when its last turn is older than the continuity window. */
   private expire(device: string, e: Entry): void {
@@ -261,32 +480,21 @@ export class DeviceRegistry {
     const resume = this.capabilities.resume ? e.lastSessionId : undefined;
     // A new conversation has had no turn yet.
     if (!resume) e.lastTurnAt = undefined;
+    const gen = this.briefGen;
+    const systemAppend = await this.readSystemAppend(device);
     if (this.closed) return undefined;
     let session: ProviderSession;
     try {
-      session = this.o.provider.openSession({
-        device,
-        model: this.o.model,
-        ...(resume ? { resume } : {}),
-        onSessionId: (id) => {
-          e.lastSessionId = id;
-        },
-        onDead: (reason) => {
-          if (e.session === session) e.session = undefined;
-          e.guard?.recordDeath();
-          this.log("warn", `[shadow-core] agent for ${device} died: ${reason}`);
-        },
-        onIdleClose: () => {
-          if (e.session === session) e.session = undefined;
-          this.log("info", `[shadow-core] agent for ${device} closed after idle time`);
-        },
-      });
+      session = this.openFor(device, e, resume, systemAppend);
     } catch (err) {
       e.guard?.recordDeath();
       this.log("warn", `[shadow-core] agent for ${device} could not start: ${(err as Error)?.message ?? String(err)}`);
       return undefined;
     }
     e.session = session;
+    e.gen = gen;
+    // A new query: memory entries are sent again (06 §Relevant note entries).
+    e.sent.clear();
     const startedAt = this.now();
     const ok = await this.waitReady(session);
     if (ok === "closed") {
@@ -306,6 +514,35 @@ export class DeviceRegistry {
       return undefined;
     }
     this.log("info", `[shadow-core] agent for ${device} ready in ${this.now() - startedAt} ms${resume ? " (resumed)" : ""}`);
+    return session;
+  }
+
+  /**
+   * Opens a session of the device; its callbacks act only while it is (or may
+   * become) the device's session. `candidate` (reseed): it becomes the
+   * device's session only at the handover and never moves the conversation
+   * pointer before that, even when the old session is gone meanwhile.
+   */
+  private openFor(device: string, e: Entry, resume: string | undefined, systemAppend: string, candidate = false): ProviderSession {
+    const session: ProviderSession = this.o.provider.openSession({
+      device,
+      model: this.o.model,
+      ...(resume ? { resume } : {}),
+      ...(systemAppend ? { systemAppend } : {}),
+      onSessionId: (id) => {
+        // `e.session === undefined`: a normal start may report its id before it is assigned.
+        if (e.session === session || (!candidate && e.session === undefined)) e.lastSessionId = id;
+      },
+      onDead: (reason) => {
+        if (e.session === session) e.session = undefined;
+        e.guard?.recordDeath();
+        this.log("warn", `[shadow-core] agent for ${device} died: ${reason}`);
+      },
+      onIdleClose: () => {
+        if (e.session === session) e.session = undefined;
+        this.log("info", `[shadow-core] agent for ${device} closed after idle time`);
+      },
+    });
     return session;
   }
 

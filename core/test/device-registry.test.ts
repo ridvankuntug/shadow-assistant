@@ -68,8 +68,12 @@ class FakeSession implements ProviderSession {
   runAttempt(): AttemptHandle {
     throw new Error("not used");
   }
-  async appendNote(): Promise<boolean> {
-    return !this.isClosed;
+  notes: string[] = [];
+  refuseNotes = false;
+  async appendNote(text: string): Promise<boolean> {
+    if (this.isClosed || this.refuseNotes) return false;
+    this.notes.push(text);
+    return true;
   }
   async setModel(m: string): Promise<void> {
     this.model = m;
@@ -383,4 +387,244 @@ test("close() does not wait for a session that is still starting", async () => {
   assert.ok(Date.now() - started < 1_000, "close returned without the start timeout");
   assert.equal(await pending, undefined);
   assert.ok((provider.sessions[0]?.closeCalls ?? 0) >= 1);
+});
+
+// --- memory and maintenance (docs/06 M6/M7) ----------------------------------
+
+test("systemAppend: every new session starts with the current brief; the sent set is cleared per session", async () => {
+  const provider = new FakeProvider();
+  let brief = "Notlar:\n- Ad: Rıdvan";
+  const reg = new DeviceRegistry({ provider, model: "haiku", systemAppend: async () => brief });
+  const a = await reg.acquire("browser");
+  assert.equal(provider.sessions[0]?.opts.systemAppend, "Notlar:\n- Ad: Rıdvan");
+  reg.sentEntries("browser").markSent([{ id: "m-aaaaaa", updatedAt: 1 }]);
+  (a as FakeSession).seeId("s-1");
+  (a as FakeSession).idleClose();
+  brief = "";
+  await reg.acquire("browser");
+  assert.equal(provider.sessions[1]?.opts.systemAppend, undefined, "empty brief → no appendix");
+  assert.equal(provider.sessions[1]?.opts.resume, "s-1");
+  assert.equal(reg.sentEntries("browser").size, 0, "a new query sends memory again");
+
+  // A failing brief read starts the session without it.
+  const p2 = new FakeProvider();
+  const reg2 = new DeviceRegistry({
+    provider: p2,
+    model: "haiku",
+    systemAppend: async () => {
+      throw new Error("disk");
+    },
+  });
+  assert.ok(await reg2.acquire("browser"));
+  assert.equal(p2.sessions[0]?.opts.systemAppend, undefined);
+});
+
+test("briefChanged: an idle session restarts at once with resume and the new brief", async () => {
+  const provider = new FakeProvider();
+  let brief = "B1";
+  const reg = new DeviceRegistry({ provider, model: "haiku", systemAppend: async () => brief });
+  const a = (await reg.acquire("browser")) as FakeSession;
+  a.seeId("conv-1");
+  brief = "B2";
+  reg.briefChanged();
+  assert.equal(a.isClosed, true);
+  await tick();
+  await tick();
+  assert.equal(provider.sessions.length, 2, "restarted in the background (prewarm on)");
+  assert.equal(provider.sessions[1]?.opts.resume, "conv-1");
+  assert.equal(provider.sessions[1]?.opts.systemAppend, "B2");
+  assert.equal(await reg.acquire("browser"), provider.sessions[1]);
+});
+
+test("briefChanged during a turn: the session restarts after the turn, or when the next turn acquires it", async () => {
+  const provider = new FakeProvider();
+  const reg = new DeviceRegistry({ provider, model: "haiku", prewarm: false, systemAppend: async () => "B" });
+  const a = (await reg.acquire("browser")) as FakeSession;
+  a.seeId("conv-1");
+  assert.equal(reg.beginTurn("browser"), true);
+  a.busy = true;
+  reg.briefChanged();
+  assert.equal(a.isClosed, false, "busy: not touched");
+  a.busy = false;
+  reg.endTurn("browser");
+  await reg.turnEnded("browser"); // after settled
+  assert.equal(a.isClosed, true);
+  assert.equal(provider.sessions.length, 1, "prewarm off: the next turn starts it");
+  const b = await reg.acquire("browser");
+  assert.equal((b as FakeSession).opts.resume, "conv-1");
+
+  // turnEnded while the lock is still held (legacy fallback): the next acquire replaces it.
+  assert.equal(reg.beginTurn("browser"), true);
+  reg.briefChanged();
+  await reg.turnEnded("browser", "conv-1");
+  assert.equal((b as FakeSession).isClosed, false);
+  reg.endTurn("browser");
+  const c = await reg.acquire("browser");
+  assert.notEqual(c, b);
+  assert.equal((b as FakeSession).isClosed, true);
+});
+
+test("hold: turns wait in acquire while maintenance runs; prewarm is skipped", async () => {
+  const provider = new FakeProvider();
+  const reg = new DeviceRegistry({ provider, model: "haiku" });
+  const a = await reg.acquire("browser");
+  let release!: () => void;
+  const held = reg.hold("browser", () => new Promise<string>((r) => (release = () => r("done"))));
+  assert.equal(reg.isHeld("browser"), true);
+  let got: unknown = "pending";
+  const turn = reg.acquire("browser").then((s) => (got = s));
+  reg.prewarm("browser");
+  await tick();
+  assert.equal(got, "pending");
+  release();
+  assert.equal(await held, "done");
+  await turn;
+  assert.equal(got, a);
+  assert.equal(reg.isHeld("browser"), false);
+  assert.equal(provider.sessions.length, 1);
+});
+
+test("reseed: a new conversation without resume, seeded with the note; old closed; continuity points to it", async () => {
+  const provider = new FakeProvider();
+  const port = new MemPort();
+  const reg = new DeviceRegistry({ provider, model: "haiku", continuity: port, systemAppend: async () => "B" });
+  const old = (await reg.acquire("browser")) as FakeSession;
+  old.seeId("conv-old");
+  reg.sentEntries("browser").markSent([{ id: "m-aaaaaa", updatedAt: 1 }]);
+  const origOpen = provider.openSession.bind(provider);
+  provider.openSession = (o) => {
+    const s = origOpen(o);
+    s.sessionId = "conv-new";
+    return s;
+  };
+  assert.equal(await reg.reseed("browser", "(Önceki konuşmanın özeti: x)"), true);
+  const fresh = provider.sessions[1] as FakeSession;
+  assert.equal(fresh.opts.resume, undefined);
+  assert.equal(fresh.opts.systemAppend, "B");
+  assert.deepEqual(fresh.notes, ["(Önceki konuşmanın özeti: x)"]);
+  assert.equal(old.isClosed, true);
+  assert.equal(reg.live("browser"), fresh);
+  assert.equal(reg.sentEntries("browser").size, 0);
+  assert.equal(reg.peekSeedNote("browser"), undefined, "stored as a note");
+  assert.deepEqual(port.records.at(-1)?.pointer, { provider: "fake", sessionId: "conv-new" });
+  // An idle close of the new session resumes the new conversation.
+  fresh.idleClose();
+  await reg.acquire("browser");
+  assert.equal(provider.sessions[2]?.opts.resume, "conv-new");
+});
+
+test("reseed: a refused note goes in front of the next prompt; a failed start keeps the old session", async () => {
+  const provider = new FakeProvider();
+  const port = new MemPort();
+  const reg = new DeviceRegistry({ provider, model: "haiku", startTimeoutMs: 30, continuity: port });
+  const old = (await reg.acquire("browser")) as FakeSession;
+  old.seeId("conv-old");
+  await reg.turnEnded("browser");
+  const origOpen = provider.openSession.bind(provider);
+  provider.openSession = (o) => {
+    const s = origOpen(o);
+    s.refuseNotes = true;
+    s.sessionId = "conv-new";
+    return s;
+  };
+  assert.equal(await reg.reseed("browser", "ÖZET"), true);
+  assert.equal(reg.peekSeedNote("browser"), "ÖZET");
+  assert.equal(reg.peekSeedNote("browser"), "ÖZET", "kept until delivered");
+  // Only in memory so far: the persisted pointer stays on the old conversation (a restart keeps its context).
+  assert.deepEqual(port.records.at(-1)?.pointer, { provider: "fake", sessionId: "conv-old" });
+  reg.seedDelivered("browser", "ANDERE");
+  assert.equal(reg.peekSeedNote("browser"), "ÖZET", "another seed does not clear it");
+  reg.seedDelivered("browser", "ÖZET");
+  assert.equal(reg.peekSeedNote("browser"), undefined);
+  // The turn that delivered it moves the pointer.
+  await reg.turnEnded("browser");
+  assert.deepEqual(port.records.at(-1)?.pointer, { provider: "fake", sessionId: "conv-new" });
+
+  const p2 = new FakeProvider();
+  const reg2 = new DeviceRegistry({ provider: p2, model: "haiku", startTimeoutMs: 30 });
+  const keep = (await reg2.acquire("browser")) as FakeSession;
+  keep.seeId("conv-keep");
+  p2.autoReady = false;
+  assert.equal(await reg2.reseed("browser", "ÖZET"), false);
+  assert.equal(reg2.live("browser"), keep);
+  assert.equal(keep.isClosed, false);
+  assert.equal(p2.sessions[1]?.isClosed, true);
+  // The half-started replacement never moved the conversation pointer.
+  keep.idleClose();
+  p2.autoReady = true;
+  await reg2.acquire("browser");
+  assert.equal(p2.sessions[2]?.opts.resume, "conv-keep");
+});
+
+test("reseed: the candidate never moves the conversation pointer, even when the old session closes meanwhile", async () => {
+  const provider = new FakeProvider();
+  const reg = new DeviceRegistry({ provider, model: "haiku", startTimeoutMs: 1_000 });
+  const old = (await reg.acquire("browser")) as FakeSession;
+  old.seeId("conv-old");
+  provider.autoReady = false;
+  const run = reg.reseed("browser", "ÖZET");
+  await tick();
+  await tick();
+  const fresh = provider.sessions[1] as FakeSession;
+  assert.ok(fresh, "candidate opened");
+  old.idleClose();
+  fresh.seeId("conv-new");
+  assert.equal(await reg.fallbackResume("browser"), "conv-old");
+  fresh.failStart();
+  assert.equal(await run, false);
+  provider.autoReady = true;
+  await reg.acquire("browser");
+  assert.equal(provider.sessions[2]?.opts.resume, "conv-old", "the failed candidate's empty conversation is not resumed");
+});
+
+test("brief changed while a session was starting: waiters get a replacement with the new brief (resumed)", async () => {
+  const provider = new FakeProvider();
+  provider.autoReady = false;
+  let brief = "B1";
+  const reg = new DeviceRegistry({ provider, model: "haiku", systemAppend: async () => brief });
+  reg.prewarm("browser");
+  await tick();
+  await tick();
+  assert.equal(provider.sessions.length, 1);
+  const waiter = reg.acquire("browser");
+  brief = "B2";
+  reg.briefChanged();
+  const first = provider.sessions[0] as FakeSession;
+  first.seeId("conv-1");
+  provider.autoReady = true;
+  first.becomeReady();
+  const got = await waiter;
+  assert.equal(got, provider.sessions[1]);
+  assert.equal(provider.sessions.length, 2, "one replacement shared by prewarm and the waiter");
+  assert.equal(first.isClosed, true);
+  assert.equal(provider.sessions[1]?.opts.systemAppend, "B2");
+  assert.equal(provider.sessions[1]?.opts.resume, "conv-1");
+  assert.equal(await reg.acquire("browser"), got);
+});
+
+test("beginActivity marks the device busy for maintenance (not exclusive); waitHold waits for a hold", async () => {
+  const reg = new DeviceRegistry({ provider: new FakeProvider(), model: "haiku" });
+  assert.equal(reg.isTurnBusy("browser"), false);
+  const a = reg.beginActivity("browser");
+  const b = reg.beginActivity("browser");
+  assert.equal(reg.isTurnBusy("browser"), true);
+  assert.equal(reg.beginTurn("browser"), true, "the turn lock is independent");
+  reg.endTurn("browser");
+  a();
+  a();
+  assert.equal(reg.isTurnBusy("browser"), true, "release is idempotent; b still runs");
+  b();
+  assert.equal(reg.isTurnBusy("browser"), false);
+
+  await reg.waitHold("browser"); // no hold: at once
+  let release!: () => void;
+  const held = reg.hold("browser", () => new Promise<void>((r) => (release = r)));
+  let waited = false;
+  const w = reg.waitHold("browser").then(() => (waited = true));
+  await tick();
+  assert.equal(waited, false);
+  release();
+  await held;
+  await w;
+  assert.equal(waited, true);
 });

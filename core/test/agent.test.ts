@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { after, test } from "node:test";
 import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
@@ -209,7 +209,8 @@ test("session.ts never loads the provider SDK: its value-import graph does not r
     for (const m of code.matchAll(/^(?:import|export)\s+(type\s)?[^;]*?\sfrom\s+"([^"]+)";/gms)) {
       if (m[1]) continue;
       const spec = m[2]!;
-      if (spec.startsWith("./")) visit(spec.slice(2).replace(/\.js$/, ".ts"));
+      // Relative to the importing file (memory/*.ts import "../x.js" and "./y.js").
+      if (spec.startsWith("./") || spec.startsWith("../")) visit(posix.join(posix.dirname(file), spec).replace(/\.js$/, ".ts"));
       else reached.push(`${file} -> ${spec}`);
     }
   };

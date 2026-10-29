@@ -333,6 +333,9 @@ test("the request signal interrupts; an attempt aborted while queued is never se
   await tick();
   await tick();
   assert.deepEqual(f.sent.map((m) => m.message.content), ["1", "3"], "the cancelled queued attempt was not sent");
+  assert.equal(await h1.sent, true);
+  assert.equal(await h2.sent, false, "accepted but cancelled while queued: never sent");
+  assert.equal(await h3.sent, true);
   ctl.abort();
   assert.equal((await h3.settled).status, "cancelled");
   agent.close();
@@ -663,6 +666,7 @@ test("setModel that never answers: agent dies after setModelTimeoutMs and every 
   assert.equal((await h.done).status, "dead");
   assert.match(deaths[0] ?? "", /setModel/);
   assert.equal(f.sent.length, 0, "the attempt never reached the model");
+  assert.equal(await h.sent, false);
   await assert.rejects(agent.setModel("opus"), DeviceAgentDeadError);
 });
 

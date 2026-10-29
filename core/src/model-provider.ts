@@ -71,6 +71,12 @@ export interface AttemptHandle {
   done: Promise<AttemptOutcome>;
   /** Internal end: usage and cost are final. Never rejects. */
   settled: Promise<AttemptOutcome>;
+  /**
+   * True once the prompt has actually been handed to the backend; false when the
+   * attempt ended without being sent (cancelled while queued, model switch failed,
+   * session closed). Resolves no later than `settled`; never rejects.
+   */
+  sent: Promise<boolean>;
 }
 
 export interface ProviderCapabilities {
@@ -128,6 +134,11 @@ export interface OpenSessionOptions {
   model: string;
   /** Session id to continue (only if `capabilities.resume`). */
   resume?: string;
+  /**
+   * Text appended to the provider's static system prompt for the life of the
+   * session (the memory brief, docs/06 §The brief). A change needs a new session.
+   */
+  systemAppend?: string;
   onSessionId?: (sessionId: string) => void;
   onDead?: (reason: string) => void;
   onIdleClose?: () => void;

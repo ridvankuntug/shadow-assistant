@@ -341,7 +341,17 @@ export function validateState(v: unknown): MemoryState | undefined {
       ...(isNum(d.failures) ? { failures: d.failures } : {}),
     };
   }
-  return { version: 1, devices, day: v.day, runsToday: v.runsToday, usageLimitUntil: v.usageLimitUntil };
+  return {
+    version: 1,
+    devices,
+    day: v.day,
+    runsToday: v.runsToday,
+    usageLimitUntil: v.usageLimitUntil,
+    ...(isNum(v.resetAt) ? { resetAt: v.resetAt } : {}),
+    ...(isObj(v.pending) && typeof v.pending.device === "string" && isNum(v.pending.fromTs) && isNum(v.pending.toTs)
+      ? { pending: { device: v.pending.device, fromTs: v.pending.fromTs, toTs: v.pending.toTs } }
+      : {}),
+  };
 }
 
 /** Filter normal form (invisible characters removed, NFKC), whitespace collapsed; undefined when the text cannot be an entry. */

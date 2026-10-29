@@ -97,6 +97,8 @@ interface Step {
   run?: (req: AttemptRequest) => Promise<void>;
   /** Hold `settled` until released. */
   holdSettle?: boolean;
+  /** Accepted but never sent (e.g. cancelled behind a model switch): `sent` false, status cancelled. */
+  unsent?: boolean;
 }
 
 class FakeLive implements ProviderSession {
@@ -121,6 +123,9 @@ class FakeLive implements ProviderSession {
       await Promise.resolve();
       if (step.run) await step.run(req);
       if (!req.signal?.aborted) for (const d of step.deltas ?? []) req.callbacks.onDelta(d);
+      if (step.unsent) {
+        return { text: "", inputTokens: 0, outputTokens: 0, durationMs: 0, status: "cancelled", model: req.model, warm: true, queryAgeMs: 5_000, doneMs: 0 };
+      }
       const status: AttemptStatus = req.signal?.aborted ? "cancelled" : (step.status ?? "ok");
       return {
         text: (step.deltas ?? []).join(""),
@@ -140,7 +145,7 @@ class FakeLive implements ProviderSession {
     const settled = step.holdSettle
       ? outcome.then((o) => new Promise<AttemptOutcome>((res) => this.releases.push(() => res(o))))
       : outcome;
-    return { done: outcome, settled };
+    return { done: outcome, settled, sent: Promise.resolve(!step.unsent) };
   }
   releaseSettled(): void {
     for (const r of this.releases.splice(0)) r();
@@ -192,6 +197,24 @@ class FakeRegistry implements SessionRegistry {
   }
   async turnEnded(device: string, sessionId?: string): Promise<void> {
     this.ended.push({ device, ...(sessionId ? { sessionId } : {}) });
+  }
+  /** Turns in progress (any tier). */
+  active = 0;
+  beginActivity(): () => void {
+    this.active++;
+    let released = false;
+    return () => {
+      if (!released) this.active--;
+      released = true;
+    };
+  }
+  /** A maintenance hold in progress (set by the test). */
+  held: Promise<void> | undefined;
+  isHeld(): boolean {
+    return this.held !== undefined;
+  }
+  async waitHold(): Promise<void> {
+    while (this.held) await this.held;
   }
 }
 
@@ -443,6 +466,47 @@ test("tier-0 exchange goes to the live session as a delimited note (no model cal
   assert.equal(live2.attempts[0]?.text, "[mod:hizli]\n<bilgi>\nKullanıcı: evde sıcaklık kaç\nShadow: Ev sıcaklığı 22 derece.\n</bilgi>\nteşekkürler");
 });
 
+test("a tier-0 turn counts as device activity and waits for a running compaction: its note goes to the session after it", async () => {
+  const old = new FakeLive(() => ({ deltas: ["x"] }));
+  const reg = new FakeRegistry(old);
+  const router = new TieredRouter({ config: parseRouterConfig(ROUTER_YAML), models: MODELS });
+  const h = harness({ registry: reg, router });
+  let release!: () => void;
+  reg.held = new Promise<void>((r) => {
+    release = () => {
+      reg.held = undefined;
+      r();
+    };
+  });
+  const turn = h.say("evde sıcaklık kaç");
+  await settle();
+  await settle();
+  assert.equal(reg.active, 1, "the turn is marked while it waits (compaction sees the device busy)");
+  assert.equal(h.of("assistant_done").length, 0, "it waits for the hold");
+  // The compaction replaced the session (reseed) before releasing the hold.
+  const fresh = new FakeLive(() => ({ deltas: ["x"] }));
+  reg.session = fresh;
+  release();
+  await turn;
+  await settle();
+  assert.equal(h.of("assistant_done")[0]?.text, "Ev sıcaklığı 22 derece.");
+  assert.deepEqual(old.notes, []);
+  assert.equal(fresh.notes.length, 1);
+  assert.equal(reg.active, 0, "released at the turn's end");
+
+  // A cancel during the wait ends the turn without running the plan.
+  reg.held = new Promise<void>(() => {});
+  const h2 = harness({ registry: reg, router });
+  const t2 = h2.say("evde sıcaklık kaç", "c1");
+  await settle();
+  await h2.send({ type: "cancel", id: "c1" });
+  await t2;
+  assert.equal(h2.of("assistant_done")[0]?.text, "");
+  assert.equal(h2.of("tool").length, 0);
+  assert.equal(reg.active, 0);
+  reg.held = undefined;
+});
+
 test("tierN.services in persistent mode: tools of other services are denied by the gate", async () => {
   let decision: unknown;
   const live = new FakeLive(() => ({
@@ -663,4 +727,25 @@ test("concurrent refused tier-0 note batches go back in creation order (A before
   const a = "Kullanıcı: evde sıcaklık kaç\nShadow: Ev sıcaklığı 22 derece.";
   const b = "Kullanıcı: Evde sıcaklık kaç?\nShadow: Ev sıcaklığı 22 derece.";
   assert.equal(live.attempts[0]?.text, `[mod:hizli]\n<bilgi>\n${a}\n${b}\n</bilgi>\nteşekkürler`);
+});
+
+test("an attempt accepted but never sent: no continuity update, no model turn; its tier-0 notes go with the next turn", async () => {
+  const live = new FakeLive((_req, n) => (n === 1 ? { unsent: true } : { deltas: ["Tamam."] }));
+  live.acceptNotes = false;
+  const router = new TieredRouter({ config: parseRouterConfig(ROUTER_YAML), models: MODELS });
+  const h = harness({ live, router });
+  await h.say("evde sıcaklık kaç");
+  await settle();
+  const note = "<bilgi>\nKullanıcı: evde sıcaklık kaç\nShadow: Ev sıcaklığı 22 derece.\n</bilgi>";
+  await h.say("teşekkürler", "t2");
+  await settle();
+  await settle();
+  assert.equal(live.attempts[0]?.text, `[mod:hizli]\n${note}\nteşekkürler`);
+  assert.deepEqual(h.registry.ended, [], "the unsent turn does not move continuity");
+  assert.equal(h.of("assistant_done")[1]?.text, "", "the unsent turn ends empty");
+  await h.say("tamam", "t3");
+  await settle();
+  await settle();
+  assert.equal(live.attempts[1]?.text, `[mod:hizli]\n${note}\ntamam`, "the notes were kept for the next turn");
+  assert.deepEqual(h.registry.ended, [{ device: "browser" }]);
 });
