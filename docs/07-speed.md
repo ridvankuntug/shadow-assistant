@@ -457,15 +457,20 @@ stores under the SDK `cwd` (`<SHADOW_DATA_DIR>/agent`, kept stable).
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "devices": {
-    "browser": { "sdkSessionId": "7c0e…", "lastTurnAt": 1767340800000, "updatedAt": 1767340801000 }
+    "browser": { "provider": "claude-sdk", "sessionId": "7c0e…", "lastTurnAt": 1767340800000, "updatedAt": 1767340801000 }
   }
 }
 ```
 
-- `sdkSessionId`: the last `session_id` seen in that device's query. It is always
+- `provider`: the `ModelProvider.id` the conversation belongs to. A device
+  whose stored pointer belongs to another provider starts a new conversation
+  (the pointer is not resumed).
+- `sessionId`: the last session id seen in that device's session. It is always
   taken from the messages, never assumed, because a resume may yield a new id.
+- Version 1 files (`sdkSessionId`, no `provider`) are still read; their entries
+  belong to `claude-sdk`. The next write is version 2.
 - `lastTurnAt`: end of the last model turn (epoch ms). Tier-0 turns do not count.
 - No text, no tokens, no client data. Device names and UUIDs only.
 
@@ -473,10 +478,13 @@ stores under the SDK `cwd` (`<SHADOW_DATA_DIR>/agent`, kept stable).
 
 - **Lookup** (when an agent starts): entry missing → new conversation. If
   `now - lastTurnAt > CORE_CONTINUITY_MIN` → new conversation and the entry is
-  removed. Otherwise `getSessionInfo(sdkSessionId, { dir: <agent cwd> })` (the
+  removed. The same window applies inside a running Core: a replacement session
+  or a legacy fallback turn more than `CORE_CONTINUITY_MIN` after the device's
+  last model turn starts a new conversation. Otherwise, for `claude-sdk`
+  pointers, `getSessionInfo(sessionId, { dir: <agent cwd> })` (the
   spike confirms the option name): when it returns nothing (the transcript was
   deleted or cleaned up) → new conversation, logged as `continuity: missing`.
-- **Write:** after each model turn, and only if `sdkSessionId` or `lastTurnAt`
+- **Write:** after each model turn, and only if the pointer or `lastTurnAt`
   changed. Writes are serialized in-process (one writer: the Core). They are
   atomic: write `devices.json.tmp-<pid>-<rand>`, `fsync`, rename over the target.
   On Windows, retry the rename up to 3 times with backoff on `EPERM`/`EBUSY`/`EACCES`
@@ -547,8 +555,8 @@ target.
 
 | Scenario | Before p50 / p95 | After p50 / p95 |
 |---|---|---|
-| 1 | 7.32 / 9.34 | – |
-| 2 | 9.04 / 9.39 | – |
+| 1 | 7.32 / 9.34 | 3.34 / 4.14 (back to back); 1.64 / 1.70 with `CORE_AGENT_SKIP_TURN_SUMMARY=1` |
+| 2 | 9.04 / 9.39 | 5.36 / 7.38 (back to back) |
 | 3 | 6.80 / 8.83 | – |
 | 4 | 5.98 / 9.74 | – |
 
@@ -576,6 +584,35 @@ save subscription usage) after one warm-up turn. Every turn was routed to tier 1
 - Extra data point (not a baseline row): scenario 1 with
   `CLAUDE_CODE_CLASSIFIER_SUMMARY=0` in the SDK subprocess environment gave
   p50 6.39 s / p95 7.84 s (5 runs), see [Spike results](#spike-results) Q12.
+
+**After S6/S8/S10 (first run), 2026-10-28**, persistent mode (default
+settings), same setup as the baseline (separate Core from source, own port and
+data dir, `CORE_READ_ONLY=1`, `DEVICE_TOKEN_BENCH`, 5 runs per scenario after
+one warm-up turn, the bench sends `speech_prefs` audio). Every turn was routed
+to tier 1 (Haiku, rule `default`); **no greeting was escalated** (no `route`
+entry with `escalated`). Scenario 2 called `GetLiveContext` each time.
+
+| Scenario | t_first p50 / p95 | t_done p50 / p95 | t_speech p50 / p95 | `timing` log (server) |
+|---|---|---|---|---|
+| 1 simple text, warm | 3.34 / 4.14 | 3.34 / 4.14 | 3.45 / 4.45 | `doneMs` 1.8 to 4.1 s, `sdkDurationMs` 3.7 to 5.0 s, `warm: true` |
+| 1 with `CORE_AGENT_SKIP_TURN_SUMMARY=1` | 1.64 / 1.70 | 1.64 / 1.70 | 1.97 / 2.05 | – |
+| 2 HA read, warm | 5.36 / 7.37 | 5.36 / 7.38 | 5.58 / 7.60 | `doneMs` 3.7 to 7.4 s |
+
+- Analysis of the gap in scenario 1 with default settings: the bench sends the
+  next turn right after `assistant_done`. That turn is queued until the
+  previous turn's `result`, which comes about 2 s later (the CLI's end-of-turn
+  summary classifier, spike Q12). The first measured run, whose previous turn
+  was the first message of the session (no classifier), took 1.81 s; with the
+  classifier switched off, all runs took 1.6 to 1.7 s. A user who pauses more
+  than about 2 s between turns does not wait for the tail, so a real warm turn
+  is expected at about 1.6 to 1.9 s. A bench with a pause between turns (S12)
+  should confirm this.
+- Cold start of a device session (prewarm on `hello`): ready in 2.3 to 2.4 s;
+  the warm-up turn right after connecting took 5.8 s.
+- Continuity (S8, manual): a code word given in one turn; the Core was killed
+  and started again on the same data dir; the first session was `resumed`
+  and the model answered the code word. Expiry after the window is covered by
+  `device-registry.test.ts` (real `ContinuityStore`), not checked by hand.
 
 ## Failure modes
 
@@ -640,11 +677,11 @@ parallel after S1. S7 needs only S3. S6, S8 and S10 are serialized on
 - [ ] **P1 — Protocol additions (shared with 06).** Types, parsing and docs for: `welcome.features`; client `speech_prefs`, `memory_list`, `memory_delete`; server `speech_chunk`, `memory`; error codes `usage_limit` (+ optional `retryAt`). Frame shapes for memory: [06 §Protocol](06-memory.md#protocol). Acceptance: parser tests for every new frame (valid, invalid, unknown fields ignored); docs/02 tables updated; old frames unchanged.
 - [x] **S4 — DeviceAgent.** Input queue, output pump, `runAttempt` resolving at `result`, `setModel` only on change, `interrupt` with drain, the 5 s interrupt watchdog, idle timer, dead detection, `costUsd` diffing, usage-limit detection (with the fallback prefix copy), tool-call cap, gate dispatcher with attempt capture. Tested with a fake `Query` (an async generator plus spies for the control methods). Acceptance: tests for two sequential attempts on one query, a model switch, interrupt then next attempt, death mid-attempt, a stale gate call denied, usage-limit mapping and the cost diff. — done 2026-10-28: `core/src/device-agent.ts` (`DeviceAgent`, `RestartBackoff`), 20 tests in `core/test/device-agent.test.ts` (fake `Query`), also visible end before `result`, `shouldQuery:false` notes, idle close, turn timeout, watchdog, MCP freshness; one Haiku smoke run. Independent review/test pending (team lead). Follow-up 2026-10-28 (provider interface + review fixes): `core/src/model-provider.ts` (neutral `ModelProvider`/`ProviderSession`), `ClaudeSdkProvider` with `oneShot`, `DeviceAgent implements ProviderSession` (+ `setModel()`); limit text streamed as deltas is held back and ends as `usage_limit` (also after a visible end); `setModel` bounded by `setModelTimeoutMs` (die on expiry); throwing callbacks cannot leave an attempt pending; a zeroed result no longer lowers the cost baseline; 28 tests.
 - [x] **S5 — Static prompt and options.** `tier1.md` conditional on `[mod:hizli]`; one system prompt for all tiers; `buildOptions` for the persistent mode (streaming prompt, no per-turn `resume`/`forkSession`, gate dispatcher); `SdkAgentRunner` kept for the legacy mode. Acceptance: existing agent tests pass; a new test checks that the options of the persistent mode do not depend on the tier. — done 2026-10-28: `buildPersistentOptions`, `persistentSystemPrompt`, `buildTurnEnvelope`/`TIER1_MARKER`, `CORE_AGENT_SKIP_TURN_SUMMARY` in `subprocessEnv`; the legacy runner prefixes escalatable prompts with the marker so the conditional `tier1.md` keeps working before S6. Watch in S6: in the one smoke run Haiku answered a marked `Merhaba, bugün nasılsın?` (fresh session) with `[[ESCALATE]]`; check the escalation rate with the bench. Follow-up 2026-10-28: `tier1.md` rewritten (greetings, small talk and thanks are never escalated; only clearly multi-step/multi-device/plan/comparison/long-explanation requests; vague requests get a short question; no "emin değilsen"); tier-0 records are delimited (`DIRECT_NOTES_START/END`, `wrapDirectNotes`, `buildTurnEnvelope({ notes })`) and `system.md` says to answer the request after `</bilgi>`. S6 must switch `Session.withDirectNotes()` (and `appendNote` texts) to `wrapDirectNotes`.
-- [ ] **S6 — Registry and session wiring.** `DeviceRegistry` (lazy create, prewarm on hello, idle close, crash backoff, legacy fallback); `Session` uses it; escalation in-session; tier-0 exchanges as `shouldQuery:false` (or `directNotes` moved to the agent, per S1); per-tier service gate; `usage_limit` error frames; `timing` log kind; config variables; `docs/04-router.md` escalation and caching sections rewritten; `.env.example`. Acceptance: all session tests pass with a mocked registry; manual check of scenario 1 at p50 ≤ 2.5 s; cancel, confirm (button and voice) and escalation work end to end; `CORE_AGENT_PERSISTENT=off` behaves exactly as before.
+- [~] **S6 — Registry and session wiring.** `DeviceRegistry` (lazy create, prewarm on hello, idle close, crash backoff, legacy fallback); `Session` uses it; escalation in-session; tier-0 exchanges as `shouldQuery:false` (or `directNotes` moved to the agent, per S1); per-tier service gate; `usage_limit` error frames; `timing` log kind; config variables; `docs/04-router.md` escalation and caching sections rewritten; `.env.example`. Acceptance: all session tests pass with a mocked registry; manual check of scenario 1 at p50 ≤ 2.5 s; cancel, confirm (button and voice) and escalation work end to end; `CORE_AGENT_PERSISTENT=off` behaves exactly as before. — implemented 2026-10-28: `core/src/device-registry.ts` (`DeviceRegistry`: lazy start shared by concurrent callers, prewarm on `hello`, ready timeout 30 s → legacy runner for that turn, idle/death replacement resuming the last id, per-device `RestartBackoff`; depends only on `model-provider.ts`); `Session` runs tiers 1-3 as attempts (`buildTurnEnvelope` with `[mod:hizli]`, escalation in-session with `ESCALATION_CONTINUE`, usage at `settled`, `busy` from another socket of the device, `error usage_limit` + `retryAt` with no answer text logged or shown); tier-0 records wrapped with `wrapDirectNotes` (also in legacy mode) and sent by `appendNote` when a session runs, else buffered; per-tier service gate (`tier_service`); `timing` log kind; `welcome.features` = `speech_stream`, `usage_limit`; config `CORE_AGENT_PERSISTENT/PREWARM/IDLE_MIN`, `CORE_TURN_TIMEOUT_MS`, `CORE_CONTINUITY_MIN`; legacy path unchanged without a registry (all old session/tier tests pass; only the tier-0 note format assertion in `tiers.test.ts` changed). Tests: `session-persistent.test.ts` (15). Open: independent review/test; manual end-to-end check of cancel, confirm (button/voice) and escalation; scenario 1 p50 is 3.34 s back to back, 1.64 s without the summary tail (see §Results analysis).
 - [ ] **S7 — Continuity store.** `devices.json` load/lookup/write/expiry/quarantine on top of S3. Acceptance: unit tests for expiry, corruption, an unknown version, serialized writes, and the missing-transcript check (injected `getSessionInfo`).
-- [ ] **S8 — Continuity wiring.** The registry resumes from the store when it starts an agent, updates the store after each model turn and flushes on shutdown. Acceptance: manual: a turn, Core restart, reconnect within 30 min, and the model remembers the previous turn; after 30 min it does not.
+- [x] **S8 — Continuity wiring.** The registry resumes from the store when it starts an agent, updates the store after each model turn and flushes on shutdown. Acceptance: manual: a turn, Core restart, reconnect within 30 min, and the model remembers the previous turn; after 30 min it does not. — done 2026-10-28: the registry asks the continuity port once per device and Core start, resumes only a pointer of its own provider, records `{provider, sessionId}` after every model turn (also legacy fallback turns) and flushes on shutdown (`index.ts` chain: server → registry → …). `continuityPort()` adapts the S7 store; its file has no provider field yet, so pointers are read as the current provider's (exact with one provider; a `provider` field in `continuity.ts` is a follow-up for a second provider). Manual restart check passed (see §Results); 9 tests in `device-registry.test.ts`. Independent review/test pending.
 - [ ] **S9 — Sentence splitter and speech stream.** As in [A2 Core](#core). Acceptance: table tests with Turkish text (decimals, ordinals, abbreviations, punctuation split across deltas, a long sentence without punctuation); speech-stream tests for ordering with lookahead, cancel during synthesis, tts failure → one error + `final`, and the lexicon applied in both modes.
-- [ ] **S10 — Speech stream wiring.** `Session` handles `speech_prefs` and feeds the stream from the live text path (after tier-1 buffering and tier 0); `firstSpeechMs` goes into the `timing` log. Acceptance: session tests where an opted-in client gets `speech_chunk` frames in order and an old client gets none; scenario 5 shows the first sound before `assistant_done` for a multi-sentence tier-2 answer.
+- [~] **S10 — Speech stream wiring.** `Session` handles `speech_prefs` and feeds the stream from the live text path (after tier-1 buffering and tier 0); `firstSpeechMs` goes into the `timing` log. Acceptance: session tests where an opted-in client gets `speech_chunk` frames in order and an old client gets none; scenario 5 shows the first sound before `assistant_done` for a multi-sentence tier-2 answer. — implemented 2026-10-28: `speech_prefs` stored per socket (latest wins, `enabled:false` stops); one `SpeechStream` per turn fed from the same live path as `assistant_delta` (after tier-1 buffering, tier 0 included), audio via tts-svc with voice/lexicon/clip, text mode for native TTS; a `cancel` (also after the visible end) stops it; `firstSpeechMs` in `timing`; `speak` unchanged. Session tests: chunks in order with `final`, no chunks for an old client or `enabled:false`, text mode, marker never spoken, cancel. Open: scenario 5 (manual, needs S11 UI) and independent review/test.
 - [ ] **S11 — UI streaming playback and usage-limit text.** As in [A2 UI](#ui); Turkish text for `usage_limit`. Acceptance: controller tests: chunks played in order, barge-in clears the queue, no double speech after `assistant_done`, fallback to `speak` against a Core without `speech_stream`, native mode speaks the chunk texts.
 - [ ] **S12 — After measurement.** The bench again; fill in §Results; tick the plan boxes. Acceptance: scenario 1 warm p50 ≤ 2.5 s, or a written analysis of the remaining gap.
 

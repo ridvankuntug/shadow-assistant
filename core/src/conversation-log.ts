@@ -51,6 +51,24 @@ export type LogEntry =
       fallback?: string;
       escalated?: boolean;
     }
+  | {
+      /**
+       * Latency split of one model turn (docs/07 §Usage records). All values in
+       * ms from receiving the frame (voice: from the transcript). `warm`: the
+       * model session was already running; `sdkDurationMs`: the model's own
+       * duration. Readers ignore unknown kinds.
+       */
+      kind: "timing";
+      id: string;
+      tier: number;
+      warm: boolean;
+      queryAgeMs: number;
+      routeMs: number;
+      firstDeltaMs?: number;
+      doneMs: number;
+      sdkDurationMs: number;
+      firstSpeechMs?: number;
+    }
   | { kind: "error"; id?: string; code: string; message: string };
 
 export type StoredEntry = LogEntry & { ts: number; sessionId: string };

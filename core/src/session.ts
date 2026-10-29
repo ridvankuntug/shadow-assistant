@@ -5,11 +5,21 @@
  * Transport-agnostic: frames come in through `handle()` and go out through
  * the `send` callback, so the whole flow is unit-testable without sockets.
  */
-import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+// Type-only: agent.ts loads the provider SDK, which session.ts must never do.
 import type { AgentRunner, TurnResult } from "./agent.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
+import type { DeviceRegistry } from "./device-registry.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
 import type { DirectToolClient } from "./mcp-direct.js";
+import {
+  SessionBusyError,
+  SessionClosedError,
+  type AttemptHandle,
+  type AttemptOutcome,
+  type PermissionCallback,
+  type PermissionDecision,
+  type ProviderSession,
+} from "./model-provider.js";
 import {
   ConfirmBroker,
   parseVoiceAnswer,
@@ -18,12 +28,14 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import type { ClientFrame, ErrorCode, ServerFrame } from "./protocol.js";
+import type { ClientFrame, ErrorCode, ServerFrame, SpeechMode } from "./protocol.js";
 import type { DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
-import type { Lexicon } from "./pronunciation.js";
+import { EMPTY_LEXICON, type Lexicon } from "./pronunciation.js";
 import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
+import { SpeechStream } from "./speech-stream.js";
+import { buildTurnEnvelope, ESCALATION_CONTINUE, wrapDirectNotes } from "./turn-envelope.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -31,15 +43,21 @@ export const DEFAULT_HISTORY_LIMIT = 20;
 export const MAX_HISTORY_LIMIT = 100;
 /** Tier-0 exchanges remembered for the model's next turn. */
 export const MAX_DIRECT_NOTES = 5;
-export const DIRECT_NOTES_HEADER = "(Bilgi: aşağıdaki kısa komutları sistem modelsiz yanıtladı; sen görmedin.)";
-/** Prompt for the stronger model when the cheap one escalated after running tools. */
-export const ESCALATION_CONTINUE =
-  "(Önceki adım bu isteği tamamlayamadı. Yukarıdaki araç sonuçlarını kullan, başarılı olmuş işlemleri tekrarlama ve kullanıcının son isteğini tamamla.)";
+
+/** A tier-0 exchange not yet shown to the model; `seq` is its creation order. */
+interface DirectNote {
+  seq: number;
+  text: string;
+}
+
+/** close() waits at most this long for turn tails (usage at `settled`, timing, speech) before session_end. */
+export const TAIL_WAIT_MS = 3_000;
 
 const LEVEL_RANK: Record<PermissionLevel, number> = { read: 0, write: 1, confirm: 2 };
 
 /** What the model is told when the gate denies one of its tool calls. */
-const DENY_MESSAGES: Record<DenyReason, string> = {
+const DENY_MESSAGES: Record<GateDeny, string> = {
+  tier_service: "This tool is not available in this mode.",
   cancelled: "Turn was cancelled.",
   builtin: "Built-in tools are disabled for this assistant.",
   read_only: "Read-only mode: only read tools may run.",
@@ -52,8 +70,17 @@ export interface Logger {
   warn(msg: string): void;
 }
 
+/** What a session needs from the device registry (device-registry.ts). */
+export type SessionRegistry = Pick<
+  DeviceRegistry,
+  "acquire" | "live" | "prewarm" | "beginTurn" | "endTurn" | "fallbackResume" | "turnEnded" | "capabilities"
+>;
+
 export interface SessionDeps {
+  /** Legacy runner: a fresh query per turn (CORE_AGENT_PERSISTENT=off, and the fallback when a device session cannot start). */
   agent: AgentRunner;
+  /** Persistent per-device sessions (docs/07 A1); absent = every turn on `agent`. */
+  registry?: SessionRegistry;
   policy: PermissionPolicy;
   router: Router;
   stt: SttClient;
@@ -63,7 +90,11 @@ export interface SessionDeps {
   confirmTimeoutMs?: number;
   /** Tier 0 MCP client; without it every direct plan falls back to the model. */
   direct?: DirectToolClient;
-  /** MCP servers loaded per model tier (router.yaml `tierN.services`); absent = all. */
+  /**
+   * MCP services per model tier (router.yaml `tierN.services`); absent = all.
+   * Legacy runner: only these servers are loaded. Persistent mode: all are
+   * loaded and the gate denies tools of other services.
+   */
   tierServices?: Partial<Record<ModelTier, readonly string[]>>;
   /** pronunciations.yaml: applied to `speak` text sent to tts-svc only; absent = none. */
   pronunciations?: Lexicon;
@@ -80,7 +111,27 @@ interface ActiveTurn {
   id: string;
   abort: AbortController;
   text: string;
+  /** Turn start (frame received; for voice: transcript ready), epoch ms. */
+  startedAt: number;
+  /** First `assistant_delta` sent, epoch ms. */
+  firstDeltaAt?: number;
+  /** Sentence-by-sentence speech for a client that opted in (A2). */
+  speech?: SpeechStream;
+  /**
+   * The model attempt ended cancelled without a user cancel (e.g. the device
+   * session closed): like a cancel, nothing more is spoken.
+   */
+  cancelled?: boolean;
 }
+
+/** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
+interface SpeechPrefs {
+  mode: SpeechMode;
+  voice?: string;
+}
+
+/** Messages the model gets for gate denials. */
+type GateDeny = DenyReason | "tier_service";
 
 export class Session {
   private turn: ActiveTurn | null = null;
@@ -96,7 +147,14 @@ export class Session {
   private closing: Promise<void> | null = null;
   private closed = false;
   /** Tier-0 exchanges not yet shown to the model. */
-  private readonly directNotes: string[] = [];
+  private readonly directNotes: DirectNote[] = [];
+  /** Sequence number of the next tier-0 note (keeps refused batches in creation order). */
+  private noteSeq = 0;
+  private speechPrefs: SpeechPrefs | undefined;
+  /** Speech streams of turns still being spoken, by turn id (a late `cancel` stops them). */
+  private readonly speaking = new Map<string, SpeechStream>();
+  /** Work that finishes after a turn's visible end (usage at `settled`, timing); close() waits for it, bounded. */
+  private readonly tails = new Set<Promise<unknown>>();
 
   constructor(
     private readonly deps: SessionDeps,
@@ -111,6 +169,8 @@ export class Session {
       client: info.client,
       clientVersion: info.clientVersion,
     });
+    // Start the device's model session now, so the first turn finds it warm (07 §Prewarm).
+    deps.registry?.prewarm(info.device);
   }
 
   get busy(): boolean {
@@ -157,9 +217,14 @@ export class Session {
       case "voices":
         await this.handleVoices(frame.id);
         return;
+      case "speech_prefs":
+        this.speechPrefs = frame.enabled ? { mode: frame.mode, ...(frame.voice ? { voice: frame.voice } : {}) } : undefined;
+        return;
       case "cancel":
         // An utterance still being transcribed must never become a turn.
         this.transcribing.get(frame.id)?.abort();
+        // Barge-in after the visible end: stop the answer that is still being spoken.
+        this.speaking.get(frame.id)?.cancel();
         if (this.turn && this.turn.id === frame.id) {
           this.broker.cancelAll(frame.id);
           this.turn.abort.abort();
@@ -262,28 +327,111 @@ export class Session {
   }
 
   private async runTurn(id: string, text: string, source: "text" | "voice"): Promise<void> {
-    const turn: ActiveTurn = { id, abort: new AbortController(), text: "" };
+    const turn: ActiveTurn = { id, abort: new AbortController(), text: "", startedAt: Date.now() };
     this.turn = turn;
+    turn.speech = this.openSpeech(turn);
     this.emit({ type: "state", state: "thinking" });
     void this.slog.append({ kind: "user", id, text, source });
 
     try {
       const decision = await this.deps.router.route({ text, source, device: this.info.device });
+      const routeMs = Date.now() - turn.startedAt;
       if (decision.tier === 0 && decision.direct) {
         if (await this.runDirect(turn, text, decision, decision.direct)) return;
         // Fallback: the cheap model takes over (nothing was changed in the home).
-        await this.runModel(turn, text, { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule });
+        await this.runModel(turn, text, { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule }, routeMs);
         return;
       }
-      await this.runModel(turn, text, decision);
+      await this.runModel(turn, text, decision, routeMs);
     } catch (err) {
       this.deps.logger.warn(`[shadow-core] turn ${id} crashed: ${(err as Error).message}`);
       this.error("model_error", "the model could not complete this turn", id);
     } finally {
       this.broker.cancelAll(id);
       if (this.turn === turn) this.turn = null;
+      this.finishSpeech(turn);
       this.emit({ type: "state", state: "idle" });
     }
+  }
+
+  // ------------------------------------------------------------ speech (A2)
+
+  /** A speech stream for this turn when the client sent `speech_prefs` (enabled). */
+  private openSpeech(turn: ActiveTurn): SpeechStream | undefined {
+    const prefs = this.speechPrefs;
+    if (!prefs) return undefined;
+    const stream = new SpeechStream({
+      turnId: turn.id,
+      mode: prefs.mode,
+      voice: prefs.voice,
+      tts: this.deps.tts,
+      lexicon: this.deps.pronunciations ?? EMPTY_LEXICON,
+      send: (frame) => this.emit(frame),
+      onError: (err) => this.error(err.code, err.message, turn.id),
+      signals: [turn.abort.signal, this.side.signal],
+    });
+    this.speaking.set(turn.id, stream);
+    void stream.done.then(() => {
+      if (this.speaking.get(turn.id) === stream) this.speaking.delete(turn.id);
+    });
+    return stream;
+  }
+
+  /** End of the turn's text: the rest is spoken (nothing after a cancel). */
+  private finishSpeech(turn: ActiveTurn): void {
+    const s = turn.speech;
+    if (!s) return;
+    if (turn.abort.signal.aborted || turn.cancelled) s.cancel();
+    else void s.end();
+  }
+
+  /** Sends answer text to the client (and to the turn's speech stream). */
+  private live(turn: ActiveTurn, chunk: string): void {
+    turn.text += chunk;
+    if (turn.abort.signal.aborted) return;
+    turn.firstDeltaAt ??= Date.now();
+    this.emit({ type: "assistant_delta", id: turn.id, text: chunk });
+    turn.speech?.push(chunk);
+  }
+
+  /** Keeps work that ends after the visible turn end, so close() can wait for it (bounded). */
+  private track(p: Promise<unknown>): void {
+    const guarded = p.then(
+      () => {},
+      (err: unknown) => {
+        this.deps.logger.warn(`[shadow-core] turn tail failed: ${(err as Error)?.message ?? String(err)}`);
+      },
+    );
+    this.tails.add(guarded);
+    void guarded.then(() => this.tails.delete(guarded));
+  }
+
+  /** `timing` log entry (07 §Usage records), written once usage and the first speech are known. */
+  private writeTiming(
+    turn: ActiveTurn,
+    tier: ModelTier,
+    routeMs: number,
+    doneAt: number,
+    tail: Promise<{ sdkDurationMs: number; warm: boolean; queryAgeMs: number }>,
+  ): void {
+    const speech = turn.speech;
+    this.track(
+      Promise.all([tail, speech?.done]).then(([t]) => {
+        const firstSpeechAt = speech?.firstChunkAt;
+        return this.slog.append({
+          kind: "timing",
+          id: turn.id,
+          tier,
+          warm: t.warm,
+          queryAgeMs: t.queryAgeMs,
+          routeMs,
+          ...(turn.firstDeltaAt !== undefined ? { firstDeltaMs: turn.firstDeltaAt - turn.startedAt } : {}),
+          doneMs: doneAt - turn.startedAt,
+          sdkDurationMs: t.sdkDurationMs,
+          ...(firstSpeechAt !== undefined ? { firstSpeechMs: firstSpeechAt - turn.startedAt } : {}),
+        });
+      }),
+    );
   }
 
   // ------------------------------------------------------------ tier 0
@@ -349,33 +497,128 @@ export class Session {
       this.recordUsage(usage("cancelled"));
       return true;
     }
-    turn.text = outcome.text;
-    this.emit({ type: "assistant_delta", id, text: outcome.text });
+    turn.text = "";
+    this.live(turn, outcome.text);
     this.emit({ type: "assistant_done", id, text: outcome.text });
     void this.slog.append({ kind: "assistant", id, text: outcome.text });
-    // The model never saw this exchange; tell it on its next turn.
-    this.directNotes.push(`Kullanıcı: ${text}\nShadow: ${outcome.text}`);
-    if (this.directNotes.length > MAX_DIRECT_NOTES) this.directNotes.shift();
+    // The model never saw this exchange; tell it.
+    this.addDirectNote(`Kullanıcı: ${text}\nShadow: ${outcome.text}`);
     this.recordUsage(usage(outcome.status === "done" ? "done" : outcome.status));
     return true;
   }
 
-  /** Prefixes tier-0 exchanges the model has not seen yet (then forgets them). */
+  /**
+   * A tier-0 exchange for the model. With a live session that stores notes, it
+   * goes into the conversation at once (`appendNote`, no model call); otherwise
+   * (legacy runner, no session running, or the note was refused) it is kept and
+   * put in front of the next model turn. Either way it is wrapped in the
+   * `<bilgi>` delimiters (turn-envelope.ts `wrapDirectNotes`).
+   */
+  private addDirectNote(note: string): void {
+    const registry = this.deps.registry;
+    const live = registry?.capabilities.notes ? registry.live(this.info.device) : undefined;
+    const entry: DirectNote = { seq: this.noteSeq++, text: note };
+    if (!live) {
+      this.bufferDirectNotes([entry]);
+      return;
+    }
+    // Older notes still buffered go first, in the same note, so the model sees them in order.
+    const batch = [...this.directNotes.splice(0), entry];
+    this.track(
+      live.appendNote(wrapDirectNotes(batch.map((n) => n.text))).then((ok) => {
+        if (!ok) this.bufferDirectNotes(batch);
+      }),
+    );
+  }
+
+  /**
+   * Keeps notes for the next model turn, merged with those already buffered in
+   * creation order (`seq`): a refused batch can come back after a later note
+   * was buffered, and concurrent refused batches can come back in any order.
+   * The oldest notes are dropped beyond MAX_DIRECT_NOTES.
+   */
+  private bufferDirectNotes(notes: readonly DirectNote[]): void {
+    this.directNotes.push(...notes);
+    this.directNotes.sort((a, b) => a.seq - b.seq);
+    if (this.directNotes.length > MAX_DIRECT_NOTES) this.directNotes.splice(0, this.directNotes.length - MAX_DIRECT_NOTES);
+  }
+
+  /** Puts the delimited tier-0 exchanges the model has not seen yet in front of the text, then forgets them. */
   private withDirectNotes(text: string): string {
-    if (this.directNotes.length === 0) return text;
-    const notes = this.directNotes.splice(0).join("\n");
-    return `${DIRECT_NOTES_HEADER}\n${notes}\n\n${text}`;
+    return buildTurnEnvelope({ text, notes: this.directNotes.splice(0).map((n) => n.text) });
   }
 
   // ------------------------------------------------------------ tiers 1-3
 
-  private async runModel(turn: ActiveTurn, text: string, decision: RouteDecision): Promise<void> {
+  private async runModel(turn: ActiveTurn, text: string, decision: RouteDecision, routeMs: number): Promise<void> {
     const id = turn.id;
     const tier: ModelTier = decision.tier === 1 || decision.tier === 3 ? decision.tier : 2;
     const escalateTo = tier === 1 ? decision.escalateTo : undefined;
-    const prompt = this.withDirectNotes(text);
-    const base = this.sdkSessionId;
     void this.slog.append({ kind: "route", id, tier, model: decision.model, ...(decision.rule ? { rule: decision.rule } : {}) });
+
+    const registry = this.deps.registry;
+    if (!registry) {
+      const result = await this.runModelLegacy(turn, text, decision, tier, escalateTo, this.sdkSessionId, routeMs);
+      if (result.sessionId) this.sdkSessionId = result.sessionId;
+      return;
+    }
+    // One model turn per device across its sockets, also on the legacy fallback
+    // (the session's own busy check does not cover a turn that runs beside it).
+    const device = this.info.device;
+    if (!registry.beginTurn(device)) {
+      this.error("busy", "a turn is already running on this device", id);
+      return;
+    }
+    try {
+      const session = await this.acquire(turn, registry);
+      if (session === "cancelled") {
+        this.finishCancelledBeforeModel(turn, tier, decision.model);
+        return;
+      }
+      if (session && (await this.runModelPersistent(turn, text, decision, tier, escalateTo, session, routeMs))) return;
+      // No session (start failed, restart backoff) or it closed under us: this turn runs on the legacy runner.
+      const base = await registry.fallbackResume(device);
+      const result = await this.runModelLegacy(turn, text, decision, tier, escalateTo, base, routeMs);
+      this.track(registry.turnEnded(device, result.sessionId));
+    } finally {
+      registry.endTurn(device);
+    }
+  }
+
+  /** The device's session (undefined: use the legacy runner), or "cancelled" when the turn was cancelled while it started. */
+  private async acquire(turn: ActiveTurn, registry: SessionRegistry): Promise<ProviderSession | undefined | "cancelled"> {
+    const signal = turn.abort.signal;
+    if (signal.aborted) return "cancelled";
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<"cancelled">((resolve) => {
+      onAbort = () => resolve("cancelled");
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([registry.acquire(this.info.device), aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private finishCancelledBeforeModel(turn: ActiveTurn, tier: ModelTier, model: string): void {
+    this.emit({ type: "assistant_done", id: turn.id, text: "" });
+    void this.slog.append({ kind: "assistant", id: turn.id, text: "", cancelled: true });
+    this.recordModelUsage(turn, tier, model, { text: "", inputTokens: 0, outputTokens: 0, durationMs: Date.now() - turn.startedAt }, "cancelled");
+  }
+
+  /** Legacy runner: a fresh query per turn; tier-1 attempts fork, escalation resumes (behaviour before 07). */
+  private async runModelLegacy(
+    turn: ActiveTurn,
+    text: string,
+    decision: RouteDecision,
+    tier: ModelTier,
+    escalateTo: RouteDecision["escalateTo"],
+    base: string | undefined,
+    routeMs: number,
+  ): Promise<TurnResult> {
+    const id = turn.id;
+    const prompt = this.withDirectNotes(text);
 
     let call = await this.callModel(turn, { prompt, model: decision.model, tier, escalatable: escalateTo !== undefined, resume: base });
     let model = decision.model;
@@ -399,7 +642,6 @@ export class Session {
     }
 
     const result = call.result;
-    if (result.sessionId) this.sdkSessionId = result.sessionId;
     const cancelled = turn.abort.signal.aborted;
     const finalText = turn.text;
     if (result.error && !cancelled) {
@@ -410,14 +652,17 @@ export class Session {
     } else {
       this.emit({ type: "assistant_done", id, text: finalText });
     }
+    const doneAt = Date.now();
     if (finalText || cancelled) {
       void this.slog.append({ kind: "assistant", id, text: finalText, ...(cancelled ? { cancelled: true } : {}) });
     }
     this.recordModelUsage(turn, callTier, model, result, cancelled ? "cancelled" : result.error ? "error" : "done");
+    this.writeTiming(turn, callTier, routeMs, doneAt, Promise.resolve({ sdkDurationMs: result.durationMs, warm: false, queryAgeMs: 0 }));
+    return result;
   }
 
   /**
-   * One model call. Escalatable (tier 1) calls are buffered: their text reaches
+   * One legacy model call. Escalatable (tier 1) calls are buffered: their text reaches
    * the client only once it is clear the model did not hand the turn on, so the
    * escalation marker is never shown or spoken.
    */
@@ -427,10 +672,6 @@ export class Session {
   ): Promise<{ result: TurnResult; escalate: boolean }> {
     const id = turn.id;
     let buffer = "";
-    const live = (chunk: string) => {
-      turn.text += chunk;
-      if (!turn.abort.signal.aborted) this.emit({ type: "assistant_delta", id, text: chunk });
-    };
     const result = await this.deps.agent.runTurn(
       {
         prompt: o.prompt,
@@ -446,7 +687,7 @@ export class Session {
       {
         onDelta: (chunk) => {
           if (o.escalatable) buffer += chunk;
-          else live(chunk);
+          else this.live(turn, chunk);
         },
         onToolResult: (_toolUseId, name, isError) => this.toolFinished(id, name, isError),
       },
@@ -456,9 +697,159 @@ export class Session {
     const escalate = marked && !result.error && !turn.abort.signal.aborted;
     if (!escalate) {
       const clean = buffer.split(ESCALATION_MARKER).join("").trim();
-      if (clean) live(clean);
+      if (clean) this.live(turn, clean);
     }
     return { result, escalate };
+  }
+
+  /**
+   * Persistent mode (07 A1): the turn runs as attempts on the device's live
+   * session. Escalation continues in the same session (no fork): the tier-2
+   * attempt sees the request, the tier-1 marker and any tool results.
+   * Returns false when the session closed before the first attempt was taken
+   * (the caller then uses the legacy runner).
+   */
+  private async runModelPersistent(
+    turn: ActiveTurn,
+    text: string,
+    decision: RouteDecision,
+    tier: ModelTier,
+    escalateTo: RouteDecision["escalateTo"],
+    session: ProviderSession,
+    routeMs: number,
+  ): Promise<boolean> {
+    const id = turn.id;
+    const escalatable = escalateTo !== undefined;
+    // Notes buffered while no session was running go in front of the request.
+    const notes = this.directNotes.slice();
+    const envelope = buildTurnEnvelope({ text, escalatable, notes: notes.map((n) => n.text) });
+    let model = decision.model;
+    let callTier: ModelTier = tier;
+
+    const first = this.attempt(turn, session, { text: envelope, model, tier, escalatable });
+    if (first === "closed") return false;
+    if (first === "busy") {
+      this.error("busy", "a turn is already running on this device", id);
+      return true;
+    }
+    // Remove exactly the notes sent (a refused batch may have been merged in meanwhile).
+    for (const n of notes) {
+      const i = this.directNotes.indexOf(n);
+      if (i >= 0) this.directNotes.splice(i, 1);
+    }
+    let call = first;
+    let out = await call.done;
+    /** The escalation attempt could not start: the turn ends as an error of the first attempt. */
+    let escalationFailed = false;
+    if (escalateTo && call.escalate() && !turn.abort.signal.aborted) {
+      void this.slog.append({ kind: "route", id, tier: escalateTo.tier, model: escalateTo.model, escalated: true });
+      const next = this.attempt(turn, session, { text: ESCALATION_CONTINUE, model: escalateTo.model, tier: escalateTo.tier, escalatable: false });
+      if (next === "closed" || next === "busy") {
+        // Usage stays the first attempt's, recorded once below under its own tier and model.
+        escalationFailed = true;
+        out = { ...out, status: "error", error: `escalation could not start (session ${next})` };
+      } else {
+        this.recordAtSettle(turn, callTier, model, call.settled, "escalated");
+        model = escalateTo.model;
+        callTier = escalateTo.tier;
+        call = next;
+        out = await call.done;
+      }
+    }
+
+    const cancelled = turn.abort.signal.aborted || out.status === "cancelled";
+    turn.cancelled = cancelled;
+    const finalText = turn.text;
+    if (out.status === "usage_limit" && !cancelled) {
+      // The limit message is an error frame, never an answer (07 §Usage limit).
+      void this.slog.append({ kind: "error", id, code: "usage_limit", message: "usage limit reached" });
+      this.emit({
+        type: "error",
+        id,
+        code: "usage_limit",
+        message: "usage limit reached",
+        ...(out.retryAt !== undefined ? { retryAt: out.retryAt } : {}),
+      });
+    } else if (out.status !== "ok" && !cancelled) {
+      const why = out.error ?? out.status;
+      this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${why}`);
+      void this.slog.append({ kind: "error", id, code: "model_error", message: why });
+      this.error("model_error", "the model could not complete this turn", id);
+      if (finalText) this.emit({ type: "assistant_done", id, text: finalText });
+    } else {
+      this.emit({ type: "assistant_done", id, text: finalText });
+    }
+    const doneAt = Date.now();
+    if (out.status !== "usage_limit" && (finalText || cancelled)) {
+      void this.slog.append({ kind: "assistant", id, text: finalText, ...(cancelled ? { cancelled: true } : {}) });
+    }
+    const settled = call.settled;
+    this.recordAtSettle(turn, callTier, model, settled, cancelled ? "cancelled" : escalationFailed ? "error" : undefined);
+    this.writeTiming(
+      turn,
+      callTier,
+      routeMs,
+      doneAt,
+      settled.then((o) => ({ sdkDurationMs: o.durationMs, warm: o.warm, queryAgeMs: o.queryAgeMs })),
+    );
+    const registry = this.deps.registry;
+    if (registry) this.track(settled.then(() => registry.turnEnded(this.info.device)));
+    return true;
+  }
+
+  /** Submits one attempt; "busy" (another socket of this device runs one) or "closed" (the session is gone). */
+  private attempt(
+    turn: ActiveTurn,
+    session: ProviderSession,
+    o: { text: string; model: string; tier: ModelTier; escalatable: boolean },
+  ): { done: Promise<AttemptOutcome>; settled: Promise<AttemptOutcome>; escalate: () => boolean } | "busy" | "closed" {
+    let buffer = "";
+    let handle: AttemptHandle;
+    try {
+      handle = session.runAttempt({
+        text: o.text,
+        model: o.model,
+        canUseTool: this.gate(turn, this.deps.tierServices?.[o.tier]),
+        signal: turn.abort.signal,
+        callbacks: {
+          onDelta: (chunk) => {
+            if (o.escalatable) buffer += chunk;
+            else this.live(turn, chunk);
+          },
+          onToolResult: (_toolUseId, name, isError) => this.toolFinished(turn.id, name, isError),
+        },
+      });
+    } catch (err) {
+      if (err instanceof SessionBusyError) return "busy";
+      if (err instanceof SessionClosedError) return "closed";
+      throw err;
+    }
+    let escalate = false;
+    const done = handle.done.then((out) => {
+      if (o.escalatable) {
+        // Buffered tier-1 text is shown only when the model did not hand the turn on.
+        escalate = buffer.includes(ESCALATION_MARKER) && out.status === "ok" && !turn.abort.signal.aborted;
+        // A cancelled attempt (also one the provider cancelled, without a user
+        // abort) shows nothing: turn.cancelled is set only after `done`, too late
+        // to stop the speech stream from sending these sentences.
+        if (!escalate && out.status !== "usage_limit" && out.status !== "cancelled") {
+          const clean = buffer.split(ESCALATION_MARKER).join("").trim();
+          if (clean) this.live(turn, clean);
+        }
+      }
+      return out;
+    });
+    return { done, settled: handle.settled, escalate: () => escalate };
+  }
+
+  /** Usage is final only at `settled` (07 §Turn boundaries). `outcome` undefined = from the status. */
+  private recordAtSettle(turn: ActiveTurn, tier: ModelTier, model: string, settled: Promise<AttemptOutcome>, outcome?: UsageOutcome): void {
+    this.track(
+      settled.then((o) => {
+        const u: UsageOutcome = outcome ?? (o.status === "ok" ? "done" : o.status === "cancelled" ? "cancelled" : "error");
+        this.recordModelUsage(turn, tier, o.model || model, o, u);
+      }),
+    );
   }
 
   private recordModelUsage(turn: ActiveTurn, tier: ModelTier, model: string, r: TurnResult, outcome: UsageOutcome): void {
@@ -519,14 +910,36 @@ export class Session {
     return this.deps.policy.levelFor(full).identity.tool;
   }
 
-  /** Builds the SDK `canUseTool` callback for one turn. */
-  gate(turn: ActiveTurn): CanUseTool {
-    return async (toolName, input, opts): Promise<PermissionResult> => {
-      const r = await this.authorize(turn, toolName, input, opts.signal);
+  /**
+   * The provider-neutral permission callback for one model call. `services`
+   * (persistent mode, router.yaml `tierN.services`): tools of any other
+   * service are denied ("not available in this mode") without asking.
+   */
+  gate(turn: ActiveTurn, services?: readonly string[]): PermissionCallback {
+    return async (toolName, input, opts): Promise<PermissionDecision> => {
+      const r = services && !this.inTierServices(toolName, services)
+        ? this.denyOutsideTier(turn, toolName, input)
+        : await this.authorize(turn, toolName, input, opts.signal);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
         : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
     };
+  }
+
+  private inTierServices(toolName: string, services: readonly string[]): boolean {
+    const service = this.deps.policy.levelFor(toolName).identity.service;
+    return service !== undefined && services.includes(service);
+  }
+
+  /** Same records as a gate denial, for a tool of a service outside the current tier. */
+  private denyOutsideTier(turn: ActiveTurn, toolName: string, input: Record<string, unknown>): { allowed: false; reason: GateDeny } {
+    const { identity } = this.deps.policy.levelFor(toolName, input);
+    const id = turn.id;
+    void this.slog.append({ kind: "tool_call", id, tool: identity.full, level: "deny", reason: "tier_service", input });
+    this.emit({ type: "tool", id, name: identity.tool, status: "denied" });
+    void this.slog.append({ kind: "permission", id, tool: identity.full, decision: "deny", level: "deny" });
+    this.deps.logger.info(`[shadow-core] denied ${identity.full} (not in this tier's services)`);
+    return { allowed: false, reason: "tier_service" };
   }
 
   /**
@@ -632,6 +1045,18 @@ export class Session {
     for (const a of this.transcribing.values()) a.abort();
     // Let the aborted turn write its final records before session_end.
     if (this.turnDone) await this.turnDone.catch(() => {});
+    // Tails (usage at `settled`, timing) normally end within milliseconds of a cancel; never wait long.
+    if (this.tails.size > 0) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.tails]),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, TAIL_WAIT_MS);
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
+    }
     await this.slog.append({ kind: "session_end", reason });
     await this.slog.flush();
   }

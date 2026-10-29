@@ -5,17 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import {
-  buildTurnEnvelope,
-  DENIED_BUILTIN_TOOLS,
-  DIRECT_NOTES_END,
-  DIRECT_NOTES_START,
-  SdkAgentRunner,
-  subprocessEnv,
-  TIER1_MARKER,
-  TurnStream,
-  wrapDirectNotes,
-} from "../src/agent.js";
+import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
+import { buildTurnEnvelope, DIRECT_NOTES_END, DIRECT_NOTES_START, TIER1_MARKER, wrapDirectNotes } from "../src/turn-envelope.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-agent-test-"));
 after(() => rmSync(base, { recursive: true, force: true }));
@@ -204,4 +195,26 @@ test("TurnStream.result({fallbackText:false}) does not emit the final text", () 
   s.consume(msg({ type: "result", subtype: "success", is_error: false, result: "Merhaba!", session_id: "s2", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
   assert.equal(s.result(0, { fallbackText: false }).text, "");
   assert.deepEqual(deltas, []);
+});
+
+test("session.ts never loads the provider SDK: its value-import graph does not reach agent.ts or the SDK", () => {
+  const src = join(import.meta.dirname, "..", "src");
+  const seen = new Set<string>();
+  const reached: string[] = [];
+  const visit = (file: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const code = readFileSync(join(src, file), "utf8");
+    // Every import/export-from statement that is not type-only (those are erased).
+    for (const m of code.matchAll(/^(?:import|export)\s+(type\s)?[^;]*?\sfrom\s+"([^"]+)";/gms)) {
+      if (m[1]) continue;
+      const spec = m[2]!;
+      if (spec.startsWith("./")) visit(spec.slice(2).replace(/\.js$/, ".ts"));
+      else reached.push(`${file} -> ${spec}`);
+    }
+  };
+  visit("session.ts");
+  assert.ok(!seen.has("agent.ts"), `agent.ts is value-imported (${[...seen].join(", ")})`);
+  assert.ok(!reached.some((r) => r.includes("@anthropic-ai/")), reached.join("\n"));
+  assert.ok(seen.has("turn-envelope.ts"));
 });

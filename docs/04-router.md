@@ -184,9 +184,19 @@ These go to a model on purpose:
    conversation log (`route`, `tool_call`, `permission`, `tool_result`,
    `assistant`, `usage`).
 
-The model never sees tier-0 exchanges, so the session remembers the last five
-and puts them, under a short header, in front of the next model prompt. That way
+The model never sees tier-0 exchanges, so the Core tells it afterwards. Each
+exchange is a record `Kullanıcı: … / Shadow: …` between `<bilgi>` and
+`</bilgi>` lines (`wrapDirectNotes` in `agent.ts`); `system.md` tells the model
+not to answer these records and to answer the request after them. That way
 "salon ışığını aç" followed by "şimdi kapat" still has its context.
+
+- Persistent mode (default, see [07](07-speed.md#a1-persistent-per-device-agent-session)):
+  when the device's model session is running, the record is appended to the
+  conversation at once without a model call (`ProviderSession.appendNote`, SDK
+  `shouldQuery: false`). It then survives reconnects.
+- Otherwise (`CORE_AGENT_PERSISTENT=off`, no session running, or the note was
+  refused) the session keeps the last five records and puts them in front of
+  the next model prompt.
 
 ### Failures
 
@@ -222,27 +232,44 @@ There is no separate classifier call.
 
 ### Tier-1 escalation
 
-Tier-1 turns get one extra system-prompt paragraph
-([`core/prompts/tier1.md`](../core/prompts/tier1.md)). If the request needs
-several steps, several devices or tools, a long explanation, a comparison or a
-plan, or if Haiku is unsure, it must answer with exactly `[[ESCALATE]]` and
-nothing else, preferably before using any tool.
+[`core/prompts/tier1.md`](../core/prompts/tier1.md) is part of the one static
+system prompt, written conditionally: its rule applies only to a user message
+whose first line is `[mod:hizli]`. The Core adds that line to escalatable
+tier-1 turns (`buildTurnEnvelope` in `agent.ts`). For such a request, if it
+clearly needs several steps or devices, a plan, a comparison or a long
+explanation, Haiku must answer with exactly `[[ESCALATE]]` and nothing else,
+preferably before using any tool. Greetings, small talk and thanks are never
+escalated.
 
 - The tier-1 answer is **buffered**: the client gets it as one
-  `assistant_delta` after the call ends, so the marker is never shown or spoken.
-  Tool frames still stream live.
-- When the answer contains the marker (and the call did not fail or get
-  cancelled), the same turn is re-run on tier 2.
-- Conversation context: when an earlier SDK session is resumed, tier-1 calls run
-  with `forkSession: true`, so the pre-turn session is left untouched. Tier 2
-  resumes that pre-turn session. The abandoned tier-1 attempt (user text plus
-  marker) is not in the history.
+  `assistant_delta` after the call ends, so the marker is never shown or spoken
+  (also not by the sentence-by-sentence speech stream). Tool frames still
+  stream live.
+- When the answer contains the marker (and the call did not fail, hit the usage
+  limit or get cancelled), the turn continues on tier 2.
+- A tier-1 *error* does not escalate. An auth or API error would just fail
+  again, at higher cost. The usage limit never escalates either.
+- Tier 2 never escalates to tier 3; Opus is reached only by tier-3 rules.
+
+**Persistent mode** (default; one live model session per device, see
+[07](07-speed.md#tier-switching-and-escalation)): the escalation continues in
+the **same session**. The model is switched to tier 2 (`setModel`) and a second
+message asks it to complete the user's last request, using any tool results
+and not repeating successful actions. The tier-2 model sees the original
+request, the tier-1 marker and any tool results. No fork, no resume. The
+tier-1 attempt (request plus marker) stays in the history; that costs a few
+tokens.
+
+**Legacy mode** (`CORE_AGENT_PERSISTENT=off`, and single turns that fall back
+to it when a device session cannot start): a fresh SDK query per call.
+
+- When an earlier SDK session is resumed, tier-1 calls run with
+  `forkSession: true`, so the pre-turn session is left untouched. Tier 2
+  resumes that pre-turn session; the abandoned tier-1 attempt is not in the
+  history.
 - If tier 1 already **ran tools** before escalating, tier 2 resumes the tier-1
   fork instead. It sees the tool results and gets the instruction not to repeat
   successful actions, so nothing runs twice.
-- A tier-1 *error* does not escalate. An auth or API error would just fail
-  again, at higher cost.
-- Tier 2 never escalates to tier 3; Opus is reached only by tier-3 rules.
 
 ### Cost
 
@@ -262,19 +289,29 @@ straight to Sonnet, which avoids a wasted Haiku call.
 
 What the Agent SDK allows, and what is done:
 
-- **Static system prompt.** One fixed prompt per tier: `system.md`, plus
-  `tier1.md` for tier 1. It is byte-identical on every turn, and the tool list
+- **Static system prompt.** One fixed prompt for all tiers: `system.md` plus
+  the conditional `tier1.md` (see [Tier-1 escalation](#tier-1-escalation)).
+  It is byte-identical on every turn and for every model, and the tool list
   comes in a fixed order, so the SDK's automatic prompt caching hits. The usage
   records show this as `cacheReadTokens`. The prompt is passed as
-  `{type: "custom", snapshot: false}`. With the default (snapshot), a resumed
-  session would keep the prompt of the tier it started on: Sonnet would get
-  Haiku's escalation paragraph, or the other way round.
+  `{type: "custom", snapshot: false}`. In persistent mode it is fixed when the
+  device's session starts. In legacy mode the tier-1 paragraph is still
+  appended only for tier-1 turns, and `snapshot: false` keeps a resumed session
+  from reusing the prompt of the tier it started on.
 - **No tools when none are needed.** Tier 0 starts no Agent SDK process. It
   loads none of the MCP tool definitions (Home Assistant's 13 tools are roughly
   1,700 tokens) and sends no system prompt.
-- **Per-tier MCP servers.** `tierN.services` in `router.yaml` limits the MCP
-  servers loaded for that tier. By default every tier gets all enabled
-  services, because tier 1 needs Home Assistant for one-tool requests.
+- **Per-tier services.** `tierN.services` in `router.yaml` limits the services
+  a tier may use (default: all enabled services, because tier 1 needs Home
+  Assistant for one-tool requests).
+  - Persistent mode: the device's session loads every enabled service once, so
+    the tool list stays stable. The permission gate denies tools of a service
+    that is not in the current tier's list ("This tool is not available in
+    this mode.", conversation log `tool_call` with reason `tier_service`). This
+    is an execution limit only: the tokens of those tool definitions are not
+    saved. The Core logs a warning at start-up when the key is set.
+  - Legacy mode: only the listed MCP servers are loaded for the call, which
+    also saves their tokens.
 
 What is not done, and why:
 
@@ -287,7 +324,9 @@ What is not done, and why:
   as a whole; the Core cannot know before the call which HA tool the model will
   need.
 - **Cross-tier cache.** The prompt cache is per model, so a tier-1 → tier-2
-  escalation does not reuse tier 1's cache. This is inherent to the API.
+  escalation does not reuse tier 1's cache: the first turn on a model after a
+  switch writes that model's cache, and returning to a model within the cache
+  lifetime reads it again. This is inherent to the API.
 
 ## Usage records
 
@@ -317,3 +356,11 @@ serialized, and a failed write only produces a warning.
 
 Only these whitelisted fields are written. Tokens, headers and tool arguments
 never appear in this file.
+
+In persistent mode a call's usage is known only when the model session reports
+the end of the call, shortly after the answer is shown; the line is written
+then. `costUsd` is the difference of the session's running total and is left
+out for the first call after a resume. A usage-limit stop is recorded as
+`error`. Each model turn also writes a `timing` entry to the conversation log
+(not to this file): route, first text, visible end, model duration and first
+speech chunk, in ms from the request ([07 §Usage records](07-speed.md#usage-records-and-the-conversation-log)).

@@ -4,11 +4,14 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import { SdkAgentRunner, subprocessEnv } from "./agent.js";
+import { getSessionInfo, query, type McpServerConfig, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
+import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
+import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
+import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { PermissionPolicy } from "./permissions.js";
 import { McpDirectClient } from "./mcp-direct.js";
@@ -46,6 +49,32 @@ export function buildMcpServers(cfg: CoreConfig, env: NodeJS.ProcessEnv): () => 
   return () => (reader && vaultSvc ? { ...remote, [vaultSvc.name]: createVaultMcpServer(reader, vaultSvc.name) } : remote);
 }
 
+/**
+ * Options of a one-shot background call (memory extraction, summaries; docs/06):
+ * no tools, no MCP, nothing from ~/.claude, no persisted session.
+ */
+export function buildOneShotOptions(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): (p: { model: string; system?: string; abortController: AbortController }) => Omit<Options, "prompt"> {
+  return (p) => ({
+    model: p.model,
+    ...(p.system !== undefined ? { systemPrompt: { type: "custom", prompt: p.system, snapshot: false } } : {}),
+    tools: [],
+    disallowedTools: DENIED_BUILTIN_TOOLS,
+    settingSources: [],
+    strictMcpConfig: true,
+    mcpServers: {},
+    permissionMode: "default",
+    canUseTool: async () => ({ behavior: "deny", message: "No tools in background calls." }),
+    abortController: p.abortController,
+    persistSession: false,
+    cwd,
+    maxTurns: 1,
+    env,
+  });
+}
+
 export async function main(): Promise<void> {
   const envFile = loadDotEnv();
   const cfg = loadConfig();
@@ -70,14 +99,59 @@ export async function main(): Promise<void> {
   await log.ensureDir();
 
   const policy = new PermissionPolicy(cfg.services.services, { readOnly: cfg.readOnly });
+  const agentCwd = join(cfg.dataDir, "agent");
+  const agentEnv = subprocessEnv(process.env);
   const agent = new SdkAgentRunner({
     systemPrompt,
     escalationPrompt,
     mcpServers: buildMcpServers(cfg, process.env),
-    cwd: join(cfg.dataDir, "agent"),
-    env: subprocessEnv(process.env),
+    cwd: agentCwd,
+    env: agentEnv,
     stderr: (line) => logger.warn(`[shadow-core] sdk: ${line.trimEnd()}`),
   });
+
+  // Persistent per-device model sessions (docs/07 A1) with continuity (A4).
+  // CORE_AGENT_PERSISTENT=off: no registry, every turn on the legacy runner.
+  let registry: DeviceRegistry | undefined;
+  if (cfg.agent.persistent) {
+    const remoteMcp = cfg.services.services.filter((s) => s.kind === "mcp" && s.enabled && s.url).map((s) => s.name);
+    const provider = new ClaudeSdkProvider({
+      queryFn: query,
+      buildOptions: (p) => agent.buildPersistentOptions(p),
+      buildOneShotOptions: buildOneShotOptions(agentCwd, agentEnv),
+      session: {
+        idleMs: cfg.agent.idleMin * 60_000,
+        turnTimeoutMs: cfg.agent.turnTimeoutMs,
+        mcpFreshness: { servers: remoteMcp },
+        log: (event, detail) => {
+          if (event === "dead" || event === "send_failed" || event === "settle_failed") {
+            logger.warn(`[shadow-core] agent ${event}: ${JSON.stringify(detail ?? {})}`);
+          }
+        },
+      },
+    });
+    const store = new ContinuityStore({
+      file: continuityFilePath(cfg.dataDir),
+      windowMin: cfg.agent.continuityMin,
+      // Only Claude SDK transcripts can be checked here; another provider's pointer is kept as is.
+      getSessionInfo: (id, owner) => (owner === provider.id ? getSessionInfo(id, { dir: agentCwd }) : Promise.resolve(true)),
+      log: (level, m) => (level === "warn" ? logger.warn(`[shadow-core] ${m}`) : logger.info(`[shadow-core] ${m}`)),
+    });
+    registry = new DeviceRegistry({
+      provider,
+      model: cfg.router ? cfg.models[1] : cfg.model,
+      continuity: continuityPort(store),
+      continuityMin: cfg.agent.continuityMin,
+      restartGuard: () => new RestartBackoff(),
+      prewarm: cfg.agent.prewarm,
+      log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
+    });
+    if (cfg.router && Object.values(cfg.router.tierServices).some((v) => v !== undefined)) {
+      logger.warn(
+        "[shadow-core] router.yaml tierN.services: in persistent mode every service is loaded and the gate denies the others (no token saving)",
+      );
+    }
+  }
   const usageLog = new UsageLog(cfg.dataDir);
   let router: Router;
   let direct: McpDirectClient | undefined;
@@ -111,6 +185,7 @@ export async function main(): Promise<void> {
       new Session(
         {
           agent,
+          registry,
           policy,
           router,
           stt,
@@ -127,6 +202,7 @@ export async function main(): Promise<void> {
       ),
     // Name, flag, status and short detail code only: no URL or token leaves through /health.
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
+    features: ["speech_stream", "usage_limit"],
     serviceHealth: monitor,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
@@ -140,6 +216,9 @@ export async function main(): Promise<void> {
   );
   logger.info(`[shadow-core] model=${cfg.model} readOnly=${cfg.readOnly} devices=${[...tokens.digests.keys()].join(",")}`);
   logger.info(
+    `[shadow-core] agent=${cfg.agent.persistent ? `persistent (idle ${cfg.agent.idleMin} min, continuity ${cfg.agent.continuityMin} min, prewarm ${cfg.agent.prewarm ? "on" : "off"})` : "per-turn (legacy)"}`,
+  );
+  logger.info(
     `[shadow-core] pronunciations: ${lexicon.found ? `${pronunciations.entries.length} entries` : "file not found (none)"}`,
   );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
@@ -152,6 +231,7 @@ export async function main(): Promise<void> {
     void monitor
       .close()
       .then(() => server.close())
+      .then(() => registry?.close())
       .then(() => direct?.close())
       .then(() => usageLog.flush())
       .then(() => process.exit(0));

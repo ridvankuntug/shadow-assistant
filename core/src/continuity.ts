@@ -1,9 +1,13 @@
 /**
- * Continuity store (docs/07-speed.md A4, task S7): device → last SDK session
- * id, in `<SHADOW_DATA_DIR>/sessions/devices.json`.
+ * Continuity store (docs/07-speed.md A4, task S7): device → last conversation
+ * pointer `{ provider, sessionId }`, in `<SHADOW_DATA_DIR>/sessions/devices.json`.
  *
- *   { "version": 1,
- *     "devices": { "browser": { "sdkSessionId": "7c0e…", "lastTurnAt": 1767340800000, "updatedAt": 1767340801000 } } }
+ *   { "version": 2,
+ *     "devices": { "browser": { "provider": "claude-sdk", "sessionId": "7c0e…",
+ *                               "lastTurnAt": 1767340800000, "updatedAt": 1767340801000 } } }
+ *
+ * Version 1 files (no provider; the id was `sdkSessionId`) are still read:
+ * their entries belong to `V1_PROVIDER` ("claude-sdk"). The next write is version 2.
  *
  * The file is only a pointer: the conversation itself is the SDK transcript.
  * It holds device names, session ids and timestamps, never text, tokens or
@@ -23,12 +27,14 @@
  *   Neither corruption nor a failing write ever throws to the caller: the turn
  *   goes on, continuity is simply lost.
  *
- * Wiring into the device registry is task S8.
+ * Wired into the device registry by `continuityPort` (device-registry.ts, S8).
  */
 import { join } from "node:path";
 import { readJsonOrQuarantine, writeFileAtomic, type AtomicFs } from "./atomic-file.js";
 
-export const CONTINUITY_FILE_VERSION = 1;
+export const CONTINUITY_FILE_VERSION = 2;
+/** Provider of every entry in a version 1 file (only the Claude Agent SDK existed then). */
+export const V1_PROVIDER = "claude-sdk";
 /** Default for CORE_CONTINUITY_MIN. */
 export const DEFAULT_CONTINUITY_MIN = 30;
 
@@ -36,12 +42,16 @@ export const DEFAULT_CONTINUITY_MIN = 30;
 const DEVICE_RE = /^[\p{L}\p{N}_.-]{1,64}$/u;
 /** SDK session ids are UUIDs; accept any short id-like token, nothing that could hold text. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+/** Provider ids (`ModelProvider.id`): short lower-case tokens. */
+const PROVIDER_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 /** Transcript checks per lookup when the entry's session keeps changing under the check. */
 const MAX_LOOKUP_CHECKS = 3;
 
 export interface ContinuityEntry {
-  /** Last `session_id` seen in the device's query. */
-  sdkSessionId: string;
+  /** `ModelProvider.id` whose conversation `sessionId` is. */
+  provider: string;
+  /** Last conversation id seen in the device's session. */
+  sessionId: string;
   /** End of the last model turn (epoch ms). */
   lastTurnAt: number;
   /** When this entry was last written (epoch ms). */
@@ -49,7 +59,7 @@ export interface ContinuityEntry {
 }
 
 export type ContinuityLookup =
-  | { resume: true; sdkSessionId: string }
+  | { resume: true; provider: string; sessionId: string; lastTurnAt: number }
   | {
       resume: false;
       /**
@@ -68,11 +78,11 @@ export interface ContinuityStoreOptions {
   windowMin?: number;
   now?: () => number;
   /**
-   * Checks that the SDK transcript still exists (the SDK's `getSessionInfo`,
-   * bound to the agent cwd by the caller). A falsy result means "gone". When
-   * omitted, the check is skipped.
+   * Checks that the conversation still exists (for "claude-sdk": the SDK's
+   * `getSessionInfo`, bound to the agent cwd by the caller). A falsy result
+   * means "gone". When omitted, the check is skipped.
    */
-  getSessionInfo?: (sdkSessionId: string) => Promise<unknown>;
+  getSessionInfo?: (sessionId: string, provider: string) => Promise<unknown>;
   log?: ContinuityLog;
   fs?: AtomicFs;
   retryDelaysMs?: readonly number[];
@@ -95,17 +105,20 @@ function isTimestamp(v: unknown): v is number {
 export function parseContinuityFile(value: unknown): Map<string, ContinuityEntry> | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const v = value as { version?: unknown; devices?: unknown };
-  if (v.version !== CONTINUITY_FILE_VERSION) return undefined;
+  if (v.version !== 1 && v.version !== CONTINUITY_FILE_VERSION) return undefined;
   if (typeof v.devices !== "object" || v.devices === null || Array.isArray(v.devices)) return undefined;
   const map = new Map<string, ContinuityEntry>();
   for (const [device, raw] of Object.entries(v.devices as Record<string, unknown>)) {
     if (!DEVICE_RE.test(device)) return undefined;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
     const e = raw as Record<string, unknown>;
-    if (typeof e.sdkSessionId !== "string" || !SESSION_ID_RE.test(e.sdkSessionId)) return undefined;
+    const provider = v.version === 1 ? V1_PROVIDER : e.provider;
+    const sessionId = v.version === 1 ? e.sdkSessionId : e.sessionId;
+    if (typeof provider !== "string" || !PROVIDER_RE.test(provider)) return undefined;
+    if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) return undefined;
     if (!isTimestamp(e.lastTurnAt) || !isTimestamp(e.updatedAt)) return undefined;
-    // Unknown extra fields are dropped: only the three known ones are ever kept.
-    map.set(device, { sdkSessionId: e.sdkSessionId, lastTurnAt: e.lastTurnAt, updatedAt: e.updatedAt });
+    // Unknown extra fields are dropped: only the known ones are ever kept.
+    map.set(device, { provider, sessionId, lastTurnAt: e.lastTurnAt, updatedAt: e.updatedAt });
   }
   return map;
 }
@@ -215,10 +228,10 @@ export class ContinuityStore {
         return { resume: false, reason: "expired" };
       }
       const check = this.options.getSessionInfo;
-      if (!check) return { resume: true, sdkSessionId: entry.sdkSessionId };
+      if (!check) return resumeOf(entry);
       let info: unknown;
       try {
-        info = await check(entry.sdkSessionId);
+        info = await check(entry.sessionId, entry.provider);
       } catch (err) {
         this.log("warn", `continuity: transcript check failed for device ${device} (${describeError(err)})`);
         return { resume: false, reason: "check_failed" };
@@ -227,7 +240,7 @@ export class ContinuityStore {
       // Forgotten while checking: the user asked for a new conversation.
       if (!current) return { resume: false, reason: "none" };
       // Replaced by a newer session while checking: check that one instead.
-      if (current.sdkSessionId !== entry.sdkSessionId) continue;
+      if (current.sessionId !== entry.sessionId || current.provider !== entry.provider) continue;
       if (this.isExpired(current, this.now())) {
         this.entries.delete(device);
         void this.scheduleWrite();
@@ -239,27 +252,31 @@ export class ContinuityStore {
         void this.scheduleWrite();
         return { resume: false, reason: "missing" };
       }
-      return { resume: true, sdkSessionId: current.sdkSessionId };
+      return resumeOf(current);
     }
     // The session kept changing under the check: start fresh this time, keep the entry.
     return { resume: false, reason: "check_failed" };
   }
 
   /**
-   * Records the end of a model turn. Writes only when the session id or
+   * Records the end of a model turn. Writes only when the pointer or
    * `lastTurnAt` changed. Resolves when the resulting write has finished;
    * never rejects (failures are logged and retried with the next write).
    */
-  record(device: string, sdkSessionId: string, lastTurnAt: number = this.now()): Promise<void> {
-    return this.track(this.doRecord(device, sdkSessionId, lastTurnAt));
+  record(device: string, pointer: { provider: string; sessionId: string }, lastTurnAt: number = this.now()): Promise<void> {
+    return this.track(this.doRecord(device, pointer.provider, pointer.sessionId, lastTurnAt));
   }
 
-  private async doRecord(device: string, sdkSessionId: string, lastTurnAt: number): Promise<void> {
+  private async doRecord(device: string, provider: string, sessionId: string, lastTurnAt: number): Promise<void> {
     if (!DEVICE_RE.test(device)) {
       this.log("warn", "continuity: refusing an invalid device name");
       return;
     }
-    if (!SESSION_ID_RE.test(sdkSessionId)) {
+    if (!PROVIDER_RE.test(provider)) {
+      this.log("warn", `continuity: refusing an invalid provider id for device ${device}`);
+      return;
+    }
+    if (!SESSION_ID_RE.test(sessionId)) {
       this.log("warn", `continuity: refusing an invalid session id for device ${device}`);
       return;
     }
@@ -269,11 +286,11 @@ export class ContinuityStore {
     }
     await this.load();
     const prev = this.entries.get(device);
-    if (prev && prev.sdkSessionId === sdkSessionId && prev.lastTurnAt === lastTurnAt) {
+    if (prev && prev.provider === provider && prev.sessionId === sessionId && prev.lastTurnAt === lastTurnAt) {
       if (this.dirty) await this.scheduleWrite();
       return;
     }
-    this.entries.set(device, { sdkSessionId, lastTurnAt, updatedAt: this.now() });
+    this.entries.set(device, { provider, sessionId, lastTurnAt, updatedAt: this.now() });
     await this.scheduleWrite();
   }
 
@@ -330,7 +347,7 @@ export class ContinuityStore {
     // Null prototype: a device named "__proto__" stays an ordinary key.
     const devices = Object.create(null) as Record<string, ContinuityEntry>;
     for (const [device, e] of [...this.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-      devices[device] = { sdkSessionId: e.sdkSessionId, lastTurnAt: e.lastTurnAt, updatedAt: e.updatedAt };
+      devices[device] = { provider: e.provider, sessionId: e.sessionId, lastTurnAt: e.lastTurnAt, updatedAt: e.updatedAt };
     }
     const body = `${JSON.stringify({ version: CONTINUITY_FILE_VERSION, devices }, null, 2)}\n`;
     // The snapshot above holds every change so far; a later change queues its own write.
@@ -342,6 +359,10 @@ export class ContinuityStore {
       this.log("warn", `continuity: cannot write devices.json (${describeError(err)}); continuity may be lost`);
     }
   }
+}
+
+function resumeOf(e: ContinuityEntry): ContinuityLookup {
+  return { resume: true, provider: e.provider, sessionId: e.sessionId, lastTurnAt: e.lastTurnAt };
 }
 
 function describeError(err: unknown): string {

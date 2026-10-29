@@ -18,7 +18,8 @@ import type { ServerFrame } from "../src/protocol.js";
 import { parseRouterConfig } from "../src/router-config.js";
 import { ESCALATION_MARKER, TieredRouter, type UsageRecord } from "../src/router.js";
 import { parseServices } from "../src/services.js";
-import { DIRECT_NOTES_HEADER, ESCALATION_CONTINUE, Session } from "../src/session.js";
+import { Session } from "../src/session.js";
+import { ESCALATION_CONTINUE } from "../src/turn-envelope.js";
 import { UsageLog } from "../src/usage-log.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-tiers-test-"));
@@ -434,8 +435,8 @@ test("tier 0 exchanges are passed to the next model turn once", async () => {
   await h.say("teşekkürler", "t2");
   await h.say("peki", "t3");
   const p1 = h.agent.calls[0]?.prompt ?? "";
-  assert.ok(p1.startsWith(DIRECT_NOTES_HEADER), p1);
-  assert.match(p1, /Kullanıcı: evde sıcaklık kaç\nShadow: Ev sıcaklığı 22 derece\.\n\nteşekkürler$/);
+  // Delimited tier-0 records (turn-envelope.ts wrapDirectNotes), then the request.
+  assert.equal(p1, "<bilgi>\nKullanıcı: evde sıcaklık kaç\nShadow: Ev sıcaklığı 22 derece.\n</bilgi>\nteşekkürler");
   assert.equal(h.agent.calls[1]?.prompt, "peki");
 });
 

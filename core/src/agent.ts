@@ -19,6 +19,8 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionCallback } from "./model-provider.js";
+import { buildTurnEnvelope } from "./turn-envelope.js";
 
 export interface TurnRequest {
   prompt: string;
@@ -26,7 +28,8 @@ export interface TurnRequest {
   /** SDK session id of the previous turn, to keep conversation context. */
   resume?: string;
   signal: AbortSignal;
-  canUseTool: CanUseTool;
+  /** The Core's provider-neutral gate (session.ts never sees an SDK type). */
+  canUseTool: PermissionCallback;
   /**
    * Tier 1: append the escalation instructions (prompts/tier1.md) to the
    * system prompt so the model can hand the turn to the stronger tier.
@@ -95,49 +98,12 @@ export const DENIED_BUILTIN_TOOLS = [
   "ReadMcpResourceTool",
 ];
 
-/**
- * First line of an escalatable tier-1 user message. `prompts/tier1.md` is
- * written conditionally on it, so one static system prompt serves every tier
- * (persistent mode) and the escalation rule applies only to marked messages.
- */
-export const TIER1_MARKER = "[mod:hizli]";
-
-/**
- * Delimiters of the tier-0 exchange records the model did not see
- * (`system.md`: never answer what is between them; answer the request after
- * them). They keep the records apart from a question in the same message.
- */
-export const DIRECT_NOTES_START = "<bilgi>";
-export const DIRECT_NOTES_END = "</bilgi>";
-
-/** Wraps tier-0 exchange records (`Kullanıcı: … / Shadow: …`) in the delimiters; "" when there are none. */
-export function wrapDirectNotes(notes: readonly string[]): string {
-  const body = notes.map((n) => n.trim()).filter((n) => n !== "");
-  if (body.length === 0) return "";
-  return [DIRECT_NOTES_START, ...body, DIRECT_NOTES_END].join("\n");
-}
-
-/**
- * The user message of one model turn ("turn envelope", docs/07 §Tier switching):
- * the tier-1 marker line (escalatable turns only), delimited tier-0 records,
- * an optional memory block (docs/06), then the user's text.
- */
-export function buildTurnEnvelope(e: { text: string; escalatable?: boolean; notes?: readonly string[]; memoryBlock?: string }): string {
-  const parts: string[] = [];
-  if (e.escalatable) parts.push(TIER1_MARKER);
-  const notes = wrapDirectNotes(e.notes ?? []);
-  if (notes) parts.push(notes);
-  if (e.memoryBlock?.trim()) parts.push(e.memoryBlock.trim());
-  parts.push(e.text);
-  return parts.join("\n");
-}
-
 export interface SdkAgentOptions {
   systemPrompt: string;
   /**
    * prompts/tier1.md. Legacy mode: appended to the system prompt for
    * escalatable (tier 1) turns. Persistent mode: always part of the one static
-   * system prompt (the rule is conditional on `TIER1_MARKER`).
+   * system prompt (the rule is conditional on `TIER1_MARKER`, turn-envelope.ts).
    */
   escalationPrompt?: string;
   /** Built per turn: in-process MCP server instances cannot be shared between queries. */

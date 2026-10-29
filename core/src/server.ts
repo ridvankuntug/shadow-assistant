@@ -16,6 +16,7 @@ import {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   parseClientFrame,
+  type ProtocolFeature,
   type ServerFrame,
   type ServiceHealth,
 } from "./protocol.js";
@@ -29,6 +30,8 @@ export interface CoreServerOptions {
   createSession: (info: SessionInfo, send: (frame: ServerFrame) => void) => Session;
   logger: Logger;
   helloTimeoutMs?: number;
+  /** Optional capabilities advertised in `welcome.features`; absent = the field is left out. */
+  features?: readonly ProtocolFeature[];
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
@@ -153,7 +156,13 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
         );
         sessions.add(session);
         opts.logger.info(`[shadow-core] device '${device}' connected (session ${sessionId})`);
-        send({ type: "welcome", protocol: PROTOCOL_VERSION, sessionId, device });
+        send({
+          type: "welcome",
+          protocol: PROTOCOL_VERSION,
+          sessionId,
+          device,
+          ...(opts.features && opts.features.length > 0 ? { features: [...opts.features] } : {}),
+        });
         send({ type: "state", state: "idle" });
         const items = opts.serviceHealth?.snapshot();
         if (items) send({ type: "services", items });

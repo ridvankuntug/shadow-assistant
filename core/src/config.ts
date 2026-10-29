@@ -41,6 +41,21 @@ export interface CoreConfig {
   systemPromptFile: string;
   /** TTS pronunciation lexicon: SHADOW_PRONUNCIATIONS_FILE or repo-root pronunciations.yaml. */
   pronunciationsFile: string;
+  /** Model sessions (docs/07 A1/A4); see .env.example. */
+  agent: AgentConfig;
+}
+
+export interface AgentConfig {
+  /** CORE_AGENT_PERSISTENT (default on); off = a fresh query per turn (behaviour before 07). */
+  persistent: boolean;
+  /** CORE_AGENT_PREWARM (default on): start the device's session on `hello`. */
+  prewarm: boolean;
+  /** CORE_AGENT_IDLE_MIN (default 10): close a device's session after this many idle minutes. */
+  idleMin: number;
+  /** CORE_TURN_TIMEOUT_MS (default 120000): host-side limit per model attempt. */
+  turnTimeoutMs: number;
+  /** CORE_CONTINUITY_MIN (default 30): a device continues its conversation within this many minutes, also after a restart. */
+  continuityMin: number;
 }
 
 /**
@@ -56,6 +71,11 @@ export function loadDotEnv(env: NodeJS.ProcessEnv = process.env): string | undef
 
 function flag(v: string | undefined): boolean {
   return v !== undefined && /^(1|true|yes|on)$/i.test(v.trim());
+}
+
+/** Default on; `0|off|false|no` turns it off. */
+function onByDefault(v: string | undefined): boolean {
+  return !/^(0|off|false|no)$/i.test(v?.trim() ?? "");
 }
 
 function positiveInt(name: string, v: string | undefined, def: number): number {
@@ -112,6 +132,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     tts: findService(services, "tts-svc"),
     systemPromptFile: join(CORE_ROOT, "prompts", "system.md"),
     pronunciationsFile: env.SHADOW_PRONUNCIATIONS_FILE || join(REPO_ROOT, "pronunciations.yaml"),
+    agent: {
+      persistent: onByDefault(env.CORE_AGENT_PERSISTENT),
+      prewarm: onByDefault(env.CORE_AGENT_PREWARM),
+      idleMin: positiveInt("CORE_AGENT_IDLE_MIN", env.CORE_AGENT_IDLE_MIN, 10),
+      turnTimeoutMs: positiveInt("CORE_TURN_TIMEOUT_MS", env.CORE_TURN_TIMEOUT_MS, 120_000),
+      continuityMin: positiveInt("CORE_CONTINUITY_MIN", env.CORE_CONTINUITY_MIN, 30),
+    },
   };
 }
 
