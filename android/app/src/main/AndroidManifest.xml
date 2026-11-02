@@ -4,6 +4,10 @@
 
     <!-- WebSocket to the Core (the UI) and the native reachability probe. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 17+ (API 37) runtime permission for LAN addresses (the Core at 192.168.1.2, on
+         Wi-Fi or through the Tailscale subnet route). Asked at startup; unknown and ignored below
+         API 37, so no maxSdk/minSdk scoping is needed. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <!-- Push-to-talk; requested at the first startCapture, never used in the background. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />

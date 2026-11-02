@@ -35,6 +35,7 @@ role (opens from the assist gesture / power key).
 | `AudioPlayer.kt` / `Speaker.kt` | `playAudio` (Core voice) / `speak` (TextToSpeech fallback) |
 | `TokenCipher.kt`, `BridgeStorage.kt` | Keystore-encrypted device token, plain other keys |
 | `CoreAddress.kt`, `CoreProbe.kt` | Default Core address, cleartext allowlist, reachability check |
+| `LocalNetworkPermission.kt` | When the Android 17 local network permission is needed / asked at startup |
 | `assist/AssistServices.kt` | `VoiceInteractionService` + session + recognition stub |
 | `res/xml/network_security_config.xml` | Cleartext only to `192.168.1.2` |
 
@@ -111,6 +112,17 @@ the app shows a native error screen with **Tekrar dene** and **Adresi
 değiştir** (back to the UI's settings to edit the address). The check is a
 plain TCP connect to the Core's host/port, run when the page has loaded, on
 every return to the foreground and after the address or token changes.
+
+**Local network permission (Android 17+).** With `targetSdk` 37, Android 17
+blocks connections to LAN addresses such as `192.168.1.2` — on Wi-Fi and
+through the Tailscale subnet route alike — unless the app holds the runtime
+permission `ACCESS_LOCAL_NETWORK` ("Yerel ağ"). The app asks for it at
+startup (together with the one-time notification prompt) and loads the UI
+once it is granted. If it is denied, a separate native error ("Yerel ağ izni
+gerekli", not "Çekirdeğe ulaşılamıyor") offers **Tekrar dene** (asks again)
+and **Ayarları aç** (the app's settings page); granting it there and coming
+back loads the UI without restarting the app. Older Android versions do not
+have this permission and are unaffected.
 
 ## Security notes
 

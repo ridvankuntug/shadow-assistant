@@ -3,10 +3,13 @@ package app.shadowassistant.android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -81,7 +84,10 @@ class MainActivity : Activity() {
     private var pageLoaded = false
     private var shownError: ErrorKind? = null
 
-    private enum class ErrorKind { MISSING_UI, LOAD_FAILED, CORE }
+    /** The UI was not loaded because the local network permission is missing (API 37+). */
+    private var uiDeferred = false
+
+    private enum class ErrorKind { MISSING_UI, LOAD_FAILED, CORE, LOCAL_NETWORK }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -121,11 +127,39 @@ class MainActivity : Activity() {
         probe = CoreProbe(main)
 
         configureWebView()
-        loadUi()
 
-        if (flags.get(FLAG_NOTIFY_ASKED) == null) {
-            flags.put(FLAG_NOTIFY_ASKED, "1")
-            if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
+        val askNotify = flags.get(FLAG_NOTIFY_ASKED) == null
+        if (askNotify) flags.put(FLAG_NOTIFY_ASKED, "1")
+        val startup = LocalNetworkPermission.startupRequest(Build.VERSION.SDK_INT, localNetworkGranted(), askNotify)
+        // Without the local network permission the UI's first WebSocket would fail; load it
+        // once the request is answered (onRequestPermissionsResult) instead.
+        uiDeferred = localNetworkMissing()
+        if (startup.isNotEmpty()) requestPermissions(startup.toTypedArray(), REQ_STARTUP)
+        if (!uiDeferred) loadUi()
+    }
+
+    private fun localNetworkGranted(): Boolean =
+        checkSelfPermission(LocalNetworkPermission.PERMISSION) == PackageManager.PERMISSION_GRANTED
+
+    private fun localNetworkMissing(): Boolean =
+        LocalNetworkPermission.missing(Build.VERSION.SDK_INT, localNetworkGranted())
+
+    /** After a request or a return from Settings: load the deferred UI, or explain why it cannot be. */
+    private fun resumeDeferredUi(explain: Boolean) {
+        if (!uiDeferred || destroyed) return
+        if (!localNetworkMissing()) {
+            uiDeferred = false
+            loadUi()
+        } else if (explain) {
+            showError(ErrorKind.LOCAL_NETWORK)
+        }
+    }
+
+    private fun openAppSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "No app settings screen", e)
         }
     }
 
@@ -264,24 +298,42 @@ class MainActivity : Activity() {
 
     private fun showError(kind: ErrorKind) {
         when (kind) {
-            ErrorKind.MISSING_UI -> showPanel(kind, getString(R.string.error_ui_title), getString(R.string.error_ui_message), false)
-            ErrorKind.LOAD_FAILED -> showPanel(kind, getString(R.string.error_load_title), getString(R.string.error_load_message), false)
+            ErrorKind.MISSING_UI -> showPanel(kind, getString(R.string.error_ui_title), getString(R.string.error_ui_message), null)
+            ErrorKind.LOAD_FAILED -> showPanel(kind, getString(R.string.error_load_title), getString(R.string.error_load_message), null)
+            // Not the Core's fault: Android blocks LAN connections until the user allows "Yerel ağ".
+            ErrorKind.LOCAL_NETWORK -> showPanel(
+                kind,
+                getString(R.string.error_local_network_title),
+                getString(R.string.error_local_network_message),
+                getString(R.string.error_open_settings),
+            )
             ErrorKind.CORE -> Unit
         }
     }
 
-    private fun showCoreError(title: String, message: String) = showPanel(ErrorKind.CORE, title, message, true)
+    // "Adresi değiştir": back to the UI, whose settings/connect screen edits the address.
+    private fun showCoreError(title: String, message: String) =
+        showPanel(ErrorKind.CORE, title, message, getString(R.string.error_change_address))
 
-    private fun showPanel(kind: ErrorKind, title: String, message: String, canContinue: Boolean) {
+    /** [secondary] is the label of the second button (null: hidden); its action depends on [kind]. */
+    private fun showPanel(kind: ErrorKind, title: String, message: String, secondary: String?) {
         shownError = kind
         errorTitle.text = title
         errorMessage.text = message
         retryButton.setOnClickListener {
-            if (kind == ErrorKind.CORE) checkCore() else loadUi()
+            when (kind) {
+                ErrorKind.CORE -> checkCore()
+                // Asks again; once permanently denied Android answers at once without a dialog.
+                ErrorKind.LOCAL_NETWORK -> requestPermissions(arrayOf(LocalNetworkPermission.PERMISSION), REQ_LOCAL_NETWORK)
+                else -> loadUi()
+            }
         }
-        secondaryButton.visibility = if (canContinue) View.VISIBLE else View.GONE
-        // "Adresi değiştir": back to the UI, whose settings/connect screen edits the address.
-        secondaryButton.setOnClickListener { hideError() }
+        secondaryButton.visibility = if (secondary != null) View.VISIBLE else View.GONE
+        secondaryButton.text = secondary.orEmpty()
+        secondaryButton.setOnClickListener {
+            // Settings → Permissions; onResume re-checks when the user comes back.
+            if (kind == ErrorKind.LOCAL_NETWORK) openAppSettings() else hideError()
+        }
         errorPanel.visibility = View.VISIBLE
         retryButton.requestFocus()
     }
@@ -334,6 +386,8 @@ class MainActivity : Activity() {
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
             )
         }
+        // Same here: decide from checkSelfPermission, not grantResults.
+        if (requestCode == REQ_STARTUP || requestCode == REQ_LOCAL_NETWORK) resumeDeferredUi(explain = true)
     }
 
     override fun onResume() {
@@ -341,6 +395,9 @@ class MainActivity : Activity() {
         webView.onResume()
         capture.onResume()
         sendEvent("visibility", BridgeJs.visibility(true))
+        // Back from Settings with "Yerel ağ" allowed: load without restarting the app. Silent
+        // otherwise, so the resume after the permission dialog cannot ask again in a loop.
+        resumeDeferredUi(explain = false)
         checkCore()
     }
 
@@ -371,7 +428,8 @@ class MainActivity : Activity() {
     private companion object {
         const val TAG = "Shadow"
         const val REQ_MIC = 1
-        const val REQ_NOTIFY = 2
+        const val REQ_STARTUP = 2 // local network (API 37+) and/or the one-time notification prompt
+        const val REQ_LOCAL_NETWORK = 3
         const val PREFS_PLAIN = "shadow_storage"
         const val PREFS_SECRET = "shadow_secure"
         const val PREFS_FLAGS = "shadow_native"

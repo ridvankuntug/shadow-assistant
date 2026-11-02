@@ -5,6 +5,7 @@
 
     <string name="error_retry">Tekrar dene</string>
     <string name="error_change_address">Adresi değiştir</string>
+    <string name="error_open_settings">Ayarları aç</string>
 
     <string name="error_ui_title">Arayüz paketi bulunamadı</string>
     <string name="error_ui_message">Uygulama arayüz dosyaları olmadan derlenmiş. Önce ui klasöründe npm run build çalıştırıp APK\'yı yeniden derleyin.</string>
@@ -17,4 +18,7 @@
 
     <string name="error_cleartext_title">Şifresiz bağlantıya izin yok</string>
     <string name="error_cleartext_message">%1$s adresine şifresiz (ws://) bağlanılamaz; yalnız %2$s izinli. Adresi düzelt ya da wss:// kullan.</string>
+
+    <string name="error_local_network_title">Yerel ağ izni gerekli</string>
+    <string name="error_local_network_message">Çekirdek yerel ağ adresinde (evde Wi-Fi, dışarıda Tailscale üzerinden) çalışıyor; Android bu adrese bağlanmak için \"Yerel ağ\" izni istiyor. İzin verilmeden çekirdeğe bağlanılamaz. Tekrar dene ile izni yeniden iste ya da Ayarları aç → İzinler bölümünden \"Yerel ağ\" iznini aç.</string>
 </resources>
