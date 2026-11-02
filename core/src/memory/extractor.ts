@@ -35,7 +35,8 @@
  * call could rephrase a fact (Jaccard < 0.8 to the stored one) and store it
  * twice; skipping instead loses at most the ops of a crash that hit before
  * the store wrote them (the same give-up as two failures in a row). Likewise
- * a store write failure after some ops were applied moves the cursor on
+ * a store write failure once any write has started (even one that failed
+ * halfway, or an exception after a successful op) moves the cursor on
  * instead of retrying the range.
  *
  * Log lines hold counts, filter names and the device name only, never
@@ -335,6 +336,7 @@ export class MemoryExtractor {
     const parsed = res.status === "ok" ? parseOps(res.json ?? tryJson(res.text)) : undefined;
     let failure: FailReason | undefined = res.status !== "ok" ? "error" : parsed ? undefined : "invalid_output";
     let applied: Omit<Extract<ExtractResult, { status: "done" }>, "status"> | undefined;
+    const progress: ApplyProgress = { started: false };
     if (parsed) {
       const last = turns[turns.length - 1] as LogTurn;
       const source: EntrySource = { by: "extract", device, sessionId: last.sessionId, turnId: last.id };
@@ -350,7 +352,7 @@ export class MemoryExtractor {
         throw err;
       }
       try {
-        const r = await this.opts.store.transaction((tx) => applyOps(tx, parsed.ops, source, rejected));
+        const r = await this.opts.store.transaction((tx) => applyOps(tx, parsed.ops, source, rejected, progress));
         if (r.writeFailed) failure = "write_failed";
         applied = { added: r.added, updated: r.updated, deleted: r.deleted, rejected: [...rejected.values()].reduce((a, b) => a + b, 0) };
         this.info(
@@ -365,7 +367,9 @@ export class MemoryExtractor {
     }
 
     delete state.pending;
-    const partial = failure === "write_failed" && applied !== undefined && applied.added + applied.updated + applied.deleted > 0;
+    // Counters miss a write that failed halfway (a topic file written, its index not) or an
+    // exception after a successful op, so any started write counts as partly applied.
+    const partial = failure === "write_failed" && progress.started;
     if (failure) {
       dev.failures = (dev.failures ?? 0) + 1;
       // A partly applied range is not retried either (a second call could rephrase and duplicate).
@@ -545,12 +549,18 @@ interface ApplyResult {
   writeFailed: boolean;
 }
 
+/** Set by `applyOps` before its first store write; survives an exception thrown by the store. */
+export interface ApplyProgress {
+  started: boolean;
+}
+
 /** Applies validated ops inside one store transaction. Rejections are counted by reason in `rejected`. */
 export async function applyOps(
   tx: MemoryTx,
   ops: readonly MemoryOp[],
   source: EntrySource,
   rejected: Map<string, number>,
+  progress: ApplyProgress = { started: false },
 ): Promise<ApplyResult> {
   const out: ApplyResult = { added: 0, updated: 0, deleted: 0, writeFailed: false };
   const reject = (reason: string) => {
@@ -565,6 +575,7 @@ export async function applyOps(
         continue;
       }
       deletes++;
+      progress.started = true;
       const r = await tx.remove([op.id]);
       if (!r.ok) reject(r.reason ?? "write_failed");
       else if (r.removed.length === 0) reject("not_found");
@@ -583,6 +594,7 @@ export async function applyOps(
       }
     }
     if (op.op === "update") {
+      progress.started = true;
       const r = await tx.update(op.id, {
         ...(op.text !== undefined ? { text: op.text } : {}),
         ...(op.keywords && op.keywords.length > 0 ? { keywords: op.keywords } : {}),
@@ -600,6 +612,7 @@ export async function applyOps(
       continue;
     }
     const target = mergeTarget(entries, op.kind, op.text);
+    progress.started = true;
     const r = target
       ? await tx.update(target.id, { text: op.text, ...(op.keywords.length > 0 ? { keywords: op.keywords } : {}), source })
       : await tx.add({ kind: op.kind, text: op.text, keywords: op.keywords, source });

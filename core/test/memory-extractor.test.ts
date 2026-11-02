@@ -8,7 +8,7 @@ import type { OneShotRequest, OneShotResult } from "../src/model-provider.js";
 import type { UsageRecord } from "../src/router.js";
 import { jaccard, MemoryExtractor, parseOps, type ExtractorOptions } from "../src/memory/extractor.js";
 import { readDeviceTurns } from "../src/memory/log-source.js";
-import { MemoryStore } from "../src/memory/store.js";
+import { MemoryStore, type AddInput, type MemoryTx, type WriteResult } from "../src/memory/store.js";
 
 const T0 = new Date(2026, 9, 28, 12, 0, 0).getTime();
 const MIN = 60_000;
@@ -492,6 +492,74 @@ test("a failed recovery-record write applies nothing and the retry calls again",
   assert.equal(s.provider.requests.length, 2);
   assert.equal((await s.store.entries()).length, 1);
   assert.equal((await s.store.readState())?.pending, undefined);
+});
+
+/** Runs the store's transactions with `add` replaced; the other ops go to the real tx. */
+function overrideAdd(store: MemoryStore, add: (real: MemoryTx["add"], input: AddInput) => Promise<WriteResult>): void {
+  const realTx = store.transaction.bind(store);
+  store.transaction = (fn) =>
+    realTx((tx) =>
+      fn({
+        entries: () => tx.entries(),
+        add: (input) => add((i) => tx.add(i), input),
+        update: (id, input) => tx.update(id, input),
+        remove: (ids, opts) => tx.remove(ids, opts),
+        isForgotten: (text) => tx.isForgotten(text),
+      }),
+    );
+}
+
+test("a write that failed halfway (no op counted) still moves the cursor on: no retry, no rephrased duplicate", async () => {
+  const s = await ready();
+  overrideAdd(s.store, async () => ({ ok: false, reason: "write_failed" }));
+  s.provider.results.push({ json: { ops: [{ op: "add", kind: "fact", text: "Kullanıcının bir kedisi var." }] } });
+  assert.deepEqual(await s.ex.maybeRun("browser", "idle"), { status: "failed", reason: "write_failed" });
+  const st = await s.store.readState();
+  assert.equal(st?.devices.browser?.cursorTs, T0 - 20 * MIN + 3, "the range counts as applied");
+  assert.equal(st?.devices.browser?.failures, 0);
+  assert.equal(st?.pending, undefined);
+});
+
+test("an exception after a successful op moves the cursor on; the next pass does not call again", async () => {
+  const s = await ready();
+  let calls = 0;
+  overrideAdd(s.store, async (real, input) => {
+    if (++calls === 2) throw Object.assign(new Error("disk"), { code: "EIO" });
+    return real(input);
+  });
+  s.provider.results.push({
+    json: {
+      ops: [
+        { op: "add", kind: "fact", text: "Kullanıcının bir kedisi var." },
+        { op: "add", kind: "preference", text: "Akşamları salon ışığı loş olsun." },
+      ],
+    },
+  });
+  assert.deepEqual(await s.ex.maybeRun("browser", "idle"), { status: "failed", reason: "write_failed" });
+  assert.equal((await s.store.entries()).length, 1);
+  assert.equal((await s.store.readState())?.devices.browser?.cursorTs, T0 - 20 * MIN + 3);
+
+  s.provider.results.push({ json: { ops: [{ op: "add", kind: "fact", text: "Evde kullanıcıya ait bir kedi yaşıyor." }] } });
+  assert.deepEqual(await s.ex.maybeRun("browser", "compact"), { status: "skipped", reason: "too_few_turns" });
+  assert.equal(s.provider.requests.length, 1);
+  assert.equal((await s.store.entries()).length, 1);
+});
+
+test("a write failure before any write started keeps the cursor for one retry", async () => {
+  const s = await ready();
+  // The transaction itself fails (e.g. the lock): no op reached the store.
+  const realTx = s.store.transaction.bind(s.store);
+  let fail = true;
+  s.store.transaction = (fn) =>
+    fail ? Promise.reject(Object.assign(new Error("lock"), { code: "EIO" })) : realTx(fn);
+  const ops = { json: { ops: [{ op: "add", kind: "fact", text: "Kullanıcının bir kedisi var." }] } };
+  s.provider.results.push(ops);
+  assert.deepEqual(await s.ex.maybeRun("browser", "idle"), { status: "failed", reason: "write_failed" });
+  assert.equal((await s.store.readState())?.devices.browser?.cursorTs, T0 - 60 * MIN);
+  fail = false;
+  s.provider.results.push(ops);
+  assert.equal((await s.ex.maybeRun("browser", "compact")).status, "done");
+  assert.equal((await s.store.entries()).length, 1);
 });
 
 test("parseOps and jaccard", () => {
