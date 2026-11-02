@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext (ws:// / http://) only to the Core's home address, which is the same
+  at home (LAN) and outside (Tailscale subnet router, WireGuard-encrypted).
+  Everything else must use TLS with a system CA (no user-installed CAs).
+  Keep the address in sync with CoreAddress.CLEARTEXT_HOST (unit-tested).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.2</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,105 @@
+name: Android
+
+# Builds the Android shell (android/) around the same ui/ bundle the browser
+# uses. Debug APK always; a signed release APK only when the signing secrets
+# exist (never for pull requests). See android/README.md → "CI and signing".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "ui/**"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "ui/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Secrets cannot be used in `if:` directly; this is only "set or not".
+      HAS_SIGNING: ${{ secrets.SHADOW_KEYSTORE_BASE64 != '' && secrets.SHADOW_KEYSTORE_PASSWORD != '' && secrets.SHADOW_KEY_ALIAS != '' && secrets.SHADOW_KEY_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI bundle (ui/dist)
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      # The build never downloads SDK packages itself (android.builder.sdkDownload=false).
+      # The runner image ships the SDK with its licences already accepted; this only
+      # adds the exact platform/build-tools the app compiles against.
+      - name: Install Android SDK packages
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-37.0" "build-tools;37.0.0"
+
+      - name: Unit tests, lint, debug APK
+        working-directory: android
+        # `bash ./gradlew`: works even if the executable bit was lost on a Windows checkout.
+        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug -PshadowVersionCode=${{ github.run_number }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shadow-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Decode release keystore
+        if: env.HAS_SIGNING == 'true' && github.event_name != 'pull_request'
+        env:
+          SHADOW_KEYSTORE_BASE64: ${{ secrets.SHADOW_KEYSTORE_BASE64 }}
+        run: |
+          umask 077
+          printf '%s' "$SHADOW_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/shadow-release.jks"
+
+      - name: Signed release APK
+        if: env.HAS_SIGNING == 'true' && github.event_name != 'pull_request'
+        working-directory: android
+        env:
+          SHADOW_KEYSTORE_PATH: ${{ runner.temp }}/shadow-release.jks
+          SHADOW_KEYSTORE_PASSWORD: ${{ secrets.SHADOW_KEYSTORE_PASSWORD }}
+          SHADOW_KEY_ALIAS: ${{ secrets.SHADOW_KEY_ALIAS }}
+          SHADOW_KEY_PASSWORD: ${{ secrets.SHADOW_KEY_PASSWORD }}
+        run: |
+          bash ./gradlew --no-daemon assembleRelease -PshadowVersionCode=${{ github.run_number }}
+          # Fails the job if the APK is not properly signed. (No --print-certs: keep the certificate out of public logs.)
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify app/build/outputs/apk/release/app-release.apk
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/shadow-release.jks"
+
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_SIGNING == 'true' && github.event_name != 'pull_request'
+        with:
+          name: shadow-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30

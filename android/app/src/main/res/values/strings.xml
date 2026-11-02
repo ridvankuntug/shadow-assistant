@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Shadow</string>
+    <string name="notification_channel">Onay istekleri</string>
+
+    <string name="error_retry">Tekrar dene</string>
+    <string name="error_change_address">Adresi değiştir</string>
+
+    <string name="error_ui_title">Arayüz paketi bulunamadı</string>
+    <string name="error_ui_message">Uygulama arayüz dosyaları olmadan derlenmiş. Önce ui klasöründe npm run build çalıştırıp APK\'yı yeniden derleyin.</string>
+
+    <string name="error_load_title">Arayüz açılamadı</string>
+    <string name="error_load_message">Arayüz yüklenirken bir hata oluştu.</string>
+
+    <string name="error_core_title">Çekirdeğe ulaşılamıyor</string>
+    <string name="error_core_message">%1$s adresine bağlanılamadı. Evdeysen Wi-Fi\'ye, dışarıdaysan Tailscale\'e bağlı olduğundan ve bilgisayarda Shadow çekirdeğinin çalıştığından emin ol.</string>
+
+    <string name="error_cleartext_title">Şifresiz bağlantıya izin yok</string>
+    <string name="error_cleartext_message">%1$s adresine şifresiz (ws://) bağlanılamaz; yalnız %2$s izinli. Adresi düzelt ya da wss:// kullan.</string>
+</resources>

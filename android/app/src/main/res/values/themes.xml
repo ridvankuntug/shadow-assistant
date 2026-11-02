@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="shadow_background">#FF05070D</color>
+    <color name="shadow_text">#FFE6EDF7</color>
+    <color name="shadow_muted">#FF9AA7B8</color>
+    <color name="shadow_accent">#FF4FC3F7</color>
+
+    <style name="Theme.Shadow" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/shadow_background</item>
+        <item name="android:colorAccent">@color/shadow_accent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
