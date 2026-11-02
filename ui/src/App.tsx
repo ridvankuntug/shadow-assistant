@@ -37,8 +37,7 @@ export default function App({ adapter, controller }: Props) {
     resolveQuality(adapter.storage.get(STORAGE_KEYS.quality), adapter.deviceClass()),
   );
   const [voiceReplies, setVoiceReplies] = useState(() => adapter.storage.get(STORAGE_KEYS.voiceReplies) !== "0");
-  // Voice choice only matters where the Core speaks (web); Android speaks natively.
-  const coreTts = adapter.tts.mode === "core";
+  // The Core speaks on every host (single voice), so the voice choice applies everywhere.
   const [voice, setVoice] = useState<string | null>(() => adapter.storage.get(STORAGE_KEYS.ttsVoice) || null);
   const [panel, setPanel] = useState<Panel>("none");
   const closePanel = useCallback(() => setPanel("none"), []);
@@ -56,16 +55,16 @@ export default function App({ adapter, controller }: Props) {
   }, [controller, voiceReplies]);
 
   useEffect(() => {
-    controller.setVoice(coreTts ? voice : null);
-  }, [controller, coreTts, voice]);
+    controller.setVoice(voice);
+  }, [controller, voice]);
 
   // The settings panel needs the voice list: ask when it is open and none is
   // loaded (also after a reconnect, which resets the list).
   const voicesStatus = state.voices.status;
   const connectedNow = state.connection.status === "connected";
   useEffect(() => {
-    if (coreTts && panel === "settings" && connectedNow && voicesStatus === "idle") controller.requestVoices();
-  }, [controller, coreTts, panel, connectedNow, voicesStatus]);
+    if (panel === "settings" && connectedNow && voicesStatus === "idle") controller.requestVoices();
+  }, [controller, panel, connectedNow, voicesStatus]);
 
   // The memory panel asks for the contents each time it opens, and again
   // after a reconnect (the welcome resets them).
@@ -111,7 +110,7 @@ export default function App({ adapter, controller }: Props) {
 
   const openSettings = () => {
     // Retry a list that could not be fetched last time.
-    if (coreTts && state.voices.status === "unavailable") controller.requestVoices();
+    if (state.voices.status === "unavailable") controller.requestVoices();
     setPanel("settings");
   };
 
@@ -237,20 +236,18 @@ export default function App({ adapter, controller }: Props) {
           reducedMotion={reducedMotion}
           coreUrl={coreUrl}
           voicePicker={
-            coreTts ? (
-              <VoicePicker
-                catalog={state.voices}
-                chosen={voice}
-                connected={connected}
-                canPreview={canPreviewVoice(state)}
-                preview={state.voicePreview}
-                awaitingSpeech={state.awaitingSpeech}
-                playing={state.playing}
-                onChange={changeVoice}
-                onPreview={(v) => controller.previewVoice(v)}
-                onRetry={() => controller.requestVoices()}
-              />
-            ) : undefined
+            <VoicePicker
+              catalog={state.voices}
+              chosen={voice}
+              connected={connected}
+              canPreview={canPreviewVoice(state)}
+              preview={state.voicePreview}
+              awaitingSpeech={state.awaitingSpeech}
+              playing={state.playing}
+              onChange={changeVoice}
+              onPreview={(v) => controller.previewVoice(v)}
+              onRetry={() => controller.requestVoices()}
+            />
           }
           onOpenMemory={memoryOn ? () => setPanel("memory") : undefined}
           onQuality={changeQuality}

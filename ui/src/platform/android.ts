@@ -241,18 +241,22 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
         // Native playback has no autoplay restriction.
       },
     },
+    // Single voice: the Core speaks (played through playAudio); the bridge's
+    // native TextToSpeech is only the fallback when the Core has no audio.
     tts: {
-      mode: "native",
-      async speak(text) {
-        const res = await request((id) => bridge.speak(id, text), null);
-        if (!res.ok) throw toError(res);
-      },
-      stop() {
-        try {
-          bridge.stopSpeaking();
-        } catch {
-          // ignore
-        }
+      mode: "core",
+      fallback: {
+        async speak(text) {
+          const res = await request((id) => bridge.speak(id, text), null);
+          if (!res.ok) throw toError(res);
+        },
+        stop() {
+          try {
+            bridge.stopSpeaking();
+          } catch {
+            // ignore
+          }
+        },
       },
     },
     storage: {

@@ -69,20 +69,25 @@ export interface PlaybackCapability {
   unlock(): void;
 }
 
+/** Speech synthesized on the device (Android TextToSpeech). */
+export interface NativeSpeech {
+  /** Resolves when speech ends or is stopped. Rejects when it cannot speak. */
+  speak(text: string): Promise<void>;
+  /** Stops current speech (resolves the pending speak()). Never throws. */
+  stop(): void;
+}
+
 /**
- * How assistant replies are spoken.
- * - "core": the app sends a Core `speak` message and plays the returned
- *   `speech` clip through `playback` (web).
- * - "native": the host speaks the text itself (Android TextToSpeech).
+ * How assistant replies are spoken. There is a single voice: the Core
+ * synthesizes all speech (tts-svc) — streamed `speech_chunk` clips or a
+ * `speak` → `speech` clip — and the app plays it through `playback`.
+ * `fallback` (Android only) speaks the reply on the device when the Core
+ * cannot produce audio (`error` for the turn's speech, e.g. `tts_unavailable`).
  */
-export type TtsCapability =
-  | { mode: "core" }
-  | {
-      mode: "native";
-      /** Resolves when speech ends or is stopped. */
-      speak(text: string): Promise<void>;
-      stop(): void;
-    };
+export type TtsCapability = {
+  mode: "core";
+  fallback?: NativeSpeech;
+};
 
 export interface KeyValueStorage {
   get(key: string): string | null;
@@ -115,6 +120,6 @@ export const STORAGE_KEYS = {
   token: "shadow.deviceToken",
   quality: "shadow.quality",
   voiceReplies: "shadow.voiceReplies",
-  /** tts-svc voice id for Core `speak` (absent = the Core's default). Core TTS mode only. */
+  /** tts-svc voice id for Core speech (`speak`, `speech_prefs`); absent = the Core's default. */
   ttsVoice: "shadow.ttsVoice",
 } as const;

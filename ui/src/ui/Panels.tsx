@@ -87,7 +87,7 @@ export function SettingsPanel({
   voiceReplies: boolean;
   reducedMotion: boolean;
   coreUrl: string;
-  /** "Ses" picker; absent where replies are spoken natively (Android). */
+  /** "Ses" picker (the Core voice, on every host); absent = no picker. */
   voicePicker?: ReactNode;
   /** Opens the "Hafıza" panel; absent (section hidden) without the Core feature `memory`. */
   onOpenMemory?: () => void;

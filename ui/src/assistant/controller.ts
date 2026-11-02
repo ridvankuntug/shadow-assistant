@@ -62,7 +62,10 @@ export const VOICE_SAMPLE_TEXT = "Merhaba, ben Shadow. Sesim kulağına nasıl g
 
 type TurnFrame = Extract<ClientMessage, { type: "user_text" } | { type: "audio" }>;
 
-/** One playable piece of a streamed answer: a tts-svc clip (web) or text for native TTS. */
+/**
+ * One playable piece of a streamed answer: a tts-svc clip, or the answer text
+ * for the native fallback (`tts.fallback`) when the Core could not synthesize it.
+ */
 type SpeechItem = { clip: AudioClip } | { text: string };
 
 /**
@@ -83,6 +86,13 @@ type SpeechQueue = {
   /** `playback_started` was dispatched (the speaking phase is on). */
   started: boolean;
   closed: boolean;
+  /** At least one Core clip arrived: a later synthesis failure is not spoken natively (it would repeat it). */
+  audio: boolean;
+  /**
+   * Native fallback chosen before `assistant_done`: the queue waits for the
+   * answer text instead of ending at `final`.
+   */
+  awaitingText: boolean;
 };
 
 export interface CoreClientLike {
@@ -154,6 +164,10 @@ export class AssistantController {
   private speech: SpeechQueue | null = null;
   /** Last turn with `assistant_done`, for a queue whose first chunk comes later. */
   private lastDoneTurn: string | null = null;
+  /** Its answer text (for the native fallback when synthesis fails after `assistant_done`). */
+  private lastDoneText = "";
+  /** The reply text of the last `speak` sent after `assistant_done` (native fallback when it fails). */
+  private speakRequest: { id: string; text: string } | null = null;
   /**
    * Turns whose text ended (`assistant_done` or a turn error) before their
    * first `speech_chunk`: there is no queue for them yet, so `bargeInTarget`
@@ -399,11 +413,11 @@ export class AssistantController {
   }
 
   /**
-   * Asks the Core for the tts-svc voice list (core TTS mode only). Does
-   * nothing while not connected or while a request is already in flight.
+   * Asks the Core for the tts-svc voice list. Does nothing while not
+   * connected or while a request is already in flight.
    */
   requestVoices(): void {
-    if (this.adapter.tts.mode !== "core" || !this.connected) return;
+    if (!this.connected) return;
     if (this.state.voices.status === "loading") return;
     const id = this.newId();
     if (!this.client?.send({ type: "voices", id })) return;
@@ -421,7 +435,7 @@ export class AssistantController {
    * (canPreviewVoice); a reply being spoken is stopped first.
    */
   previewVoice(voice: string | null): boolean {
-    if (this.adapter.tts.mode !== "core" || !canPreviewVoice(this.state)) return false;
+    if (!canPreviewVoice(this.state)) return false;
     this.adapter.playback.unlock();
     this.stopSpeaking();
     const id = this.newId();
@@ -495,11 +509,11 @@ export class AssistantController {
     this.dispatch({ type: "barge_in", turnId: target });
   }
 
-  /** Stops the clip or native speech now playing and clears the streamed-speech queue. */
+  /** Stops the clip or native fallback speech now playing and clears the streamed-speech queue. */
   private stopLocalAudio(): void {
     this.closeSpeech();
     this.adapter.playback.stop();
-    if (this.adapter.tts.mode === "native") this.adapter.tts.stop();
+    this.adapter.tts.fallback?.stop();
   }
 
   /**
@@ -557,6 +571,8 @@ export class AssistantController {
   }
 
   private handleServer(msg: ServerMessage): void {
+    // Read before the reducer clears `awaitingSpeech` for the error.
+    const failedSpeak = msg.type === "error" ? this.failedSpeakReply(msg.id) : null;
     this.dispatch({ type: "server", msg });
     switch (msg.type) {
       case "welcome":
@@ -578,7 +594,7 @@ export class AssistantController {
       case "assistant_done":
         if (this.speechStreaming()) {
           // The Core speaks this turn through speech_chunk; a `speak` now would say it twice.
-          this.speechTurnEnded(msg.id);
+          this.speechTurnEnded(msg.id, msg.text);
           break;
         }
         if (this.voiceReplies && !isCancelled(this.state, msg.id) && msg.text.trim()) {
@@ -591,6 +607,16 @@ export class AssistantController {
       case "error":
         if (msg.id !== undefined && msg.id === this.state.memory.requestId) {
           this.clearMemoryTimer();
+          break;
+        }
+        if (failedSpeak) {
+          this.speakNatively(failedSpeak.id, failedSpeak.text, msg.code);
+          break;
+        }
+        // Errors of the voice list or the "Dene" sample are not about a turn's speech.
+        if (msg.id !== undefined && (msg.id === this.state.voices.requestId || msg.id === this.state.voicePreview?.id)) break;
+        if (msg.id !== undefined && msg.code === "tts_unavailable" && this.speechStreaming()) {
+          this.streamSynthesisFailed(msg.id);
           break;
         }
         // A failed turn may never send its `final` chunk. (tts_unavailable is
@@ -619,14 +645,13 @@ export class AssistantController {
 
   /**
    * Sends `speech_prefs` when the Core has `speech_stream` and the wanted
-   * prefs differ from the last ones sent: mode `audio` for core TTS (with the
-   * chosen voice), `text` for native TTS.
+   * prefs differ from the last ones sent. Always mode `audio` (the Core is the
+   * single voice) with the chosen voice; `text` mode is not used.
    */
   private syncSpeechPrefs(): void {
     if (!this.connected || !hasFeature(this.state, "speech_stream")) return;
-    const mode = this.adapter.tts.mode === "core" ? "audio" : "text";
-    const prefs: SpeechPrefsMessage = { type: "speech_prefs", enabled: this.voiceReplies, mode };
-    if (mode === "audio" && this.voice) prefs.voice = this.voice;
+    const prefs: SpeechPrefsMessage = { type: "speech_prefs", enabled: this.voiceReplies, mode: "audio" };
+    if (this.voice) prefs.voice = this.voice;
     const last = this.sentPrefs;
     if (last && last.enabled === prefs.enabled && last.mode === prefs.mode && last.voice === prefs.voice) return;
     if (this.client?.send(prefs)) this.sentPrefs = prefs;
@@ -636,12 +661,20 @@ export class AssistantController {
    * The turn's text is over (`assistant_done` or a turn error): from now on
    * its queue waits at most SPEECH_FINAL_TIMEOUT_MS for further chunks.
    */
-  private speechTurnEnded(turnId: string): void {
+  private speechTurnEnded(turnId: string, text?: string): void {
     this.lastDoneTurn = turnId;
+    this.lastDoneText = text ?? "";
     const q = this.speech;
     if (q?.turnId !== turnId) {
       if (!this.droppedSpeech.has(turnId)) this.pendingSpeech.add(turnId);
       return;
+    }
+    if (q.awaitingText) {
+      // Synthesis failed before the answer was complete: speak it natively now
+      // (a turn error brings no text; the queue just ends).
+      q.awaitingText = false;
+      if (!q.closed && text?.trim()) q.items.push({ text: clipForSpeech(text) });
+      this.pumpSpeech();
     }
     if (q.closed || q.final) return;
     q.done = true;
@@ -655,37 +688,68 @@ export class AssistantController {
       if (msg.final) this.droppedSpeech.delete(msg.id); // nothing more comes for it
       return;
     }
-    let q = this.speech;
-    if (!q || q.turnId !== msg.id) {
-      this.pendingSpeech.delete(msg.id);
-      // A newer turn: whatever is left of the previous one stops.
-      if (q && !q.closed) {
-        this.stopLocalAudio();
-        if (q.started) this.dispatch({ type: "playback_ended", id: q.turnId });
-      }
-      q = {
-        turnId: msg.id,
-        items: [],
-        nextSeq: 0,
-        final: false,
-        done: this.lastDoneTurn === msg.id,
-        busy: false,
-        started: false,
-        closed: false,
-      };
-      this.speech = q;
-    }
+    const q = this.queueFor(msg.id);
     if (q.closed || msg.seq < q.nextSeq) return; // stopped, or a repeated frame
     q.nextSeq = msg.seq + 1;
-    // Only the payload of this client's mode is playable.
-    if (this.adapter.tts.mode === "core") {
-      if (msg.data && msg.mime) q.items.push({ clip: { mime: msg.mime, data: msg.data } });
-    } else if (msg.text) {
-      q.items.push({ text: msg.text });
+    // Only audio is playable (mode `audio`); a `text` payload is ignored.
+    if (msg.data && msg.mime) {
+      q.items.push({ clip: { mime: msg.mime, data: msg.data } });
+      q.audio = true;
     }
     if (msg.final) q.final = true;
     if (q.done && !q.final) this.armSpeechFinalTimer();
     else if (q.final) this.clearSpeechFinalTimer();
+    this.pumpSpeech();
+  }
+
+  /** The queue of `turnId`, created (replacing what is left of an older turn) when needed. */
+  private queueFor(turnId: string): SpeechQueue {
+    const q = this.speech;
+    if (q && q.turnId === turnId) return q;
+    this.pendingSpeech.delete(turnId);
+    // A newer turn: whatever is left of the previous one stops.
+    if (q && !q.closed) {
+      this.stopLocalAudio();
+      if (q.started) this.dispatch({ type: "playback_ended", id: q.turnId });
+    }
+    const next: SpeechQueue = {
+      turnId,
+      items: [],
+      nextSeq: 0,
+      final: false,
+      done: this.lastDoneTurn === turnId,
+      busy: false,
+      started: false,
+      closed: false,
+      audio: false,
+      awaitingText: false,
+    };
+    this.speech = next;
+    return next;
+  }
+
+  /**
+   * `error tts_unavailable` for a streamed turn: the Core stops synthesizing
+   * and sends `final`. With a native fallback and no Core clip received yet,
+   * the whole answer is spoken natively instead — now when its text is known,
+   * else at `assistant_done`. After a clip, the rest stays silent (the chunk
+   * texts are unknown, and repeating the start would speak it twice).
+   */
+  private streamSynthesisFailed(turnId: string): void {
+    if (!this.adapter.tts.fallback || !this.voiceReplies || isCancelled(this.state, turnId)) return;
+    if (this.droppedSpeech.has(turnId)) return;
+    const current = this.speech?.turnId === turnId ? this.speech : null;
+    if (current && (current.closed || current.audio)) return;
+    const q = this.queueFor(turnId);
+    if (q.done) {
+      const text = this.lastDoneTurn === turnId ? this.lastDoneText : "";
+      if (!text.trim()) return;
+      q.items.push({ text: clipForSpeech(text) });
+      if (!q.final) this.armSpeechFinalTimer(); // as for a queue created after `assistant_done`
+    } else {
+      q.awaitingText = true;
+    }
+    this.dismissNoticeFor(turnId, "tts_unavailable");
     this.pumpSpeech();
   }
 
@@ -707,7 +771,7 @@ export class AssistantController {
     if (!q || q.closed || q.busy) return;
     const item = q.items.shift();
     if (!item) {
-      if (q.final) this.finishSpeech(q);
+      if (q.final && !q.awaitingText) this.finishSpeech(q);
       return;
     }
     q.busy = true;
@@ -717,9 +781,9 @@ export class AssistantController {
     }
     let playing: Promise<void>;
     try {
-      const tts = this.adapter.tts;
+      const fallback = this.adapter.tts.fallback;
       if ("clip" in item) playing = this.adapter.playback.play(item.clip);
-      else playing = tts.mode === "native" ? tts.speak(item.text) : Promise.resolve();
+      else playing = fallback ? fallback.speak(item.text) : Promise.resolve();
     } catch (err) {
       playing = Promise.reject(err);
     }
@@ -761,6 +825,7 @@ export class AssistantController {
     const q = this.speech;
     if (!q || q.closed) return;
     q.final = true;
+    q.awaitingText = false; // no `assistant_done` can come any more
     this.clearSpeechFinalTimer();
     this.pumpSpeech();
   }
@@ -782,23 +847,50 @@ export class AssistantController {
 
   private speakReply(id: string, text: string): void {
     const clipped = clipForSpeech(text);
-    const tts = this.adapter.tts;
-    if (tts.mode === "core") {
-      const frame = this.voice ? { type: "speak" as const, id, text: clipped, voice: this.voice } : { type: "speak" as const, id, text: clipped };
-      if (this.client?.send(frame)) {
-        this.dispatch({ type: "speech_requested", id });
-      }
-      return;
+    const frame = this.voice ? { type: "speak" as const, id, text: clipped, voice: this.voice } : { type: "speak" as const, id, text: clipped };
+    if (this.client?.send(frame)) {
+      this.speakRequest = { id, text: clipped };
+      this.dispatch({ type: "speech_requested", id });
     }
+  }
+
+  /**
+   * The reply `speak` that an incoming `error` answers, if it still waits
+   * for its clip (not stopped, cancelled or replaced) and a native fallback
+   * exists. The "Dene" sample has no fallback (it previews a Core voice).
+   */
+  private failedSpeakReply(id: string | undefined): { id: string; text: string } | null {
+    const r = this.speakRequest;
+    if (!this.adapter.tts.fallback || !r || id === undefined || r.id !== id) return null;
+    return shouldPlaySpeech(this.state, id) ? r : null;
+  }
+
+  /** The Core could not synthesize the reply: the host speaks it instead. */
+  private speakNatively(id: string, text: string, errorCode: string): void {
+    const fallback = this.adapter.tts.fallback;
+    if (!fallback) return;
+    this.speakRequest = null;
+    this.dismissNoticeFor(id, errorCode);
     this.dispatch({ type: "playback_started", id });
-    tts
-      .speak(clipped)
+    let speaking: Promise<void>;
+    try {
+      speaking = fallback.speak(text);
+    } catch (err) {
+      speaking = Promise.reject(err);
+    }
+    speaking
       .catch((err) => {
         if (!isCancelled(this.state, id)) {
           this.dispatch({ type: "notice", notice: { code: "tts_failed", message: toPlatformError(err).message } });
         }
       })
       .finally(() => this.dispatch({ type: "playback_ended", id }));
+  }
+
+  /** The Core's speech error notice is moot when the fallback speaks the reply. */
+  private dismissNoticeFor(turnId: string, code: string): void {
+    const n = this.state.notice;
+    if (n && n.turnId === turnId && n.code === code) this.dispatch({ type: "dismiss_notice" });
   }
 
   private play(id: string, clip: { mime: string; data: string }): void {

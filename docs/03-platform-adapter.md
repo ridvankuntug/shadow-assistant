@@ -35,9 +35,13 @@ interface PlatformAdapter {
     level(): number;                         // 0..1 output loudness
     unlock(): void;                          // called from a user gesture (autoplay rules)
   };
-  readonly tts:
-    | { mode: "core" }                       // web: Core `speak` -> tts-svc -> `speech` -> playback.play
-    | { mode: "native"; speak(text: string): Promise<void>; stop(): void }; // Android
+  readonly tts: {
+    mode: "core";                            // single voice: the Core (tts-svc) speaks, the app plays it via playback
+    fallback?: {                             // Android only: native TextToSpeech when the Core has no audio
+      speak(text: string): Promise<void>;    // resolves when finished OR stopped
+      stop(): void;
+    };
+  };
   readonly storage: { get(key): string | null; set(key, value): void; remove(key): void };
   vibrate(pattern: number[]): void;          // ms on/off pattern; ignored where unsupported
   notify(title: string, body: string): void; // optional; ignored where unsupported
@@ -77,12 +81,12 @@ type Utterance = { mime: string; data: string; durationMs: number };
 | `shadow.deviceToken` | Device token for `hello` (secret — see below) |
 | `shadow.quality` | `high` / `medium` / `low` (absent = device default) |
 | `shadow.voiceReplies` | `1` / `0` (absent = on) |
-| `shadow.ttsVoice` | tts-svc voice id sent with Core speak (absent = the Core's default). Core TTS mode only; unused on Android (native TTS). |
+| `shadow.ttsVoice` | tts-svc voice id sent with Core `speak` and `speech_prefs` (absent = the Core's default). Used on web and Android alike (the Core is the single voice); the native fallback ignores it. |
 
 ### How the app uses it
 
 - **Push-to-talk.** Press: if Shadow is speaking or a turn is in flight, the
-  controller first *barges in* — `playback.stop()` (or `tts.stop()`), then a
+  controller first *barges in* — `playback.stop()` (and `tts.fallback.stop()`), then a
   Core `cancel` for that turn — and calls `mic.start()`. Release: `mic.stop()`,
   then one `audio` message. While a confirmation is pending nothing is
   cancelled; the utterance is the voice answer. Recording auto-stops after 60 s.
@@ -92,28 +96,37 @@ type Utterance = { mime: string; data: string; durationMs: number };
   cancelled turn has wound down.)
 - **Replies, streamed (Core with `speech_stream`).** After `welcome` lists the
   feature, the app sends `speech_prefs` ([02 §Streamed speech](02-core-protocol.md#streamed-speech)):
-  `enabled` = the voice-replies switch, mode `audio` for `tts.mode === "core"`
-  (with the voice from Settings → Ses) and `text` for `"native"`. It sends it
-  again when the switch or the voice changes. The Core then sends the answer
+  `enabled` = the voice-replies switch, always mode `audio` (with the voice
+  from Settings → Ses; mode `text` is not used). It sends it again when the
+  switch or the voice changes. The Core then sends the answer
   sentence by sentence as `speech_chunk` frames while the text streams, and the
   app does **not** send `speak` after `assistant_done` (that would speak twice).
   The **queue rule**: one queue per turn; each chunk is played with
-  `playback.play(clip)` (core mode) or `tts.speak(text)` (native mode), and each
-  call starts only after the previous promise resolved, so the adapter never gets
-  two overlapping calls. "Speaking" is shown from the first chunk until the
+  `playback.play(clip)`, and each call starts only after the previous promise
+  resolved, so the adapter never gets two overlapping calls. "Speaking" is shown from the first chunk until the
   queue is empty after the turn's `final` chunk (or 35 s after `assistant_done`
   without one, or when the socket drops). Barge-in, Durdur and switching voice
-  replies off call `playback.stop()` / `tts.stop()` and clear the queue; later
-  chunks of that turn are dropped. A failing clip shows a notice and skips the
-  rest of that answer. The adapter interface is the same as for the
-  non-streamed path; the Android bridge speaks one text per `tts.speak` call.
+  replies off call `playback.stop()` / `tts.fallback.stop()` and clear the
+  queue; later chunks of that turn are dropped. A failing clip shows a notice
+  and skips the rest of that answer.
+  **Native fallback (Android):** when the Core reports `error tts_unavailable`
+  for the turn (it then stops synthesizing and sends `final`) and **no clip of
+  that turn has arrived yet**, the whole answer text (from `assistant_done`, clipped to 2000 chars like `speak`;
+  waited for if needed) is spoken once with `tts.fallback.speak(text)` through
+  the same queue, and the notice is dropped. If a clip already arrived, the
+  clips that came are played and the rest stays silent (the notice stays) —
+  speaking the full text would repeat the start. Without `fallback` (web) the
+  answer is only shown as text, as before.
 - **Replies, after the answer (older Core, no `speech_stream`).** On
-  `assistant_done`, if voice replies are on:
-  `tts.mode === "core"` → the app sends `speak` and plays the returned
-  `speech` clip with `playback.play`; `tts.mode === "native"` → `tts.speak(text)`.
-  "Speaking" is shown while that promise is pending. In core mode the `speak`
-  frame carries the voice chosen in Settings → Ses (`voice`, omitted for the
-  default). The voice preview ("Dene") always uses `speak`.
+  `assistant_done`, if voice replies are on, the app sends `speak` and plays
+  the returned `speech` clip with `playback.play`. "Speaking" is shown while
+  that promise is pending. The `speak` frame carries the voice chosen in
+  Settings → Ses (`voice`, omitted for the default). If the Core answers the
+  `speak` with an `error` (e.g. `tts_unavailable`) while the app still waits
+  for it, a host with `tts.fallback` speaks the reply text with
+  `tts.fallback.speak(text)` instead (once; the notice is dropped; a failing
+  fallback shows `tts_failed`). The voice preview ("Dene") always uses `speak`
+  and has no fallback (it previews a Core voice).
 - **Usage limit.** `error usage_limit` is shown as "Kullanım limitine ulaşıldı;
   HH:MM'de sıfırlanır." (the time from `retryAt`, with the date when it is not
   today; without `retryAt` only the first part).
@@ -152,7 +165,7 @@ The bridge must therefore be injected **before the page loads**
 - Playback: one shared `AudioContext`; clips are decoded with
   `decodeAudioData` and played through an analyser (for `level()`).
   `stop()` resolves the pending `play()`.
-- TTS: `mode: "core"`.
+- TTS: `mode: "core"`, no `fallback` (a reply the Core cannot synthesize is shown as text only).
 - Storage: `localStorage`, falling back to memory when it is blocked. The
   device token is therefore readable by scripts on the same origin; serve the
   UI from a trusted origin only.
@@ -183,7 +196,7 @@ never block the bridge thread for long.
 | `playAudio(requestId: String, mime: String, base64: String)` | void | async | Play a clip (currently `audio/wav` from tts-svc). Callback `{"ok":true}` when playback **finishes or is stopped by `stopAudio()`**; `playback_failed` if it cannot be decoded/played. A new `playAudio` while playing stops the old clip first (and answers its callback `{"ok":true}`). |
 | `stopAudio()` | void | sync | Stop playback. Must be safe when idle. |
 | `getOutputLevel(): Float` | 0..1 | sync | Output loudness while playing or speaking. Optional; missing = 0. |
-| `speak(requestId: String, text: String)` | void | async | Native `TextToSpeech` (Turkish voice). Callback `{"ok":true}` when the utterance finishes **or is stopped by `stopSpeaking()`**; error otherwise. |
+| `speak(requestId: String, text: String)` | void | async | Native `TextToSpeech` (Turkish voice) — **fallback only**: replies are normally Core audio played with `playAudio`; the UI calls `speak` only when the Core cannot produce audio (`tts_unavailable` / a failed `speak`). Callback `{"ok":true}` when the utterance finishes **or is stopped by `stopSpeaking()`**; error otherwise. |
 | `stopSpeaking()` | void | sync | Stop TTS. Must be safe when idle. |
 | `vibrate(patternJson: String)` | void | sync | e.g. `"[30,60,30]"` — on/off milliseconds starting with "on". Optional. |
 | `notify(title: String, body: String)` | void | sync | System notification, used for a confirmation request while the app is in the background. Optional. |

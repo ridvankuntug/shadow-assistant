@@ -41,7 +41,8 @@ describe("selectAdapter", () => {
     expect(choice.reason).toBe("android-bridge");
     expect(choice.adapter.kind).toBe("android");
     expect(choice.adapter.clientKind).toBe("android");
-    expect(choice.adapter.tts.mode).toBe("native");
+    expect(choice.adapter.tts.mode).toBe("core");
+    expect(choice.adapter.tts.fallback).toBeDefined();
   });
 
   it("falls back to web for an incomplete bridge", () => {
@@ -134,12 +135,15 @@ describe("Android adapter", () => {
     win.__shadowAndroidCallback!(playId, '{"ok":true}');
     await expect(played).resolves.toBeUndefined();
 
-    if (adapter.tts.mode !== "native") throw new Error("expected native tts");
-    const spoken = adapter.tts.speak("Merhaba");
+    const fallback = adapter.tts.fallback;
+    if (!fallback) throw new Error("expected a native TTS fallback");
+    const spoken = fallback.speak("Merhaba");
     const [speakId, text] = vi.mocked(bridge.speak).mock.calls[0];
     expect(text).toBe("Merhaba");
     win.__shadowAndroidCallback!(speakId, '{"ok":true}');
     await expect(spoken).resolves.toBeUndefined();
+    fallback.stop();
+    expect(bridge.stopSpeaking).toHaveBeenCalled();
   });
 
   it("clamps levels, serialises vibration patterns, reads device class from getInfo", () => {

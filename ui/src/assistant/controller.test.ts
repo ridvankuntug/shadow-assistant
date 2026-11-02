@@ -119,6 +119,20 @@ function fakeClient() {
   };
 }
 
+/** An Android-like host: Core speech plus a native fallback; `speak` answers through `pending`. */
+function fallbackTts() {
+  const pending: Array<() => void> = [];
+  const speak = vi.fn((text: string) => {
+    void text;
+    return new Promise<void>((res) => pending.push(res));
+  });
+  const stop = vi.fn(() => {
+    for (const res of pending.splice(0)) res();
+  });
+  const tts: TtsCapability = { mode: "core", fallback: { speak, stop } };
+  return { tts, speak, stop, pending, spoken: () => speak.mock.calls.map(([x]) => x) };
+}
+
 function setup(tts?: TtsCapability, features?: string[]) {
   const a = fakeAdapter(tts);
   const c = fakeClient();
@@ -523,23 +537,81 @@ describe("AssistantController", () => {
     expect(t.controller.getState().notice?.code).toBe("not_connected");
   });
 
-  it("native TTS (Android): speaks locally instead of sending speak", async () => {
-    const speak = deferred<void>();
-    const stop = vi.fn(() => speak.resolve());
-    const t = setup({ mode: "native", speak: vi.fn(() => speak.promise), stop });
+  it("Android (fallback host): the reply is a Core speak played through playback; native TTS stays silent", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts);
+    t.controller.setVoice("tr_TR-b");
     t.controller.sendText("selam");
     t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
-    expect(t.sentTypes()).toEqual(["user_text"]);
+    expect(t.sent[t.sent.length - 1]).toEqual({ type: "speak", id: "t1", text: "Merhaba", voice: "tr_TR-b" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "speech", id: "t1", mime: "audio/wav", data: "UklGRg==" });
+    expect(t.calls).toContain("play:audio/wav");
+    t.finishPlayback();
+    await flush();
+    expect(t.phase()).toBe("idle");
+    expect(f.speak).not.toHaveBeenCalled();
+  });
+
+  it("a failed speak is spoken natively once, without the notice; barge-in stops it", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts);
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(f.spoken()).toEqual(["Merhaba"]);
+    expect(t.controller.getState().notice).toBeNull();
     expect(t.phase()).toBe("speaking");
+    // A repeated error does not speak it again.
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(f.spoken()).toEqual(["Merhaba"]);
     await t.controller.startTalk(); // barge-in
-    expect(stop).toHaveBeenCalled();
-    expect(t.sent).toContainEqual({ type: "cancel", id: "t1" });
+    expect(f.stop).toHaveBeenCalled();
+    await flush();
+    expect(t.phase()).toBe("listening");
+  });
+
+  it("a speak error after a stop, and an error for the Dene sample, are not spoken natively", () => {
+    const f = fallbackTts();
+    const t = setup(f.tts);
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "state", state: "idle" });
+    t.controller.stopSpeaking();
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.controller.previewVoice(null);
+    t.receive({ type: "error", id: "t2", code: "tts_unavailable", message: "down" });
+    expect(f.speak).not.toHaveBeenCalled();
+    expect(t.controller.getState().voicePreview).toEqual({ id: "t2", failed: true });
+  });
+
+  it("a host without a fallback (web) keeps the notice and stays silent when speak fails", () => {
+    const t = setup();
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(t.controller.getState().notice?.code).toBe("tts_unavailable");
+    expect(t.phase()).not.toBe("speaking");
+  });
+
+  it("a failing fallback shows tts_failed and ends the speaking phase", async () => {
+    const speak = vi.fn(async () => {
+      throw new PlatformError("unknown", "no engine");
+    });
+    const t = setup({ mode: "core", fallback: { speak, stop: vi.fn() } });
+    t.controller.sendText("selam");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    await flush();
+    expect(t.controller.getState().notice?.code).toBe("tts_failed");
+    expect(t.phase()).toBe("idle");
   });
 });
 
 describe("streamed speech (speech_stream)", () => {
   const STREAM = ["speech_stream", "memory", "usage_limit"];
-  const nativeTts = (speak: (text: string) => Promise<void>) => ({ mode: "native" as const, speak: vi.fn(speak), stop: vi.fn() });
   const chunk = (id: string, seq: number, data?: string, final = false): ServerMessage =>
     data ? { type: "speech_chunk", id, seq, final, mime: "audio/wav", data } : { type: "speech_chunk", id, seq, final };
   const playedData = (t: ReturnType<typeof setup>) => vi.mocked(t.adapter.playback.play).mock.calls.map(([clip]) => clip.data);
@@ -557,12 +629,12 @@ describe("streamed speech (speech_stream)", () => {
     ]);
   });
 
-  it("native TTS opts in with text mode and no voice", () => {
-    const t = setup(nativeTts(async () => {}));
+  it("a host with a native fallback (Android) also opts in with audio mode and the chosen voice", () => {
+    const t = setup(fallbackTts().tts);
     t.controller.setVoice("tr_TR-b");
     t.drop();
     t.connect(STREAM);
-    expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: true, mode: "text" });
+    expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: true, mode: "audio", voice: "tr_TR-b" });
   });
 
   it("sends speech_prefs again only when voice replies or the voice change", () => {
@@ -683,26 +755,119 @@ describe("streamed speech (speech_stream)", () => {
     expect(t.sent).toContainEqual({ type: "speech_prefs", enabled: false, mode: "audio" });
   });
 
-  it("native mode speaks the chunk texts in order through tts.speak", async () => {
-    const pending: Array<() => void> = [];
-    const tts = nativeTts(() => new Promise<void>((res) => pending.push(res)));
-    const t = setup(tts, STREAM);
+  it("Android plays the Core chunks through playback; the fallback stays silent", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
     t.controller.sendText("anlat");
-    t.receive({ type: "speech_chunk", id: "t1", seq: 0, final: false, text: "Birinci cümle." });
-    t.receive({ type: "speech_chunk", id: "t1", seq: 1, final: true, text: "İkinci cümle." });
-    expect(tts.speak.mock.calls.map(([x]) => x)).toEqual(["Birinci cümle."]);
-    expect(t.phase()).toBe("speaking");
-    pending.shift()!();
+    t.receive(chunk("t1", 0, "A"));
+    t.receive(chunk("t1", 1, "B", true));
+    t.finishPlayback();
     await flush();
-    expect(tts.speak.mock.calls.map(([x]) => x)).toEqual(["Birinci cümle.", "İkinci cümle."]);
-    t.receive({ type: "assistant_done", id: "t1", text: "Birinci cümle. İkinci cümle." });
-    expect(t.sentTypes()).toEqual(["user_text"]);
+    expect(playedData(t)).toEqual(["A", "B"]);
+    expect(f.speak).not.toHaveBeenCalled();
+  });
+
+  it("tts_unavailable before any clip and before assistant_done: the whole answer is spoken natively at assistant_done", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "assistant_delta", id: "t1", text: "Bir." });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.receive(chunk("t1", 0, undefined, true)); // the Core's final marker after the failure
+    expect(t.controller.getState().notice).toBeNull();
+    expect(f.speak).not.toHaveBeenCalled();
+    t.receive({ type: "assistant_delta", id: "t1", text: " İki." });
+    t.receive({ type: "assistant_done", id: "t1", text: "Bir. İki." });
     t.receive({ type: "state", state: "idle" });
+    expect(f.spoken()).toEqual(["Bir. İki."]);
     expect(t.phase()).toBe("speaking");
-    pending.shift()!();
+    expect(t.sentTypes()).toEqual(["user_text"]); // no speak: it is not said twice
+    f.pending.shift()!();
     await flush();
     expect(t.phase()).toBe("idle");
     expect(vi.mocked(t.adapter.playback.play)).not.toHaveBeenCalled();
+  });
+
+  it("tts_unavailable after assistant_done (before any clip): spoken natively at once", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    t.receive({ type: "state", state: "idle" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(f.spoken()).toEqual(["Merhaba"]);
+    t.receive(chunk("t1", 0, undefined, true));
+    expect(t.phase()).toBe("speaking");
+    f.pending.shift()!();
+    await flush();
+    expect(t.phase()).toBe("idle");
+  });
+
+  it("tts_unavailable after a clip: the clips that arrived play, nothing is spoken natively, the notice stays", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.receive(chunk("t1", 1, undefined, true));
+    t.receive({ type: "assistant_done", id: "t1", text: "Bir. İki." });
+    t.finishPlayback();
+    await flush();
+    expect(playedData(t)).toEqual(["A"]);
+    expect(f.speak).not.toHaveBeenCalled();
+    expect(t.controller.getState().notice?.code).toBe("tts_unavailable");
+  });
+
+  it("barge-in while the fallback waits for or speaks the answer stops it", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    await t.controller.startTalk(); // barge-in before assistant_done
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    expect(f.speak).not.toHaveBeenCalled();
+
+    const u = setup(fallbackTts().tts, STREAM);
+    const g = u.adapter.tts.fallback!;
+    u.controller.sendText("anlat");
+    u.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    u.receive({ type: "state", state: "idle" });
+    u.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    expect(g.speak).toHaveBeenCalledTimes(1);
+    await u.controller.startTalk();
+    expect(g.stop).toHaveBeenCalled();
+    await flush();
+    expect(u.phase()).toBe("listening");
+  });
+
+  it("a voices error while the fallback waits for the answer does not disturb it", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.receive(chunk("t1", 0, undefined, true));
+    t.controller.requestVoices();
+    t.receive({ type: "error", id: "t2", code: "tts_unavailable", message: "down" });
+    expect(t.controller.getState().voices.status).toBe("unavailable");
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    expect(f.spoken()).toEqual(["Merhaba"]);
+  });
+
+  it("a turn error after a fallback was chosen ends the queue silently", async () => {
+    const f = fallbackTts();
+    const t = setup(f.tts, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "error", id: "t1", code: "tts_unavailable", message: "down" });
+    t.receive(chunk("t1", 0, undefined, true));
+    t.receive({ type: "error", id: "t1", code: "model_error", message: "boom" });
+    t.receive({ type: "state", state: "idle" });
+    await flush();
+    expect(f.speak).not.toHaveBeenCalled();
+    expect(t.phase()).toBe("idle");
   });
 
   it("ignores repeated chunks and chunks without a payload for this client's mode", () => {
@@ -906,10 +1071,10 @@ describe("voice picker (T5.3)", () => {
     expect(t.sent[t.sent.length - 1]).toEqual({ type: "voices", id: "t2" });
   });
 
-  it("does not ask while disconnected or on a native-TTS host (Android)", () => {
-    const native = setup({ mode: "native", speak: vi.fn(async () => {}), stop: vi.fn() });
-    native.controller.requestVoices();
-    expect(native.sent).toEqual([]);
+  it("asks on a host with a native fallback (Android) too, but not while disconnected", () => {
+    const android = setup(fallbackTts().tts);
+    android.controller.requestVoices();
+    expect(android.sent).toEqual([{ type: "voices", id: "t1" }]);
     const t = setup();
     t.drop();
     t.controller.requestVoices();
@@ -987,7 +1152,7 @@ describe("voice picker (T5.3)", () => {
     expect(t.sent[t.sent.length - 1]).toEqual({ type: "speak", id: "t2", text: VOICE_SAMPLE_TEXT });
   });
 
-  it("Dene is refused while a turn is in flight or a confirm is pending, and on Android", () => {
+  it("Dene is refused while a turn is in flight or a confirm is pending; allowed on Android", () => {
     const t = setup();
     t.controller.sendText("selam");
     expect(t.controller.previewVoice(null)).toBe(false);
@@ -996,9 +1161,9 @@ describe("voice picker (T5.3)", () => {
     expect(t.controller.previewVoice(null)).toBe(false);
     expect(t.sentTypes()).toEqual(["user_text"]);
 
-    const native = setup({ mode: "native", speak: vi.fn(async () => {}), stop: vi.fn() });
-    expect(native.controller.previewVoice(null)).toBe(false);
-    expect(native.sent).toEqual([]);
+    const android = setup(fallbackTts().tts);
+    expect(android.controller.previewVoice(null)).toBe(true);
+    expect(android.sentTypes()).toEqual(["speak"]);
   });
 
   it("Dene stops a reply that is being spoken first", () => {
