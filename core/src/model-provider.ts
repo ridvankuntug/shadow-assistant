@@ -10,8 +10,9 @@
  *   calls (memory extraction, Core-side compaction summary).
  * - `ProviderSession` is one live conversation: attempts, notes, model switch,
  *   cancel, optional compaction.
- * - Tools stay where they are: the permission gate is passed in per attempt as a
- *   neutral `PermissionCallback`; each provider adapts it to its own mechanism.
+ * - Tools: every provider gets the same Core MCP gateway (`mcp-gateway.ts`, T7.y);
+ *   the permission gate is passed in per attempt as a neutral `PermissionCallback`
+ *   and runs inside the gateway's tool call, so the decision stays in the Core.
  */
 import type { TurnCallbacks, TurnResult } from "./agent.js";
 

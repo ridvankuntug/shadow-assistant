@@ -175,3 +175,43 @@ test("ConfirmBroker: an answer after expiresAt counts as timeout", async () => {
   b.resolve(second.request.requestId, true, "voice");
   assert.deepEqual(await second.result, { approved: true, by: "voice" });
 });
+
+test("mirrored MCP service: a tool no rule names is unclassified and held at confirm (T7.y)", () => {
+  const services = parseServices(
+    [
+      "services:",
+      "  - name: lab",
+      "    kind: mcp",
+      "    url: http://localhost:1/sse",
+      "    permission: read",
+      "    tools:",
+      '      "known__Read": read',
+      '      "light__*": write',
+      "  - name: shadow-vault",
+      "    kind: vault",
+      "    permission: read",
+    ].join("\n"),
+    {},
+  ).services;
+  const p = new PermissionPolicy(services);
+  // Even with a `read` service default, a new tool of a mirrored service asks first.
+  assert.deepEqual(
+    [p.levelFor("mcp__lab__brand_new").level, p.levelFor("mcp__lab__brand_new").reason],
+    ["confirm", "unclassified_tool"],
+  );
+  assert.equal(p.levelFor("mcp__lab__known__Read").level, "read");
+  assert.equal(p.levelFor("mcp__lab__light__x").level, "write");
+  // Core-side (non-mirrored) services keep their default.
+  assert.equal(p.levelFor("mcp__shadow-vault__read_note").level, "read");
+  assert.deepEqual(p.classifyTool("lab", "brand_new"), { classified: false, level: "confirm" });
+  assert.deepEqual(p.classifyTool("lab", "light__on"), { classified: true, level: "write" });
+  assert.deepEqual(p.exactToolRules("lab"), ["known__Read"]);
+});
+
+test("repo services.yaml: HA tools without a rule stay at confirm", () => {
+  const { services } = loadServicesFile(join(fileURLToPath(new URL("../..", import.meta.url)), "services.yaml"), { HA_URL: "http://localhost:1", HA_CORE_TOKEN: "t" });
+  const p = new PermissionPolicy(services);
+  assert.equal(p.levelFor(`${HA}media__HassMediaPause`).level, "confirm");
+  assert.equal(p.classifyTool("home-assistant", "media__HassMediaPause").classified, false);
+  assert.equal(p.classifyTool("home-assistant", "intent__HassTurnOn").classified, true);
+});

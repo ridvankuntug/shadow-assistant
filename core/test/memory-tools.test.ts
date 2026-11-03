@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { MemoryStore } from "../src/memory/store.js";
-import { createMemoryMcpServer, FORGET_ALL_VALUE, MEMORY_SERVER_NAME, memoryForget, memoryListText } from "../src/memory/tools.js";
+import { z } from "zod";
+import { FORGET_ALL_VALUE, MEMORY_SERVER_NAME, memoryForget, memoryListText, memoryTools } from "../src/memory/tools.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import { loadServicesFile } from "../src/services.js";
 
@@ -98,17 +99,14 @@ test("permission policy from the repo services.yaml: list read, forget write, al
   assert.equal(policy.levelFor(`${P}memory_add`, {}).level, "confirm");
 });
 
-test("the MCP server exposes exactly memory_list and memory_forget; `all` accepts only the string", async () => {
+test("the gateway tools are exactly memory_list and memory_forget; `all` accepts only the string", async () => {
   const { store } = await seeded();
-  const server = createMemoryMcpServer(store);
-  assert.equal(server.name, MEMORY_SERVER_NAME);
-  assert.equal(server.type, "sdk");
-  // Reach the registered tools through the MCP server instance (SDK internals, read-only).
-  const registered = (server.instance as unknown as { _registeredTools: Record<string, { inputSchema?: unknown }> })._registeredTools;
-  assert.deepEqual(Object.keys(registered).sort(), ["memory_forget", "memory_list"]);
-  const schema = registered.memory_forget?.inputSchema as { safeParse(v: unknown): { success: boolean } } | undefined;
-  assert.equal(typeof schema?.safeParse, "function");
-  assert.equal(schema?.safeParse({ all: "true" }).success, true);
+  const tools = memoryTools(store);
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["memory_forget", "memory_list"]);
+  const forget = tools.find((t) => t.name === "memory_forget");
+  assert.ok(forget);
+  const schema = z.object(forget.shape);
+  assert.equal(schema.safeParse({ all: "true" }).success, true);
   // A boolean would not be escalated by the gate (string-only confirm_inputs), so it must be refused.
-  assert.equal(schema?.safeParse({ all: true }).success, false);
+  assert.equal(schema.safeParse({ all: true }).success, false);
 });

@@ -4,21 +4,24 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getSessionInfo, query, type McpServerConfig, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionInfo, query, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
 import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
+import { DevNotes } from "./dev-notes.js";
 import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { MemoryExtractor } from "./memory/extractor.js";
 import { DeviceMaintenance, formatBrief } from "./memory/lifecycle.js";
 import { MemoryStore } from "./memory/store.js";
-import { createMemoryMcpServer } from "./memory/tools.js";
+import { memoryTools } from "./memory/tools.js";
+import { createGatewaySdkServers } from "./gateway-sdk.js";
+import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from "./mcp-direct.js";
+import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
 import { PermissionPolicy } from "./permissions.js";
-import { McpDirectClient } from "./mcp-direct.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
@@ -27,36 +30,63 @@ import { Session, type Logger } from "./session.js";
 import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
-import { createVaultMcpServer, VaultReader } from "./vault.js";
+import { VaultReader, vaultTools } from "./vault.js";
 
 const logger: Logger = {
   info: (m) => console.log(m),
   warn: (m) => console.warn(m),
 };
 
-/** MCP servers handed to the SDK for each turn (only enabled services; `shadow-memory` only with a memory store). */
-export function buildMcpServers(cfg: CoreConfig, env: NodeJS.ProcessEnv, memory?: MemoryStore): () => Record<string, McpServerConfig> {
-  const remote: Record<string, McpServerConfig> = {};
+/**
+ * Tool sources of the Core MCP gateway (T7.y), in services.yaml order: enabled
+ * remote MCP services (mirrored over `client`, the connection tier 0 shares),
+ * the vault and, with a memory store, the memory tools.
+ */
+export function buildGatewaySources(
+  cfg: CoreConfig,
+  client: RemoteMcpClient,
+  memory?: MemoryStore,
+  env: NodeJS.ProcessEnv = process.env,
+): GatewaySource[] {
+  const out: GatewaySource[] = [];
   for (const svc of cfg.services.services) {
-    if (svc.kind !== "mcp" || !svc.enabled || !svc.url) continue;
-    const token = svc.tokenEnv ? env[svc.tokenEnv] : undefined;
-    const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
-    remote[svc.name] =
-      svc.transport === "http"
-        ? { type: "http", url: svc.url, headers, alwaysLoad: true, timeout: svc.timeoutMs }
-        : { type: "sse", url: svc.url, headers, alwaysLoad: true, timeout: svc.timeoutMs };
+    if (!svc.enabled) continue;
+    if (svc.kind === "mcp" && svc.url) {
+      out.push({
+        kind: "remote",
+        service: svc.name,
+        client,
+        timeoutMs: svc.timeoutMs ?? DEFAULT_DIRECT_TIMEOUT_MS,
+        // Same URL and token the client connects with; kept in memory only, to mask them in error texts.
+        secrets: serviceSecrets(svc.url, svc.tokenEnv ? env[svc.tokenEnv] : undefined),
+      });
+    } else if (svc.kind === "vault" && cfg.vaultDir) {
+      const reader = new VaultReader({ root: cfg.vaultDir, allow: svc.allow ?? [], maxBytes: svc.maxBytes });
+      out.push({ kind: "local", service: svc.name, tools: vaultTools(reader) });
+    } else if (svc.kind === "memory" && memory) {
+      out.push({ kind: "local", service: svc.name, tools: memoryTools(memory) });
+    }
   }
-  const vaultSvc = cfg.services.services.find((s) => s.kind === "vault" && s.enabled);
-  const reader =
-    vaultSvc && cfg.vaultDir
-      ? new VaultReader({ root: cfg.vaultDir, allow: vaultSvc.allow ?? [], maxBytes: vaultSvc.maxBytes })
-      : undefined;
-  const memorySvc = memory ? cfg.services.services.find((s) => s.kind === "memory" && s.enabled) : undefined;
-  return () => ({
-    ...remote,
-    ...(reader && vaultSvc ? { [vaultSvc.name]: createVaultMcpServer(reader, vaultSvc.name) } : {}),
-    ...(memory && memorySvc ? { [memorySvc.name]: createMemoryMcpServer(memory, memorySvc.name) } : {}),
-  });
+  return out;
+}
+
+/** Longest wait of a model session start for the remote services' first tool list (instructions). */
+export const GATEWAY_SESSION_WAIT_MS = 3_000;
+
+/**
+ * SDK-side per-call limit for gateway tools. Everything a call can wait on
+ * runs inside it, in the worst case one after the other: a list refresh for a
+ * tool the cache lacks (one service timeout), the confirmation, a reconnect
+ * and the call itself (one service timeout each), plus 10 s slack. The
+ * gateway also refuses to forward a call approved too late for this limit
+ * (`McpGateway.call`), so a timed-out call never runs on the service.
+ */
+export function gatewayCallTimeoutMs(cfg: CoreConfig): number {
+  const slowest = Math.max(
+    DEFAULT_DIRECT_TIMEOUT_MS,
+    ...cfg.services.services.filter((s) => s.kind === "mcp" && s.enabled).map((s) => s.timeoutMs ?? DEFAULT_DIRECT_TIMEOUT_MS),
+  );
+  return slowest + cfg.confirmTimeoutMs + 2 * slowest + 10_000;
 }
 
 /**
@@ -128,19 +158,33 @@ export async function main(): Promise<void> {
   await log.ensureDir();
 
   const policy = new PermissionPolicy(cfg.services.services, { readOnly: cfg.readOnly });
+  // One MCP client per remote service, shared by tier 0 and the gateway (one SSE connection).
+  const mcpClient = new McpDirectClient(cfg.services.services, process.env);
+  const gateway = new McpGateway({
+    sources: buildGatewaySources(cfg, mcpClient, memory),
+    classifier: policy,
+    devNotes: new DevNotes({ dir: join(cfg.dataDir, "dev-notes"), log: (m) => logger.warn(m) }),
+    log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
+  });
+  const gatewayTimeoutMs = gatewayCallTimeoutMs(cfg);
   const agentCwd = join(cfg.dataDir, "agent");
   const agentEnv = subprocessEnv(process.env);
   const agent = new SdkAgentRunner({
     systemPrompt,
     escalationPrompt,
-    mcpServers: buildMcpServers(cfg, process.env, memory),
+    mcpServers: (gate) =>
+      createGatewaySdkServers(gateway, gate, {
+        timeoutMs: gatewayTimeoutMs,
+        log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
+      }),
     cwd: agentCwd,
     env: agentEnv,
     stderr: (line) => logger.warn(`[shadow-core] sdk: ${line.trimEnd()}`),
   });
 
   // The model provider: live sessions (persistent mode) and one-shot background calls (memory).
-  const remoteMcp = cfg.services.services.filter((s) => s.kind === "mcp" && s.enabled && s.url).map((s) => s.name);
+  // No MCP freshness check: the CLI only has in-process gateway servers; the
+  // remote connection is the Core's own and reconnects on demand (mcp-direct.ts).
   const provider = new ClaudeSdkProvider({
     queryFn: query,
     buildOptions: (p) => agent.buildPersistentOptions(p),
@@ -148,7 +192,6 @@ export async function main(): Promise<void> {
     session: {
       idleMs: cfg.agent.idleMin * 60_000,
       turnTimeoutMs: cfg.agent.turnTimeoutMs,
-      mcpFreshness: { servers: remoteMcp },
       log: (event, detail) => {
         if (event === "dead" || event === "send_failed" || event === "settle_failed") {
           logger.warn(`[shadow-core] agent ${event}: ${JSON.stringify(detail ?? {})}`);
@@ -174,7 +217,15 @@ export async function main(): Promise<void> {
       continuityMin: cfg.agent.continuityMin,
       restartGuard: () => new RestartBackoff(),
       prewarm: cfg.agent.prewarm,
-      ...(memory ? { systemAppend: async () => formatBrief(await memory.briefForPrompt()) } : {}),
+      // Read before every session start (prewarm included; tier 0 never waits on it):
+      // a short wait for the remote services' first list, so the session's MCP
+      // servers carry their instructions (HA's Assist prompt). A service that is
+      // down costs at most GATEWAY_SESSION_WAIT_MS; its instructions then reach
+      // the next session started after it answered.
+      systemAppend: async () => {
+        await gateway.whenListed(GATEWAY_SESSION_WAIT_MS);
+        return memory ? formatBrief(await memory.briefForPrompt()) : "";
+      },
       log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
     });
     if (cfg.router && Object.values(cfg.router.tierServices).some((v) => v !== undefined)) {
@@ -223,7 +274,7 @@ export async function main(): Promise<void> {
     const enabled = cfg.services.services.filter((s) => s.enabled).map((s) => s.name);
     for (const w of checkRouterServices(cfg.router, enabled)) logger.warn(`[shadow-core] router.yaml: ${w}`);
     router = new TieredRouter({ config: cfg.router, models: cfg.models, onUsage: (u) => void usageLog.append(u) });
-    direct = cfg.router.direct.enabled ? new McpDirectClient(cfg.services.services, process.env) : undefined;
+    direct = cfg.router.direct.enabled ? mcpClient : undefined;
   } else {
     const passthrough = new PassthroughRouter(cfg.model);
     router = { route: () => passthrough.route(), onUsage: (u) => void usageLog.append(u) };
@@ -295,6 +346,9 @@ export async function main(): Promise<void> {
   );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
+  // List the remote services once now, so the first session gets their tools and instructions.
+  void gateway.warm();
+  logger.info(`[shadow-core] mcp gateway: ${gateway.services.join(", ") || "no services"}`);
   logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);
 
   // SIGBREAK is Windows Ctrl+Break; onShutdownSignal runs the shutdown only once.
@@ -306,7 +360,8 @@ export async function main(): Promise<void> {
       .close()
       .then(() => server.close())
       .then(() => registry?.close())
-      .then(() => direct?.close())
+      .then(() => gateway.close())
+      .then(() => mcpClient.close())
       .then(() => usageLog.flush())
       .then(() => process.exit(0));
   });

@@ -187,6 +187,10 @@ execution limit is kept. The token saving is lost; it remains only with
 
 ### Permission gate (`canUseTool`)
 
+> T7.y: the dispatcher is now handed to the Core MCP gateway and runs inside
+> each tool call (docs/02 §Core MCP gateway); the SDK's `canUseTool` is only a
+> guard that lets gateway tools through. The behaviour below is unchanged.
+
 `canUseTool` is fixed when the query starts, but `Session.gate(turn)` is a
 per-turn closure today. The agent therefore passes one dispatcher:
 

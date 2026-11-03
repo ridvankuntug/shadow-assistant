@@ -8,6 +8,11 @@
  *   built-in → always denied (the model only gets MCP tools)
  *   unknown  → confirm (safe default)
  *
+ * Tools of a mirrored MCP service (`kind: mcp`, e.g. Home Assistant) that no
+ * services.yaml rule names (exact or glob) are "unclassified": they are held at
+ * `confirm` whatever the service default says, until a rule classifies them
+ * (T7.y; the gateway records them in dev-notes as "new tool: classify").
+ *
  * Tool-name globs match case-insensitively so `*Lock*` also catches `lock__…`.
  */
 import { randomUUID } from "node:crypto";
@@ -84,15 +89,17 @@ export class PermissionPolicy {
     const svc = identity.service ? this.byName.get(identity.service) : undefined;
     if (!svc) return { identity, level: "confirm", reason: "unknown_service" };
 
-    // 1) exact rule, 2) first matching glob in file order, 3) service default.
+    // 1) exact rule, 2) first matching glob in file order, 3) service default
+    //    (a mirrored MCP service's unclassified tool: at least confirm).
     let level: PermissionLevel = svc.permission;
     let reason = "service_default";
-    const exact = svc.tools.find((r) => !isGlob(r.pattern) && r.pattern === identity.tool);
-    const glob = exact ? undefined : svc.tools.find((r) => isGlob(r.pattern) && matchGlob(r.pattern, identity.tool, true));
-    const rule = exact ?? glob;
+    const rule = findRule(svc, identity.tool);
     if (rule) {
       level = rule.level;
       reason = `rule:${rule.pattern}`;
+    } else if (svc.kind === "mcp" && level !== "confirm") {
+      level = "confirm";
+      reason = "unclassified_tool";
     }
 
     // 4) risky argument values escalate to confirm (never lower).
@@ -102,6 +109,28 @@ export class PermissionPolicy {
     }
     return { identity, level, reason };
   }
+
+  /**
+   * Whether a services.yaml rule (exact or glob) names this tool of this
+   * service, and the level a call without risky arguments gets.
+   */
+  classifyTool(service: string, tool: string): { classified: boolean; level: PermissionLevel | "deny" } {
+    const svc = this.byName.get(service);
+    const level = this.levelFor(`mcp__${service}__${tool}`).level;
+    return { classified: svc !== undefined && findRule(svc, tool) !== undefined, level };
+  }
+
+  /** The exact (non-glob) tool names the service's rules mention. */
+  exactToolRules(service: string): string[] {
+    return (this.byName.get(service)?.tools ?? []).filter((r) => !isGlob(r.pattern)).map((r) => r.pattern);
+  }
+}
+
+function findRule(svc: ServiceDef, tool: string): ServiceDef["tools"][number] | undefined {
+  return (
+    svc.tools.find((r) => !isGlob(r.pattern) && r.pattern === tool) ??
+    svc.tools.find((r) => isGlob(r.pattern) && matchGlob(r.pattern, tool, true))
+  );
 }
 
 function matchConfirmInputs(rules: Record<string, string[]>, input: Record<string, unknown>): string | undefined {

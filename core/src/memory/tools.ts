@@ -1,5 +1,5 @@
 /**
- * `shadow-memory` in-process MCP server (docs/06-memory.md §Voice commands,
+ * `shadow-memory` tools, served by the Core MCP gateway (docs/06-memory.md §Voice commands,
  * task M5): `memory_list` (read) and `memory_forget` (write; `all` raised to
  * confirm by services.yaml `confirm_inputs`).
  *
@@ -13,8 +13,8 @@
  * Results are Turkish text for the model. Entry texts are memory data: the
  * list says so, and forget tells the model to stop using removed entries.
  */
-import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import type { LocalTool } from "../mcp-gateway.js";
 import { selectRelevant } from "./match.js";
 import type { MemoryStore } from "./store.js";
 import { isEntryId, MEMORY_BUDGETS, warningKey, type MemoryEntry } from "./types.js";
@@ -22,10 +22,6 @@ import { isEntryId, MEMORY_BUDGETS, warningKey, type MemoryEntry } from "./types
 export const MEMORY_SERVER_NAME = "shadow-memory";
 /** The only accepted value of `memory_forget.all` (see the module comment). */
 export const FORGET_ALL_VALUE = "true";
-
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], isError };
-}
 
 function line(e: MemoryEntry): string {
   return `- [${e.id}] (${e.kind}) ${e.text}`;
@@ -91,48 +87,44 @@ export async function memoryForget(store: MemoryStore, args: ForgetArgs): Promis
   return { text: parts.join(" "), isError: false };
 }
 
-export function createMemoryMcpServer(store: MemoryStore, name = MEMORY_SERVER_NAME): McpSdkServerConfigWithInstance {
-  return createSdkMcpServer({
-    name,
-    version: "1.0.0",
-    alwaysLoad: true,
-    tools: [
-      tool(
-        "memory_list",
-        "Kullanıcı hakkında kalıcı hafızadaki kayıtları (kimlik, tür, metin) ve bütçe uyarılarını listeler. 'Neyi hatırlıyorsun' için.",
-        { query: z.string().max(200).optional().describe("İsteğe bağlı: yalnız bu sözcüklerle ilgili kayıtlar") },
-        async ({ query }) => {
-          try {
-            return textResult(await memoryListText(store, query));
-          } catch {
-            return textResult("Hafıza okunamadı.", true);
-          }
-        },
-        { annotations: { readOnlyHint: true } },
-      ),
-      tool(
-        "memory_forget",
+/** The memory tools for the gateway (`kind: local` source). */
+export function memoryTools(store: MemoryStore): LocalTool[] {
+  return [
+    {
+      name: "memory_list",
+      description: "Kullanıcı hakkında kalıcı hafızadaki kayıtları (kimlik, tür, metin) ve bütçe uyarılarını listeler. 'Neyi hatırlıyorsun' için.",
+      shape: { query: z.string().max(200).optional().describe("İsteğe bağlı: yalnız bu sözcüklerle ilgili kayıtlar") },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        try {
+          return { text: await memoryListText(store, args.query as string | undefined), isError: false };
+        } catch {
+          return { text: "Hafıza okunamadı.", isError: true };
+        }
+      },
+    },
+    {
+      name: "memory_forget",
+      description:
         "Kalıcı hafızadan kayıt siler ve bir daha öğrenilmemesini sağlar ('bunu unut'). Önce memory_list ile kimlikleri bul. " +
-          `Her şeyi silmek için all: "${FORGET_ALL_VALUE}" (kullanıcıdan onay istenir).`,
-        {
-          ids: z.array(z.string().max(20)).max(MEMORY_BUDGETS.entriesMax).optional().describe("memory_list'teki kayıt kimlikleri, ör. m-7f3a9c"),
-          all: z.literal(FORGET_ALL_VALUE).optional().describe(`Tüm hafızayı silmek için "${FORGET_ALL_VALUE}"`),
-          text: z
-            .string()
-            .max(MEMORY_BUDGETS.textMaxChars * 2)
-            .optional()
-            .describe("İsteğe bağlı: unutulacak bilginin kısa metni (kayıtlı olmasa da bir daha öğrenilmez)"),
-        },
-        async (args) => {
-          try {
-            const r = await memoryForget(store, args);
-            return textResult(r.text, r.isError);
-          } catch {
-            return textResult("Hafıza yazılamadı.", true);
-          }
-        },
-        { annotations: { destructiveHint: true } },
-      ),
-    ],
-  });
+        `Her şeyi silmek için all: "${FORGET_ALL_VALUE}" (kullanıcıdan onay istenir).`,
+      shape: {
+        ids: z.array(z.string().max(20)).max(MEMORY_BUDGETS.entriesMax).optional().describe("memory_list'teki kayıt kimlikleri, ör. m-7f3a9c"),
+        all: z.literal(FORGET_ALL_VALUE).optional().describe(`Tüm hafızayı silmek için "${FORGET_ALL_VALUE}"`),
+        text: z
+          .string()
+          .max(MEMORY_BUDGETS.textMaxChars * 2)
+          .optional()
+          .describe("İsteğe bağlı: unutulacak bilginin kısa metni (kayıtlı olmasa da bir daha öğrenilmez)"),
+      },
+      annotations: { destructiveHint: true },
+      handler: async (args) => {
+        try {
+          return await memoryForget(store, args as ForgetArgs);
+        } catch {
+          return { text: "Hafıza yazılamadı.", isError: true };
+        }
+      },
+    },
+  ];
 }

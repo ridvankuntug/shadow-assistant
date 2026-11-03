@@ -22,6 +22,7 @@ import {
   type DeviceAgentOptions,
 } from "../src/device-agent.js";
 import type { PermissionCallback } from "../src/model-provider.js";
+import type { GatewayGate } from "../src/mcp-gateway.js";
 
 const msg = (m: unknown) => m as SDKMessage;
 const tick = () => new Promise((r) => setImmediate(r));
@@ -169,7 +170,7 @@ function makeAgent(f: FakeSdk, o: Partial<DeviceAgentOptions> = {}): DeviceAgent
     model: "haiku",
     buildOptions: (p) => {
       f.buildArgs = p;
-      return { model: p.model, canUseTool: p.canUseTool, ...(p.resume ? { resume: p.resume } : {}) };
+      return { model: p.model, canUseTool: p.gate as unknown as CanUseTool, ...(p.resume ? { resume: p.resume } : {}) };
     },
     queryFn: f.queryFn,
     idleMs: 0,
@@ -369,6 +370,43 @@ test("gate dispatcher: no attempt → deny; a call that outlives its attempt's c
   const r = await pending;
   assert.equal(r?.behavior, "deny");
   assert.equal((await h.settled).status, "cancelled");
+  agent.close();
+});
+
+test("gate dispatcher bindTurn: pins the attempt current at the call's start; a later attempt does not inherit the call", async () => {
+  const f = new FakeSdk();
+  f.reply = () => {};
+  const agent = makeAgent(f);
+  const dispatch = f.buildArgs?.gate as GatewayGate;
+  assert.equal(typeof dispatch.bindTurn, "function");
+  assert.equal(dispatch.bindTurn?.(), undefined, "no attempt → no binding (the gateway refuses the call)");
+
+  const asked: string[] = [];
+  const gateOf = (tag: string): PermissionCallback => async (name, input) => {
+    asked.push(`${tag}:${name}`);
+    return { behavior: "allow", updatedInput: input };
+  };
+  const opts = { signal: new AbortController().signal, toolUseID: "t1" };
+  const hA = agent.runAttempt(attempt("a", { canUseTool: gateOf("A") }));
+  await tick();
+  const boundA = dispatch.bindTurn?.();
+  assert.ok(boundA);
+  assert.equal(boundA.isCurrent(), true);
+  await agent.interrupt();
+  assert.equal((await hA.settled).status, "cancelled");
+  assert.equal(boundA.isCurrent(), false);
+
+  const hB = agent.runAttempt(attempt("b", { canUseTool: gateOf("B") }));
+  await tick();
+  assert.equal(boundA.isCurrent(), false, "a new attempt does not make the old binding current");
+  assert.equal((await boundA.gate("mcp__ha__Turn", {}, opts)).behavior, "deny");
+  assert.deepEqual(asked, [], "turn B's gate is never asked for turn A's call");
+  const boundB = dispatch.bindTurn?.();
+  assert.ok(boundB?.isCurrent());
+  assert.equal((await boundB.gate("mcp__ha__Turn", {}, opts)).behavior, "allow");
+  assert.deepEqual(asked, ["B:mcp__ha__Turn"]);
+  await agent.interrupt();
+  await hB.settled;
   agent.close();
 });
 
@@ -761,7 +799,7 @@ test("ClaudeSdkProvider: openSession builds a DeviceAgent; oneShot returns text,
   let mode: "session" | "oneshot" = "session";
   const provider = new ClaudeSdkProvider({
     queryFn: (a) => (mode === "session" ? f.queryFn(a) : oneShotQuery(a)),
-    buildOptions: (p) => ({ model: p.model, canUseTool: p.canUseTool }),
+    buildOptions: (p) => ({ model: p.model, canUseTool: p.gate as unknown as CanUseTool }),
     buildOneShotOptions: (p) => {
       oneShotArgs.push(p);
       return { model: p.model };

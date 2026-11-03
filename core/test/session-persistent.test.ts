@@ -10,7 +10,8 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
 import { ConversationLog } from "../src/conversation-log.js";
-import type { DirectToolClient, DirectToolResult } from "../src/mcp-direct.js";
+import type { DirectToolClient, DirectToolResult, RemoteMcpClient } from "../src/mcp-direct.js";
+import { McpGateway, type GatewayToolResult } from "../src/mcp-gateway.js";
 import {
   SessionBusyError,
   SessionClosedError,
@@ -530,6 +531,41 @@ test("tierN.services in persistent mode: tools of other services are denied by t
   const h2 = harness({ live: live2, tierServices: { 1: ["home-assistant"] } });
   await h2.say("ışık açık mı");
   assert.equal((allowed as { behavior: string }).behavior, "allow");
+});
+
+test("tierN.services through the gateway: a tool of a service the tier does not allow is not forwarded (isError)", async () => {
+  const forwarded: string[] = [];
+  const remote: RemoteMcpClient = {
+    listTools: async () => ({ tools: [{ name: "homeassistant__GetLiveContext", inputSchema: { type: "object" } }] }),
+    callTool: async (_s, tool) => {
+      forwarded.push(tool);
+      return { text: `ok:${tool}`, isError: false };
+    },
+  };
+  const gw = new McpGateway({ sources: [{ kind: "remote", service: "home-assistant", client: remote }] });
+  const run = async (tierServices: readonly string[]) => {
+    let result: GatewayToolResult | undefined;
+    const live = new FakeLive(() => ({
+      run: async (req) => {
+        result = await gw.call("home-assistant", "homeassistant__GetLiveContext", {}, req.canUseTool, {
+          signal: new AbortController().signal,
+          toolUseID: "tu1",
+        });
+      },
+      deltas: ["tamam"],
+    }));
+    const h = harness({ live, tierServices: { 1: tierServices } });
+    await h.say("ışık açık mı");
+    return { result, h };
+  };
+  const denied = await run(["vault"]);
+  assert.deepEqual(denied.result, { content: [{ type: "text", text: "This tool is not available in this mode." }], isError: true });
+  assert.deepEqual(forwarded, [], "nothing reached the service");
+  assert.deepEqual(denied.h.of("tool").map((f) => f.status), ["denied"]);
+  const allowed = await run(["home-assistant"]);
+  assert.equal(allowed.result?.isError, false);
+  assert.deepEqual(forwarded, ["homeassistant__GetLiveContext"]);
+  gw.close();
 });
 
 // ------------------------------------------------------------------ S10: speech stream

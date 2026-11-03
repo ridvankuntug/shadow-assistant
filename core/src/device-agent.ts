@@ -31,14 +31,13 @@
 import { randomUUID } from "node:crypto";
 import {
   USAGE_LIMIT_ERROR_PREFIXES as SDK_USAGE_LIMIT_PREFIXES,
-  type CanUseTool,
   type Options,
-  type PermissionResult,
   type Query,
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { TurnStream, type TurnCallbacks } from "./agent.js";
+import type { BoundGate, GatewayGate } from "./mcp-gateway.js";
 import {
   SessionBusyError,
   SessionClosedError,
@@ -50,6 +49,8 @@ import {
   type OneShotRequest,
   type OneShotResult,
   type OpenSessionOptions,
+  type PermissionCallback,
+  type PermissionDecision,
   type ProviderCapabilities,
   type ProviderSession,
 } from "./model-provider.js";
@@ -168,7 +169,8 @@ export interface DeviceAgentOptions {
   buildOptions: (p: {
     model: string;
     resume?: string;
-    canUseTool: CanUseTool;
+    /** Forwards each gateway tool call to the current attempt's Core gate (`AttemptRequest.canUseTool`). */
+    gate: PermissionCallback;
     abortController: AbortController;
     memoryBrief?: string;
   }) => Omit<Options, "prompt">;
@@ -281,7 +283,7 @@ interface Note {
 
 type Slot = Attempt | Note;
 
-const CANCELLED_DENY: PermissionResult = { behavior: "deny", message: "Turn was cancelled." };
+const CANCELLED_DENY: PermissionDecision = { behavior: "deny", message: "Turn was cancelled." };
 
 function userMessage(text: string, shouldQuery: boolean): SDKUserMessage {
   return {
@@ -334,7 +336,7 @@ export class DeviceAgent implements ProviderSession {
     const options = opts.buildOptions({
       model: opts.model,
       resume: opts.resume,
-      canUseTool: this.dispatch,
+      gate: this.dispatch,
       abortController: this.abortController,
       ...(opts.systemAppend ? { memoryBrief: opts.systemAppend } : {}),
     });
@@ -616,20 +618,52 @@ export class DeviceAgent implements ProviderSession {
     }
   }
 
-  /** The one `canUseTool` of the query: forwards to the attempt that is current when the call starts. */
-  private readonly dispatch: CanUseTool = async (toolName, input, options) => {
+  /**
+   * The one gate of the query (called by the gateway inside each tool call):
+   * forwards to the attempt that is current when the call starts. The gateway
+   * uses `bindTurn` (`GatewayGate`) to pin that attempt at the very start of
+   * the call, before it may wait on a list refresh, and to check before
+   * forwarding that the attempt still runs.
+   */
+  private readonly dispatch: GatewayGate = Object.assign(
+    async (toolName: string, input: Record<string, unknown>, options: { signal: AbortSignal; toolUseID: string }) => {
+      const a = this.currentAttempt();
+      return a ? this.gateFor(a, toolName, input, options) : CANCELLED_DENY;
+    },
+    {
+      bindTurn: (): BoundGate | undefined => {
+        const a = this.currentAttempt();
+        if (!a) return undefined;
+        return {
+          gate: (toolName, input, options) => this.gateFor(a, toolName, input, options),
+          isCurrent: () => this.inflight === a && !a.settled && !a.stopReason,
+        };
+      },
+    },
+  );
+
+  private currentAttempt(): Attempt | undefined {
     const a = this.inflight;
-    if (!a || a.kind !== "attempt" || a.settled || a.stopReason) return CANCELLED_DENY;
+    return a && a.kind === "attempt" && !a.settled && !a.stopReason ? a : undefined;
+  }
+
+  private async gateFor(
+    a: Attempt,
+    toolName: string,
+    input: Record<string, unknown>,
+    options: { signal: AbortSignal; toolUseID: string },
+  ): Promise<PermissionDecision> {
+    if (a.settled || a.stopReason) return CANCELLED_DENY;
     this.pendingGateCalls++;
     try {
-      const r: PermissionResult = await a.req.canUseTool(toolName, input, { signal: options.signal, toolUseID: options.toolUseID });
+      const r = await a.req.canUseTool(toolName, input, { signal: options.signal, toolUseID: options.toolUseID });
       // The attempt may have been cancelled while the confirmation was open.
       if (a.settled || a.stopReason) return CANCELLED_DENY;
       return r;
     } finally {
       this.pendingGateCalls--;
     }
-  };
+  }
 
   private async pump(): Promise<void> {
     try {

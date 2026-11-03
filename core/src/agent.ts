@@ -4,8 +4,12 @@
  * Security posture (T2.1):
  *   - `tools: []` removes every built-in tool (Bash, Read, Write, Edit,
  *     WebFetch, …) from the model's context; `disallowedTools` repeats the
- *     common ones as defence in depth, and the permission gate denies any
- *     non-MCP tool that still shows up.
+ *     common ones as defence in depth, and the SDK `canUseTool` guard denies
+ *     any tool that is not a gateway tool (`gatewayToolGuard`).
+ *   - MCP (T7.y): the SDK only gets the Core MCP gateway's in-process servers
+ *     (`gateway-sdk.ts`); no service URL or token reaches the CLI. The
+ *     permission decision (levels, confirm, cancel) is taken by the Core gate
+ *     inside each tool call, not by the SDK.
  *   - `settingSources: []` + `strictMcpConfig: true`: nothing from the user's
  *     ~/.claude (settings, CLAUDE.md, MCP servers, plugins) is loaded.
  *   - Auth: the SDK uses the machine's Claude Code login; ANTHROPIC_API_KEY is
@@ -14,11 +18,11 @@
 import { mkdirSync } from "node:fs";
 import {
   query,
-  type CanUseTool,
   type McpServerConfig,
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { gatewayToolGuard } from "./gateway-sdk.js";
 import type { PermissionCallback } from "./model-provider.js";
 import { buildTurnEnvelope } from "./turn-envelope.js";
 
@@ -106,8 +110,12 @@ export interface SdkAgentOptions {
    * system prompt (the rule is conditional on `TIER1_MARKER`, turn-envelope.ts).
    */
   escalationPrompt?: string;
-  /** Built per turn: in-process MCP server instances cannot be shared between queries. */
-  mcpServers: () => Record<string, McpServerConfig>;
+  /**
+   * The gateway's servers for one query, bound to that query's Core gate
+   * (`gateway-sdk.ts` `createGatewaySdkServers`). Built per query:
+   * in-process MCP server instances cannot be shared between queries.
+   */
+  mcpServers: (gate: PermissionCallback) => Record<string, McpServerConfig>;
   /** Working directory of the SDK subprocess (keeps its session files apart). */
   cwd: string;
   maxTurns?: number;
@@ -122,8 +130,8 @@ export interface PersistentOptionsRequest {
   model: string;
   /** Session id to continue (A4 continuity), if any. */
   resume?: string;
-  /** The DeviceAgent's gate dispatcher; fixed for the life of the query. */
-  canUseTool: CanUseTool;
+  /** The DeviceAgent's gate dispatcher (to the current attempt's Core gate); fixed for the life of the query. */
+  gate: PermissionCallback;
   /** Owned by the DeviceAgent; aborted only on close. */
   abortController: AbortController;
   /** Memory brief (docs/06), appended to the static system prompt when present. */
@@ -166,7 +174,7 @@ export class SdkAgentRunner implements AgentRunner {
       req.escalatable && this.opts.escalationPrompt
         ? `${this.opts.systemPrompt}\n\n${this.opts.escalationPrompt}`
         : this.opts.systemPrompt;
-    let mcpServers = this.opts.mcpServers();
+    let mcpServers = this.opts.mcpServers(req.canUseTool);
     if (req.mcpServerNames) {
       const keep = new Set(req.mcpServerNames);
       mcpServers = Object.fromEntries(Object.entries(mcpServers).filter(([name]) => keep.has(name)));
@@ -182,7 +190,7 @@ export class SdkAgentRunner implements AgentRunner {
       settingSources: [],
       strictMcpConfig: true,
       mcpServers,
-      canUseTool: req.canUseTool,
+      canUseTool: gatewayToolGuard(Object.keys(mcpServers)),
       permissionMode: "default",
       includePartialMessages: true,
       abortController,
@@ -205,6 +213,7 @@ export class SdkAgentRunner implements AgentRunner {
 
   /** Options of a persistent streaming-input query; independent of the tier by design. */
   buildPersistentOptions(p: PersistentOptionsRequest): Omit<Options, "prompt"> {
+    const mcpServers = this.opts.mcpServers(p.gate);
     return {
       model: p.model,
       systemPrompt: { type: "custom", prompt: this.persistentSystemPrompt(p.memoryBrief), snapshot: false },
@@ -214,8 +223,8 @@ export class SdkAgentRunner implements AgentRunner {
       strictMcpConfig: true,
       // All enabled services: the tool list stays stable for the whole session;
       // per-tier service limits are enforced by the gate (docs/07 §Tier switching).
-      mcpServers: this.opts.mcpServers(),
-      canUseTool: p.canUseTool,
+      mcpServers,
+      canUseTool: gatewayToolGuard(Object.keys(mcpServers)),
       permissionMode: "default",
       includePartialMessages: true,
       abortController: p.abortController,

@@ -324,6 +324,7 @@ Every tool call the model attempts goes through the gate
 | `write` | Runs; recorded in the conversation log and the Core log. |
 | `confirm` | Waits for the user (see above). |
 | unknown tool/service | Treated as `confirm`. |
+| unclassified tool of a mirrored MCP service (no rule names it) | `confirm`, whatever the service default; noted in dev-notes ("new tool: classify"). |
 | built-in tools (Bash, Read, Write, WebFetch, …) | Always denied; they are also removed from the model's tool list. |
 
 Lookup per tool: exact name rule → first matching glob rule (file order,
@@ -332,6 +333,34 @@ a call to `confirm` when an argument (e.g. `domain`, `device_class`) has a liste
 value — used for locks, alarms and garage doors that generic intents like
 `HassTurnOn`/`HassTurnOff` can also drive. `CORE_READ_ONLY=1` denies every
 non-`read` tool without asking (smoke tests).
+
+### Core MCP gateway (T7.y)
+
+The model never talks to a service directly. The Core runs one MCP gateway
+([`core/src/mcp-gateway.ts`](../core/src/mcp-gateway.ts), provider-neutral):
+
+- Home Assistant's tool list is **mirrored** over the Core's own SSE connection
+  (the same one tier 0 uses, [`mcp-direct.ts`](../core/src/mcp-direct.ts)): same
+  names, descriptions, JSON schemas and server instructions. The vault and
+  memory tools are served by the same gateway. The model gets neither the HA
+  address nor the token.
+- Each call: known tool → the gate above (`Session.gate()`) → forward. A denied,
+  cancelled or failed call is an ordinary tool result with `isError: true`;
+  the turn goes on. Service errors reach the model as a short generic text,
+  details only the Core log.
+- Claude Agent SDK: one in-process MCP server per gateway service
+  ([`gateway-sdk.ts`](../core/src/gateway-sdk.ts)), so tool names stay
+  `mcp__<service>__<tool>`. The SDK's `canUseTool` only lets gateway tools
+  through to the gateway (where the decision is taken) and denies everything
+  else; built-in tools are also removed (`tools: []`) and listed in
+  `disallowedTools`. A confirmation now waits inside the tool call, so the
+  server's call timeout is `CORE_CONFIRM_TIMEOUT_MS` + the service timeout + 10 s.
+- The remote list is cached (served at once; refreshed in the background after
+  60 s; a real change is pushed to live sessions with `tools/list_changed`).
+  Each fresh list is recorded in `<SHADOW_DATA_DIR>/dev-notes/tools.json`: new
+  unclassified tools, added/removed tools (a rename shows as both) and exact
+  `services.yaml` rules whose tool is no longer listed — one entry each, with a
+  counter and last-seen time.
 
 ## Model and services
 
@@ -349,8 +378,9 @@ non-`read` tool without asking (smoke tests).
   `assistant_delta`, `assistant_done`) and its tool calls pass the same permission
   gate. A tier-1 answer arrives as a single `assistant_delta` (it is buffered so
   that an escalation to tier 2 stays invisible to the client).
-- Home Assistant is reached through its MCP Server integration over **SSE**
-  (`${HA_URL}/mcp_server/sse`, `Authorization: Bearer <HA_CORE_TOKEN>`).
+- Home Assistant is reached by the Core (never by the model process) through its
+  MCP Server integration over **SSE** (`${HA_URL}/mcp_server/sse`,
+  `Authorization: Bearer <HA_CORE_TOKEN>`); see "Core MCP gateway" above.
   HA's `/api/mcp` streamable-HTTP endpoint is not used (broken on the current HA version).
 - The `shadow-vault` tools (`list_notes`, `read_note`) read `.md` notes from
   `SHADOW_VAULT_DIR`, limited to the `allow` globs in `services.yaml`. `Private`

@@ -1,6 +1,6 @@
 /**
  * Read-only access to selected notes of the Shadow vault, exposed to the model
- * as an in-process SDK MCP server (`shadow-vault`: `list_notes`, `read_note`).
+ * through the Core MCP gateway (`shadow-vault`: `list_notes`, `read_note`).
  *
  * Guarantees (enforced on the resolved real path, so symlinks cannot escape):
  *   - only paths inside SHADOW_VAULT_DIR
@@ -11,9 +11,9 @@
  */
 import { open, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { matchGlob } from "./glob.js";
+import type { LocalTool } from "./mcp-gateway.js";
 
 export const DEFAULT_MAX_BYTES = 64 * 1024;
 const MAX_LIST_ENTRIES = 300;
@@ -195,48 +195,40 @@ export class VaultReader {
   }
 }
 
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], isError };
-}
-
 export const VAULT_SERVER_NAME = "shadow-vault";
 
-export function createVaultMcpServer(reader: VaultReader, name = VAULT_SERVER_NAME): McpSdkServerConfigWithInstance {
-  return createSdkMcpServer({
-    name,
-    version: "1.0.0",
-    alwaysLoad: true,
-    tools: [
-      tool(
-        "list_notes",
-        "Shadow vault'unda okunmasına izin verilen notları listeler (salt okuma).",
-        { folder: z.string().max(300).optional().describe("İsteğe bağlı alt klasör, vault köküne göre") },
-        async ({ folder }) => {
-          try {
-            const { notes, truncated } = await reader.list(folder);
-            const body = notes.length > 0 ? notes.join("\n") : "(izinli not yok)";
-            return textResult(truncated ? `${body}\n(liste kısaltıldı)` : body);
-          } catch (err) {
-            return textResult(err instanceof VaultAccessError ? err.message : "listing failed", true);
-          }
-        },
-        { annotations: { readOnlyHint: true } },
-      ),
-      tool(
-        "read_note",
-        "Shadow vault'undan izinli bir notu okur (salt okuma, boyut sınırlı).",
-        { path: z.string().min(1).max(500).describe("Notun vault köküne göre yolu, ör. knowledge/konu.md") },
-        async ({ path }) => {
-          try {
-            const r = await reader.read(path);
-            const tail = r.truncated ? `\n\n[not ${reader.maxBytes} bayttan sonra kesildi]` : "";
-            return textResult(`# ${r.path}\n\n${r.text}${tail}`);
-          } catch (err) {
-            return textResult(err instanceof VaultAccessError ? err.message : "read failed", true);
-          }
-        },
-        { annotations: { readOnlyHint: true } },
-      ),
-    ],
-  });
+/** The vault's tools for the gateway (`kind: local` source). */
+export function vaultTools(reader: VaultReader): LocalTool[] {
+  return [
+    {
+      name: "list_notes",
+      description: "Shadow vault'unda okunmasına izin verilen notları listeler (salt okuma).",
+      shape: { folder: z.string().max(300).optional().describe("İsteğe bağlı alt klasör, vault köküne göre") },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        try {
+          const { notes, truncated } = await reader.list(args.folder as string | undefined);
+          const body = notes.length > 0 ? notes.join("\n") : "(izinli not yok)";
+          return { text: truncated ? `${body}\n(liste kısaltıldı)` : body, isError: false };
+        } catch (err) {
+          return { text: err instanceof VaultAccessError ? err.message : "listing failed", isError: true };
+        }
+      },
+    },
+    {
+      name: "read_note",
+      description: "Shadow vault'undan izinli bir notu okur (salt okuma, boyut sınırlı).",
+      shape: { path: z.string().min(1).max(500).describe("Notun vault köküne göre yolu, ör. knowledge/konu.md") },
+      annotations: { readOnlyHint: true },
+      handler: async (args) => {
+        try {
+          const r = await reader.read(args.path as string);
+          const tail = r.truncated ? `\n\n[not ${reader.maxBytes} bayttan sonra kesildi]` : "";
+          return { text: `# ${r.path}\n\n${r.text}${tail}`, isError: false };
+        } catch (err) {
+          return { text: err instanceof VaultAccessError ? err.message : "read failed", isError: true };
+        }
+      },
+    },
+  ];
 }

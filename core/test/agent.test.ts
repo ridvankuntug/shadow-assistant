@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { after, test } from "node:test";
-import type { CanUseTool, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionCallback } from "../src/model-provider.js";
 import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
 import { buildTurnEnvelope, DIRECT_NOTES_END, DIRECT_NOTES_START, TIER1_MARKER, wrapDirectNotes } from "../src/turn-envelope.js";
 
@@ -127,16 +128,17 @@ test("persistent options: one static prompt with tier1.md, all MCP servers, no t
     mcpServers: () => ({ a: { type: "sse", url: "http://localhost:1/a" }, b: { type: "sse", url: "http://localhost:1/b" } }),
     cwd: join(base, "cwd"),
   });
-  const gate: CanUseTool = async () => ({ behavior: "deny", message: "" });
+  const gate: PermissionCallback = async () => ({ behavior: "deny", message: "" });
   const ac = new AbortController();
-  const a = runner.buildPersistentOptions({ model: "haiku", canUseTool: gate, abortController: ac });
-  const b = runner.buildPersistentOptions({ model: "haiku", canUseTool: gate, abortController: ac });
-  assert.deepEqual({ ...a, env: undefined }, { ...b, env: undefined }, "nothing per-turn in the options");
+  const a = runner.buildPersistentOptions({ model: "haiku", gate, abortController: ac });
+  const b = runner.buildPersistentOptions({ model: "haiku", gate, abortController: ac });
+  // The SDK guard is a fresh closure per query; everything else is identical.
+  assert.deepEqual({ ...a, env: undefined, canUseTool: undefined }, { ...b, env: undefined, canUseTool: undefined }, "nothing per-turn in the options");
   assert.deepEqual(a.systemPrompt, { type: "custom", prompt: "sys\n\nesc", snapshot: false });
   assert.deepEqual(Object.keys(a.mcpServers ?? {}), ["a", "b"]);
   assert.equal(a.forkSession, undefined);
   assert.equal("resume" in a, false);
-  assert.equal(a.canUseTool, gate);
+  assert.notEqual(a.canUseTool, gate, "the Core gate runs inside the gateway call, not in the SDK");
   assert.equal(a.abortController, ac);
   assert.equal(a.maxTurns, 12);
   assert.deepEqual(a.tools, []);
@@ -144,7 +146,7 @@ test("persistent options: one static prompt with tier1.md, all MCP servers, no t
   assert.equal(a.strictMcpConfig, true);
   assert.equal(a.includePartialMessages, true);
   assert.equal(a.allowedTools, undefined);
-  const resumed = runner.buildPersistentOptions({ model: "haiku", resume: "s9", canUseTool: gate, abortController: ac, memoryBrief: "mem" });
+  const resumed = runner.buildPersistentOptions({ model: "haiku", resume: "s9", gate, abortController: ac, memoryBrief: "mem" });
   assert.equal(resumed.resume, "s9");
   assert.deepEqual(resumed.systemPrompt, { type: "custom", prompt: "sys\n\nesc\n\nmem", snapshot: false });
 });
