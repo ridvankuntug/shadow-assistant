@@ -10,7 +10,11 @@ import { parse as parseYaml } from "yaml";
 export type PermissionLevel = "read" | "write" | "confirm";
 export const PERMISSION_LEVELS: readonly PermissionLevel[] = ["read", "write", "confirm"];
 
-export type ServiceKind = "mcp" | "http" | "vault" | "memory";
+/**
+ * `device` is Core-internal (the built-in `shadow-device` service, device-state.ts);
+ * services.yaml cannot declare it.
+ */
+export type ServiceKind = "mcp" | "http" | "vault" | "memory" | "device";
 export type McpTransport = "sse" | "http";
 
 export interface ToolRule {

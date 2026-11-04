@@ -1,5 +1,6 @@
 /**
- * HTTP + WebSocket server: `GET /health` and the `/ws` endpoint.
+ * HTTP + WebSocket server: `GET /health`, `POST /device/state` (T11, see
+ * `handleDeviceState`) and the `/ws` endpoint.
  *
  * Authentication: the first frame must be `hello` with a valid device token
  * within HELLO_TIMEOUT_MS; otherwise `{"type":"error","code":"unauthorized"}`
@@ -7,9 +8,14 @@
  * every connection is refused.
  */
 import { randomUUID } from "node:crypto";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { authenticate, type DeviceTokens } from "./auth.js";
+import {
+  MAX_DEVICE_STATE_BYTES,
+  parseDeviceStateBody,
+  type CaseBatteryReading,
+} from "./device-state.js";
 import {
   CLOSE_PROTOCOL_ERROR,
   CLOSE_UNAUTHORIZED,
@@ -40,7 +46,19 @@ export interface CoreServerOptions {
    * `services` frame.
    */
   serviceHealth?: ServiceHealthSource;
+  /** Store of `POST /device/state` readings; absent = the route answers 404 like any unknown path. */
+  deviceState?: DeviceStateSink;
+  /** Body timeout of `POST /device/state`; default DEVICE_STATE_BODY_TIMEOUT_MS. */
+  deviceStateBodyTimeoutMs?: number;
+  /** Clock for the reading time checks of `POST /device/state`. */
+  now?: () => number;
 }
+
+export interface DeviceStateSink {
+  recordCaseBattery(device: string, reading: CaseBatteryReading): Promise<{ stored: boolean }>;
+}
+
+export const DEVICE_STATE_PATH = "/device/state";
 
 export interface ServiceHealthSource {
   snapshot(): ServiceHealth[] | undefined;
@@ -60,9 +78,151 @@ function rawToString(data: RawData): string {
   return Buffer.from(data).toString("utf8");
 }
 
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { "Content-Type": "application/json", ...headers });
+  res.end(JSON.stringify(body));
+}
+
+/**
+ * Error answer sent before the request body was (fully) read: the connection
+ * is closed after the response instead of draining an unread, possibly large
+ * body to keep it alive.
+ */
+function refuse(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  sendJson(res, status, body, { Connection: "close", ...headers });
+}
+
+/** The bearer token of the `Authorization` header, or undefined. The query string is never looked at. */
+export function bearerToken(header: string | undefined): string | undefined {
+  const m = /^Bearer[ \t]+(\S+)[ \t]*$/i.exec(header ?? "");
+  return m ? m[1] : undefined;
+}
+
+/** `application/json`, with or without parameters (`; charset=utf-8`). */
+function isJsonContentType(header: string | undefined): boolean {
+  return ((header ?? "").split(";")[0] ?? "").trim().toLowerCase() === "application/json";
+}
+
+/** Longest time the body of a `POST /device/state` may take to arrive. */
+export const DEVICE_STATE_BODY_TIMEOUT_MS = 10_000;
+
+type BodyRead = { ok: true; body: Buffer } | { ok: false; reason: "too_large" | "aborted" };
+
+/**
+ * Reads at most `limit` bytes of the body. Stops reading as soon as the body
+ * turns out to be larger (`too_large`); a stream error, a connection closed
+ * before the end or a body slower than `timeoutMs` is `aborted`.
+ */
+function readBodyLimited(req: IncomingMessage, limit: number, timeoutMs: number): Promise<BodyRead> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const timer = setTimeout(() => finish({ ok: false, reason: "aborted" }), timeoutMs);
+    const finish = (v: BodyRead) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onAbort);
+      req.off("close", onAbort);
+      if (!v.ok) req.pause();
+      resolve(v);
+    };
+    const onData = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) finish({ ok: false, reason: "too_large" });
+      else chunks.push(chunk);
+    };
+    const onEnd = () => finish({ ok: true, body: Buffer.concat(chunks) });
+    const onAbort = () => finish({ ok: false, reason: "aborted" });
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onAbort);
+    req.on("close", onAbort);
+  });
+}
+
 export function createCoreServer(opts: CoreServerOptions): CoreServer {
-  const http = createServer((req, res) => {
+  const now = opts.now ?? Date.now;
+
+  /** The device of a valid `Authorization: Bearer` header, or null. */
+  const deviceOf = (req: IncomingMessage): string | null => {
+    const token = bearerToken(req.headers.authorization);
+    return token !== undefined && opts.tokens.digests.size > 0 ? authenticate(opts.tokens, token) : null;
+  };
+
+  /**
+   * `POST /device/state` (docs/02-core-protocol.md, "Device state"). Order:
+   * method (405) → bearer token from the header, before any body byte is
+   * read (401) → content type (415) → size, declared or counted (413) → JSON
+   * and fields (400) → store → 204. The device name comes from the token,
+   * never from the body; the token is never logged.
+   */
+  async function handleDeviceState(req: IncomingMessage, res: ServerResponse, sink: DeviceStateSink): Promise<void> {
+    if (req.method !== "POST") {
+      refuse(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
+      return;
+    }
+    const device = deviceOf(req);
+    if (!device) {
+      opts.logger.warn("[shadow-core] rejected device state: invalid device token");
+      refuse(res, 401, { error: "unauthorized" });
+      return;
+    }
+    if (!isJsonContentType(req.headers["content-type"])) {
+      refuse(res, 415, { error: "unsupported_media_type" });
+      return;
+    }
+    const declared = req.headers["content-length"];
+    if (declared !== undefined && Number(declared) > MAX_DEVICE_STATE_BYTES) {
+      refuse(res, 413, { error: "payload_too_large" });
+      return;
+    }
+    const read = await readBodyLimited(req, MAX_DEVICE_STATE_BYTES, opts.deviceStateBodyTimeoutMs ?? DEVICE_STATE_BODY_TIMEOUT_MS);
+    if (!read.ok) {
+      if (read.reason === "too_large") refuse(res, 413, { error: "payload_too_large" });
+      // Client gone, broken or too slow: no answer, drop the connection.
+      else req.socket.destroy();
+      return;
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(read.body.toString("utf8"));
+    } catch {
+      sendJson(res, 400, { error: "bad_request", message: "body is not valid JSON" });
+      return;
+    }
+    const parsed = parseDeviceStateBody(body, now());
+    if (!parsed.ok) {
+      sendJson(res, 400, { error: "bad_request", message: parsed.message });
+      return;
+    }
+    try {
+      const r = await sink.recordCaseBattery(device, parsed.caseBattery);
+      opts.logger.info(
+        `[shadow-core] device '${device}' case battery ${r.stored ? "stored" : "ignored (older than the stored reading)"}`,
+      );
+    } catch (err) {
+      opts.logger.warn(`[shadow-core] device '${device}' state not stored: ${(err as Error)?.name ?? "error"}`);
+      sendJson(res, 500, { error: "internal" });
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  }
+
+  const onRequest = (req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? "/").split("?")[0];
+    if (path === DEVICE_STATE_PATH && opts.deviceState) {
+      const sink = opts.deviceState;
+      handleDeviceState(req, res, sink).catch(() => {
+        if (!res.headersSent) refuse(res, 500, { error: "internal" });
+        else res.destroy();
+      });
+      return;
+    }
     if (req.method === "GET" && path === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", service: "core", version: CORE_VERSION, ...(opts.health?.() ?? {}) }));
@@ -70,6 +230,16 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     }
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "not_found" }));
+  };
+  const http = createServer(onRequest);
+  // `Expect: 100-continue`: Node would ask for the body at once; for the
+  // device-state path the token is checked first, so an unauthenticated
+  // client is answered 401 without being invited to send its body.
+  http.on("checkContinue", (req: IncomingMessage, res: ServerResponse) => {
+    const path = (req.url ?? "/").split("?")[0];
+    const refuseFirst = path === DEVICE_STATE_PATH && opts.deviceState !== undefined && (req.method !== "POST" || !deviceOf(req));
+    if (!refuseFirst) res.writeContinue();
+    onRequest(req, res);
   });
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });

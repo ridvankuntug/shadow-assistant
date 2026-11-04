@@ -9,6 +9,7 @@ shell) uses. TypeScript types for all frames live in a single module:
   `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true,"status":"down","detail"?:"timeout"}]}`
   (`status` and `detail` as in *Service health*; `status` is `unknown` before the first check round and
   `detail` is present only when the check set one. No URLs, tokens or error messages.)
+- Device state: `POST http://<core-host>:<CORE_PORT>/device/state` (bearer token; see *Device state*).
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
   every frame that belongs to that turn.
@@ -342,7 +343,7 @@ The model never talks to a service directly. The Core runs one MCP gateway
 - Home Assistant's tool list is **mirrored** over the Core's own SSE connection
   (the same one tier 0 uses, [`mcp-direct.ts`](../core/src/mcp-direct.ts)): same
   names, descriptions, JSON schemas and server instructions. The vault and
-  memory tools are served by the same gateway. The model gets neither the HA
+  memory tools and the built-in `shadow-device` tool (see *Device state*) are served by the same gateway. The model gets neither the HA
   address nor the token.
 - Each call: known tool → the gate above (`Session.gate()`) → forward. A denied,
   cancelled or failed call is an ordinary tool result with `isError: true`;
@@ -361,6 +362,82 @@ The model never talks to a service directly. The Core runs one MCP gateway
   unclassified tools, added/removed tools (a rename shows as both) and exact
   `services.yaml` rules whose tool is no longer listed — one entry each, with a
   counter and last-seen time.
+
+## Device state (T11)
+
+Besides the WebSocket, the phone reports device state over plain HTTP on the
+same port. Today this is only the Galaxy Buds **case battery**, which the phone
+gets from the Buds Case Widget. The percentage can only be read while the case
+lid is open (in practice when the earbuds are taken out), so a reading says
+nothing about charging; an old reading stays valid and is reported with its age.
+
+`POST http://<core-host>:<CORE_PORT>/device/state`
+([`core/src/server.ts`](../core/src/server.ts),
+[`core/src/device-state.ts`](../core/src/device-state.ts))
+
+- **Auth:** `Authorization: Bearer <device token>`, the same `DEVICE_TOKEN_<NAME>`
+  tokens as the WebSocket (constant-time comparison, never logged). The device
+  name comes from the token, never from the body. A token in the URL/query is
+  ignored (and does not authenticate).
+- **Body:** `Content-Type: application/json` (parameters such as
+  `; charset=utf-8` allowed), at most **4096 bytes**:
+
+  ```json
+  {"caseBattery":{"percent":57,"atEpochMs":1793793600000,"source":"buds-case-widget"}}
+  ```
+
+  | Field | Rule |
+  |---|---|
+  | `caseBattery` | required object |
+  | `percent` | integer 0–100 |
+  | `atEpochMs` | integer (epoch ms, when the phone read it); at most 5 min ahead of the Core clock and at most 365 days in the past |
+  | `source` | optional string, at most 64 characters (`null` counts as absent) |
+
+  Unknown top-level and `caseBattery` fields are ignored.
+- **Responses**, checked in this order:
+
+  | Status | Body | When |
+  |---|---|---|
+  | `405` | `{"error":"method_not_allowed"}`, `Allow: POST` | any method other than `POST` on this path |
+  | `401` | `{"error":"unauthorized"}` | missing, malformed or unknown token (the body is not read) |
+  | `415` | `{"error":"unsupported_media_type"}` | content type is not `application/json` |
+  | `413` | `{"error":"payload_too_large"}` | declared or actual body over 4096 bytes (reading stops there) |
+  | `400` | `{"error":"bad_request","message":"…"}` | not JSON, or a field breaks the rules above |
+  | `204` | none | accepted (stored, or ignored as older — see below) |
+  | `500` | `{"error":"internal"}` | the reading could not be stored (also: a device name that cannot be a file name — only `a-z`, `0-9`, `_`, `-`, not a Windows device name such as `nul`; the Core warns about such tokens at startup) |
+
+  Error answers sent before the body was fully read close the connection. A
+  body that does not arrive within 10 s, or a client that disconnects mid-body,
+  gets no answer (the connection is dropped). With `Expect: 100-continue` the
+  method and token are checked before `100 Continue` is sent, so a refused
+  client is never asked for its body.
+- **Storage:** `<SHADOW_DATA_DIR>/device-state/<device>.json`, one file per
+  device, written atomically (temp file + fsync + rename):
+
+  ```json
+  {"device":"android","caseBattery":{"percent":57,"atEpochMs":1793793600000,
+   "source":"buds-case-widget","receivedAtEpochMs":1793793601234}}
+  ```
+
+  A reading replaces the stored one only if its `atEpochMs` is newer or equal;
+  an older one (e.g. a delayed retry from the phone) still gets `204` but is not
+  written. Requests of one device are serialized. A corrupt file is moved to
+  `<file>.corrupt-<ts>` and treated as absent.
+
+### `case_battery` tool
+
+The gateway serves a built-in local service `shadow-device` with one tool,
+`mcp__shadow-device__case_battery` (no arguments, level **`read`**,
+`readOnlyHint`). It is Core-internal: not declared in `services.yaml`, no health
+check, not in the `services` list (a `services.yaml` service named
+`shadow-device`, even a disabled one, turns the built-in one off). Over all device files it returns
+the reading with the newest `atEpochMs` as Turkish text: percent, reading time
+(local `YYYY-MM-DD HH:mm` on the Core machine plus ISO UTC), age ("12 dakika
+önce", "3 saat 5 dakika önce", "2 gün 4 saat önce"), the device and `source` (as one quoted line: control
+and line-break characters are replaced, so it cannot add lines to the answer),
+and a note that this is the value from the last time the case was opened and
+does not show whether the case is charging. Without any reading it says
+"Henüz kılıf bataryası okuması yok".
 
 ## Model and services
 

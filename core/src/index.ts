@@ -12,6 +12,7 @@ import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
 import { DevNotes } from "./dev-notes.js";
 import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
+import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { MemoryExtractor } from "./memory/extractor.js";
@@ -122,6 +123,11 @@ export async function main(): Promise<void> {
 
   const tokens = loadDeviceTokens();
   for (const name of tokens.rejected) logger.warn(`[shadow-core] ${name} ignored: shorter than 16 characters`);
+  for (const device of tokens.digests.keys()) {
+    if (!isUsableDeviceName(device)) {
+      logger.warn(`[shadow-core] device '${device}': name not usable as a file name (a-z, 0-9, '_', '-'); its POST /device/state gets 500`);
+    }
+  }
   if (tokens.digests.size === 0) {
     throw new Error("no device tokens configured (set at least one DEVICE_TOKEN_<NAME> in .env); refusing to start");
   }
@@ -157,11 +163,21 @@ export async function main(): Promise<void> {
   const log = new ConversationLog(cfg.dataDir);
   await log.ensureDir();
 
-  const policy = new PermissionPolicy(cfg.services.services, { readOnly: cfg.readOnly });
+  // Phone-reported device state (T11): written by POST /device/state, read by the case_battery tool.
+  const deviceState = new DeviceStateStore({
+    dir: join(cfg.dataDir, "device-state"),
+    log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
+  });
+  const deviceService = deviceStateService(cfg.services.services, deviceState);
+  if (!deviceService) logger.warn(`[shadow-core] services.yaml declares '${DEVICE_SERVICE_NAME}'; the built-in case_battery tool is off`);
+  const policy = new PermissionPolicy(
+    deviceService ? [...cfg.services.services, deviceService.def] : cfg.services.services,
+    { readOnly: cfg.readOnly },
+  );
   // One MCP client per remote service, shared by tier 0 and the gateway (one SSE connection).
   const mcpClient = new McpDirectClient(cfg.services.services, process.env);
   const gateway = new McpGateway({
-    sources: buildGatewaySources(cfg, mcpClient, memory),
+    sources: [...buildGatewaySources(cfg, mcpClient, memory), ...(deviceService ? [deviceService.source] : [])],
     classifier: policy,
     devNotes: new DevNotes({ dir: join(cfg.dataDir, "dev-notes"), log: (m) => logger.warn(m) }),
     log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
@@ -324,6 +340,7 @@ export async function main(): Promise<void> {
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
     features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : [])],
     serviceHealth: monitor,
+    deviceState,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
 
