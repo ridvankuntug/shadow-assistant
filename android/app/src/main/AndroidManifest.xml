@@ -13,6 +13,9 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Confirmation requests while the app is in the background (Android 13+ runtime permission). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Galaxy Buds case battery shared by Buds Case Widget (T11): its read-only provider and change
+         broadcast. "dangerous", defined by that app: asked once at startup only if it is installed. -->
+    <uses-permission android:name="io.github.budscasewidget.permission.READ_CASE_BATTERY" />
 
     <uses-feature
         android:name="android.hardware.microphone"
@@ -23,6 +26,8 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <!-- Buds Case Widget: its permission and provider must be visible to check their owner. -->
+        <package android:name="io.github.budscasewidget" />
     </queries>
 
     <!-- The token blob is useless elsewhere (its Keystore key never leaves the device): no backups. -->
@@ -85,5 +90,20 @@
                 android:name="android.speech"
                 android:resource="@xml/recognition_service" />
         </service>
+
+        <!-- Buds Case Widget change broadcast (T11). Sent explicitly to this package with
+             sendBroadcast(intent, READ_CASE_BATTERY), so only a holder of the permission gets it.
+             No android:permission here: the sender does not hold READ_CASE_BATTERY itself, so that
+             would block the real broadcast. Exported because the sender is another app; any app
+             could send it, so the receiver ignores the extras and only enqueues a job that reads
+             the permission-protected provider (see CaseBatterySync). -->
+        <receiver
+            android:name=".CaseBatteryReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="io.github.budscasewidget.action.CASE_BATTERY_CHANGED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

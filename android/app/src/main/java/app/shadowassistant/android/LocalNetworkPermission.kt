@@ -25,10 +25,17 @@ object LocalNetworkPermission {
      * Permissions to ask for in one dialog sequence at startup. Android runs only
      * one permission request at a time (a second concurrent request is answered
      * with an empty result at once), so the local network permission and the
-     * one-time notification prompt go out together.
+     * one-time notification prompt go out together, with the one-time Buds case
+     * battery permission ([CaseBattery.shouldAsk] decides [askCaseBattery]).
      */
-    fun startupRequest(sdk: Int, localNetworkGranted: Boolean, askNotifications: Boolean): List<String> = buildList {
+    fun startupRequest(
+        sdk: Int,
+        localNetworkGranted: Boolean,
+        askNotifications: Boolean,
+        askCaseBattery: Boolean = false,
+    ): List<String> = buildList {
         if (missing(sdk, localNetworkGranted)) add(PERMISSION)
         if (askNotifications && sdk >= POST_NOTIFICATIONS_SINCE_SDK) add(POST_NOTIFICATIONS)
+        if (askCaseBattery) add(CaseBattery.PERMISSION)
     }
 }

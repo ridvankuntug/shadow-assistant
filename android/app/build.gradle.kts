@@ -94,6 +94,8 @@ androidComponents {
 dependencies {
     implementation("androidx.core:core-ktx:1.19.1")
     implementation("androidx.webkit:webkit:1.18.0")
+    // One-off, network-constrained job that forwards the Buds case battery to the Core (T11).
+    implementation("androidx.work:work-runtime-ktx:2.12.0")
 
     testImplementation("junit:junit:4.13.2")
     // Real org.json for JVM unit tests (android.jar only has stubs).

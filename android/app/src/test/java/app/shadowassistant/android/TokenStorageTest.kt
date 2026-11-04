@@ -148,4 +148,92 @@ class TokenStorageTest {
         BridgeStorage(plain, MapStore(), cipher) {}.seedDefaults(MapStore())
         assertEquals("wss://example.test/ws", plain.map[BridgeStorage.CORE_URL_KEY])
     }
+
+    // --- connection pair (address + token as one snapshot) ---------------------
+
+    private val newUrl = "wss://new.example.test/ws"
+
+    @Test
+    fun addressWithoutItsTokenIsNotAPair() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, "wss://old.example.test/ws")
+        s.set(BridgeStorage.TOKEN_KEY, "old-token")
+        // UI saving a new connection: address written, token not yet.
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        assertNull(s.connection())
+        // The page still sees both keys as before (bridge contract unchanged).
+        assertEquals(newUrl, s.get(BridgeStorage.CORE_URL_KEY))
+        assertEquals("old-token", s.get(BridgeStorage.TOKEN_KEY))
+    }
+
+    @Test
+    fun tokenWriteCompletesThePair() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        assertEquals(BridgeStorage.Connection(newUrl, token), s.connection())
+        assertFalse(s.connection().toString().contains(token))
+    }
+
+    @Test
+    fun installWithoutTheFlagIsClean() {
+        // Address and token saved by a version before the flag existed.
+        val plain = MapStore()
+        val secret = MapStore()
+        BridgeStorage(plain, secret, cipher) {}.set(BridgeStorage.TOKEN_KEY, token)
+        plain.put(BridgeStorage.CORE_URL_KEY, newUrl)
+        assertNull(secret.get(BridgeStorage.PAIR_DIRTY_KEY))
+        assertEquals(BridgeStorage.Connection(newUrl, token), BridgeStorage(plain, secret, cipher) {}.connection())
+    }
+
+    @Test
+    fun failedTokenWriteLeavesThePairDirty() {
+        val plain = MapStore()
+        val secret = MapStore()
+        BridgeStorage(plain, secret, cipher) {}.set(BridgeStorage.TOKEN_KEY, "old-token")
+        val failing = object : TokenCipher {
+            override fun encrypt(plain: String): String = throw GeneralSecurityException("keystore unavailable")
+            override fun decrypt(blob: String): String? = cipher.decrypt(blob)
+        }
+        val s = BridgeStorage(plain, secret, failing) {}
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        assertFalse(s.set(BridgeStorage.TOKEN_KEY, token))
+        assertNull(s.connection())
+    }
+
+    @Test
+    fun dirtyFlagSurvivesARestart() {
+        // Process died between the two writes: a new instance over the same stores is still dirty.
+        val plain = MapStore()
+        val secret = MapStore()
+        BridgeStorage(plain, secret, cipher) {}.apply {
+            set(BridgeStorage.TOKEN_KEY, "old-token")
+            set(BridgeStorage.CORE_URL_KEY, newUrl)
+        }
+        val reopened = BridgeStorage(plain, secret, cipher) {}
+        assertNull(reopened.connection())
+        reopened.set(BridgeStorage.TOKEN_KEY, token)
+        assertEquals(BridgeStorage.Connection(newUrl, token), reopened.connection())
+    }
+
+    @Test
+    fun dirtyFlagIsNotVisibleToThePage() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        assertNull(s.get(BridgeStorage.PAIR_DIRTY_KEY))
+        // The page writing or removing that key name touches only its own plain key.
+        s.remove(BridgeStorage.PAIR_DIRTY_KEY)
+        assertNull(s.connection())
+    }
+
+    @Test
+    fun missingHalfIsNotAPair() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        assertNull(s.connection())
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        s.remove(BridgeStorage.TOKEN_KEY)
+        assertNull(s.connection())
+    }
 }

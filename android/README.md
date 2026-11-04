@@ -14,7 +14,10 @@ role (opens from the assist gesture / power key).
   Assistant or a model. The WebSocket and `hello`/token flow are the UI's own,
   identical to the browser (`client: "android"`).
 - No wake word, nothing listens in the background. The microphone is only open
-  while you hold/latch the talk button in the foreground.
+  while you hold/latch the talk button in the foreground. The one background
+  exception is the Buds case battery (below): a manifest broadcast receiver and
+  a one-off WorkManager job — no service, no persistent notification, no
+  periodic work.
 
 | | |
 |---|---|
@@ -36,6 +39,8 @@ role (opens from the assist gesture / power key).
 | `TokenCipher.kt`, `BridgeStorage.kt` | Keystore-encrypted device token, plain other keys |
 | `CoreAddress.kt`, `CoreProbe.kt` | Default Core address, cleartext allowlist, reachability check |
 | `LocalNetworkPermission.kt` | When the Android 17 local network permission is needed / asked at startup |
+| `CaseBattery.kt`, `CaseBatterySync.kt` | Buds case battery: validation, Core request, receiver + WorkManager job |
+| `AppStorage.kt` | Opens the stores (shared by the activity and the background job) |
 | `assist/AssistServices.kt` | `VoiceInteractionService` + session + recognition stub |
 | `res/xml/network_security_config.xml` | Cleartext only to `192.168.1.2` |
 
@@ -123,6 +128,23 @@ gerekli", not "Çekirdeğe ulaşılamıyor") offers **Tekrar dene** (asks again)
 and **Ayarları aç** (the app's settings page); granting it there and coming
 back loads the UI without restarting the app. Older Android versions do not
 have this permission and are unaffected.
+
+**Buds case battery (T11).** Shadow does not read the Galaxy Buds case
+itself; [Buds Case Widget](https://github.com/ridvankuntug/BudsCaseWidget)
+(v0.2.0+) does and shares the last value (read-only provider + change
+broadcast, permission `io.github.budscasewidget.permission.READ_CASE_BATTERY`,
+protection level `dangerous`). If that app is installed, Shadow asks for the
+permission once at startup, in the same dialog sequence as the others; if it
+is not installed or the permission is denied, only this feature is off (allow
+it later under the app's permissions in Settings). On the change broadcast,
+whenever the app comes to the foreground and when the token is saved, a one-off unique
+WorkManager job (needs a network; a newer trigger replaces it) reads the
+provider and sends `POST /device/state` to the Core with the stored address
+(`ws`→`http`, `wss`→`https`) and the device token as a bearer header. It gives
+up quietly without the local network permission, token or address, retries
+network errors/5xx at most 5 times and gives up on other answers (any 4xx). The
+broadcast's extras are ignored (any app could send it): the value always
+comes from the provider, whose owner is checked.
 
 ## Security notes
 

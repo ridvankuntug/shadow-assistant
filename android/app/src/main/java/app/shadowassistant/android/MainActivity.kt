@@ -4,7 +4,6 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -101,13 +100,8 @@ class MainActivity : Activity() {
         secondaryButton = findViewById(R.id.error_secondary)
         applyInsets()
 
-        storage = BridgeStorage(
-            plain = SharedPrefsStore(getSharedPreferences(PREFS_PLAIN, Context.MODE_PRIVATE)),
-            secret = SharedPrefsStore(getSharedPreferences(PREFS_SECRET, Context.MODE_PRIVATE)),
-            cipher = AesGcmTokenCipher({ AndroidKeystoreKey.getOrCreate(KEY_ALIAS) }, BridgeStorage.TOKEN_KEY.toByteArray()),
-            log = { Log.w(TAG, it) },
-        )
-        val flags = SharedPrefsStore(getSharedPreferences(PREFS_FLAGS, Context.MODE_PRIVATE))
+        storage = AppStorage.bridge(this) { Log.w(TAG, it) }
+        val flags = AppStorage.flags(this)
         storage.seedDefaults(flags)
 
         focus = AudioFocus(getSystemService(AudioManager::class.java), main)
@@ -130,7 +124,14 @@ class MainActivity : Activity() {
 
         val askNotify = flags.get(FLAG_NOTIFY_ASKED) == null
         if (askNotify) flags.put(FLAG_NOTIFY_ASKED, "1")
-        val startup = LocalNetworkPermission.startupRequest(Build.VERSION.SDK_INT, localNetworkGranted(), askNotify)
+        // Buds case battery (T11): asked once, only if Buds Case Widget is installed; a refusal turns off only this feature.
+        val askCase = CaseBattery.shouldAsk(
+            installed = CaseBatterySync.installed(this),
+            granted = CaseBatterySync.granted(this),
+            askedBefore = flags.get(FLAG_CASE_BATTERY_ASKED) != null,
+        )
+        if (askCase) flags.put(FLAG_CASE_BATTERY_ASKED, "1")
+        val startup = LocalNetworkPermission.startupRequest(Build.VERSION.SDK_INT, localNetworkGranted(), askNotify, askCase)
         // Without the local network permission the UI's first WebSocket would fail; load it
         // once the request is answered (onRequestPermissionsResult) instead.
         uiDeferred = localNetworkMissing()
@@ -241,6 +242,9 @@ class MainActivity : Activity() {
             notify = notifier::notify,
             onStorageChanged = { key ->
                 if (key == BridgeStorage.CORE_URL_KEY || key == BridgeStorage.TOKEN_KEY) checkCore()
+                // Connecting: the UI writes the address first and the token last, so trigger on the
+                // token only (the job then finds a matching address/token pair).
+                if (key == BridgeStorage.TOKEN_KEY) CaseBatterySync.syncIfAllowed(this)
             },
         )
         // Injected before the first load so selectAdapter() finds it (docs/03 §2).
@@ -399,6 +403,9 @@ class MainActivity : Activity() {
         // otherwise, so the resume after the permission dialog cannot ask again in a loop.
         resumeDeferredUi(explain = false)
         checkCore()
+        // Opening the app (also a return from Settings or a permission dialog): send the provider's
+        // current value, catching up on a missed broadcast. No-op without the permission; REPLACE keeps one job.
+        CaseBatterySync.syncIfAllowed(this)
     }
 
     override fun onPause() {
@@ -430,10 +437,7 @@ class MainActivity : Activity() {
         const val REQ_MIC = 1
         const val REQ_STARTUP = 2 // local network (API 37+) and/or the one-time notification prompt
         const val REQ_LOCAL_NETWORK = 3
-        const val PREFS_PLAIN = "shadow_storage"
-        const val PREFS_SECRET = "shadow_secure"
-        const val PREFS_FLAGS = "shadow_native"
         const val FLAG_NOTIFY_ASKED = "notifyPermissionAsked"
-        const val KEY_ALIAS = "shadow.deviceToken.v1"
+        const val FLAG_CASE_BATTERY_ASKED = "caseBatteryPermissionAsked"
     }
 }
