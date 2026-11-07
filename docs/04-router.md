@@ -91,6 +91,18 @@ Before matching, both the text and the patterns are normalized:
 - filler words are removed;
 - Turkish letters are folded to ASCII for comparison (`isigini ac` = `ışığını aç`).
 
+When the text matches no rule as said, it is tried once more with Turkish
+number words 0..100 as digits ([`numbers.ts`](../core/src/numbers.ts), T7.w.1):
+"yüzde elli", "yüzde elliye", "yüz de elli" (a speech-to-text slip) → `yüzde 50`;
+"yüzde yüz", "yüzlü yap" → `yüzde 100`. Words that are also ordinary words
+("yüz" = face, "altı", "yedi", "yüzlü" = -faced) are converted only after
+"yüzde" or before a level verb of the light-level rule (yap · ayarla · getir ·
+olarak and their polite forms), so "yüzünü yıka" or "güler yüzlü" never become
+a number; the article "bir" and the pronouns "ona / onu / onda / ondan" only
+after "yüzde" ("onu yap", "ışığını bir yap" go to the model). Text that matched before
+is routed exactly as before; the converted form is used for matching only and
+a captured `<ad>` keeps the words as said ("oda iki", not "oda 2").
+
 Folding maps exactly one character to one character, so the captured `<ad>` is
 cut from the unfolded text and keeps its Turkish letters. The Core can then say
 the name back as the user said it ("yatak odası").

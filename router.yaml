@@ -19,7 +19,8 @@
 #   {@name}   the list `groups.name` (mixable: {@open|@light-up|çalıştır})
 #   <ad>      the device/place name *         any words (also none)
 #   <sayi>    a number, 1..3 digits ("%50", "yüzde 50", "50'ye" → "yüzde 50"
-#             / "50"); light-set rules only, values over 100 do not match
+#             / "50"); number words too ("yüzde elli", "yüzlü yap", see
+#             core/src/numbers.ts); light-set rules only, values over 100 do not match
 # A pattern is the whole utterance: questions ("açık mı", "açtın mı"), negative
 # commands ("açma") and several sentences never match and go to the model.
 #

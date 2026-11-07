@@ -376,7 +376,15 @@ export type RuleMatch = { rule: string; tier: 0; plan: DirectPlan } | { rule: st
  */
 export const TIER0_MAX_CHARS = 200;
 
-export function matchRules(cfg: CompiledRouterConfig, text: PreparedText): RuleMatch | undefined {
+/**
+ * `original`: set for a text whose number words were converted (numbers.ts):
+ * gives back the words as said behind a span of `display`, so `<ad>` is
+ * captured as said ("oda iki", not "oda 2").
+ */
+export function matchRules(
+  cfg: CompiledRouterConfig,
+  text: PreparedText & { original?: (start: number, end: number) => string },
+): RuleMatch | undefined {
   if (text.folded === "") return undefined;
   const subject = `${text.folded} `;
   const tier0Allowed = text.folded.length <= TIER0_MAX_CHARS;
@@ -389,7 +397,7 @@ export function matchRules(cfg: CompiledRouterConfig, text: PreparedText): RuleM
       let name: string | undefined;
       const span = m.indices?.groups?.ad;
       if (span) {
-        name = text.display.slice(span[0], span[1]);
+        name = text.original ? text.original(span[0], span[1]) : text.display.slice(span[0], span[1]);
         const folded = fold(name);
         if (cfg.direct.stopNames.has(folded)) continue;
         // "ışığı kapat ve mutfağı aç": the capture spans a second clause, not a name.

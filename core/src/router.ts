@@ -12,7 +12,17 @@
  * pure and cheap (no I/O, no model call). Design: docs/04-router.md.
  */
 import { matchRules, type CompiledRouterConfig, type DirectPlan } from "./router-config.js";
-import { prepareText } from "./turkish.js";
+import { prepareNumbers } from "./numbers.js";
+import { prepareText, type PreparedText } from "./turkish.js";
+
+/**
+ * Second matching pass over the text with number words as digits (T7.w.1);
+ * skipped when nothing changed. A captured name comes back as said.
+ */
+function matchWithNumbers(cfg: CompiledRouterConfig, prepared: PreparedText): ReturnType<typeof matchRules> {
+  const numeric = prepareNumbers(prepared);
+  return numeric ? matchRules(cfg, numeric) : undefined;
+}
 
 export type Tier = 0 | 1 | 2 | 3;
 
@@ -108,7 +118,12 @@ export class TieredRouter implements Router {
       ...(cfg.escalation.enabled ? { escalateTo: { tier: 2 as ModelTier, model: models[2] } } : {}),
     };
     const prepared = prepareText(input.text, cfg.fillers);
-    const hit = matchRules(cfg, prepared);
+    // Number words ("yüzde elli", "yüzlü yap") are tried only when the text as
+    // said matches nothing: a request that matched before T7.w.1 is routed the
+    // same way; a name holding a number word ("oda iki") is captured as said in both passes.
+    // The converted form is used for matching only; input.text (shown, logged,
+    // sent to the model) is untouched.
+    const hit = matchRules(cfg, prepared) ?? matchWithNumbers(cfg, prepared);
     if (hit) {
       if (hit.tier === 0) {
         if (cfg.direct.enabled) {
