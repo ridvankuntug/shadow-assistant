@@ -8,7 +8,7 @@
  *
  * Producers inside the Core (backup, service health, HA events, T11-B) call
  * `raise()` / `resolve()`; the user marks items read / unread or deletes them.
- * Not wired to any producer or client yet (T7.w.5b).
+ * Clients reach it through `NotificationCenter` (session.ts, T7.w.5b); no producer yet.
  *
  * - `key` (optional, unique per `source`) dedupes a recurring condition: a
  *   raise on an existing key replaces title / body / urgency and bumps

@@ -44,7 +44,7 @@ export interface CoreServerOptions {
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
-   * Counts for GET /health `inbox` (e.g. `{ dev: 3 }`), sent **only** to
+   * Counts for GET /health `inbox` (e.g. `{ dev: 3, notifications: 1 }`), sent **only** to
    * loopback requests (the tray on the same machine): numbers, no titles.
    * Remote callers get the body without `inbox`.
    */

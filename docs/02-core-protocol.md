@@ -10,8 +10,9 @@ shell) uses. TypeScript types for all frames live in a single module:
   (`status` and `detail` as in *Service health*; `status` is `unknown` before the first check round and
   `detail` is present only when the check set one. No URLs, tokens or error messages.)
   Only for requests from a loopback address (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`; the tray on the
-  same machine) the body also has `"inbox":{"dev":<open>}`: the Development badge count (see
-  *Development*), a number only. Remote callers get the body without `inbox`.
+  same machine) the body also has `"inbox":{"dev":<open>,"notifications":<unread>}`: the
+  Development badge count (see *Development*) and the number of unread notifications (see
+  *Notifications*), numbers only. Remote callers get the body without `inbox`.
 - Device state: `POST http://<core-host>:<CORE_PORT>/device/state` (bearer token; see *Device state*).
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
@@ -52,6 +53,8 @@ refuses to start.
 | `{"type":"memory_delete","id":"m2","entryId":"m-7f3a9c"}` | Delete one memory entry (feature `memory`). See *Memory*. |
 | `{"type":"dev_list","id":"d1"}` | Ask for the Development items (feature `dev`). See *Development*. |
 | `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"}` | One action on one Development item (feature `dev`). See *Development*. |
+| `{"type":"notifications_list","id":"q1"}` | Ask for the notification inbox (feature `notifications`). See *Notifications*. |
+| `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"}` | One action on one notification (feature `notifications`). See *Notifications*. |
 
 ## Core → Client
 
@@ -70,6 +73,9 @@ refuses to start.
 | `{"type":"memory","id":"m1","brief":{…},"topics":[…],"warnings":[…]}` | Reply to `memory_list` / `memory_delete`. See *Memory*. |
 | `{"type":"dev","id":"d1","items":[…],"open":3,"canManage":false}` | Reply to `dev_list` / `dev_action`. See *Development*. |
 | `{"type":"dev_count","open":3}` | The Development badge count changed (every authenticated socket; feature `dev`). See *Development*. |
+| `{"type":"notifications","id":"q1","items":[…],"unread":1}` | Reply to `notifications_list` / `notification_action`. See *Notifications*. |
+| `{"type":"notification","item":{…},"speak"?:true}` | A notification was raised or changed (every authenticated socket; `speak` on at most one). See *Notifications*. |
+| `{"type":"notification_removed","notificationId":"n-…"}` | A notification was deleted or resolved (every authenticated socket). See *Notifications*. |
 | `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…","retryAt"?:<epoch ms>}` | See *Errors*. `retryAt` only with `usage_limit`. |
@@ -92,6 +98,7 @@ The protocol number stays 1.
 | `memory` | Memory is enabled: `memory_list` / `memory_delete` are answered. Without it clients hide the memory settings. |
 | `usage_limit` | The Core reports a reached subscription usage limit as `error usage_limit` (+ `retryAt`). |
 | `dev` | The Development tab is available: `dev_list` / `dev_action` are answered and `dev_count` is sent. Without it clients hide the tab and its badge. |
+| `notifications` | The notification inbox is available: `notifications_list` / `notification_action` are answered and `notification` / `notification_removed` are sent. Without it clients hide the inbox and its badge. |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -111,7 +118,7 @@ Agent SDK's `mcp__<service>__` prefix.
 | `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
-| `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed. |
+| `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted). |
 | `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` outside `CORE_DEV_DEVICES`). |
 | `internal` | Unexpected server error. |
 
@@ -214,8 +221,8 @@ arguments, entity or room names, error messages, URLs or tokens.
 
 - `dev_list` is answered with `dev` (same `id`).
 - `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active,
-  re-validated first), `ignore` ("Yok say": a rule candidate → rejected, a note →
-  `ignored`; a suspended rule answers `not_allowed` for now) and `fixed`
+  re-validated first), `ignore` ("Yok say": a rule candidate or a suspended rule →
+  rejected, a note → `ignored`; an active rule answers `not_allowed`) and `fixed`
   ("Düzeltildi": notes only). It is answered with a fresh
   `dev` frame (same `id`). Actions are idempotent: repeating one (e.g.
   `add_rule` on an active rule) is answered with the fresh list.
@@ -227,6 +234,61 @@ arguments, entity or room names, error messages, URLs or tokens.
 - `dev_count` is sent to every authenticated socket when the badge count
   changes, only by a Core with the feature `dev` (clients that do not know the
   frame ignore it). `dev` frames go only to the requesting socket.
+
+## Notifications
+
+With the feature `notifications`. Design:
+[`docs/08-learning-fast-path.md` §T7.w.5](08-learning-fast-path.md#t7w5-notification-store).
+One shared inbox for the home, kept by the Core in
+`<SHADOW_DATA_DIR>/notifications/notifications.json`. Items come from producers
+inside the Core (none yet); clients list them and mark them read / unread or
+delete them. Development items are not notifications.
+
+```json
+{"type":"notifications","id":"q1","unread":1,
+ "items":[{"id":"n-0123456789abcdef","source":"service","urgency":"normal","title":"…","body":"…",
+           "createdAt":"2026-11-07T18:00:00.000Z","updatedAt":"2026-11-07T18:05:00.000Z",
+           "readAt":null,"raised":2}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | `n-` + 16 hex characters; send it back as `notification_action.notificationId`. |
+| `source` | Short producer name (`service`, `backup`, `ha`, `device-state`, `test`). Clients show unknown values as-is. |
+| `urgency` | `normal` or `urgent`. Clients treat unknown values as `normal`. |
+| `title`, `body` | Short Turkish text; `body` may be empty. |
+| `createdAt`, `updatedAt` | ISO 8601. A producer raising the same condition again replaces title / body / urgency and bumps `updatedAt` and `raised`. |
+| `readAt` | ISO 8601 when read on any device, `null` while unread. Shared by every device. |
+| `raised` | How many times the producer raised it (1 for a new item). |
+
+The producer's dedupe key is not sent. Items are kept until the user deletes
+them or the producer resolves them.
+
+- `notifications_list` is answered with `notifications` (same `id`): every item,
+  most recently updated first, and `unread`.
+- `notification_action` `action` is one of `read`, `unread` and `delete`. It is
+  answered with a fresh `notifications` frame (same `id`). `read` / `unread` are
+  idempotent (repeating one changes nothing and broadcasts nothing). Errors
+  (with `id`): an unknown or already deleted `notificationId` → `unknown_item`;
+  a malformed frame (missing `notificationId`, unknown `action`) → `bad_request`.
+- Every change goes to **every authenticated socket**: `notification` with the
+  whole item for a new or changed item (raised again, read, unread), and
+  `notification_removed` for a deleted or resolved one. The socket that asked
+  gets the broadcast too. Clients that do not know these frames ignore them.
+- **Urgent items are spoken once, on one device.** When an urgent item is
+  raised (new, or raised again as a new reminder), the `notification` frame to
+  exactly one socket carries `"speak":true`: among the sockets whose client
+  sent `speech_prefs` with `enabled:true`, the one whose device had the most
+  recent turn (ties: that socket's own latest turn, then the newest socket).
+  That client speaks title + body through its usual speech path. With no such
+  socket nothing is spoken. `speak` is never sent again for the item: not in
+  `notifications`, not after a reconnect, not when it is read or changed
+  without a new reminder. Being spoken does not mark an item read.
+- There is no push to a phone whose app is not connected; it sees the items in
+  `notifications_list` on its next connect.
+- While the Core cannot read its notifications file (locked, or invalid and not
+  movable aside) the inbox reads as empty (`unread: 0`) and actions answer
+  `unknown_item`; the Core logs the cause and retries on the next request.
 
 ## Voices
 

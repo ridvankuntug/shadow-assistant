@@ -130,6 +130,25 @@ export interface DevActionFrame {
   action: DevAction;
 }
 
+/** Inbox actions (docs/08-learning-fast-path.md, T7.w.5). `read` / `unread` are shared across devices. */
+export type NotificationAction = "read" | "unread" | "delete";
+export const NOTIFICATION_ACTIONS: readonly NotificationAction[] = ["read", "unread", "delete"];
+
+/** Asks for the inbox (feature `notifications`); answered by `notifications` or `error`. */
+export interface NotificationsListFrame {
+  type: "notifications_list";
+  id: string;
+}
+
+/** Applies one action to one inbox item; answered by a fresh `notifications` frame or `error`. */
+export interface NotificationActionFrame {
+  type: "notification_action";
+  id: string;
+  /** `items[].id` of a `notifications` frame (or `item.id` of a `notification` broadcast). */
+  notificationId: string;
+  action: NotificationAction;
+}
+
 export type ClientFrame =
   | HelloFrame
   | UserTextFrame
@@ -144,7 +163,9 @@ export type ClientFrame =
   | MemoryListFrame
   | MemoryDeleteFrame
   | DevListFrame
-  | DevActionFrame;
+  | DevActionFrame
+  | NotificationsListFrame
+  | NotificationActionFrame;
 
 // ---------------------------------------------------------------- core → client
 
@@ -159,7 +180,7 @@ export type ErrorCode =
   | "model_error"
   | "busy"
   | "usage_limit"
-  /** Development: the `itemId` is not (or no longer) listed. */
+  /** Development: the `itemId` is not (or no longer) listed. Notifications: the `notificationId` is unknown (or deleted). */
   | "unknown_item"
   /** Development: the action is not valid for the item, or this device may not do it. */
   | "not_allowed"
@@ -169,7 +190,7 @@ export type ErrorCode =
  * Optional capabilities a Core lists in `welcome.features`. Clients must
  * ignore names they do not know; a missing name means the feature is off.
  */
-export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev";
+export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications";
 
 export interface HistoryItem {
   id: string;
@@ -301,6 +322,59 @@ export interface DevCountFrame {
   open: number;
 }
 
+/** `normal`: inbox, tray count, quiet phone notification; `urgent`: also spoken once on one device. */
+export type NotificationUrgency = "normal" | "urgent";
+
+/**
+ * One inbox item, as stored (docs/08 §Item) without the producer's dedupe
+ * `key`. Display only; clients show unknown `source` values as-is.
+ */
+export interface NotificationInfo {
+  /** `n-` + 16 hex chars; send it back as `notification_action.notificationId`. */
+  id: string;
+  /** Short producer name (`service`, `backup`, `ha`, `device-state`, `test`). */
+  source: string;
+  urgency: NotificationUrgency;
+  title: string;
+  /** May be empty. */
+  body: string;
+  /** ISO 8601. */
+  createdAt: string;
+  updatedAt: string;
+  /** ISO 8601 when read (on any device), null while unread. */
+  readAt: string | null;
+  /** How many times the producer raised it (1 for a new item). */
+  raised: number;
+}
+
+export interface NotificationsFrame {
+  type: "notifications";
+  /** The `notifications_list` / `notification_action` request id. */
+  id: string;
+  /** Every item, most recently updated first. */
+  items: NotificationInfo[];
+  /** Number of unread items (badge). */
+  unread: number;
+}
+
+/**
+ * A new or changed item (raised again, read, unread), broadcast to every
+ * authenticated socket. `speak: true` goes to at most one session, only when
+ * an urgent item is raised (new, or raised again with renotify); it is never
+ * repeated, not even after a reconnect.
+ */
+export interface NotificationFrame {
+  type: "notification";
+  item: NotificationInfo;
+  speak?: true;
+}
+
+/** An item was deleted or resolved; broadcast to every authenticated socket. */
+export interface NotificationRemovedFrame {
+  type: "notification_removed";
+  notificationId: string;
+}
+
 export type ServerFrame =
   | {
       type: "welcome";
@@ -330,6 +404,9 @@ export type ServerFrame =
   | MemoryFrame
   | DevFrame
   | DevCountFrame
+  | NotificationsFrame
+  | NotificationFrame
+  | NotificationRemovedFrame
   /** `retryAt` (epoch ms): only on `usage_limit`, when the reset time is known. */
   | { type: "error"; id?: string; code: ErrorCode; message: string; retryAt?: number }
   | { type: "services"; items: ServiceHealth[] }
@@ -465,6 +542,21 @@ export function parseClientFrame(raw: string): ParseResult {
         return bad(`dev_action.action must be one of ${DEV_ACTIONS.join(", ")}`);
       }
       return { ok: true, frame: { type: "dev_action", id: data.id, itemId: data.itemId, action: action as DevAction } };
+    }
+    case "notifications_list":
+      if (!isId(data.id)) return bad("notifications_list.id must be a non-empty string");
+      return { ok: true, frame: { type: "notifications_list", id: data.id } };
+    case "notification_action": {
+      if (!isId(data.id)) return bad("notification_action.id must be a non-empty string");
+      if (!isId(data.notificationId)) return bad("notification_action.notificationId must be a non-empty string");
+      const action = data.action;
+      if (typeof action !== "string" || !(NOTIFICATION_ACTIONS as readonly string[]).includes(action)) {
+        return bad(`notification_action.action must be one of ${NOTIFICATION_ACTIONS.join(", ")}`);
+      }
+      return {
+        ok: true,
+        frame: { type: "notification_action", id: data.id, notificationId: data.notificationId, action: action as NotificationAction },
+      };
     }
     default:
       return bad(`unknown frame type`);

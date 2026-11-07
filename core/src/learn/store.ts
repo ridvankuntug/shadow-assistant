@@ -6,7 +6,7 @@
  *       │                                              │                       │
  *       └─(2 conflicts)─▶ blocked                      └─reject()─▶ rejected   │ max_failures
  *                                                                              ▼ fallbacks in a row,
- *                                                                          suspended   or not allowed at load
+ *                                                                          suspended   or not allowed at load (reject() → rejected)
  *
  * - A phrasing (token array) has one entry; its signature (service + tool +
  *   domain + binding) is fixed until a conflicting observation restarts the
@@ -15,8 +15,9 @@
  *   ekle", wired in T7.w.4b), which re-validates the rule against the current
  *   ceilings and applies only after the new file is on disk. Suspension, by
  *   contrast, takes effect in memory at once even if its write fails.
- * - There is no way back from `suspended` / `rejected` / `blocked` here
- *   (docs/08 decision 4: not built until decided).
+ * - There is no way back from `suspended` / `rejected` / `blocked` to
+ *   `active` here, and no active → rejected (docs/08 decision 4: not built
+ *   until decided); a suspended rule can only be rejected ("Yok say").
  * - Load re-validates: an active rule whose tool, service or domain the
  *   current `learning` block (or the code ceiling) no longer allows becomes
  *   `suspended` (`not_allowed`); observing / candidate counts made under
@@ -234,11 +235,15 @@ export class LearnedRuleStore {
     });
   }
 
-  /** candidate → rejected ("Yok say"): the phrasing is not suggested again. Resolves whether it changed. */
+  /**
+   * candidate or suspended → rejected ("Yok say"): the phrasing is not
+   * suggested again. An active rule is never rejected here (removing it is
+   * docs/08 decision 4). Resolves whether it changed.
+   */
   reject(id: string): Promise<boolean> {
     return this.change(false, (data) => {
       const entry = data.rules.find((r) => r.id === id);
-      if (!entry || entry.status !== "candidate") return { result: false, changed: false };
+      if (!entry || (entry.status !== "candidate" && entry.status !== "suspended")) return { result: false, changed: false };
       entry.status = "rejected";
       this.prune(data);
       return { result: true, changed: true };

@@ -246,6 +246,21 @@ describe("outcomes and suspension", () => {
     assert.deepEqual(await s.recordOutcome(id, "failure", "tool_error"), { suspended: true });
   });
 
+  test("reject(): a suspended rule becomes rejected; an active rule is never rejected", async () => {
+    const { s } = store(freshDir());
+    const id = await candidate(s, LEVEL);
+    assert.ok((await s.activate(id, "phone")).ok);
+    assert.equal(await s.reject(id), false);
+    assert.equal((await s.list())[0]?.status, "active");
+    for (let i = 0; i < 3; i++) await s.recordOutcome(id, "failure", "name_not_found");
+    assert.equal((await s.list())[0]?.status, "suspended");
+    assert.equal(await s.reject(id), true);
+    assert.equal((await s.list())[0]?.status, "rejected");
+    assert.equal(s.snapshot().length, 0);
+    assert.equal(await s.reject(id), false);
+    assert.deepEqual(await s.activate(id, "phone"), { ok: false, reason: "not_candidate" });
+  });
+
   test("a rule router.yaml no longer allows is suspended (not_allowed) at load", async () => {
     const { dir, id } = await activeRule();
     const narrowed: CompiledRouterConfig = parseRouterConfig("version: 1\nlearning: { tools: [intent__HassTurnOn] }");

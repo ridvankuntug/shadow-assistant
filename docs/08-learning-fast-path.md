@@ -542,7 +542,7 @@ no-op answered with the fresh list).
 | Action | Rule candidate | Suspended rule | Note |
 |---|---|---|---|
 | `add_rule` ("Kuralı ekle") | → `active` (re-validated first) | – ([decision 4](#kullanıcı-kararı-gerekli-decisions-for-the-user)) | – |
-| `ignore` ("Yok say") | → `rejected` | → `rejected` (not built yet: `LearnedRuleStore.reject()` takes candidates only, so T7.w.4b answers `not_allowed`) | `status: ignored` |
+| `ignore` ("Yok say") | → `rejected` | → `rejected` (`LearnedRuleStore.reject()` takes candidates and suspended rules, never active ones) | `status: ignored` |
 | `fixed` ("Düzeltildi") | – | – | `status: fixed` (does not change rules or services.yaml) |
 
 Badge count `open` = candidates + suspended rules + open notes.
@@ -869,7 +869,7 @@ T7.w.7 has no task (deferred).
 - [x] **T7.w.4c — UI Development panel.** As in [UI](#ui). Acceptance: controller
   tests for list, actions, badge and `canManage`; panel hidden without the `dev`
   feature; no `notify` or sound for development items.
-- [ ] **T7.w.4d — Tray counts.** As in [Tray](#tray). Acceptance: tray tests parse
+- [x] **T7.w.4d — Tray counts.** As in [Tray](#tray). Acceptance: tray tests parse
   `inbox` (present, absent, malformed); menu items open `#dev` / `#notifications`;
   no balloon for development counts; no token read from `.env`.
 - [x] **T7.w.5a — Notification store.** `raise` (with `key`, `renotify`),
@@ -877,7 +877,7 @@ T7.w.7 has no task (deferred).
   limit, quarantine. Acceptance: unit tests including the T11-B sequence (raise,
   renotify, read as acknowledgement, resolve) with a fake clock; items survive a
   restart; nothing is pruned silently.
-- [ ] **T7.w.5b — Notification frames.** `notifications` feature, list/action frames,
+- [x] **T7.w.5b — Notification frames.** `notifications` feature, list/action frames,
   `notification` / `notification_removed` broadcast, urgent `speak` to one
   session, loopback `inbox.notifications`. Acceptance: session tests for list,
   read, delete, a broadcast reaching two sockets, an urgent item spoken by one
@@ -967,3 +967,25 @@ T7.w.7 has no task (deferred).
   §T7.w.3. Open, for a decision: a suspended rule counts in `open` but no tab action can
   clear it (the UI offers "Yok say", the Core answers `not_allowed`) until decision 4 or a
   `reject()` for suspended rules in store.ts.
+- 2026-11-07: T7.w.5b done (senior-dev; senior-code-reviewer 2 rounds, no critical or high
+  finding; tester: core 1183/1183, ui 356/356, lint, build, 9 of 10 mutations killed, the
+  10th an equivalent mutant). `NotificationCenter`
+  in session.ts (beside `DevelopmentTab`): each session attaches itself for the broadcasts and
+  reports its turns. Narrowest readings: `speak` on an urgent raise that is new or has
+  `renotify` (a keyed update without it is not spoken again); the speaker is the socket with
+  speech on (`speech_prefs` enabled) whose device had the latest turn, ties by that socket's
+  own latest turn, then the newest socket; no such socket → nothing spoken. Frames carry the
+  stored fields without the producer's `key`. `read` / `unread` idempotent without a
+  broadcast; `delete` of a missing item → `unknown_item`. `NotificationCenter.flush()` runs in
+  the shutdown chain. UI: frame types and parser only (`ui/src/protocol/types.ts`), no-op
+  reducer cases in `ui/src/assistant/state.ts`. Also O1: `LearnedRuleStore.reject()` takes
+  suspended rules too, so "Yok say" on a suspended rule rejects it and the badge drops; the
+  open item above (suspended rule cannot be cleared) is closed. Active → rejected and
+  re-activation stay out (decision 4).
+  Review round 1 fixed: `NotificationCenter.flush()` on the center's chain in the shutdown
+  chain; tie-breaker and closed-socket speaker tests; docs/02 states that an unreadable
+  notifications file reads as an empty inbox / `unknown_item`. Left open (related findings): the
+  store does not report `unavailable` to list/actions; `delete` of a missing item is
+  `unknown_item` (5c should ignore it after a `notification_removed`); every action clones the
+  list (needs a store API change); no server-level test of welcome-before-broadcast and the
+  index.ts wiring.

@@ -24,13 +24,14 @@ import { memoryTools } from "./memory/tools.js";
 import { createGatewaySdkServers } from "./gateway-sdk.js";
 import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from "./mcp-direct.js";
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
+import { NOTIFICATIONS_DIR, NotificationStore } from "./notifications.js";
 import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
-import { DevelopmentTab, Session, type Logger, type SessionLearning } from "./session.js";
+import { DevelopmentTab, NotificationCenter, Session, type Logger, type SessionLearning } from "./session.js";
 import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
@@ -311,6 +312,10 @@ export async function main(): Promise<void> {
   }
   devTab = new DevelopmentTab({ rules: learnedRules, toolNotes, turnNotes, managers: cfg.devDevices, logger });
   await devTab.view(); // the first badge count, for /health `inbox`
+  // The home's notification inbox (docs/08 T7.w.5). No producer yet: later ones call notificationCenter.raise()/resolve().
+  const notificationStore = new NotificationStore({ dir: join(cfg.dataDir, NOTIFICATIONS_DIR), log: (m) => logger.warn(m) });
+  const notificationCenter = new NotificationCenter({ store: notificationStore, logger });
+  await notificationCenter.refresh(); // the first unread count, for /health `inbox`
   const tierServices = cfg.router?.tierServices;
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
@@ -351,16 +356,17 @@ export async function main(): Promise<void> {
           learning,
           turnNotes: recordTurnNote,
           dev: devTab,
+          notifications: notificationCenter,
         },
         info,
         send,
       ),
     // Name, flag, status and short detail code only: no URL or token leaves through /health.
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
-    // Loopback requests only (the tray): the Development badge count, no titles.
-    inbox: () => ({ dev: devTab?.open ?? 0 }),
+    // Loopback requests only (the tray): the Development badge count and unread notifications, no titles.
+    inbox: () => ({ dev: devTab?.open ?? 0, notifications: notificationCenter.unread }),
     devCount: devTab,
-    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev"],
+    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications"],
     serviceHealth: monitor,
     deviceState,
   });
@@ -410,6 +416,8 @@ export async function main(): Promise<void> {
       .then(() => learnedRules?.flush())
       // Coalesced turn notes not yet on disk (never rejects).
       .then(() => turnNotes.flush())
+      // After the inbox changes in flight, a failed notification write is retried once more (never rejects).
+      .then(() => notificationCenter.flush())
       .then(() => process.exit(0));
   });
 }

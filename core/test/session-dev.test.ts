@@ -303,7 +303,7 @@ test("add_rule re-validates: a candidate the current router.yaml no longer allow
 
 // ------------------------------------------------------------------ ignore / fixed
 
-test("ignore: a candidate is rejected and leaves the list (repeat answers the list); suspended rules are not handled here", async () => {
+test("ignore: a candidate is rejected and leaves the list (repeat answers the list)", async () => {
   const h = await harness();
   const id = await candidate(h);
   const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" });
@@ -315,7 +315,7 @@ test("ignore: a candidate is rejected and leaves the list (repeat answers the li
   assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "fixed" })), "unknown_item");
 });
 
-test("a suspended rule is listed and counted; ignore and add_rule on it are not_allowed (docs/08 decision 4)", async () => {
+test("a suspended rule is listed and counted; add_rule and fixed on it are not_allowed (docs/08 decision 4)", async () => {
   const h = await harness({ managers: ["browser"] });
   const id = await candidate(h);
   assert.ok((await h.store.activate(id, "browser")).ok);
@@ -323,10 +323,33 @@ test("a suspended rule is listed and counted; ignore and add_rule on it are not_
   const v = await h.list();
   assert.equal(ruleOf(v.items, id)?.status, "suspended");
   assert.equal(v.open, 1);
-  for (const action of ["ignore", "add_rule", "fixed"] as const) {
+  for (const action of ["add_rule", "fixed"] as const) {
     assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action })), "not_allowed", action);
   }
   assert.equal((await h.store.list())[0]?.status, "suspended");
+});
+
+test("ignore on a suspended rule rejects it: it leaves the list and the badge drops to 0 (repeat answers the list)", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await candidate(h);
+  assert.ok((await h.store.activate(id, "browser")).ok);
+  for (let i = 0; i < 3; i++) await h.store.recordOutcome(id, "failure", "name_not_found");
+  assert.equal((await h.list()).open, 1);
+  const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" });
+  assert.equal(r.type, "dev");
+  const frame = r as Extract<ServerFrame, { type: "dev" }>;
+  assert.equal(ruleOf(frame.items, id), undefined);
+  assert.equal(frame.open, 0);
+  assert.equal((await h.store.list())[0]?.status, "rejected");
+  assert.equal((await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" })).type, "dev");
+});
+
+test("ignore on an active rule is not_allowed and the rule stays active (no removal from the tab, decision 4)", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await candidate(h);
+  assert.ok((await h.store.activate(id, "browser")).ok);
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" })), "not_allowed");
+  assert.equal((await h.store.list())[0]?.status, "active");
 });
 
 test("notes: ignore and fixed from any device (idempotent), status stored; add_rule on a note and fixed on a rule are not_allowed", async () => {

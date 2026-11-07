@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEV_ACTIONS, MAX_TEXT_CHARS, parseClientFrame } from "../src/protocol.js";
+import { DEV_ACTIONS, MAX_TEXT_CHARS, NOTIFICATION_ACTIONS, parseClientFrame } from "../src/protocol.js";
 
 const ok = (raw: unknown) => {
   const r = parseClientFrame(JSON.stringify(raw));
@@ -150,4 +150,45 @@ test("existing frames are unchanged by the dev frames", () => {
   assert.deepEqual(ok({ type: "cancel", id: "t1" }), { type: "cancel", id: "t1" });
   bad({ type: "dev" });
   bad({ type: "dev_count", open: 1 });
+});
+
+test("notifications_list / notification_action (feature notifications): ids and action required; unknown fields ignored", () => {
+  assert.deepEqual(ok({ type: "notifications_list", id: "n1", extra: true }), { type: "notifications_list", id: "n1" });
+  for (const action of NOTIFICATION_ACTIONS) {
+    assert.deepEqual(ok({ type: "notification_action", id: "n2", notificationId: "n-0123456789abcdef", action, extra: [1] }), {
+      type: "notification_action",
+      id: "n2",
+      notificationId: "n-0123456789abcdef",
+      action,
+    });
+  }
+  assert.deepEqual([...NOTIFICATION_ACTIONS], ["read", "unread", "delete"]);
+  bad({ type: "notifications_list" });
+  bad({ type: "notifications_list", id: "" });
+  bad({ type: "notifications_list", id: 5 });
+  // The request id comes back with the rejection.
+  assert.equal(bad({ type: "notification_action", id: "n2", action: "read" }).id, "n2");
+  bad({ type: "notification_action", id: "n2", notificationId: "", action: "read" });
+  bad({ type: "notification_action", id: "n2", notificationId: "x".repeat(129), action: "read" });
+  bad({ type: "notification_action", id: "n2", notificationId: 7, action: "read" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-1" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-1", action: "archive" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-1", action: "READ" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-1", action: ["read"] });
+  bad({ type: "notification_action", notificationId: "n-1", action: "read" });
+  // An item id field from another frame does not count.
+  bad({ type: "notification_action", id: "n2", itemId: "n-1", action: "read" });
+});
+
+test("existing frames are unchanged by the notification frames; Core frames are not client frames", () => {
+  assert.deepEqual(ok({ type: "dev_list", id: "d1" }), { type: "dev_list", id: "d1" });
+  assert.deepEqual(ok({ type: "dev_action", id: "d2", itemId: "n-1", action: "ignore" }), {
+    type: "dev_action",
+    id: "d2",
+    itemId: "n-1",
+    action: "ignore",
+  });
+  bad({ type: "notifications", id: "n1", items: [], unread: 0 });
+  bad({ type: "notification", item: {} });
+  bad({ type: "notification_removed", notificationId: "n-1" });
 });

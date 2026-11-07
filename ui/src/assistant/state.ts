@@ -767,5 +767,11 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
     case "dev_count":
       // Badge only; the list is refreshed when the panel opens (or "Yenile").
       return msg.open === s.dev.open ? s : { ...s, dev: { ...s.dev, open: msg.open } };
+
+    case "notifications":
+    case "notification":
+    case "notification_removed":
+      // The inbox arrives with T7.w.5c; until then these frames change nothing.
+      return s;
   }
 }

@@ -18,6 +18,18 @@ import { parseServerMessage, type ServerMessage } from "./types.ts";
 // ---------------------------------------------------------------------------
 // parseServerMessage
 
+const NOTE = {
+  id: "n-fedcba9876543210",
+  source: "test",
+  urgency: "normal" as const,
+  title: "Bilgi",
+  body: "",
+  createdAt: "2026-11-07T18:00:00.000Z",
+  updatedAt: "2026-11-07T18:00:00.000Z",
+  readAt: null,
+  raised: 1,
+};
+
 const VALID: ServerMessage[] = [
   { type: "welcome", protocol: 1, sessionId: "s1", device: "browser" },
   { type: "state", state: "idle" },
@@ -118,6 +130,30 @@ const VALID: ServerMessage[] = [
   { type: "dev", id: "d2", items: [], open: 0, canManage: true },
   { type: "dev_count", open: 0 },
   { type: "dev_count", open: 7 },
+  { type: "welcome", protocol: 1, sessionId: "s2", device: "phone", features: ["dev", "notifications"] },
+  {
+    type: "notifications",
+    id: "q1",
+    items: [
+      {
+        id: "n-0123456789abcdef",
+        source: "test",
+        urgency: "urgent",
+        title: "Örnek başlık",
+        body: "Örnek gövde",
+        createdAt: "2026-11-07T18:00:00.000Z",
+        updatedAt: "2026-11-07T18:05:00.000Z",
+        readAt: null,
+        raised: 2,
+      },
+      { ...NOTE, readAt: "2026-11-07T19:00:00.000Z" },
+    ],
+    unread: 1,
+  },
+  { type: "notifications", id: "q2", items: [], unread: 0 },
+  { type: "notification", item: NOTE },
+  { type: "notification", item: { ...NOTE, urgency: "urgent" }, speak: true },
+  { type: "notification_removed", notificationId: "n-0123456789abcdef" },
 ];
 
 describe("parseServerMessage", () => {
@@ -165,6 +201,19 @@ describe("parseServerMessage", () => {
     ["dev_count without open", '{"type":"dev_count"}'],
     ["dev_count open not a count", '{"type":"dev_count","open":"3"}'],
     ["dev_count negative", '{"type":"dev_count","open":-2}'],
+    ["notifications without id", '{"type":"notifications","items":[],"unread":0}'],
+    ["notifications without items", '{"type":"notifications","id":"q","unread":0}'],
+    ["notifications items not array", '{"type":"notifications","id":"q","items":{},"unread":0}'],
+    ["notifications without unread", '{"type":"notifications","id":"q","items":[]}'],
+    ["notifications negative unread", '{"type":"notifications","id":"q","items":[],"unread":-1}'],
+    ["notifications fractional unread", '{"type":"notifications","id":"q","items":[],"unread":0.5}'],
+    ["notification without item", '{"type":"notification"}'],
+    ["notification item not object", '{"type":"notification","item":"n-1"}'],
+    ["notification item without id", '{"type":"notification","item":{"source":"test","urgency":"normal","title":"t","body":"","createdAt":"a","updatedAt":"a","readAt":null,"raised":1}}'],
+    ["notification item readAt number", '{"type":"notification","item":{"id":"n","source":"test","urgency":"normal","title":"t","body":"","createdAt":"a","updatedAt":"a","readAt":5,"raised":1}}'],
+    ["notification_removed without id", '{"type":"notification_removed"}'],
+    ["notification_removed empty id", '{"type":"notification_removed","notificationId":""}'],
+    ["notification_removed id not string", '{"type":"notification_removed","notificationId":7}'],
   ])("rejects %s", (_name, raw) => {
     expect(parseServerMessage(raw)).toBeNull();
   });
@@ -285,6 +334,45 @@ describe("parseServerMessage protocol additions (speech_stream, memory, usage_li
       ),
     ).toEqual({ type: "dev", id: "d", open: 0, canManage: false, items: [{ ...base, itemId: "n", type: "note", kind: "future", status: "later" }] });
     expect(parseServerMessage(JSON.stringify({ type: "dev_count", open: 3, extra: 1 }))).toEqual({ type: "dev_count", open: 3 });
+  });
+
+  it("notifications: keeps known fields only (no key), drops malformed items; unknown urgency reads as normal; speak only when true", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({
+        type: "notifications",
+        id: "q1",
+        unread: 2,
+        extra: "dropped",
+        items: [
+          { ...NOTE, key: "k-1", extra: 1 },
+          { ...NOTE, id: "n-2", urgency: "critical" },
+          { ...NOTE, id: "n-3", urgency: 5 },
+          { ...NOTE, id: "" },
+          { ...NOTE, id: "n-4", title: 7 },
+          { ...NOTE, id: "n-5", body: undefined },
+          { ...NOTE, id: "n-6", raised: -1 },
+          { ...NOTE, id: "n-7", readAt: undefined },
+          { ...NOTE, id: "n-8", createdAt: null },
+          "junk",
+        ],
+      }),
+    );
+    expect(msg).toEqual({ type: "notifications", id: "q1", unread: 2, items: [NOTE, { ...NOTE, id: "n-2" }] });
+    for (const speak of [false, "true", 1, null]) {
+      const m = parseServerMessage(JSON.stringify({ type: "notification", item: NOTE, speak }));
+      expect(m).toEqual({ type: "notification", item: NOTE });
+      expect(m && "speak" in m).toBe(false);
+    }
+    expect(parseServerMessage(JSON.stringify({ type: "notification", item: { ...NOTE, urgency: "urgent", key: "k" }, speak: true }))).toEqual({
+      type: "notification",
+      item: { ...NOTE, urgency: "urgent" },
+      speak: true,
+    });
+    expect(parseServerMessage(JSON.stringify({ type: "notification", item: { ...NOTE, title: 1 } }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ type: "notification_removed", notificationId: "n-1", extra: 1 }))).toEqual({
+      type: "notification_removed",
+      notificationId: "n-1",
+    });
   });
 
   it("welcome: keeps only string features, ignores a malformed features field and unknown fields", () => {

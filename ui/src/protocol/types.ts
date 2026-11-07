@@ -52,6 +52,17 @@ export type DevAction = "add_rule" | "ignore" | "fixed";
 export type DevListMessage = { type: "dev_list"; id: string };
 /** One action on one Development item; answered by a fresh `dev` frame or `error`. */
 export type DevActionMessage = { type: "dev_action"; id: string; itemId: string; action: DevAction };
+/** Inbox actions (Core feature `notifications`); `read` / `unread` are shared by every device. */
+export type NotificationAction = "read" | "unread" | "delete";
+/** Asks for the inbox (Core feature `notifications`). */
+export type NotificationsListMessage = { type: "notifications_list"; id: string };
+/** One action on one inbox item; answered by a fresh `notifications` frame or `error`. */
+export type NotificationActionMessage = {
+  type: "notification_action";
+  id: string;
+  notificationId: string;
+  action: NotificationAction;
+};
 
 export type ClientMessage =
   | HelloMessage
@@ -67,13 +78,15 @@ export type ClientMessage =
   | MemoryListMessage
   | MemoryDeleteMessage
   | DevListMessage
-  | DevActionMessage;
+  | DevActionMessage
+  | NotificationsListMessage
+  | NotificationActionMessage;
 
 // ---------------------------------------------------------------------------
 // Core -> Client
 
 /** Optional Core capabilities this client uses (`welcome.features`). */
-export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev";
+export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;
@@ -181,6 +194,32 @@ export type DevItem = {
 export type DevMessage = { type: "dev"; id: string; items: DevItem[]; open: number; canManage: boolean };
 /** Badge count change, broadcast to every authenticated socket. */
 export type DevCountMessage = { type: "dev_count"; open: number };
+/** `urgent`: also spoken once, on the one device the Core picks (`notification.speak`). */
+export type NotificationUrgency = "normal" | "urgent";
+/**
+ * One inbox item (display only). `source` is a short producer name, shown
+ * as-is when unknown; times are ISO 8601 strings; `readAt` null = unread.
+ */
+export type NotificationInfo = {
+  id: string;
+  source: string;
+  urgency: NotificationUrgency;
+  title: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+  readAt: string | null;
+  raised: number;
+};
+/** Answer to `notifications_list` / `notification_action`. */
+export type NotificationsMessage = { type: "notifications"; id: string; items: NotificationInfo[]; unread: number };
+/**
+ * A new or changed item, broadcast to every authenticated socket. `speak`
+ * (only on a just-raised urgent item, to one socket only): say title + body.
+ */
+export type NotificationMessage = { type: "notification"; item: NotificationInfo; speak?: true };
+/** An item was deleted or resolved; broadcast to every authenticated socket. */
+export type NotificationRemovedMessage = { type: "notification_removed"; notificationId: string };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -200,6 +239,9 @@ export type ServerMessage =
   | MemoryMessage
   | DevMessage
   | DevCountMessage
+  | NotificationsMessage
+  | NotificationMessage
+  | NotificationRemovedMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -399,6 +441,46 @@ function toDev(o: Obj): DevMessage | null {
 }
 
 /**
+ * A valid inbox item with only the known fields, or null. An unknown
+ * `urgency` string reads as `normal` (never spoken), so a newer Core's level
+ * still shows in the inbox.
+ */
+function toNotificationInfo(v: unknown): NotificationInfo | null {
+  if (!isObj(v) || !str(v, "id") || !v.id) return null;
+  for (const k of ["source", "urgency", "title", "body", "createdAt", "updatedAt"]) if (!str(v, k)) return null;
+  if (v.readAt !== null && !str(v, "readAt")) return null;
+  if (!isCount(v.raised)) return null;
+  return {
+    id: v.id as string,
+    source: v.source as string,
+    urgency: v.urgency === "urgent" ? "urgent" : "normal",
+    title: v.title as string,
+    body: v.body as string,
+    createdAt: v.createdAt as string,
+    updatedAt: v.updatedAt as string,
+    readAt: v.readAt as string | null,
+    raised: v.raised,
+  };
+}
+
+function toNotifications(o: Obj): NotificationsMessage | null {
+  if (!str(o, "id") || !isCount(o.unread) || !Array.isArray(o.items)) return null;
+  return {
+    type: "notifications",
+    id: o.id as string,
+    items: o.items.map(toNotificationInfo).filter((i): i is NotificationInfo => i !== null),
+    unread: o.unread,
+  };
+}
+
+/** `speak` is kept only when it is exactly `true`. */
+function toNotification(o: Obj): NotificationMessage | null {
+  const item = toNotificationInfo(o.item);
+  if (!item) return null;
+  return o.speak === true ? { type: "notification", item, speak: true } : { type: "notification", item };
+}
+
+/**
  * Parses one raw text frame. Returns null for anything that is not a valid,
  * known v1 server message (unknown types are ignored for forward
  * compatibility).
@@ -473,6 +555,14 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       return toDev(o);
     case "dev_count":
       return isCount(o.open) ? { type: "dev_count", open: o.open } : null;
+    case "notifications":
+      return toNotifications(o);
+    case "notification":
+      return toNotification(o);
+    case "notification_removed":
+      return str(o, "notificationId") && o.notificationId
+        ? { type: "notification_removed", notificationId: o.notificationId as string }
+        : null;
     case "pong":
       return { type: "pong" };
     default:

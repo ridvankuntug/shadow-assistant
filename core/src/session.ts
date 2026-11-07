@@ -37,7 +37,18 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import type { ClientFrame, DevAction, DevItem, ErrorCode, MemoryFrame, ServerFrame, SpeechMode } from "./protocol.js";
+import type { NotificationItem, NotificationStore, RaiseInput, RaiseResult } from "./notifications.js";
+import type {
+  ClientFrame,
+  DevAction,
+  DevItem,
+  ErrorCode,
+  MemoryFrame,
+  NotificationAction,
+  NotificationInfo,
+  ServerFrame,
+  SpeechMode,
+} from "./protocol.js";
 import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
@@ -151,6 +162,13 @@ export interface SessionDeps {
   wanderCalls?: number;
   /** The Development tab (T7.w.4, feature `dev`): `dev_list` / `dev_action`; absent = `bad_request`. */
   dev?: Pick<DevelopmentTab, "view" | "act" | "canManage">;
+  /**
+   * The notification inbox (T7.w.5, feature `notifications`): the session
+   * attaches itself for the `notification` broadcasts, reports its turns (for
+   * the urgent speaker) and answers `notifications_list` /
+   * `notification_action`; absent = `bad_request`.
+   */
+  notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "list" | "act">;
 }
 
 /** What a session needs for pattern learning. */
@@ -240,6 +258,8 @@ export class Session {
   private readonly sentHere = new SentEntries();
   /** The "result not paired" learning note is logged once per session. */
   private unpairedLogged = false;
+  /** Stops the notification broadcasts to this socket (close()). */
+  private readonly detachNotifications: (() => void) | undefined;
 
   constructor(
     private readonly deps: SessionDeps,
@@ -256,6 +276,13 @@ export class Session {
     });
     // Start the device's model session now, so the first turn finds it warm (07 §Prewarm).
     deps.registry?.prewarm(info.device);
+    // Synchronous with the server's welcome: a broadcast (always after an await) never precedes it.
+    this.detachNotifications = deps.notifications?.attach({
+      sessionId: info.sessionId,
+      device: info.device,
+      speaks: () => this.speechPrefs !== undefined,
+      deliver: (frame) => this.emit(frame),
+    });
   }
 
   get busy(): boolean {
@@ -334,6 +361,42 @@ export class Session {
       case "dev_action":
         await this.handleDev(frame.id, { itemId: frame.itemId, action: frame.action });
         return;
+      case "notifications_list":
+        await this.handleNotifications(frame.id);
+        return;
+      case "notification_action":
+        await this.handleNotifications(frame.id, { notificationId: frame.notificationId, action: frame.action });
+        return;
+    }
+  }
+
+  // ------------------------------------------------------------ notifications (T7.w.5)
+
+  /**
+   * `notifications_list` (no `action`) and `notification_action`: answered
+   * with a fresh `notifications` frame to this socket only, or an `error`
+   * with the request id. The change itself reaches every socket as a
+   * `notification` / `notification_removed` broadcast (this one included).
+   */
+  private async handleNotifications(id: string, action?: { notificationId: string; action: NotificationAction }): Promise<void> {
+    const center = this.deps.notifications;
+    if (!center) {
+      this.error("bad_request", "notifications are disabled", id);
+      return;
+    }
+    try {
+      if (action) {
+        const r = await center.act(this.info.device, action.notificationId, action.action);
+        if (!r.ok) {
+          this.error(r.code, r.message, id);
+          return;
+        }
+      }
+      const v = await center.list();
+      this.emit({ type: "notifications", id, items: v.items, unread: v.unread });
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] notifications request failed: ${(err as Error)?.name ?? "error"}`);
+      this.error("internal", "notifications are unavailable", id);
     }
   }
 
@@ -502,6 +565,8 @@ export class Session {
   private startTurn(id: string, text: string, source: "text" | "voice"): Promise<void> {
     // Second guard for paths that awaited (e.g. transcription) after handle()'s check.
     if (this.closing) return Promise.resolve();
+    // The device with the latest turn speaks the next urgent notification.
+    this.deps.notifications?.turnStarted(this.info.device, this.info.sessionId);
     const done = this.runTurn(id, text, source);
     this.turnDone = done;
     return done;
@@ -1536,6 +1601,7 @@ export class Session {
   }
 
   private async doClose(reason: string): Promise<void> {
+    this.detachNotifications?.();
     this.broker.cancelAll();
     this.closed = true;
     this.turn?.abort.abort();
@@ -1719,6 +1785,7 @@ export class DevelopmentTab {
    * One action by `device` (from its token). Idempotent: an action whose
    * result is already in place (`add_rule` on an active rule, `ignore` on a
    * rejected one, the same note status again) succeeds without a change.
+   * `ignore` rejects a candidate or a suspended rule, never an active one.
    */
   async act(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
     if (action === "add_rule" && !this.canManage(device)) {
@@ -1758,8 +1825,8 @@ export class DevelopmentTab {
       }
       case "ignore": {
         if (rule.status === "rejected") return { ok: true };
-        // The store rejects candidates only; a suspended rule stays until decision 4.
-        if (rule.status !== "candidate") return notValid();
+        // Candidates and suspended rules; an active rule is not removed from the tab (decision 4).
+        if (rule.status !== "candidate" && rule.status !== "suspended") return notValid();
         if (await rules.reject(rule.id)) {
           this.o.logger.info(`[shadow-core] learned rule ${rule.id} rejected by device ${device}`);
           return { ok: true };
@@ -1835,4 +1902,208 @@ function unknownItem(): DevActResult {
 
 function notAllowed(): DevActResult {
   return { ok: false, code: "not_allowed", message: "this action is not valid for the item" };
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (T7.w.5b; docs/08 §T7.w.5 Delivery, docs/02 §Notifications)
+
+/** One authenticated socket as the notification center sees it. */
+export interface NotificationListener {
+  readonly sessionId: string;
+  /** From the token. */
+  readonly device: string;
+  /** Whether the client has speech on (`speech_prefs` enabled); only such a socket is asked to speak. */
+  speaks(): boolean;
+  deliver(frame: ServerFrame): void;
+}
+
+export interface NotificationCenterOptions {
+  store: Pick<NotificationStore, "raise" | "resolve" | "markRead" | "markUnread" | "delete" | "list" | "unreadCount" | "flush">;
+  logger: Logger;
+}
+
+export type NotificationActResult = { ok: true } | { ok: false; code: Extract<ErrorCode, "unknown_item">; message: string };
+
+/** The item as clients see it: the stored fields without the producer's dedupe `key`. */
+export function notificationInfo(item: NotificationItem): NotificationInfo {
+  return {
+    id: item.id,
+    source: item.source,
+    urgency: item.urgency,
+    title: item.title,
+    body: item.body,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    readAt: item.readAt,
+    raised: item.raised,
+  };
+}
+
+/**
+ * The one inbox of the home over the notification store: the producer API
+ * (`raise` / `resolve`), the user's list and actions, and the broadcasts.
+ * Every change goes to every attached socket as `notification` (new or
+ * changed) or `notification_removed`. One instance serves every socket; all
+ * changes run on one chain, so broadcasts follow the store's order.
+ *
+ * Urgent speech: when an urgent item is raised (new, or raised again with
+ * `renotify`), exactly one socket gets `speak: true`: among the sockets with
+ * speech on, the one whose device had the most recent turn (ties: the
+ * socket's own latest turn, then the newest socket). Nothing is spoken when
+ * no socket has speech on, and nothing is spoken again later: a reconnect or
+ * a `notifications` list never carries `speak`.
+ */
+export class NotificationCenter {
+  /** Attached sockets → attach order. */
+  private readonly listeners = new Map<NotificationListener, number>();
+  /** Order of the latest turn per device and per socket. */
+  private readonly deviceTurns = new Map<string, number>();
+  private readonly sessionTurns = new Map<string, number>();
+  /** One counter for attach and turn order (no clock ties). */
+  private seq = 0;
+  private lastUnread = 0;
+  /** Serializes store calls, their broadcasts and the unread count. */
+  private chain: Promise<unknown> = Promise.resolve();
+
+  constructor(private readonly o: NotificationCenterOptions) {}
+
+  /** Unread items after the last change (sync, for /health `inbox`); `refresh()` once at startup. */
+  get unread(): number {
+    return this.lastUnread;
+  }
+
+  /** Re-reads the unread count from the store. */
+  refresh(): Promise<number> {
+    return this.serial(() => this.recount());
+  }
+
+  /** Starts the broadcasts to one socket. Returns the detach function (socket closed). */
+  attach(listener: NotificationListener): () => void {
+    this.listeners.set(listener, ++this.seq);
+    return () => {
+      this.listeners.delete(listener);
+      this.sessionTurns.delete(listener.sessionId);
+    };
+  }
+
+  /** A turn started on `device` (socket `sessionId`): that device speaks the next urgent item. */
+  turnStarted(device: string, sessionId: string): void {
+    const n = ++this.seq;
+    this.deviceTurns.set(device, n);
+    this.sessionTurns.set(sessionId, n);
+  }
+
+  /**
+   * Producer API: creates an item or updates the keyed one (NotificationStore.raise) and broadcasts it.
+   * Only a new urgent item, or an urgent raise with `renotify`, is spoken: a producer that raises a
+   * keyed item again as urgent (e.g. normal → urgent) must pass `renotify: true` to have it spoken.
+   */
+  raise(input: RaiseInput): Promise<RaiseResult> {
+    return this.serial(async () => {
+      const r = await this.o.store.raise(input);
+      if (!r.ok) return r;
+      const speak = r.item.urgency === "urgent" && (r.created || input.renotify === true);
+      this.broadcast({ type: "notification", item: notificationInfo(r.item) }, speak ? this.speaker() : undefined);
+      await this.recount();
+      return r;
+    });
+  }
+
+  /** Producer API: removes the keyed item (the condition is over) and broadcasts the removal. Resolves whether one was removed. */
+  resolve(source: string, key: string): Promise<boolean> {
+    return this.serial(async () => {
+      // On the same chain as every other change: the item found here is the one resolve() removes.
+      const item = (await this.o.store.list()).find((i) => i.source === source && i.key === key);
+      if (!item || !(await this.o.store.resolve(source, key))) return false;
+      this.broadcast({ type: "notification_removed", notificationId: item.id });
+      await this.recount();
+      return true;
+    });
+  }
+
+  /** All items (most recently updated first) and the unread count. */
+  list(): Promise<{ items: NotificationInfo[]; unread: number }> {
+    return this.serial(async () => {
+      const items = await this.o.store.list();
+      return { items: items.map(notificationInfo), unread: items.filter((i) => i.readAt === null).length };
+    });
+  }
+
+  /**
+   * One user action by `device` (from its token). `read` / `unread` are
+   * idempotent (no broadcast when nothing changed); `delete` of an unknown
+   * or already deleted item is `unknown_item`.
+   */
+  act(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
+    return this.serial(async () => {
+      if (action === "delete") {
+        if (!(await this.o.store.delete(notificationId))) return unknownNotification();
+        this.o.logger.info(`[shadow-core] notification ${notificationId} deleted by device ${device}`);
+        this.broadcast({ type: "notification_removed", notificationId });
+        await this.recount();
+        return { ok: true };
+      }
+      const before = (await this.o.store.list()).find((i) => i.id === notificationId);
+      if (!before) return unknownNotification();
+      const after = action === "read" ? await this.o.store.markRead(notificationId) : await this.o.store.markUnread(notificationId);
+      if (!after) return unknownNotification();
+      if (after.readAt !== before.readAt) {
+        this.broadcast({ type: "notification", item: notificationInfo(after) });
+        await this.recount();
+      }
+      return { ok: true };
+    });
+  }
+
+  /** Waits for the changes in flight, then retries a failed store write (shutdown). Never rejects. */
+  flush(): Promise<void> {
+    return this.serial(() => this.o.store.flush()).catch(() => {});
+  }
+
+  /** The socket that speaks an urgent item now, or undefined (no socket has speech on). */
+  private speaker(): NotificationListener | undefined {
+    let best: { l: NotificationListener; rank: number[] } | undefined;
+    for (const [l, attached] of this.listeners) {
+      if (!safe(() => l.speaks(), false)) continue;
+      const rank = [this.deviceTurns.get(l.device) ?? 0, this.sessionTurns.get(l.sessionId) ?? 0, attached];
+      if (!best || compareRank(rank, best.rank) > 0) best = { l, rank };
+    }
+    return best?.l;
+  }
+
+  private broadcast(frame: ServerFrame, speaker?: NotificationListener): void {
+    for (const l of [...this.listeners.keys()]) {
+      const out: ServerFrame = l === speaker && frame.type === "notification" ? { ...frame, speak: true } : frame;
+      safe(() => l.deliver(out), undefined);
+    }
+  }
+
+  private async recount(): Promise<number> {
+    this.lastUnread = await this.o.store.unreadCount();
+    return this.lastUnread;
+  }
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn);
+    this.chain = run.catch((err: unknown) => this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`));
+    return run;
+  }
+}
+
+function compareRank(a: readonly number[], b: readonly number[]): number {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return (a[i] ?? 0) - (b[i] ?? 0);
+  return 0;
+}
+
+/** A listener must never break a broadcast or the speaker choice. */
+function safe<T>(fn: () => T, fallback: T): T {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+
+function unknownNotification(): NotificationActResult {
+  return { ok: false, code: "unknown_item", message: "unknown notification" };
 }
