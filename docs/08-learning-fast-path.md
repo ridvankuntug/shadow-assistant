@@ -96,7 +96,8 @@ case battery reminder of T11-B).
 - **Built-in tools.** `tools: []`, `disallowedTools: DENIED_BUILTIN_TOOLS`,
   `settingSources: []`, `strictMcpConfig`, `canUseTool: gatewayToolGuard(...)`
   in `buildOptions()` / `buildPersistentOptions()` ([`agent.ts`](../core/src/agent.ts))
-  and `buildOneShotOptions()` ([`index.ts`](../core/src/index.ts)); the session
+  and `buildOneShotOptions()` ([`one-shot.ts`](../core/src/one-shot.ts), moved out of
+  `index.ts` by T7.w.6a); the session
   gate denies any non-`mcp__` name (`identifyTool().builtin` → `deny`).
 
 ## T7.w.1 Number normalization (input only)
@@ -476,7 +477,7 @@ writers on one file, a schema migration, and nothing gained.
 | Kind | Recorded when | Key (one note per key) |
 |---|---|---|
 | `missing_capability` | the model asked for something the Core cannot give: a built-in tool (gate `builtin`), a tool outside the tier's services (`tier_service`), a tool name the gateway does not list (`unknown_tool`, recorded in `McpGateway.call()`, before the gate) | kind + reason + service + tool |
-| `wandering` | a model turn with ≥ `wander_calls` tool calls (default 5) or stopped by the tool-call cap (`tool_cap`) | kind + tier + route source/rule + sorted unique tool names (max 5) |
+| `wandering` | a model turn with ≥ `wander_calls` tool calls (default 5; `DEFAULT_WANDER_CALLS` in session.ts, not a router.yaml key in v1) or stopped by the tool-call cap (`tool_cap`, persistent sessions) | kind + tier + route source/rule + sorted unique tool names (max 5) |
 | `tool_error` | a tool result with `isError`, or the service unreachable (model or tier 0); user denials are not errors | kind + service + tool + class (`error` / `unavailable`) |
 | `rule_suspended` | a learned rule was suspended | kind + rule id + reason |
 
@@ -484,6 +485,21 @@ Each note: key fields, a short Turkish `message`, `count`, `firstSeen`,
 `lastSeen`, `lastTurnId`, and the Development-tab state `status?` (`ignored` /
 `fixed`; absent = open) with `statusAt`.
 
+- **Where each kind is recorded (T7.w.3b):** `builtin` and `tier_service` in the
+  session gate. In production the SDK guard (`gatewayToolGuard`, gateway-sdk.ts)
+  denies every non-gateway name before the Core gate sees it, so a `builtin` note
+  only appears for a built-in name that reaches the gate; recording the guard's
+  denials needs gateway-sdk.ts / agent.ts and a turn id there (not in T7.w.3b).
+  `unknown_tool` in `McpGateway.call()`, which serves no particular turn, so these
+  notes have **no `lastTurnId`**. `wandering` counts the model calls that reached
+  the Core gate (calls refused before it, by the SDK guard or as `unknown_tool`,
+  are not counted). `tool_error` in the session: at tier 0 with both classes, on
+  the model path for an `isError` result of a call the gate allowed, always class
+  `error` (the session sees only `isError`, so an unreachable service, an approval
+  that came too late for the call's time limit or a call of an ended turn are not
+  told apart); a denied call (user, timeout, read-only, tier) and the error result
+  of a cancelled turn are not errors. `rule_suspended` when a run suspends a learned
+  rule (a load-time suspension by router.yaml is only logged).
 - **Privacy rule (same as `tools.json`, enforced by a test):** only enum values,
   tool and service names from the catalog, tier, route source / static rule id,
   learned rule id, counts, times and the opaque `lastTurnId`. Never user text,
@@ -514,19 +530,19 @@ Behind a new feature flag `dev` in `welcome.features`, mirroring the memory fram
 | client → Core | `dev_list` | `id` |
 | client → Core | `dev_action` | `id`, `itemId`, `action`: `add_rule` \| `ignore` \| `fixed` |
 | Core → client | `dev` | `id` (request id), `items[]`, `open` (badge count), `canManage` |
-| Core → all authenticated sockets | `dev_count` | `open` (sent when it changes) |
+| Core → all authenticated sockets | `dev_count` | `open` (sent when it changes; clients do not announce features, so a client that does not know the frame ignores it) |
 
 `items[]`: `{ itemId, type: "rule" | "note", kind, status, message, count,
 firstSeen, lastSeen, rule?: { tokens, tool, domains, numberRange?, observations } }`.
 Display only; it carries the fields of the files, nothing more. Errors:
 `unknown_item`, `not_allowed` (action not valid for the item, or the device may
-not do it), `bad_frame`. Actions are idempotent (`add_rule` on an active rule is a
+not do it), `bad_request` (malformed frame; the existing code, no new `bad_frame`). Actions are idempotent (`add_rule` on an active rule is a
 no-op answered with the fresh list).
 
 | Action | Rule candidate | Suspended rule | Note |
 |---|---|---|---|
 | `add_rule` ("Kuralı ekle") | → `active` (re-validated first) | – ([decision 4](#kullanıcı-kararı-gerekli-decisions-for-the-user)) | – |
-| `ignore` ("Yok say") | → `rejected` | → `rejected` | `status: ignored` |
+| `ignore` ("Yok say") | → `rejected` | → `rejected` (not built yet: `LearnedRuleStore.reject()` takes candidates only, so T7.w.4b answers `not_allowed`) | `status: ignored` |
 | `fixed` ("Düzeltildi") | – | – | `status: fixed` (does not change rules or services.yaml) |
 
 Badge count `open` = candidates + suspended rules + open notes.
@@ -671,7 +687,7 @@ Most of this exists and passes today:
 
 Gaps, closed by T7.w.6a (unit level, no SDK process):
 
-1. **One-shot options.** `buildOneShotOptions()` (index.ts; memory extraction and
+1. **One-shot options.** `buildOneShotOptions()` (`one-shot.ts`, moved out of index.ts; memory extraction and
    lifecycle summaries) has no test: assert `tools: []`, `mcpServers: {}`,
    `disallowedTools`, `settingSources: []`, `strictMcpConfig`, `maxTurns: 1`,
    `persistSession: false`, and that its `canUseTool` denies any name.
@@ -722,7 +738,7 @@ ever learned from such a turn.
 | services.yaml raises the tool to `confirm` | the learned rule asks for confirmation (gate) |
 | router.yaml narrows `learning` | affected rules `suspended` (`not_allowed`) at load |
 | a store write fails | logged; in-memory state kept; next write retries; a rule activation is not applied |
-| a client without `dev` / `notifications` | no frames sent to it; badges hidden |
+| a client that does not know `dev` / `notifications` | it ignores the broadcast count frames (they go to every authenticated socket; clients do not announce features); request frames are only sent by clients that saw the feature; badges hidden without the feature |
 
 ## Kullanıcı kararı gerekli (decisions for the user)
 
@@ -837,14 +853,14 @@ T7.w.7 has no task (deferred).
   `dev-notes.test.ts` passes unchanged; tests for each `turns.json` kind and for
   reopen-after-fixed; a privacy test feeds secret-looking arguments, text, entity
   names and error messages and asserts none of them reach either file.
-- [ ] **T7.w.3b — Recording turn notes.** `missing_capability` (gate and
+- [x] **T7.w.3b — Recording turn notes.** `missing_capability` (gate and
   `McpGateway.call()`), `wandering`, `tool_error`, `rule_suspended`. Acceptance:
   session/gateway tests for each kind; `lastTurnId` set; a user denial is not a
   `tool_error`.
 - [x] **T7.w.4a — Protocol: dev frames.** Types, parsing, `dev` feature, docs/02.
   Acceptance: parser tests (valid, invalid, unknown fields ignored); old frames
   unchanged.
-- [ ] **T7.w.4b — Core: Development listing and actions.** `dev_list`, `dev_action`,
+- [x] **T7.w.4b — Core: Development listing and actions.** `dev_list`, `dev_action`,
   `dev_count` broadcast, `CORE_DEV_DEVICES` (+ `.env.example`), loopback-only
   `inbox.dev` in `/health`. Acceptance: `add_rule` from a listed device activates
   a candidate (re-validated) and the next matching utterance runs at tier 0;
@@ -874,7 +890,7 @@ T7.w.7 has no task (deferred).
   channel, per-item ids. Acceptance: manual on a phone: a test item appears while
   the app is in the background; two items show as two notifications; a
   confirmation still uses its own channel; dismissing does not delete the item.
-- [~] **T7.w.6a — Built-in tools test gaps.** The two additions in
+- [x] **T7.w.6a — Built-in tools test gaps.** The two additions in
   [T7.w.6](#t7w6-built-in-tools-closed). Acceptance: the tests fail if `tools`,
   `mcpServers`, `settingSources` or the guard of `buildOneShotOptions()` is
   loosened, or if an unknown non-`mcp__` name is allowed.
@@ -934,3 +950,20 @@ T7.w.7 has no task (deferred).
   can still be stored as a literal even when it is also a home name. Option:
   check name words first (blocks more phrasings, e.g. "lambası" when a device is
   called "Tavan Lambası").
+- 2026-11-07: T7.w.3b, T7.w.4b and the rest of T7.w.6a implemented (senior-dev); review
+  and tester pending. Narrowest readings: `unknown_tool` notes come from the gateway and
+  have no `lastTurnId` (it serves no turn; giving it one needs device-agent.ts /
+  gateway-sdk.ts); model-path `tool_error` is always class `error`; `wander_calls` is a
+  code default (5), not a router.yaml key; `bad_request` stays the malformed-frame code
+  (docs/08 aligned); `dev_count` goes to every authenticated socket (docs/08 aligned with
+  docs/02); `ignore` on a suspended rule answers `not_allowed` (the store rejects
+  candidates only; store.ts is outside the 4b files); loopback for `/health` `inbox` also
+  accepts `::ffff:127.0.0.1`. `buildOneShotOptions()` moved unchanged to `one-shot.ts`.
+- 2026-11-07: T7.w.3b, T7.w.4b, T7.w.6a done (senior-code-reviewer 2 rounds, no critical or
+  high finding; tester: core 1165/1165, lint, build, ui 336/336, 11 mutations killed).
+  Round 1 fixed: an approving device name the rule file cannot store gets its own
+  `not_allowed` message; the narrow readings for `builtin` (the SDK guard denies first),
+  `wandering` (calls that reached the gate) and model-path `tool_error` are written in
+  §T7.w.3. Open, for a decision: a suspended rule counts in `open` but no tab action can
+  clear it (the UI offers "Yok say", the Core answers `not_allowed`) until decision 4 or a
+  `reject()` for suspended rules in store.ts.

@@ -17,7 +17,7 @@ import {
   type HealthTarget,
 } from "../src/health.js";
 import type { ServerFrame, ServiceHealth } from "../src/protocol.js";
-import { createCoreServer } from "../src/server.js";
+import { createCoreServer, isLoopbackAddress } from "../src/server.js";
 import { parseServices } from "../src/services.js";
 import type { Session } from "../src/session.js";
 
@@ -481,4 +481,110 @@ test("server: before the first round no services frame is sent on connect", asyn
     await server.close();
     await monitor.close();
   }
+});
+
+// ------------------------------------------------------------------ T7.w.4b: inbox and dev_count
+
+test("isLoopbackAddress: 127.0.0.1, ::1 and the IPv4-mapped form only", () => {
+  for (const a of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) assert.equal(isLoopbackAddress(a), true, a);
+  for (const a of [undefined, "", "127.0.0.2", "192.0.2.10", "::ffff:192.0.2.10", "fe80::1", "localhost", "0.0.0.0"]) {
+    assert.equal(isLoopbackAddress(a), false, String(a));
+  }
+});
+
+/** Runs the server's HTTP handler for a GET from `remoteAddress` (no socket needed). */
+function getFrom(server: ReturnType<typeof createCoreServer>, path: string, remoteAddress: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  return new Promise((resolve) => {
+    let status = 0;
+    const req = { method: "GET", url: path, headers: {}, socket: { remoteAddress } } as unknown as IncomingMessage;
+    const res = {
+      headersSent: false,
+      writeHead(s: number) {
+        status = s;
+        return this;
+      },
+      end(chunk?: string) {
+        resolve({ status, body: JSON.parse(chunk ?? "{}") as Record<string, unknown> });
+      },
+    } as unknown as ServerResponse;
+    server.http.emit("request", req, res);
+  });
+}
+
+test("server: GET /health has `inbox` only for loopback requests", async () => {
+  let open = 3;
+  const server = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),
+    logger: quiet,
+    health: () => ({ services: [] }),
+    inbox: () => ({ dev: open }),
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  const { port } = await server.listen(0, "127.0.0.1");
+  try {
+    // A real loopback request.
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.deepEqual(body.inbox, { dev: 3 });
+    assert.deepEqual(body.services, []);
+    open = 0;
+    assert.deepEqual((await getFrom(server, "/health", "::1")).body.inbox, { dev: 0 });
+    assert.deepEqual((await getFrom(server, "/health", "::ffff:127.0.0.1")).body.inbox, { dev: 0 });
+    // Remote callers: the same body without `inbox`.
+    for (const remote of ["192.0.2.10", "::ffff:192.0.2.10", "fe80::1"]) {
+      const r = await getFrom(server, "/health", remote);
+      assert.equal(r.status, 200);
+      assert.equal("inbox" in r.body, false, remote);
+      assert.equal(r.body.status, "ok");
+      assert.deepEqual(r.body.services, []);
+    }
+  } finally {
+    await server.close();
+  }
+  // Without an inbox source nobody gets the field.
+  const plain = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),
+    logger: quiet,
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  assert.equal("inbox" in (await getFrom(plain, "/health", "127.0.0.1")).body, false);
+});
+
+test("server: dev_count reaches every authenticated socket, not an unauthenticated one; close() unsubscribes", async () => {
+  const listeners = new Set<(open: number) => void>();
+  const devCount = {
+    subscribe(l: (open: number) => void) {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+  };
+  const server = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN, DEVICE_TOKEN_ANDROID: `${TOKEN}-2` }),
+    logger: quiet,
+    devCount,
+    features: ["dev"],
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  const { port } = await server.listen(0, "127.0.0.1");
+  try {
+    const anon = await wsClient(port);
+    const a = await wsClient(port);
+    const b = await wsClient(port);
+    a.ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN, client: "web" }));
+    b.ws.send(JSON.stringify({ type: "hello", protocol: 1, token: `${TOKEN}-2`, client: "android" }));
+    await a.wait(1, "state");
+    await b.wait(1, "state");
+    for (const l of listeners) l(4);
+    const [fa] = await a.wait(1, "dev_count");
+    const [fb] = await b.wait(1, "dev_count");
+    assert.deepEqual(fa, { type: "dev_count", open: 4 });
+    assert.deepEqual(fb, { type: "dev_count", open: 4 });
+    assert.equal(anon.frames.length, 0);
+    anon.ws.close();
+    a.ws.close();
+    b.ws.close();
+  } finally {
+    await server.close();
+  }
+  assert.equal(listeners.size, 0);
 });

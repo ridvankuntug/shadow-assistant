@@ -17,10 +17,13 @@
  *   with `isError: true`, so the turn goes on.
  * - Each fresh remote list is classified by the permission policy and handed
  *   to dev-notes ("new tool: classify", added/removed tools, stale rules).
+ * - A call naming a tool the gateway does not offer is a turn dev-note
+ *   (`missing_capability`, reason `unknown_tool`; T7.w.3), recorded before the
+ *   gate. The gateway serves no particular turn, so the note has no turn id.
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { CatalogEntry, DevNotes } from "./dev-notes.js";
+import type { CatalogEntry, DevNotes, TurnNotes } from "./dev-notes.js";
 import { DirectUnavailableError, untilAborted, type RemoteMcpClient } from "./mcp-direct.js";
 import type { PermissionCallback } from "./model-provider.js";
 
@@ -82,7 +85,9 @@ export type GatewayGate = PermissionCallback & { bindTurn?: () => BoundGate | un
 export interface McpGatewayOptions {
   sources: readonly GatewaySource[];
   classifier?: ToolClassifier;
-  devNotes?: DevNotes;
+  devNotes?: Pick<DevNotes, "recordCatalog">;
+  /** Turn dev-notes: unknown tool names (`missing_capability` / `unknown_tool`). */
+  turnNotes?: Pick<TurnNotes, "record">;
   /** A cached remote list younger than this is served without asking the service. Default 60 s. */
   listTtlMs?: number;
   /** Retry interval of `warm()` while a remote service has never been listed. Default 30 s. */
@@ -439,7 +444,7 @@ export class McpGateway {
     let input = args ?? {};
     if (src.kind === "local") {
       local = src.tools.find((t) => t.name === tool);
-      if (!local) return text(GATEWAY_MESSAGES.unknownTool(tool), true);
+      if (!local) return this.unknownTool(service, tool);
       const parsed = z.object(local.shape).safeParse(input);
       if (!parsed.success) return text(GATEWAY_MESSAGES.invalidArgs(tool, zodSummary(parsed.error)), true);
     } else {
@@ -453,7 +458,7 @@ export class McpGateway {
           return text(GATEWAY_MESSAGES.unavailable(service), true);
         }
       }
-      if (!known) return text(GATEWAY_MESSAGES.unknownTool(tool), true);
+      if (!known) return this.unknownTool(service, tool);
       if (!bound.isCurrent()) return text(GATEWAY_MESSAGES.noTurn, true);
     }
 
@@ -512,6 +517,20 @@ export class McpGateway {
       this.o.log?.("warn", `[shadow-core] gateway: ${service}/${tool} failed: ${detail}`);
       return text(GATEWAY_MESSAGES.unavailable(service), true);
     }
+  }
+
+  /**
+   * A tool the service does not offer: refused before the gate and noted. The
+   * name is the model's own; TurnNotes stores it only if it looks like an
+   * identifier. Never throws.
+   */
+  private unknownTool(service: string, tool: string): GatewayToolResult {
+    try {
+      void this.o.turnNotes?.record({ kind: "missing_capability", reason: "unknown_tool", service, tool }).catch(() => {});
+    } catch {
+      // a broken recorder must never affect the call
+    }
+    return text(GATEWAY_MESSAGES.unknownTool(tool), true);
   }
 }
 

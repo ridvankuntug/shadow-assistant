@@ -7,6 +7,7 @@ import { after, test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { PermissionCallback } from "../src/model-provider.js";
 import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
+import { buildOneShotOptions } from "../src/one-shot.js";
 import { buildTurnEnvelope, DIRECT_NOTES_END, DIRECT_NOTES_START, TIER1_MARKER, wrapDirectNotes } from "../src/turn-envelope.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-agent-test-"));
@@ -57,6 +58,34 @@ test("buildOptions: the SDK guard denies a name no list knows (T7.w.6a)", async 
     assert.equal((await ask(name))?.behavior, "deny", name);
   }
   assert.equal((await ask("mcp__home-assistant__intent__HassTurnOn"))?.behavior, "allow");
+});
+
+test("one-shot background options are closed: no tools, no MCP, no settings, one turn, not persisted, guard denies all (T7.w.6a)", async () => {
+  const env = { PATH: "x" };
+  const abortController = new AbortController();
+  const build = buildOneShotOptions(join(base, "cwd"), env);
+  const opts = build({ model: "haiku", system: "sys", abortController });
+  assert.deepEqual(opts.tools, []);
+  assert.deepEqual(opts.mcpServers, {});
+  assert.deepEqual(opts.settingSources, []);
+  assert.equal(opts.strictMcpConfig, true);
+  assert.equal(opts.maxTurns, 1);
+  assert.equal(opts.persistSession, false);
+  assert.equal(opts.permissionMode, "default");
+  assert.equal(opts.allowedTools, undefined, "nothing may bypass canUseTool");
+  assert.deepEqual(opts.disallowedTools, DENIED_BUILTIN_TOOLS);
+  assert.equal(opts.model, "haiku");
+  assert.deepEqual(opts.systemPrompt, { type: "custom", prompt: "sys", snapshot: false });
+  assert.equal(opts.abortController, abortController);
+  assert.equal(opts.env, env);
+  assert.equal(opts.cwd, join(base, "cwd"));
+  assert.equal("systemPrompt" in build({ model: "haiku", abortController }), false, "no system prompt unless given");
+  const guard = opts.canUseTool;
+  assert.ok(guard);
+  for (const name of ["Bash", "Read", "FutureTool", "mcp__home-assistant__intent__HassTurnOn", "mcp__shadow-memory__memory_forget", ""]) {
+    const d = await guard(name, {}, { signal: new AbortController().signal, toolUseID: "t" } as Parameters<NonNullable<typeof guard>>[2]);
+    assert.equal(d.behavior, "deny", name);
+  }
 });
 
 test("buildOptions: tier-1 escalation prompt, fork only when resuming, MCP server filter", () => {

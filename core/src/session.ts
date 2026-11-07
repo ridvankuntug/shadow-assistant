@@ -5,13 +5,15 @@
  * Transport-agnostic: frames come in through `handle()` and go out through
  * the `send` callback, so the whole flow is unit-testable without sockets.
  */
+import { createHash } from "node:crypto";
 // Type-only: agent.ts loads the provider SDK, which session.ts must never do.
 import type { AgentRunner, TurnResult } from "./agent.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
+import { toolNoteKey, turnNoteKey, type DevNotes, type NoteStatus, type TurnNoteInput, type TurnNotes } from "./dev-notes.js";
 import type { DeviceRegistry } from "./device-registry.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
 import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
-import type { LearnedRuleStore } from "./learn/store.js";
+import type { LearnedRuleRecord, LearnedRuleStore } from "./learn/store.js";
 import { parseLiveContext } from "./live-context.js";
 import type { DirectToolClient } from "./mcp-direct.js";
 import type { DeviceMaintenance } from "./memory/lifecycle.js";
@@ -35,7 +37,7 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import type { ClientFrame, ErrorCode, MemoryFrame, ServerFrame, SpeechMode } from "./protocol.js";
+import type { ClientFrame, DevAction, DevItem, ErrorCode, MemoryFrame, ServerFrame, SpeechMode } from "./protocol.js";
 import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
@@ -75,6 +77,11 @@ const LEARNED_FAILURES: ReadonlySet<string> = new Set([
   "no_name",
   "no_brightness",
 ]);
+
+/** Model tool calls in one turn from which it counts as `wandering` (docs/08 §T7.w.3). */
+export const DEFAULT_WANDER_CALLS = 5;
+/** Distinct tool names kept per turn for the `wandering` note (the note keeps at most 5). */
+const MAX_TURN_TOOL_NAMES = 16;
 
 /** close() waits at most this long for turn tails (usage at `settled`, timing, speech) before session_end. */
 export const TAIL_WAIT_MS = 3_000;
@@ -138,6 +145,12 @@ export interface SessionDeps {
   maintenance?: SessionMaintenance;
   /** Pattern learning (T7.w.2, docs/08); absent = nothing observed, learned outcomes not counted. */
   learning?: SessionLearning;
+  /** Turn dev-notes (T7.w.3, `dev-notes/turns.json`); absent = none recorded. Never holds text, arguments or results. */
+  turnNotes?: Pick<TurnNotes, "record">;
+  /** Model tool calls per turn from which a `wandering` note is recorded; default DEFAULT_WANDER_CALLS. */
+  wanderCalls?: number;
+  /** The Development tab (T7.w.4, feature `dev`): `dev_list` / `dev_action`; absent = `bad_request`. */
+  dev?: Pick<DevelopmentTab, "view" | "act" | "canManage">;
 }
 
 /** What a session needs for pattern learning. */
@@ -182,6 +195,12 @@ interface ActiveTurn {
   waitedForCompactMs?: number;
   /** Set for a turn the learner may look at (`source: "default"`, learning on). */
   observed?: TurnObservation;
+  /** Model tool calls that reached the Core gate in this turn (all attempts; `wandering`). */
+  toolCalls: number;
+  /** Their distinct tool names (service-relative), bounded by MAX_TURN_TOOL_NAMES. */
+  toolNames: Set<string>;
+  /** Tool use ids the gate allowed: only their `isError` results are `tool_error` notes (a denial is not an error). */
+  allowedUseIds: Set<string>;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -309,6 +328,41 @@ export class Session {
       case "memory_delete":
         await this.handleMemory(frame.id, frame.entryId);
         return;
+      case "dev_list":
+        await this.handleDev(frame.id);
+        return;
+      case "dev_action":
+        await this.handleDev(frame.id, { itemId: frame.itemId, action: frame.action });
+        return;
+    }
+  }
+
+  // ------------------------------------------------------------ Development tab (T7.w.4)
+
+  /**
+   * `dev_list` (no `action`) and `dev_action`: answered with a fresh `dev`
+   * frame to this socket only, or an `error` with the request id. The device
+   * is the one from the token (`info.device`), never `hello.client`.
+   */
+  private async handleDev(id: string, action?: { itemId: string; action: DevAction }): Promise<void> {
+    const dev = this.deps.dev;
+    if (!dev) {
+      this.error("bad_request", "development tab is disabled", id);
+      return;
+    }
+    try {
+      if (action) {
+        const r = await dev.act(this.info.device, action.itemId, action.action);
+        if (!r.ok) {
+          this.error(r.code, r.message, id);
+          return;
+        }
+      }
+      const v = await dev.view();
+      this.emit({ type: "dev", id, items: v.items, open: v.open, canManage: dev.canManage(this.info.device) });
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] development request failed: ${(err as Error)?.name ?? "error"}`);
+      this.error("internal", "development items are unavailable", id);
     }
   }
 
@@ -477,7 +531,15 @@ export class Session {
   }
 
   private async runTurn(id: string, text: string, source: "text" | "voice"): Promise<void> {
-    const turn: ActiveTurn = { id, abort: new AbortController(), text: "", startedAt: Date.now() };
+    const turn: ActiveTurn = {
+      id,
+      abort: new AbortController(),
+      text: "",
+      startedAt: Date.now(),
+      toolCalls: 0,
+      toolNames: new Set(),
+      allowedUseIds: new Set(),
+    };
     this.turn = turn;
     // Any tier, for the whole turn (tier-0 confirmations included): no compaction starts meanwhile.
     const endActivity = this.deps.registry?.beginActivity?.(this.info.device);
@@ -645,10 +707,12 @@ export class Session {
         try {
           const result = await client.callTool(plan.service, tool, args, turn.abort.signal);
           this.toolFinished(id, full, result.isError);
+          if (result.isError) this.note({ kind: "tool_error", service: plan.service, tool, errorClass: "error", turnId: id });
           return { status: "ok", result };
         } catch (err) {
           if (turn.abort.signal.aborted) return { status: "denied", reason: "cancelled" };
           this.toolFinished(id, full, true);
+          this.note({ kind: "tool_error", service: plan.service, tool, errorClass: "unavailable", turnId: id });
           const message = (err as Error).message;
           this.deps.logger.warn(`[shadow-core] direct ${plan.service}/${tool} failed: ${message}`);
           return { status: "unavailable", message };
@@ -657,7 +721,7 @@ export class Session {
       outcome = await runDirectPlan(plan, call, { fallbackOnError: decision.fallbackOnError === true });
     }
     if (turn.abort.signal.aborted) outcome = { kind: "cancelled" };
-    if (decision.source === "learned" && decision.learnedId !== undefined) this.reportLearned(decision.learnedId, outcome);
+    if (decision.source === "learned" && decision.learnedId !== undefined) this.reportLearned(decision.learnedId, outcome, id);
 
     const usage = (o: UsageOutcome): UsageRecord => ({
       turnId: id,
@@ -700,13 +764,67 @@ export class Session {
    * Counts one run of an active learned rule (off the turn path): a success,
    * a fallback of the rule's own (toward suspension) or neutral.
    */
-  private reportLearned(id: string, outcome: DirectOutcome): void {
+  private reportLearned(id: string, outcome: DirectOutcome, turnId: string): void {
     const store = this.deps.learning?.store;
     if (!store) return;
     let p: Promise<unknown> | undefined;
     if (outcome.kind === "reply" && outcome.status === "done") p = store.recordOutcome(id, "success");
-    else if (outcome.kind === "fallback" && LEARNED_FAILURES.has(outcome.reason)) p = store.recordOutcome(id, "failure", outcome.reason);
+    else if (outcome.kind === "fallback" && LEARNED_FAILURES.has(outcome.reason)) {
+      const reason = outcome.reason;
+      p = store.recordOutcome(id, "failure", reason).then((r) => {
+        // The reason is the fallback's enum value (LEARNED_FAILURES), never a message.
+        if (r.suspended) this.note({ kind: "rule_suspended", ruleId: id, reason, turnId });
+      });
+    }
     if (p) this.track(p);
+  }
+
+  // ------------------------------------------------------------ turn dev-notes (T7.w.3)
+
+  /** Records one turn dev-note. Never throws; fire and forget (TurnNotes coalesces the writes). */
+  private note(input: TurnNoteInput): void {
+    const notes = this.deps.turnNotes;
+    if (!notes) return;
+    try {
+      void notes.record(input).catch(() => {});
+    } catch {
+      // a broken recorder must never affect the turn
+    }
+  }
+
+  /**
+   * A model tool result: `isError` of a call the gate allowed is a `tool_error`
+   * (class `error`: the model path cannot tell an unreachable service from a
+   * failing tool). Denied calls (user, gate) and calls the gateway refused
+   * before the gate (unknown tool: `missing_capability`) are not errors; nor
+   * is the error result of a cancelled turn.
+   */
+  private noteModelResult(turn: ActiveTurn, toolUseId: string, name: string | undefined, isError: boolean): void {
+    if (!isError || !turn.allowedUseIds.has(toolUseId) || turn.abort.signal.aborted || !name) return;
+    const { identity } = this.deps.policy.levelFor(name);
+    if (identity.service === undefined) return;
+    this.note({ kind: "tool_error", service: identity.service, tool: identity.tool, errorClass: "error", turnId: turn.id });
+  }
+
+  /** One model tool call reached the gate: counted for `wandering`. */
+  private countToolCall(turn: ActiveTurn, toolName: string): void {
+    turn.toolCalls++;
+    if (turn.toolNames.size < MAX_TURN_TOOL_NAMES) turn.toolNames.add(this.deps.policy.levelFor(toolName).identity.tool);
+  }
+
+  /** A model turn with many tool calls, or one the tool-call cap stopped, is `wandering`. */
+  private noteWandering(turn: ActiveTurn, decision: RouteDecision, tier: ModelTier, toolCap: boolean): void {
+    const limit = this.deps.wanderCalls ?? DEFAULT_WANDER_CALLS;
+    if (!toolCap && turn.toolCalls < limit) return;
+    this.note({
+      kind: "wandering",
+      trigger: toolCap ? "tool_cap" : "calls",
+      tier,
+      routeSource: decision.source ?? "none",
+      ...(decision.rule !== undefined ? { routeRule: decision.rule } : {}),
+      tools: [...turn.toolNames],
+      turnId: turn.id,
+    });
   }
 
   // ------------------------------------------------------------ pattern learning (T7.w.2)
@@ -962,6 +1080,8 @@ export class Session {
     this.writeTiming(turn, callTier, routeMs, doneAt, Promise.resolve({ sdkDurationMs: result.durationMs, warm: false, queryAgeMs: 0 }));
     // Legacy results are final on return.
     this.learnAtSettle(turn, decision, Promise.resolve(), () => !cancelled && !result.error);
+    // The legacy runner has no tool-call cap of its own (maxTurns ends it as an error): calls only.
+    this.noteWandering(turn, decision, callTier, false);
     return result;
   }
 
@@ -996,6 +1116,7 @@ export class Session {
         onToolResult: (toolUseId, name, isError) => {
           this.toolFinished(id, name, isError);
           this.observeResult(turn, toolUseId, isError);
+          this.noteModelResult(turn, toolUseId, name, isError);
         },
       },
     );
@@ -1129,6 +1250,10 @@ export class Session {
       turn.observed = undefined;
       return true;
     }
+    const wanderTier = callTier;
+    this.track(
+      Promise.all(attemptsSettled).then((all) => this.noteWandering(turn, decision, wanderTier, all.some((o) => o.status === "tool_cap"))),
+    );
     let lastStatus: AttemptOutcome["status"] | undefined;
     this.learnAtSettle(
       turn,
@@ -1174,6 +1299,7 @@ export class Session {
           onToolResult: (toolUseId, name, isError) => {
             this.toolFinished(turn.id, name, isError);
             this.observeResult(turn, toolUseId, isError);
+            this.noteModelResult(turn, toolUseId, name, isError);
           },
         },
       });
@@ -1275,10 +1401,12 @@ export class Session {
    */
   gate(turn: ActiveTurn, services?: readonly string[]): PermissionCallback {
     return async (toolName, input, opts): Promise<PermissionDecision> => {
+      this.countToolCall(turn, toolName);
       const r = services && !this.inTierServices(toolName, services)
         ? this.denyOutsideTier(turn, toolName, input)
         : await this.authorize(turn, toolName, input, opts.signal);
       this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level);
+      if (r.allowed) turn.allowedUseIds.add(opts.toolUseID);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
         : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
@@ -1298,6 +1426,13 @@ export class Session {
     this.emit({ type: "tool", id, name: identity.tool, status: "denied" });
     void this.slog.append({ kind: "permission", id, tool: identity.full, decision: "deny", level: "deny" });
     this.deps.logger.info(`[shadow-core] denied ${identity.full} (not in this tier's services)`);
+    this.note({
+      kind: "missing_capability",
+      reason: "tier_service",
+      tool: identity.tool,
+      ...(identity.service !== undefined ? { service: identity.service } : {}),
+      turnId: id,
+    });
     return { allowed: false, reason: "tier_service", level: "deny" };
   }
 
@@ -1359,7 +1494,11 @@ export class Session {
     };
 
     if (turn.abort.signal.aborted) return deny("cancelled");
-    if (level === "deny") return deny("builtin");
+    if (level === "deny") {
+      // Tool name only (the SDK's own guard denies most built-ins before they get here).
+      this.note({ kind: "missing_capability", reason: "builtin", tool, turnId: id });
+      return deny("builtin");
+    }
     if (this.deps.policy.options.readOnly && level !== "read") return deny("read_only");
     if (level === "read" || level === "write") return allow();
 
@@ -1435,4 +1574,265 @@ export function memoryFrame(id: string, snap: MemorySnapshot): MemoryFrame {
     })),
     warnings: snap.warnings.map((w) => (w.topic ? { code: w.code, topic: w.topic } : { code: w.code })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Development tab (T7.w.4b; docs/08 §T7.w.4, docs/02 §Development)
+
+/** Where the tab's items come from; each source is optional (learning off = no rules). */
+export interface DevelopmentSources {
+  rules?: Pick<LearnedRuleStore, "list" | "activate" | "reject">;
+  /** `dev-notes/tools.json` (MCP gateway's tool lists). */
+  toolNotes?: Pick<DevNotes, "read" | "setStatus">;
+  /** `dev-notes/turns.json` (T7.w.3). */
+  turnNotes?: Pick<TurnNotes, "read" | "setStatus">;
+  /** CORE_DEV_DEVICES: devices that may `add_rule`; empty = nobody (fail closed). */
+  managers: readonly string[];
+  logger: Logger;
+  /** Delay that coalesces `changed()` calls into one recount. Default DEV_RECOUNT_MS. */
+  recountMs?: number;
+}
+
+export type DevActResult = { ok: true } | { ok: false; code: Extract<ErrorCode, "unknown_item" | "not_allowed" | "internal">; message: string };
+
+/** Device names `LearnedRuleStore.activate()` stores as `activatedBy` (its NAME_RE). */
+const ACTIVATING_DEVICE_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+
+/** `changed()` calls within this many ms cause one recount (and at most one `dev_count`). */
+export const DEV_RECOUNT_MS = 500;
+
+/** Learned-rule statuses the tab lists (observing, rejected and blocked entries are not shown). */
+const LISTED_RULE_STATUSES: ReadonlySet<string> = new Set(["candidate", "active", "suspended"]);
+const RULE_MESSAGES: Record<string, string> = {
+  candidate: "öğrenilen kural adayı: onay bekliyor",
+  active: "öğrenilen kural etkin",
+  suspended: "öğrenilen kural askıya alındı",
+};
+
+/** Opaque item ids: `r-<rule id>`, `t-<hash>` (tools.json), `n-<hash>` (turns.json). The hash is of the note's key. */
+const ruleItemId = (id: string) => `r-${id}`;
+const noteItemId = (prefix: "t" | "n", key: string) => `${prefix}-${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+
+interface NoteLike {
+  kind: string;
+  message: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  status?: NoteStatus;
+}
+
+function noteItem(itemId: string, n: NoteLike): DevItem {
+  return {
+    itemId,
+    type: "note",
+    kind: n.kind,
+    status: n.status ?? "open",
+    message: n.message,
+    count: n.count,
+    firstSeen: n.firstSeen,
+    lastSeen: n.lastSeen,
+  };
+}
+
+function ruleItem(r: LearnedRuleRecord): DevItem {
+  return {
+    itemId: ruleItemId(r.id),
+    type: "rule",
+    kind: "learned_rule",
+    status: r.status,
+    message: RULE_MESSAGES[r.status] ?? "",
+    count: r.observations,
+    firstSeen: r.firstSeen,
+    lastSeen: r.lastSeen,
+    // The rule file has no number range (it is optional in the frame).
+    rule: { tokens: [...r.tokens], tool: r.tool, domains: [...r.domains], observations: r.observations },
+  };
+}
+
+/**
+ * The Development tab over the learned-rule store and both dev-note files:
+ * listing, the three actions, and the badge count (`open` = rule candidates
+ * + suspended rules + open notes). One instance serves every socket; the
+ * count goes to `subscribe()` listeners (the server's `dev_count` broadcast)
+ * whenever it changes. Display only: items carry the fields of the files.
+ */
+export class DevelopmentTab {
+  private readonly managers: ReadonlySet<string>;
+  private readonly listeners = new Set<(open: number) => void>();
+  private lastOpen: number | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  /** Serializes views so a count is never published out of order. */
+  private chain: Promise<unknown> = Promise.resolve();
+  private closed = false;
+
+  constructor(private readonly o: DevelopmentSources) {
+    this.managers = new Set(o.managers);
+  }
+
+  /** Whether `device` may use `add_rule` (CORE_DEV_DEVICES; unset = nobody). */
+  canManage(device: string): boolean {
+    return this.managers.has(device);
+  }
+
+  /** Last published badge count; undefined before the first view. */
+  get open(): number | undefined {
+    return this.lastOpen;
+  }
+
+  /** Called with the new count whenever it changes. Returns the unsubscribe function. */
+  subscribe(listener: (open: number) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /** Something the tab lists may have changed: recount soon (coalesced). Never throws. */
+  changed(): void {
+    if (this.timer || this.closed) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.view().catch((err: unknown) => this.o.logger.warn(`[shadow-core] development count failed: ${(err as Error)?.name ?? "error"}`));
+    }, this.o.recountMs ?? DEV_RECOUNT_MS);
+    this.timer.unref?.();
+  }
+
+  /** Stops pending recounts and drops the listeners (shutdown). */
+  close(): void {
+    this.closed = true;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.listeners.clear();
+  }
+
+  /** The current items and badge count; publishes the count if it changed. */
+  view(): Promise<{ items: DevItem[]; open: number }> {
+    const run = this.chain.then(async () => {
+      const v = await this.collect();
+      this.publish(v.open);
+      return v;
+    });
+    this.chain = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * One action by `device` (from its token). Idempotent: an action whose
+   * result is already in place (`add_rule` on an active rule, `ignore` on a
+   * rejected one, the same note status again) succeeds without a change.
+   */
+  async act(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
+    if (action === "add_rule" && !this.canManage(device)) {
+      return { ok: false, code: "not_allowed", message: "this device may not add rules (CORE_DEV_DEVICES)" };
+    }
+    if (itemId.startsWith("r-")) return this.actOnRule(device, itemId, action);
+    if (itemId.startsWith("t-") || itemId.startsWith("n-")) return this.actOnNote(device, itemId, action);
+    return unknownItem();
+  }
+
+  private async actOnRule(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
+    const rules = this.o.rules;
+    if (!rules) return unknownItem();
+    const find = async () => (await rules.list()).find((r) => ruleItemId(r.id) === itemId);
+    const rule = await find();
+    if (!rule) return unknownItem();
+    const listed = LISTED_RULE_STATUSES.has(rule.status);
+    const notValid = (): DevActResult => (listed ? notAllowed() : unknownItem());
+    switch (action) {
+      case "add_rule": {
+        if (rule.status === "active") return { ok: true };
+        // Suspended rules cannot come back from the tab (docs/08 decision 4).
+        if (rule.status !== "candidate") return notValid();
+        // The store keeps `activatedBy` only in this form; say so instead of blaming router.yaml.
+        if (!ACTIVATING_DEVICE_RE.test(device)) {
+          return { ok: false, code: "not_allowed", message: "this device name cannot be stored as the approving device" };
+        }
+        const r = await rules.activate(rule.id, device);
+        if (r.ok) {
+          this.o.logger.info(`[shadow-core] learned rule ${rule.id} activated by device ${device}`);
+          return { ok: true };
+        }
+        if (r.reason === "not_candidate") return (await find())?.status === "active" ? { ok: true } : notAllowed();
+        if (r.reason === "unknown") return unknownItem();
+        if (r.reason === "not_allowed") return { ok: false, code: "not_allowed", message: "the rule is no longer allowed by router.yaml" };
+        return { ok: false, code: "internal", message: "the rule could not be stored" };
+      }
+      case "ignore": {
+        if (rule.status === "rejected") return { ok: true };
+        // The store rejects candidates only; a suspended rule stays until decision 4.
+        if (rule.status !== "candidate") return notValid();
+        if (await rules.reject(rule.id)) {
+          this.o.logger.info(`[shadow-core] learned rule ${rule.id} rejected by device ${device}`);
+          return { ok: true };
+        }
+        return (await find())?.status === "rejected" ? { ok: true } : notAllowed();
+      }
+      case "fixed":
+        return notValid();
+    }
+  }
+
+  private async actOnNote(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
+    const found = await this.findNote(itemId);
+    if (!found) return unknownItem();
+    if (action === "add_rule") return notAllowed();
+    const status: NoteStatus = action === "ignore" ? "ignored" : "fixed";
+    if (!(await found.set(status))) return unknownItem();
+    this.o.logger.info(`[shadow-core] dev-note ${itemId} marked ${status} by device ${device}`);
+    return { ok: true };
+  }
+
+  private async findNote(itemId: string): Promise<{ set: (s: NoteStatus) => Promise<boolean> } | undefined> {
+    if (itemId.startsWith("t-") && this.o.toolNotes) {
+      const src = this.o.toolNotes;
+      for (const n of (await src.read()).notes) {
+        const key = toolNoteKey(n);
+        if (noteItemId("t", key) === itemId) return { set: (s) => src.setStatus(key, s) };
+      }
+    }
+    if (itemId.startsWith("n-") && this.o.turnNotes) {
+      const src = this.o.turnNotes;
+      for (const n of (await src.read()).notes) {
+        const key = turnNoteKey(n);
+        if (noteItemId("n", key) === itemId) return { set: (s) => src.setStatus(key, s) };
+      }
+    }
+    return undefined;
+  }
+
+  private async collect(): Promise<{ items: DevItem[]; open: number }> {
+    const [rules, tools, turns] = await Promise.all([
+      this.o.rules ? this.o.rules.list() : Promise.resolve([]),
+      this.o.toolNotes ? this.o.toolNotes.read().then((f) => f.notes) : Promise.resolve([]),
+      this.o.turnNotes ? this.o.turnNotes.read().then((f) => f.notes) : Promise.resolve([]),
+    ]);
+    const ruleItems = rules.filter((r) => LISTED_RULE_STATUSES.has(r.status)).map(ruleItem);
+    const noteItems = [
+      ...tools.map((n) => noteItem(noteItemId("t", toolNoteKey(n)), n)),
+      ...turns.map((n) => noteItem(noteItemId("n", turnNoteKey(n)), n)),
+    ].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+    const open =
+      ruleItems.filter((i) => i.status === "candidate" || i.status === "suspended").length +
+      noteItems.filter((i) => i.status === "open").length;
+    return { items: [...ruleItems, ...noteItems], open };
+  }
+
+  private publish(open: number): void {
+    if (open === this.lastOpen) return;
+    this.lastOpen = open;
+    for (const l of [...this.listeners]) {
+      try {
+        l(open);
+      } catch {
+        // a listener must not break the count
+      }
+    }
+  }
+}
+
+function unknownItem(): DevActResult {
+  return { ok: false, code: "unknown_item", message: "unknown development item" };
+}
+
+function notAllowed(): DevActResult {
+  return { ok: false, code: "not_allowed", message: "this action is not valid for the item" };
 }

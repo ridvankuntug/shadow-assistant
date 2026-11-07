@@ -45,6 +45,11 @@ export interface CoreConfig {
   agent: AgentConfig;
   /** Assistant memory and context compaction (docs/06); see .env.example. */
   memory: MemoryConfig;
+  /**
+   * CORE_DEV_DEVICES: device names (lower case, as from DEVICE_TOKEN_<NAME>)
+   * that may use "Kuralı ekle" in the Development tab. Empty = nobody.
+   */
+  devDevices: string[];
 }
 
 export interface MemoryConfig {
@@ -93,6 +98,11 @@ function flag(v: string | undefined): boolean {
 /** Default on; `0|off|false|no` turns it off. */
 function onByDefault(v: string | undefined): boolean {
   return !/^(0|off|false|no)$/i.test(v?.trim() ?? "");
+}
+
+/** Comma-separated device names, lower-cased like `DEVICE_TOKEN_<NAME>` names; blanks and repeats dropped. */
+export function parseDeviceList(v: string | undefined): string[] {
+  return [...new Set((v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter((x) => x !== ""))];
 }
 
 function positiveInt(name: string, v: string | undefined, def: number): number {
@@ -166,6 +176,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
         ? 0
         : positiveInt("CORE_COMPACT_AT_TOKENS", env.CORE_COMPACT_AT_TOKENS, 50_000),
     },
+    devDevices: parseDeviceList(env.CORE_DEV_DEVICES),
   };
 }
 

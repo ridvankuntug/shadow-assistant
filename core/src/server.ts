@@ -2,6 +2,9 @@
  * HTTP + WebSocket server: `GET /health`, `POST /device/state` (T11, see
  * `handleDeviceState`) and the `/ws` endpoint.
  *
+ * `GET /health` has no auth; its `inbox` counts (T7.w.4, for the tray) are
+ * added only for requests from a loopback address.
+ *
  * Authentication: the first frame must be `hello` with a valid device token
  * within HELLO_TIMEOUT_MS; otherwise `{"type":"error","code":"unauthorized"}`
  * is sent and the socket is closed with 4401. With no device tokens configured
@@ -41,6 +44,14 @@ export interface CoreServerOptions {
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
+   * Counts for GET /health `inbox` (e.g. `{ dev: 3 }`), sent **only** to
+   * loopback requests (the tray on the same machine): numbers, no titles.
+   * Remote callers get the body without `inbox`.
+   */
+  inbox?: () => Record<string, number>;
+  /** Development badge count (T7.w.4): every change goes to every authenticated socket as `dev_count`. */
+  devCount?: DevCountSource;
+  /**
    * Service health source (HealthMonitor). Authenticated clients get the
    * current list right after `welcome` + `state` and every change as a
    * `services` frame.
@@ -59,6 +70,19 @@ export interface DeviceStateSink {
 }
 
 export const DEVICE_STATE_PATH = "/device/state";
+
+export interface DevCountSource {
+  subscribe(listener: (open: number) => void): () => void;
+}
+
+/**
+ * Whether a socket's peer address is the local machine: `127.0.0.1`, `::1`
+ * or the IPv4-mapped `::ffff:127.0.0.1` (a server bound to `::`). Nothing
+ * else counts (no `X-Forwarded-For`, no other 127.x address).
+ */
+export function isLoopbackAddress(address: string | undefined): boolean {
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
 
 export interface ServiceHealthSource {
   snapshot(): ServiceHealth[] | undefined;
@@ -224,8 +248,9 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
       return;
     }
     if (req.method === "GET" && path === "/health") {
+      const inbox = opts.inbox && isLoopbackAddress(req.socket.remoteAddress) ? { inbox: opts.inbox() } : {};
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", service: "core", version: CORE_VERSION, ...(opts.health?.() ?? {}) }));
+      res.end(JSON.stringify({ status: "ok", service: "core", version: CORE_VERSION, ...(opts.health?.() ?? {}), ...inbox }));
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -251,6 +276,10 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
   const authed = new Set<(frame: ServerFrame) => void>();
   const unsubscribeHealth = opts.serviceHealth?.subscribe((items) => {
     for (const send of authed) send({ type: "services", items });
+  });
+  // Clients that do not know `dev_count` ignore it (docs/02 §Development).
+  const unsubscribeDev = opts.devCount?.subscribe((open) => {
+    for (const send of authed) send({ type: "dev_count", open });
   });
 
   http.on("upgrade", (req: IncomingMessage, socket, head) => {
@@ -384,6 +413,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     async close() {
       shuttingDown = true;
       unsubscribeHealth?.();
+      unsubscribeDev?.();
       authed.clear();
       for (const client of wss.clients) client.close(1001, "server shutting down");
       await Promise.all([...sessions].map((s) => s.close("server_shutdown").catch(() => {})));

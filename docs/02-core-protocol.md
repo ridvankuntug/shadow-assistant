@@ -9,6 +9,9 @@ shell) uses. TypeScript types for all frames live in a single module:
   `200 {"status":"ok","service":"core","version":"…","services":[{"name":"…","enabled":true,"status":"down","detail"?:"timeout"}]}`
   (`status` and `detail` as in *Service health*; `status` is `unknown` before the first check round and
   `detail` is present only when the check set one. No URLs, tokens or error messages.)
+  Only for requests from a loopback address (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`; the tray on the
+  same machine) the body also has `"inbox":{"dev":<open>}`: the Development badge count (see
+  *Development*), a number only. Remote callers get the body without `inbox`.
 - Device state: `POST http://<core-host>:<CORE_PORT>/device/state` (bearer token; see *Device state*).
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
@@ -202,7 +205,7 @@ actions, never a push or a sound.
 | `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`) or `learned_rule`. |
 | `status` | Rules: `candidate`, `active`, `suspended`. Notes: `open`, `ignored`, `fixed`. Clients show unknown values as-is. |
 | `count`, `firstSeen`, `lastSeen` | Occurrences / observations and ISO 8601 times, as stored. |
-| `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange`, `observations`. |
+| `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange` (not sent today: the rule file keeps no range), `observations`. |
 | `open` | Badge count: rule candidates + suspended rules + open notes. |
 | `canManage` | Whether this device may use `add_rule`. |
 
@@ -211,8 +214,9 @@ arguments, entity or room names, error messages, URLs or tokens.
 
 - `dev_list` is answered with `dev` (same `id`).
 - `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active,
-  re-validated first), `ignore` ("Yok say": a rule → rejected, a note →
-  `ignored`) and `fixed` ("Düzeltildi": notes only). It is answered with a fresh
+  re-validated first), `ignore` ("Yok say": a rule candidate → rejected, a note →
+  `ignored`; a suspended rule answers `not_allowed` for now) and `fixed`
+  ("Düzeltildi": notes only). It is answered with a fresh
   `dev` frame (same `id`). Actions are idempotent: repeating one (e.g.
   `add_rule` on an active rule) is answered with the fresh list.
 - Errors (with `id`): an unknown `itemId` → `unknown_item`; an action not valid

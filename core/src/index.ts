@@ -4,13 +4,13 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getSessionInfo, query, type Options } from "@anthropic-ai/claude-agent-sdk";
-import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv } from "./agent.js";
+import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
+import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
 import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
-import { DevNotes } from "./dev-notes.js";
+import { DevNotes, TurnNotes } from "./dev-notes.js";
 import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
@@ -24,12 +24,13 @@ import { memoryTools } from "./memory/tools.js";
 import { createGatewaySdkServers } from "./gateway-sdk.js";
 import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from "./mcp-direct.js";
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
+import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
-import { Session, type Logger, type SessionLearning } from "./session.js";
+import { DevelopmentTab, Session, type Logger, type SessionLearning } from "./session.js";
 import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
@@ -92,32 +93,6 @@ export function gatewayCallTimeoutMs(cfg: CoreConfig): number {
   return slowest + cfg.confirmTimeoutMs + 2 * slowest + 10_000;
 }
 
-/**
- * Options of a one-shot background call (memory extraction, summaries; docs/06):
- * no tools, no MCP, nothing from ~/.claude, no persisted session.
- */
-export function buildOneShotOptions(
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-): (p: { model: string; system?: string; abortController: AbortController }) => Omit<Options, "prompt"> {
-  return (p) => ({
-    model: p.model,
-    ...(p.system !== undefined ? { systemPrompt: { type: "custom", prompt: p.system, snapshot: false } } : {}),
-    tools: [],
-    disallowedTools: DENIED_BUILTIN_TOOLS,
-    settingSources: [],
-    strictMcpConfig: true,
-    mcpServers: {},
-    permissionMode: "default",
-    canUseTool: async () => ({ behavior: "deny", message: "No tools in background calls." }),
-    abortController: p.abortController,
-    persistSession: false,
-    cwd,
-    maxTurns: 1,
-    env,
-  });
-}
-
 export async function main(): Promise<void> {
   const envFile = loadDotEnv();
   const cfg = loadConfig();
@@ -178,10 +153,23 @@ export async function main(): Promise<void> {
   );
   // One MCP client per remote service, shared by tier 0 and the gateway (one SSE connection).
   const mcpClient = new McpDirectClient(cfg.services.services, process.env);
+  // Dev-notes (tools.json, turns.json) and the Development tab over them (docs/08 T7.w.3/T7.w.4).
+  // Every writer tells the tab, which recounts the badge (coalesced) and broadcasts `dev_count`.
+  // Assigned once the learned-rule store exists (below).
+  let devTab: DevelopmentTab | undefined = undefined;
+  const devNotesDir = join(cfg.dataDir, "dev-notes");
+  const toolNotes = new DevNotes({ dir: devNotesDir, log: (m) => logger.warn(m) });
+  const turnNotes = new TurnNotes({ dir: devNotesDir, log: (m) => logger.warn(m) });
+  const recordTurnNote: Pick<TurnNotes, "record"> = {
+    record: (input) => turnNotes.record(input).finally(() => devTab?.changed()),
+  };
   const gateway = new McpGateway({
     sources: [...buildGatewaySources(cfg, mcpClient, memory), ...(deviceService ? [deviceService.source] : [])],
     classifier: policy,
-    devNotes: new DevNotes({ dir: join(cfg.dataDir, "dev-notes"), log: (m) => logger.warn(m) }),
+    devNotes: {
+      recordCatalog: (service, tools, exactRules) => toolNotes.recordCatalog(service, tools, exactRules).finally(() => devTab?.changed()),
+    },
+    turnNotes: recordTurnNote,
     log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
   });
   const gatewayTimeoutMs = gatewayCallTimeoutMs(cfg);
@@ -300,7 +288,15 @@ export async function main(): Promise<void> {
       await store.load();
       const policy = learnPolicy(cfg.router, cfg.services.services);
       learned = { rules: () => store.snapshot(), targetFilter: learnTargetFilter(policy) };
-      learning = { store, policy, minObservations: cfg.router.learning.minObservations };
+      // A new candidate or a suspension changes the Development badge.
+      learning = {
+        store: {
+          observe: (x) => store.observe(x).finally(() => devTab?.changed()),
+          recordOutcome: (id, outcome, reason) => store.recordOutcome(id, outcome, reason).finally(() => devTab?.changed()),
+        },
+        policy,
+        minObservations: cfg.router.learning.minObservations,
+      };
       learnedRules = store;
     }
     router = new TieredRouter({ config: cfg.router, models: cfg.models, onUsage: (u) => void usageLog.append(u), learned });
@@ -309,6 +305,12 @@ export async function main(): Promise<void> {
     const passthrough = new PassthroughRouter(cfg.model);
     router = { route: () => passthrough.route(), onUsage: (u) => void usageLog.append(u) };
   }
+  // "Kuralı ekle" only for CORE_DEV_DEVICES; unset = nobody (fail closed, docs/08 decision 3).
+  for (const d of cfg.devDevices) {
+    if (!tokens.digests.has(d)) logger.warn(`[shadow-core] CORE_DEV_DEVICES: '${d}' has no DEVICE_TOKEN_<NAME>; ignored in practice`);
+  }
+  devTab = new DevelopmentTab({ rules: learnedRules, toolNotes, turnNotes, managers: cfg.devDevices, logger });
+  await devTab.view(); // the first badge count, for /health `inbox`
   const tierServices = cfg.router?.tierServices;
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
@@ -347,13 +349,18 @@ export async function main(): Promise<void> {
           memory,
           maintenance,
           learning,
+          turnNotes: recordTurnNote,
+          dev: devTab,
         },
         info,
         send,
       ),
     // Name, flag, status and short detail code only: no URL or token leaves through /health.
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
-    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : [])],
+    // Loopback requests only (the tray): the Development badge count, no titles.
+    inbox: () => ({ dev: devTab?.open ?? 0 }),
+    devCount: devTab,
+    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev"],
     serviceHealth: monitor,
     deviceState,
   });
@@ -377,6 +384,9 @@ export async function main(): Promise<void> {
     `[shadow-core] memory: ${memory ? `on (model ${cfg.memory.model}, idle ${cfg.memory.idleMin} min, every ${cfg.memory.everyTurns} turns)` : "off"}; compaction: ${cfg.memory.compactAtTokens > 0 && registry ? `at ${cfg.memory.compactAtTokens} tokens` : "off"}`,
   );
   logger.info(`[shadow-core] learning: ${learnedRules ? `on (${learnedRules.snapshot().length} active learned rules)` : "off"}`);
+  logger.info(
+    `[shadow-core] development tab: ${devTab.open ?? 0} open; "Kuralı ekle" ${cfg.devDevices.length > 0 ? `for ${cfg.devDevices.join(",")}` : "off (CORE_DEV_DEVICES not set)"}`,
+  );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
   // List the remote services once now, so the first session gets their tools and instructions.
@@ -395,8 +405,11 @@ export async function main(): Promise<void> {
       .then(() => registry?.close())
       .then(() => gateway.close())
       .then(() => mcpClient.close())
+      .then(() => devTab?.close())
       .then(() => usageLog.flush())
       .then(() => learnedRules?.flush())
+      // Coalesced turn notes not yet on disk (never rejects).
+      .then(() => turnNotes.flush())
       .then(() => process.exit(0));
   });
 }
