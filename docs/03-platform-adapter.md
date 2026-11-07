@@ -44,7 +44,7 @@ interface PlatformAdapter {
   };
   readonly storage: { get(key): string | null; set(key, value): void; remove(key): void };
   vibrate(pattern: number[]): void;          // ms on/off pattern; ignored where unsupported
-  notify(title: string, body: string): void; // optional; ignored where unsupported
+  notify(title: string, body: string, item?: { id: string; urgent: boolean }): void; // optional; ignored where unsupported
   deviceClass(): "phone" | "tablet" | "desktop";
   prefersReducedMotion(): boolean;
   isVisible(): boolean;
@@ -200,6 +200,7 @@ never block the bridge thread for long.
 | `stopSpeaking()` | void | sync | Stop TTS. Must be safe when idle. |
 | `vibrate(patternJson: String)` | void | sync | e.g. `"[30,60,30]"` — on/off milliseconds starting with "on". Optional. |
 | `notify(title: String, body: String)` | void | sync | System notification, used for a confirmation request while the app is in the background. Optional. |
+| `notifyItem(id: String, title: String, body: String, urgent: Boolean)` | void | sync | System notification for one inbox item (docs/08 T7.w.5d): own channel (silent, or the urgent channel), one notification per item id; dismissing it does not delete the item. Optional; the UI falls back to `notify`. |
 | `getItem(key: String): String?` | string or null | sync | Persistent storage (see storage keys). Store `shadow.deviceToken` encrypted (e.g. Android Keystore-backed). |
 | `setItem(key: String, value: String)` | void | sync | |
 | `removeItem(key: String)` | void | sync | |

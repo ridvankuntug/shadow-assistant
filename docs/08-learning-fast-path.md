@@ -882,11 +882,11 @@ T7.w.7 has no task (deferred).
   session, loopback `inbox.notifications`. Acceptance: session tests for list,
   read, delete, a broadcast reaching two sockets, an urgent item spoken by one
   session only and not again after a reconnect; docs/02 updated.
-- [ ] **T7.w.5c — UI inbox.** Panel, badge, `#notifications`, urgent speech, phone
+- [x] **T7.w.5c — UI inbox.** Panel, badge, `#notifications`, urgent speech, phone
   `notify` for new items and for unread items not yet shown. Acceptance:
   controller tests (badge, read/delete, urgent spoken once, catch-up shows each
   item once).
-- [ ] **T7.w.5d — Android channels.** Notifications channel (no sound), urgent
+- [x] **T7.w.5d — Android channels.** Notifications channel (no sound), urgent
   channel, per-item ids. Acceptance: manual on a phone: a test item appears while
   the app is in the background; two items show as two notifications; a
   confirmation still uses its own channel; dismissing does not delete the item.
@@ -989,3 +989,28 @@ T7.w.7 has no task (deferred).
   `unknown_item` (5c should ignore it after a `notification_removed`); every action clones the
   list (needs a store API change); no server-level test of welcome-before-broadcast and the
   index.ts wiring.
+- 2026-11-07: T7.w.5c done (senior-dev; code-reviewer 1 round, no critical or high finding; ui
+  373/373, lint, build). "Bildirimler" panel (`NotificationsPanel.tsx`), a bell in the top bar
+  with the unread count (only with `notifications`), `#notifications` opens it and is cleared;
+  `NotificationsView` in state.ts (also outside the 5c file list: the reducer the 5b no-op cases
+  were waiting for). Narrowest readings: the phone record is `shadow.notificationsShown`
+  (`{id: raised}`), so each raise is shown once (a renotify shows again, marking unread does not);
+  an item that arrives while the app is in front only counts as shown; read items count as
+  shown; the catch-up is the first list after each `welcome` (oldest first, record cut to the
+  listed items). Urgent `speak` uses the reply path (`speak` frame, native fallback) and waits
+  until no turn, recording, confirmation or streamed answer is in the way; "Durdur", voice
+  replies off and a reconnect drop what still waits. `unknown_item` for an item already removed
+  by a broadcast is swallowed (L4). Delete asks first in the panel. Round 1 fixed: the speech
+  queue no longer runs from inside `dispatch` (microtask), is dropped by Durdur / voice off, is
+  not held by an empty streamed answer and wakes on a silent `final` (5 mutations killed).
+  Platform: `notify(title, body, item?)`; the Android adapter calls the optional bridge method
+  `notifyItem(id, title, body, urgent)` and falls back to `notify` on older shells.
+- 2026-11-07: T7.w.5d code and unit tests done (senior-dev; code-reviewer 1 round, no finding;
+  `gradlew testDebugUnitTest assembleDebug` green, 76 unit tests). **Manual phone check pending**
+  (acceptance: a test item while the app is in the background, two items as two notifications, a
+  confirmation on its own channel, dismissing does not delete). `Notifier.kt`: channels
+  "Onay istekleri" (unchanged id), "Bildirimler" (default importance, no sound, no vibration) and
+  "Acil bildirimler" (high); items are keyed by tag `item:<id>` with their own id 2, so no item
+  replaces the confirmation (id 1, no tag) or another item. Bridge `notifyItem(id, title, body,
+  urgent)` (trusted page only, id checked, lengths capped as `notify`). No new permission or
+  dependency. docs/03 (bridge table) not updated: outside the 5c/5d files.

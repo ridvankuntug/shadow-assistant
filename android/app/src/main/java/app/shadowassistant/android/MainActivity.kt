@@ -240,6 +240,7 @@ class MainActivity : Activity() {
             storage = storage,
             vibrate = ::vibrate,
             notify = notifier::notify,
+            notifyItem = notifier::notifyItem,
             onStorageChanged = { key ->
                 if (key == BridgeStorage.CORE_URL_KEY || key == BridgeStorage.TOKEN_KEY) checkCore()
                 // Connecting: the UI writes the address first and the token last, so trigger on the

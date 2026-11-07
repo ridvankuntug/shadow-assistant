@@ -26,6 +26,7 @@ class ShadowBridge(
     private val storage: BridgeStorage,
     private val vibrate: (LongArray) -> Unit,
     private val notify: (String, String) -> Unit,
+    private val notifyItem: (String, String, String, Boolean) -> Unit,
     private val onStorageChanged: (String) -> Unit,
 ) {
     @JavascriptInterface
@@ -78,6 +79,19 @@ class ShadowBridge(
         val t = title.orEmpty().take(MAX_TITLE)
         val b = body.orEmpty().take(MAX_BODY)
         if (t.isNotBlank() || b.isNotBlank()) main.post { notify(t, b) }
+    }
+
+    /**
+     * An inbox item as its own system notification (T7.w.5d; optional for the
+     * page, which falls back to [notify] on older shells). A bad id is ignored.
+     */
+    @JavascriptInterface
+    fun notifyItem(id: String?, title: String?, body: String?, urgent: Boolean) {
+        if (!trusted()) return
+        val itemId = Notifier.validItemId(id) ?: return
+        val t = title.orEmpty().take(MAX_TITLE)
+        val b = body.orEmpty().take(MAX_BODY)
+        if (t.isNotBlank() || b.isNotBlank()) main.post { notifyItem(itemId, t, b, urgent) }
     }
 
     @JavascriptInterface

@@ -2,6 +2,8 @@
 <resources>
     <string name="app_name">Shadow</string>
     <string name="notification_channel">Onay istekleri</string>
+    <string name="notification_channel_items">Bildirimler</string>
+    <string name="notification_channel_urgent">Acil bildirimler</string>
 
     <string name="error_retry">Tekrar dene</string>
     <string name="error_change_address">Adresi değiştir</string>
