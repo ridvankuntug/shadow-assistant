@@ -14,7 +14,12 @@
 //               MOCK_MEMORY=0 (no `memory` feature; memory_list/memory_delete get bad_request),
 //               MOCK_MEMORY_SILENT=1 (memory frames are never answered, to see the UI timeout),
 //               MOCK_DEV=0 (no `dev` feature; dev_list/dev_action get bad_request),
-//               MOCK_DEV_MANAGE=0 (canManage false: "Kuralı ekle" hidden, add_rule gets not_allowed).
+//               MOCK_DEV_MANAGE=0 (canManage false: "Kuralı ekle" hidden, add_rule gets not_allowed),
+//               MOCK_NOTIFICATIONS=0 (no `notifications` feature; notifications_list/notification_action get bad_request).
+// Test producer for the inbox (with notifications on): a message starting with "bildirim:" raises
+// a normal item, "acil:" an urgent one (title = the rest), broadcast to every socket; the urgent
+// one carries `speak: true` to the sender only, when it sent speech_prefs enabled (the real Core
+// picks the device with the latest turn). The message then runs as a normal turn.
 // With speech_stream (default) a client that sent speech_prefs gets one speech_chunk per
 // sentence while the answer streams (a sine tone in audio mode, the sentence in text mode).
 // A message containing "limit" is answered with `error usage_limit` (retryAt in 2 hours).
@@ -30,6 +35,7 @@ const SPEECH_STREAM = process.env.MOCK_SPEECH_STREAM !== "0";
 const MEMORY = process.env.MOCK_MEMORY !== "0";
 const DEV = process.env.MOCK_DEV !== "0";
 const DEV_MANAGE = process.env.MOCK_DEV_MANAGE !== "0";
+const NOTIFICATIONS = process.env.MOCK_NOTIFICATIONS !== "0";
 // Like the real Core: service tool names without the Agent SDK's mcp__<service>__ prefix.
 const LOCK_TOOL = "intent__HassTurnOff";
 
@@ -438,6 +444,92 @@ function handleDev(ctx, msg) {
   }, 300);
 }
 
+// ------------------------------------------------------------- notifications
+// Shared across connections; kept until deleted (as docs/02 *Notifications*), lost when the mock restarts.
+let notificationSeq = 0;
+const notificationId = () => `n-${String(++notificationSeq).padStart(16, "0")}`;
+const notificationStore = [
+  {
+    id: notificationId(),
+    source: "service",
+    urgency: "normal",
+    title: "Ses servisi yeniden başladı",
+    body: "Kısa bir süre yanıt vermedi; şimdi çalışıyor.",
+    createdAt: devDay,
+    updatedAt: devDay,
+    readAt: devNow,
+    raised: 1,
+  },
+  {
+    id: notificationId(),
+    source: "test",
+    urgency: "normal",
+    title: "Deneme bildirimi",
+    body: "Bu bir örnek bildirimdir.",
+    createdAt: devNow,
+    updatedAt: devNow,
+    readAt: null,
+    raised: 2,
+  },
+];
+
+const byUpdated = (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? -1 : 1);
+
+function notificationsFrame(id) {
+  const items = [...notificationStore].sort(byUpdated);
+  return { type: "notifications", id, items, unread: items.filter((i) => i.readAt === null).length };
+}
+
+function broadcastNotification(item, speakTo) {
+  for (const ws of authedSockets) send(ws, ws === speakTo ? { type: "notification", item, speak: true } : { type: "notification", item });
+}
+
+/** "bildirim: …" / "acil: …" in a user_text: the test producer (see the header). */
+function maybeRaise(ctx, text) {
+  const m = /^(bildirim|acil):\s*(.*)$/i.exec(text.trim());
+  if (!NOTIFICATIONS || !m) return;
+  const now = new Date().toISOString();
+  const urgent = m[1].toLowerCase() === "acil";
+  const item = {
+    id: notificationId(),
+    source: "test",
+    urgency: urgent ? "urgent" : "normal",
+    title: m[2] || (urgent ? "Acil deneme" : "Deneme"),
+    body: "",
+    createdAt: now,
+    updatedAt: now,
+    readAt: null,
+    raised: 1,
+  };
+  notificationStore.push(item);
+  console.log(`[mock-core] notification raised: ${item.id} ${item.urgency}`);
+  broadcastNotification(item, urgent && ctx.speechPrefs?.enabled ? ctx.ws : null);
+}
+
+function handleNotifications(ctx, msg) {
+  if (!NOTIFICATIONS) return sendError(ctx.ws, "bad_request", `Bilinmeyen tür: ${msg.type}`, msg.id);
+  setTimeout(() => {
+    if (msg.type === "notification_action") {
+      const i = notificationStore.findIndex((n) => n.id === msg.notificationId);
+      if (i < 0) return sendError(ctx.ws, "unknown_item", "unknown notificationId", msg.id);
+      const item = notificationStore[i];
+      console.log(`[mock-core] notification_action: ${msg.action} ${item.id}`);
+      if (msg.action === "delete") {
+        notificationStore.splice(i, 1);
+        for (const ws of authedSockets) send(ws, { type: "notification_removed", notificationId: item.id });
+      } else if (msg.action === "read" || msg.action === "unread") {
+        const read = msg.action === "read";
+        if (read === (item.readAt !== null)) return send(ctx.ws, notificationsFrame(msg.id)); // idempotent
+        item.readAt = read ? new Date().toISOString() : null;
+        broadcastNotification(item, null);
+      } else {
+        return sendError(ctx.ws, "bad_request", "unknown action", msg.id);
+      }
+    }
+    send(ctx.ws, notificationsFrame(msg.id));
+  }, 300);
+}
+
 const MOCK_VOICES = [
   { id: "tr_TR-dfki-medium", label: "DFKI (kadın)", quality: "medium" },
   { id: "tr_TR-fahrettin-medium", label: "Fahrettin (erkek)", quality: "medium" },
@@ -483,6 +575,7 @@ function handleFrame(ctx, msg) {
     case "ping":
       return send(ws, { type: "pong" });
     case "user_text":
+      maybeRaise(ctx, String(msg.text ?? ""));
       return startTurnOrBusy(ctx, msg.id, String(msg.text ?? ""));
     case "audio":
       return handleAudio(ctx, msg);
@@ -503,6 +596,9 @@ function handleFrame(ctx, msg) {
     case "dev_list":
     case "dev_action":
       return handleDev(ctx, msg);
+    case "notifications_list":
+    case "notification_action":
+      return handleNotifications(ctx, msg);
     case "speech_prefs":
       if (!SPEECH_STREAM) return sendError(ws, "bad_request", "Bilinmeyen tür: speech_prefs");
       if (typeof msg.enabled !== "boolean" || (msg.mode !== "audio" && msg.mode !== "text")) {
@@ -545,7 +641,7 @@ function onMessage(ctx, raw) {
     ctx.authed = true;
     clearTimeout(ctx.authTimer);
     const welcome = { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" };
-    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : []), ...(DEV ? ["dev"] : [])];
+    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : []), ...(DEV ? ["dev"] : []), ...(NOTIFICATIONS ? ["notifications"] : [])];
     if (features.length > 0) welcome.features = features;
     send(ctx.ws, welcome);
     send(ctx.ws, { type: "state", state: "idle" });

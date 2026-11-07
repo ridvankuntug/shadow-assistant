@@ -95,6 +95,9 @@ export interface KeyValueStorage {
   remove(key: string): void;
 }
 
+/** An inbox item shown as a system notification (`PlatformAdapter.notify`). */
+export type NotifyItem = { id: string; urgent: boolean };
+
 export interface PlatformAdapter {
   readonly kind: "web" | "android";
   /** Value for the Core `hello.client` field. */
@@ -105,8 +108,15 @@ export interface PlatformAdapter {
   readonly storage: KeyValueStorage;
   /** Short haptic feedback; silently ignored where unsupported. */
   vibrate(pattern: number[]): void;
-  /** Optional system notification; silently ignored where unsupported. */
-  notify(title: string, body: string): void;
+  /**
+   * Optional system notification; silently ignored where unsupported. Without
+   * `item` it is a confirmation request (one high-importance notification
+   * that the next request replaces). With `item` it is an inbox item: its own
+   * system notification per `item.id` (raising the item again replaces it), on
+   * a quiet channel or, `urgent`, a high-importance one. Dismissing it never
+   * changes the item.
+   */
+  notify(title: string, body: string, item?: NotifyItem): void;
   deviceClass(): DeviceClass;
   prefersReducedMotion(): boolean;
   isVisible(): boolean;
@@ -122,4 +132,10 @@ export const STORAGE_KEYS = {
   voiceReplies: "shadow.voiceReplies",
   /** tts-svc voice id for Core speech (`speak`, `speech_prefs`); absent = the Core's default. */
   ttsVoice: "shadow.ttsVoice",
+  /**
+   * Inbox items already shown as a system notification on this device, as
+   * JSON `{ "<item id>": <raised> }`: each raise of an item is shown once
+   * (docs/08 §T7.w.5 Delivery, catch-up on connect).
+   */
+  notificationsShown: "shadow.notificationsShown",
 } as const;

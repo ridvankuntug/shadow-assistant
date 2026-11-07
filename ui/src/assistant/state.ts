@@ -13,6 +13,8 @@ import type {
   DevItem,
   HistoryItem,
   MemoryMessage,
+  NotificationAction,
+  NotificationInfo,
   ServerMessage,
   ServerState,
   ServiceHealth,
@@ -125,6 +127,26 @@ export type DevView = {
   staleIds: string[];
 };
 
+/**
+ * The notification inbox (Core feature `notifications`). Same request model
+ * as the Development panel: one `notifications_list` / `notification_action`
+ * at a time (`acting` = its item and action), `error` keeps the last items.
+ * `items` is the whole inbox (most recently updated first) once a list
+ * arrived; the `notification` / `notification_removed` broadcasts keep it
+ * current. `unread` is the badge count, null until the Core told one.
+ */
+export type NotificationsView = {
+  status: "idle" | "loading" | "ready" | "error";
+  requestId: string | null;
+  acting: { notificationId: string; action: NotificationAction } | null;
+  items: NotificationInfo[] | null;
+  unread: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /** Replaced request ids whose late errors are dropped (as `DevView.staleIds`). */
+  staleIds: string[];
+};
+
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
 export type VoicePreview = { id: string; failed: boolean };
 
@@ -171,6 +193,7 @@ export type AssistantState = {
   voicePreview: VoicePreview | null;
   memory: MemoryView;
   dev: DevView;
+  notifications: NotificationsView;
 };
 
 export type Action =
@@ -196,11 +219,14 @@ export type Action =
   | { type: "memory_requested"; id: string; entryId?: string }
   | { type: "memory_timeout"; id: string }
   | { type: "dev_requested"; id: string; acting?: { itemId: string; action: DevAction } }
-  | { type: "dev_timeout"; id: string };
+  | { type: "dev_timeout"; id: string }
+  | { type: "notifications_requested"; id: string; acting?: { notificationId: string; action: NotificationAction } }
+  | { type: "notifications_timeout"; id: string };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
 const MAX_STALE_DEV = 8;
+const MAX_STALE_NOTIFICATIONS = 8;
 
 export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
@@ -231,6 +257,16 @@ export const initialState: AssistantState = {
     items: null,
     open: null,
     canManage: false,
+    errorCode: null,
+    errorMessage: null,
+    staleIds: [],
+  },
+  notifications: {
+    status: "idle",
+    requestId: null,
+    acting: null,
+    items: null,
+    unread: null,
     errorCode: null,
     errorMessage: null,
     staleIds: [],
@@ -348,6 +384,54 @@ export function devItemActions(item: DevItem, canManage: boolean): DevAction[] {
   return item.status === "open" ? ["fixed", "ignore"] : [];
 }
 
+/** The inbox and its badge may be offered: connected to a Core with the `notifications` feature. */
+export function notificationsAvailable(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "notifications");
+}
+
+/** The inbox badge count (0 = no count): only while the inbox is available. */
+export function notificationsBadgeCount(s: AssistantState): number {
+  return notificationsAvailable(s) ? (s.notifications.unread ?? 0) : 0;
+}
+
+/** The action that toggles an item: `read` while unread, `unread` once read. */
+export function notificationToggleAction(item: NotificationInfo): "read" | "unread" {
+  return item.readAt === null ? "read" : "unread";
+}
+
+/** Inbox order (as the Core lists it): most recently updated first, then by id. */
+function byUpdated(a: NotificationInfo, b: NotificationInfo): number {
+  return Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/**
+ * Applies a `notification` broadcast (new or changed item) to the loaded
+ * inbox. Before the first list the item is not stored: that list is computed
+ * after the change (frames on one socket keep their order), so it holds the
+ * item. The badge moves by the item's own unread change.
+ */
+function upsertNotification(n: NotificationsView, item: NotificationInfo): NotificationsView {
+  if (n.items === null) return n;
+  const old = n.items.find((i) => i.id === item.id);
+  const delta = (item.readAt === null ? 1 : 0) - (old && old.readAt === null ? 1 : 0);
+  const items = [...n.items.filter((i) => i.id !== item.id), item].sort(byUpdated);
+  return { ...n, items, unread: n.unread === null ? null : Math.max(0, n.unread + delta) };
+}
+
+/** Applies a `notification_removed` broadcast. */
+function removeNotification(n: NotificationsView, id: string): NotificationsView {
+  if (n.items === null) return n;
+  const old = n.items.find((i) => i.id === id);
+  if (!old) return n;
+  const unread = n.unread === null ? null : Math.max(0, n.unread - (old.readAt === null ? 1 : 0));
+  return { ...n, items: n.items.filter((i) => i.id !== id), unread };
+}
+
+/** A failed or unanswered inbox request (keeps the shown items). */
+function notificationsFailed(n: NotificationsView, code: string, message?: string): NotificationsView {
+  return { ...n, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
+}
+
 /** A failed or unanswered Development request (keeps the shown items). */
 function devFailed(d: DevView, code: string, message?: string): DevView {
   return { ...d, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
@@ -426,6 +510,7 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         // Its answer can no longer arrive.
         memory: s.memory.status === "loading" ? memoryFailed(s.memory, "connection") : s.memory,
         dev: s.dev.status === "loading" ? devFailed(s.dev, "connection") : s.dev,
+        notifications: s.notifications.status === "loading" ? notificationsFailed(s.notifications, "connection") : s.notifications,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -542,6 +627,21 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
     case "dev_timeout":
       return s.dev.status === "loading" && s.dev.requestId === a.id ? { ...s, dev: devFailed(s.dev, "timeout") } : s;
 
+    case "notifications_requested": {
+      const n = s.notifications;
+      const prev = n.requestId;
+      const staleIds = prev && prev !== a.id ? [...n.staleIds, prev].slice(-MAX_STALE_NOTIFICATIONS) : n.staleIds;
+      return {
+        ...s,
+        notifications: { ...n, status: "loading", requestId: a.id, acting: a.acting ?? null, errorCode: null, errorMessage: null, staleIds },
+      };
+    }
+
+    case "notifications_timeout":
+      return s.notifications.status === "loading" && s.notifications.requestId === a.id
+        ? { ...s, notifications: notificationsFailed(s.notifications, "timeout") }
+        : s;
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -569,6 +669,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         memory: initialState.memory,
         // Same for the Development items and the badge (the controller asks again).
         dev: initialState.dev,
+        // And the inbox (the controller asks again, also for the phone catch-up).
+        notifications: initialState.notifications,
       };
 
     case "state": {
@@ -695,6 +797,17 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         return s.dev.status === "loading" ? { ...s, dev: devFailed(s.dev, msg.code, msg.message) } : s;
       }
       if (msg.id !== undefined && s.dev.staleIds.includes(msg.id)) return s;
+      // And errors of the inbox. An action on an item that is no longer listed
+      // (another device deleted it and its `notification_removed` came first)
+      // answers `unknown_item`: the wanted outcome, not an error.
+      if (msg.id !== undefined && msg.id === s.notifications.requestId) {
+        const n = s.notifications;
+        if (n.status !== "loading") return s;
+        const target = n.acting?.notificationId;
+        const gone = msg.code === "unknown_item" && target !== undefined && !n.items?.some((i) => i.id === target);
+        return { ...s, notifications: gone ? { ...n, status: "ready", acting: null } : notificationsFailed(n, msg.code, msg.message) };
+      }
+      if (msg.id !== undefined && s.notifications.staleIds.includes(msg.id)) return s;
       if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
         return {
           ...s,
@@ -769,9 +882,27 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       return msg.open === s.dev.open ? s : { ...s, dev: { ...s.dev, open: msg.open } };
 
     case "notifications":
+      // Only the answer to the latest request (as with dev); it still counts
+      // after the local timeout.
+      if (msg.id !== s.notifications.requestId) return s;
+      return {
+        ...s,
+        notifications: {
+          status: "ready",
+          requestId: msg.id,
+          acting: null,
+          items: msg.items,
+          unread: msg.unread,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: s.notifications.staleIds,
+        },
+      };
+
     case "notification":
+      return { ...s, notifications: upsertNotification(s.notifications, msg.item) };
+
     case "notification_removed":
-      // The inbox arrives with T7.w.5c; until then these frames change nothing.
-      return s;
+      return { ...s, notifications: removeNotification(s.notifications, msg.notificationId) };
   }
 }

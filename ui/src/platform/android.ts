@@ -31,6 +31,11 @@ export interface ShadowAndroidBridge {
   stopSpeaking(): void;
   vibrate(patternJson: string): void;
   notify(title: string, body: string): void;
+  /**
+   * Optional (shells from T7.w.5d on): an inbox item as its own system
+   * notification, keyed by `id`, on the quiet or (`urgent`) the urgent channel.
+   */
+  notifyItem?(id: string, title: string, body: string, urgent: boolean): void;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
@@ -290,9 +295,11 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
         // ignore
       }
     },
-    notify(title, body) {
+    notify(title, body, item) {
       try {
-        bridge.notify?.(title, body);
+        // An older shell without notifyItem shows the item like a confirmation request.
+        if (item && typeof bridge.notifyItem === "function") bridge.notifyItem(item.id, title, body, item.urgent);
+        else bridge.notify?.(title, body);
       } catch {
         // ignore
       }

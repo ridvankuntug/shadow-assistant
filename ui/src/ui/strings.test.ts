@@ -9,6 +9,9 @@ import {
   devStatusText,
   devToolText,
   memoryCharsText,
+  notificationSourceText,
+  notificationsErrorText,
+  notificationsUnreadText,
   memoryErrorText,
   memoryWarningText,
 } from "./strings.ts";
@@ -73,5 +76,15 @@ describe("development panel texts", () => {
     expect(devErrorText("not_allowed")).toMatch(/yetkisi yok/);
     expect(devErrorText("internal")).toBe("Çekirdekte beklenmeyen bir hata oluştu.");
     expect(devErrorText("weird", "boom")).toBe("Hata: boom");
+  });
+});
+
+describe("notification inbox texts", () => {
+  it("source labels (unknown as-is), unread count and error texts", () => {
+    expect(notificationSourceText("device-state")).toBe("Cihaz durumu");
+    expect(notificationSourceText("yeni-kaynak")).toBe("yeni-kaynak");
+    expect(notificationsUnreadText(3)).toBe("3 okunmamış bildirim");
+    expect(notificationsErrorText("timeout")).toContain("yanıt vermedi");
+    expect(notificationsErrorText("unknown_item")).toContain("artık yok");
   });
 });

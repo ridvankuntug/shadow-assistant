@@ -7,8 +7,17 @@
  * unit-tested with a fake adapter and a fake socket.
  */
 import { CoreClient, type CoreClientOptions, type StatusEvent } from "../protocol/client.ts";
-import type { ClientMessage, DevAction, ServerMessage, SpeechChunkMessage, SpeechPrefsMessage } from "../protocol/types.ts";
-import { toPlatformError, type AudioClip, type PlatformAdapter } from "../platform/types.ts";
+import type {
+  ClientMessage,
+  DevAction,
+  NotificationAction,
+  NotificationInfo,
+  NotificationMessage,
+  ServerMessage,
+  SpeechChunkMessage,
+  SpeechPrefsMessage,
+} from "../protocol/types.ts";
+import { STORAGE_KEYS, toPlatformError, type AudioClip, type PlatformAdapter } from "../platform/types.ts";
 import {
   bargeInTarget,
   canPreviewVoice,
@@ -20,6 +29,8 @@ import {
   initialState,
   isCancelled,
   memoryAvailable,
+  notificationsAvailable,
+  notificationToggleAction,
   reducer,
   shouldPlaySpeech,
   type Action,
@@ -52,6 +63,10 @@ export const VOICES_TIMEOUT_MS = 8_000;
 export const MEMORY_TIMEOUT_MS = 8_000;
 /** Same for `dev_list` / `dev_action` in the Development panel. */
 export const DEV_TIMEOUT_MS = 8_000;
+/** Same for `notifications_list` / `notification_action` in the inbox. */
+export const NOTIFICATIONS_TIMEOUT_MS = 8_000;
+/** Urgent items waiting to be spoken (the UI was busy); more are not queued. */
+const MAX_ANNOUNCEMENTS = 5;
 /**
  * Streamed speech: after `assistant_done`, a turn whose queue waits for more
  * chunks is closed when no chunk (and no `final`) arrived for this long, so a
@@ -160,6 +175,20 @@ export class AssistantController {
   private voicesTimer: ReturnType<typeof setTimeout> | null = null;
   private memoryTimer: ReturnType<typeof setTimeout> | null = null;
   private devTimer: ReturnType<typeof setTimeout> | null = null;
+  private notificationsTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Set by `welcome`: the next inbox list is the catch-up of this connection
+   * (unread items not yet shown on this device go to the system once).
+   */
+  private catchUpPending = false;
+  /**
+   * Texts of urgent items the Core asked this device to speak
+   * (`notification.speak`), waiting until no turn, recording, confirm or
+   * reply speech is in the way. Dropped with the connection.
+   */
+  private readonly announcements: string[] = [];
+  /** A flushAnnouncement() microtask is queued. */
+  private flushScheduled = false;
   /**
    * The last `speech_prefs` this connection sent, null before the first one
    * (or when the Core lacks `speech_stream`). Its `enabled` decides whether
@@ -204,6 +233,7 @@ export class AssistantController {
     if (next === this.state) return;
     this.state = next;
     for (const l of this.listeners) l();
+    if (this.announcements.length > 0) this.scheduleAnnouncement();
   }
 
   private get connected(): boolean {
@@ -251,6 +281,9 @@ export class AssistantController {
     // A memory or Development request in flight is failed by the reducer ("connection").
     this.clearMemoryTimer();
     this.clearDevTimer();
+    this.clearNotificationsTimer();
+    // The Core picked this socket to speak them; a new connection never speaks them again.
+    this.announcements.length = 0;
     // No more chunks can come: play what arrived, then end. The next Core
     // session needs its own speech_prefs; old turn ids are meaningless there.
     this.sentPrefs = null;
@@ -271,6 +304,7 @@ export class AssistantController {
     this.clearVoicesTimer();
     this.clearMemoryTimer();
     this.clearDevTimer();
+    this.clearNotificationsTimer();
     this.stopLocalAudio();
   }
 
@@ -382,6 +416,8 @@ export class AssistantController {
 
   /** Stops speaking / the turn in flight without starting to listen. */
   stop(): void {
+    // "Durdur" also silences urgent items still waiting to be spoken (they stay in the inbox).
+    this.announcements.length = 0;
     this.bargeIn();
   }
 
@@ -390,6 +426,7 @@ export class AssistantController {
    * the model turn keeps running. Used when voice replies are switched off.
    */
   stopSpeaking(): void {
+    this.announcements.length = 0;
     this.dropPendingSpeech();
     this.stopLocalAudio();
     this.dispatch({ type: "speech_stopped" });
@@ -410,6 +447,7 @@ export class AssistantController {
 
   setVoiceReplies(enabled: boolean): void {
     this.voiceReplies = enabled;
+    if (!enabled) this.announcements.length = 0;
     this.syncSpeechPrefs();
   }
 
@@ -519,6 +557,42 @@ export class AssistantController {
     return true;
   }
 
+  /**
+   * Asks the Core for the inbox (`notifications_list`). Only with the
+   * `notifications` feature, while connected and no inbox request is in
+   * flight. Also sent after `welcome`, for the badge and the catch-up.
+   */
+  requestNotifications(): boolean {
+    return this.sendNotifications((id) => ({ type: "notifications_list", id }));
+  }
+
+  /**
+   * One action on one listed item; the Core answers with the fresh inbox.
+   * `read` only for an unread item, `unread` only for a read one, `delete`
+   * always (the panel asks first). Only ever sent for a user action.
+   */
+  notificationAction(notificationId: string, action: NotificationAction): boolean {
+    const item = this.state.notifications.items?.find((i) => i.id === notificationId);
+    if (!item || (action !== "delete" && action !== notificationToggleAction(item))) return false;
+    return this.sendNotifications((id) => ({ type: "notification_action", id, notificationId, action }), { notificationId, action });
+  }
+
+  private sendNotifications(
+    frame: (id: string) => Extract<ClientMessage, { type: "notifications_list" | "notification_action" }>,
+    acting?: { notificationId: string; action: NotificationAction },
+  ): boolean {
+    if (!notificationsAvailable(this.state) || this.state.notifications.status === "loading") return false;
+    const id = this.newId();
+    if (!this.client?.send(frame(id))) return false;
+    this.dispatch(acting ? { type: "notifications_requested", id, acting } : { type: "notifications_requested", id });
+    this.clearNotificationsTimer();
+    this.notificationsTimer = setTimeout(() => {
+      this.notificationsTimer = null;
+      this.dispatch({ type: "notifications_timeout", id });
+    }, NOTIFICATIONS_TIMEOUT_MS);
+    return true;
+  }
+
   dismissNotice(): void {
     this.dispatch({ type: "dismiss_notice" });
   }
@@ -615,6 +689,11 @@ export class AssistantController {
     this.devTimer = null;
   }
 
+  private clearNotificationsTimer(): void {
+    if (this.notificationsTimer !== null) clearTimeout(this.notificationsTimer);
+    this.notificationsTimer = null;
+  }
+
   private clearMaxTimer(): void {
     if (this.maxTimer !== null) clearTimeout(this.maxTimer);
     this.maxTimer = null;
@@ -629,11 +708,15 @@ export class AssistantController {
         this.clearVoicesTimer(); // the reducer reset the voice list
         this.clearMemoryTimer(); // and the memory view
         this.clearDevTimer(); // and the Development view
+        this.clearNotificationsTimer(); // and the inbox
+        this.catchUpPending = true;
         this.sentPrefs = null; // a new Core session: opt in again
         this.syncSpeechPrefs();
         this.requestHistory();
         // The badge count: the Core sends `dev_count` only when it changes.
         this.requestDev();
+        // The inbox badge and the catch-up of unread items not yet shown here.
+        this.requestNotifications();
         break;
       case "voices":
         if (msg.id === this.state.voices.requestId) this.clearVoicesTimer();
@@ -644,6 +727,17 @@ export class AssistantController {
       // Development frames are silent: no notify, vibration or sound (docs/08 §T7.w.4).
       case "dev":
         if (msg.id === this.state.dev.requestId) this.clearDevTimer();
+        break;
+      case "notifications":
+        if (msg.id !== this.state.notifications.requestId) break;
+        this.clearNotificationsTimer();
+        if (this.catchUpPending) {
+          this.catchUpPending = false;
+          this.catchUp(msg.items);
+        }
+        break;
+      case "notification":
+        this.onNotification(msg);
         break;
       case "state":
         if (msg.state === "idle" && this.cancelling) this.flushQueuedTurn();
@@ -672,6 +766,12 @@ export class AssistantController {
         }
         // A late error for an earlier Development request: not about a turn.
         if (msg.id !== undefined && this.state.dev.staleIds.includes(msg.id)) break;
+        // Same for the inbox.
+        if (msg.id !== undefined && msg.id === this.state.notifications.requestId) {
+          this.clearNotificationsTimer();
+          break;
+        }
+        if (msg.id !== undefined && this.state.notifications.staleIds.includes(msg.id)) break;
         if (failedSpeak) {
           this.speakNatively(failedSpeak.id, failedSpeak.text, msg.code);
           break;
@@ -697,6 +797,110 @@ export class AssistantController {
       default:
         break;
     }
+  }
+
+  // --- notifications (docs/08 §T7.w.5 Delivery) -------------------------------
+
+  /**
+   * A new or changed inbox item. `speak`: this device was picked to say it
+   * (once). An unread item whose current raise was not shown on this device
+   * goes to the system notification while the app is not visible; in front
+   * the inbox badge shows it, so it only counts as shown. Read items count as
+   * shown too, so marking one unread again (here or elsewhere) never pops a
+   * notification. Being spoken or shown never marks an item read.
+   */
+  private onNotification(msg: NotificationMessage): void {
+    const item = msg.item;
+    if (msg.speak) this.announce(item);
+    const shown = this.loadShown();
+    if (shown[item.id] === item.raised) return;
+    if (item.readAt === null && !this.adapter.isVisible()) this.showItem(item);
+    shown[item.id] = item.raised;
+    this.saveShown(shown);
+  }
+
+  /**
+   * The first inbox list of a connection: every unread item whose current
+   * raise was not shown on this device yet is shown once (oldest first, so
+   * the newest ends on top). The record is then cut to the listed items.
+   */
+  private catchUp(items: NotificationInfo[]): void {
+    const shown = this.loadShown();
+    const next: Record<string, number> = {};
+    for (const item of [...items].reverse()) {
+      if (item.readAt === null && shown[item.id] !== item.raised) this.showItem(item);
+      next[item.id] = item.raised;
+    }
+    this.saveShown(next);
+  }
+
+  private showItem(item: NotificationInfo): void {
+    this.adapter.notify(item.title, item.body, { id: item.id, urgent: item.urgency === "urgent" });
+  }
+
+  /** `{ id: raised }` of items already shown here; anything unreadable reads as none. */
+  private loadShown(): Record<string, number> {
+    const out: Record<string, number> = {};
+    try {
+      const v: unknown = JSON.parse(this.adapter.storage.get(STORAGE_KEYS.notificationsShown) ?? "{}");
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        for (const [k, n] of Object.entries(v)) if (typeof n === "number") out[k] = n;
+      }
+    } catch {
+      // A damaged record: start over (at worst an item is shown once more).
+    }
+    return out;
+  }
+
+  private saveShown(shown: Record<string, number>): void {
+    this.adapter.storage.set(STORAGE_KEYS.notificationsShown, JSON.stringify(shown));
+  }
+
+  /** Queues title + body of an urgent item for the usual speech path (only with voice replies on). */
+  private announce(item: NotificationInfo): void {
+    if (!this.voiceReplies) return;
+    const text = clipForSpeech([item.title, item.body].map((t) => t.trim()).filter(Boolean).join(". "));
+    if (!text || this.announcements.length >= MAX_ANNOUNCEMENTS) return;
+    this.announcements.push(text);
+    this.scheduleAnnouncement();
+  }
+
+  /**
+   * Runs flushAnnouncement() once the current call has finished its side
+   * effects. Never synchronously from dispatch(): an intermediate state (e.g.
+   * `barge_in` before `capture: starting`, or a speech error before the
+   * native fallback starts) would look free.
+   */
+  private scheduleAnnouncement(): void {
+    if (this.flushScheduled) return;
+    this.flushScheduled = true;
+    queueMicrotask(() => {
+      this.flushScheduled = false;
+      this.flushAnnouncement();
+    });
+  }
+
+  /**
+   * Speaks the next queued urgent item once nothing else is in the way, as a
+   * `speak` like a reply after `assistant_done`: the Core voice, the native
+   * fallback when synthesis fails, "Durdur" and barge-in stop it.
+   */
+  private flushAnnouncement(): void {
+    if (this.announcements.length === 0) return;
+    if (!this.voiceReplies) {
+      this.announcements.length = 0;
+      return;
+    }
+    const s = this.state;
+    if (!canPreviewVoice(s) || s.playing !== null || s.awaitingSpeech !== null) return;
+    if (this.speech !== null && !this.speech.closed) return;
+    // Streamed speech of the last answer may still come (its first chunk is
+    // late). Only an answer with text waits: an empty or failed turn may never
+    // send a chunk and must not hold the queue.
+    const t = this.lastDoneTurn;
+    if (t !== null && this.pendingSpeech.has(t) && this.lastDoneText.trim()) return;
+    const text = this.announcements.shift();
+    if (text) this.speakReply(this.newId(), text);
   }
 
   // --- streamed speech (speech_stream) ---------------------------------------
@@ -872,6 +1076,8 @@ export class AssistantController {
     q.items = [];
     this.clearSpeechFinalTimer();
     if (q.started) this.dispatch({ type: "playback_ended", id: q.turnId });
+    // A queue that never played dispatches nothing: wake a waiting urgent item here.
+    else if (this.announcements.length > 0) this.scheduleAnnouncement();
   }
 
   /** Stops the queue without dispatching (the caller updates the state). */

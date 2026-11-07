@@ -1,7 +1,7 @@
 /** User-facing Turkish strings. */
 import type { Notice, Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
-import type { DevAction, DevRuleInfo, MemoryWarning } from "../protocol/types.ts";
+import type { DevAction, DevRuleInfo, MemoryWarning, NotificationAction } from "../protocol/types.ts";
 import type { Quality } from "../scene/quality.ts";
 import type { SttStatus } from "./serviceHealth.ts";
 
@@ -280,6 +280,48 @@ export function devErrorText(code: string, message?: string | null): string {
       return "Bu öğe artık listede yok. Listeyi yenile.";
     case "not_allowed":
       return "Bu işlem bu öğe için geçerli değil ya da bu cihazın yetkisi yok.";
+    case "bad_request":
+      return "Çekirdek isteği reddetti. Listeyi yenile.";
+    default:
+      return noticeText(code, message ?? undefined);
+  }
+}
+
+// ------------------------------------------------------- notification inbox
+
+export const NOTIFICATION_ACTION_LABEL: Record<NotificationAction, string> = {
+  read: "Okundu",
+  unread: "Okunmadı",
+  delete: "Sil",
+};
+
+const NOTIFICATION_SOURCE: Record<string, string> = {
+  service: "Servis",
+  backup: "Yedekleme",
+  ha: "Ev",
+  "device-state": "Cihaz durumu",
+  test: "Deneme",
+};
+
+/** Producer name in Turkish; unknown sources as-is (docs/02 *Notifications*). */
+export function notificationSourceText(source: string): string {
+  return NOTIFICATION_SOURCE[source] ?? source;
+}
+
+/** Badge / heading label: "3 okunmamış bildirim". */
+export function notificationsUnreadText(unread: number): string {
+  return `${unread} okunmamış bildirim`;
+}
+
+/** Why the last inbox request failed (`timeout` / `connection` are local codes). */
+export function notificationsErrorText(code: string, message?: string | null): string {
+  switch (code) {
+    case "timeout":
+      return "Çekirdek bildirim isteğine yanıt vermedi.";
+    case "connection":
+      return "Bağlantı koptu; bildirimler alınamadı.";
+    case "unknown_item":
+      return "Bu bildirim artık yok. Listeyi yenile.";
     case "bad_request":
       return "Çekirdek isteği reddetti. Listeyi yenile.";
     default:

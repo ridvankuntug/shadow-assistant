@@ -156,6 +156,19 @@ describe("Android adapter", () => {
     expect(adapter.deviceClass()).toBe("phone");
   });
 
+  it("notify: a confirmation goes to notify; an inbox item to notifyItem, or to notify on an older shell", () => {
+    const bridge = { ...fakeBridge(), notifyItem: vi.fn() };
+    const adapter = createAndroidAdapter({ ShadowAndroid: bridge });
+    adapter.notify("Onay", "Kapı kilidi");
+    adapter.notify("Başlık", "Metin", { id: "n-1", urgent: true });
+    expect(bridge.notify).toHaveBeenCalledTimes(1);
+    expect(bridge.notify).toHaveBeenCalledWith("Onay", "Kapı kilidi");
+    expect(bridge.notifyItem).toHaveBeenCalledWith("n-1", "Başlık", "Metin", true);
+    const old = fakeBridge();
+    createAndroidAdapter({ ShadowAndroid: old }).notify("Başlık", "Metin", { id: "n-1", urgent: false });
+    expect(old.notify).toHaveBeenCalledWith("Başlık", "Metin");
+  });
+
   it("follows visibility events pushed by the shell", () => {
     const win: AndroidWindow = { ShadowAndroid: fakeBridge() };
     const adapter = createAndroidAdapter(win);

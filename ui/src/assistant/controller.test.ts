@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CoreClientOptions, StatusEvent } from "../protocol/client.ts";
-import type { ClientMessage, DevItem, ServerMessage } from "../protocol/types.ts";
+import type { ClientMessage, DevItem, NotificationInfo, ServerMessage } from "../protocol/types.ts";
 import { PlatformError, type PlatformAdapter, type TtsCapability, type Utterance } from "../platform/types.ts";
 import {
   AssistantController,
@@ -8,13 +8,14 @@ import {
   DEV_TIMEOUT_MS,
   MAX_UTTERANCE_MS,
   MEMORY_TIMEOUT_MS,
+  NOTIFICATIONS_TIMEOUT_MS,
   SPEECH_FINAL_TIMEOUT_MS,
   VOICES_TIMEOUT_MS,
   VOICE_SAMPLE_TEXT,
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
-import { derivePhase, devBadgeCount } from "./state.ts";
+import { derivePhase, devBadgeCount, notificationsBadgeCount } from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -1438,6 +1439,324 @@ describe("development panel (T7.w.4c)", () => {
       t.controller.requestDev();
       t.drop();
       expect(t.controller.getState().dev).toMatchObject({ status: "error", errorCode: "connection" });
+    });
+  });
+});
+
+describe("notification inbox (T7.w.5c)", () => {
+  const item = (id: string, over: Partial<NotificationInfo> = {}): NotificationInfo => ({
+    id,
+    source: "test",
+    urgency: "normal",
+    title: `Başlık ${id}`,
+    body: `Metin ${id}`,
+    createdAt: "2026-11-07T18:00:00.000Z",
+    updatedAt: "2026-11-07T18:00:00.000Z",
+    readAt: null,
+    raised: 1,
+    ...over,
+  });
+  const list = (id: string, items: NotificationInfo[]): ServerMessage => ({
+    type: "notifications",
+    id,
+    items,
+    unread: items.filter((i) => i.readAt === null).length,
+  });
+  const READ = "2026-11-07T19:00:00.000Z";
+
+  /**
+   * Connected to a Core with `notifications` (+ `extra`), an in-memory storage
+   * shared by every connection of this controller; the notifications_list sent
+   * on welcome ("t1") is answered with `answer` (unless null).
+   */
+  function inbox(answer: NotificationInfo[] | null = [], extra: string[] = [], store = new Map<string, string>()) {
+    const t = setup(undefined, undefined);
+    t.adapter.storage.get = (k) => store.get(k) ?? null;
+    t.adapter.storage.set = (k, v) => void store.set(k, v);
+    t.adapter.storage.remove = (k) => void store.delete(k);
+    let visible = true;
+    t.adapter.isVisible = () => visible;
+    // Reconnect with the feature now that the storage is in place.
+    t.drop();
+    t.connect(["notifications", ...extra]);
+    const listId = () => {
+      const last = [...t.sent].reverse().find((m) => m.type === "notifications_list");
+      return last && "id" in last ? (last.id as string) : "";
+    };
+    if (answer) t.receive(list(listId(), answer));
+    return {
+      ...t,
+      store,
+      listId,
+      setVisible: (v: boolean) => (visible = v),
+      notified: () => (t.adapter.notify as ReturnType<typeof vi.fn>).mock.calls,
+      badge: () => notificationsBadgeCount(t.controller.getState()),
+      /** Drops and reconnects; answers the new list with `items`. */
+      reconnect(items: NotificationInfo[]) {
+        t.drop();
+        t.sent.length = 0;
+        t.connect(["notifications", ...extra]);
+        t.receive(list(listId(), items));
+      },
+    };
+  }
+
+  it("without the feature: no notifications_list on welcome, no requests, no badge", () => {
+    const t = setup(undefined, ["dev"]);
+    expect(t.sentTypes()).not.toContain("notifications_list");
+    expect(t.controller.requestNotifications()).toBe(false);
+    t.receive({ type: "notification", item: item("n-1") });
+    expect(notificationsBadgeCount(t.controller.getState())).toBe(0);
+    expect(t.adapter.notify).not.toHaveBeenCalled();
+  });
+
+  it("list after welcome fills the inbox and the badge; broadcasts keep both current", () => {
+    const t = inbox([item("n-1"), item("n-2", { readAt: READ })]);
+    expect(t.controller.getState().notifications).toMatchObject({ status: "ready", unread: 1 });
+    expect(t.badge()).toBe(1);
+    t.receive({ type: "notification", item: item("n-3", { updatedAt: "2026-11-08T08:00:00.000Z" }) });
+    expect(t.badge()).toBe(2);
+    expect(t.controller.getState().notifications.items?.map((i) => i.id)).toEqual(["n-3", "n-1", "n-2"]);
+    t.receive({ type: "notification", item: item("n-1", { readAt: READ }) }); // read on another device
+    expect(t.badge()).toBe(1);
+    t.receive({ type: "notification", item: item("n-1", { readAt: READ }) }); // repeated: no change
+    expect(t.badge()).toBe(1);
+    t.receive({ type: "notification_removed", notificationId: "n-3" });
+    expect(t.badge()).toBe(0);
+    t.receive({ type: "notification_removed", notificationId: "n-2" }); // a read one
+    expect(t.badge()).toBe(0);
+    expect(t.controller.getState().notifications.items?.map((i) => i.id)).toEqual(["n-1"]);
+    t.receive({ type: "notification", item: item("n-4") });
+    t.drop();
+    expect(t.badge()).toBe(0); // gone while disconnected
+  });
+
+  it("read / unread / delete: one frame per user action, only when valid for the listed item", () => {
+    const t = inbox([item("n-1"), item("n-2", { readAt: READ })]);
+    t.sent.length = 0;
+    expect(t.controller.notificationAction("n-1", "unread")).toBe(false); // already unread
+    expect(t.controller.notificationAction("n-2", "read")).toBe(false); // already read
+    expect(t.controller.notificationAction("nope", "delete")).toBe(false);
+    expect(t.sent).toEqual([]);
+    expect(t.controller.notificationAction("n-1", "read")).toBe(true);
+    const id = "t2";
+    expect(t.sent).toEqual([{ type: "notification_action", id, notificationId: "n-1", action: "read" }]);
+    expect(t.controller.getState().notifications).toMatchObject({ status: "loading", acting: { notificationId: "n-1", action: "read" } });
+    expect(t.controller.notificationAction("n-2", "delete")).toBe(false); // one request at a time
+    t.receive({ type: "notification", item: item("n-1", { readAt: READ }) });
+    t.receive(list(id, [item("n-1", { readAt: READ }), item("n-2", { readAt: READ })]));
+    expect(t.controller.getState().notifications).toMatchObject({ status: "ready", acting: null, unread: 0 });
+    expect(t.controller.notificationAction("n-2", "unread")).toBe(true);
+    expect(t.sent[1]).toMatchObject({ type: "notification_action", notificationId: "n-2", action: "unread" });
+    t.receive(list("t3", [item("n-1", { readAt: READ }), item("n-2")]));
+    expect(t.controller.notificationAction("n-2", "delete")).toBe(true);
+    expect(t.sent[2]).toMatchObject({ type: "notification_action", notificationId: "n-2", action: "delete" });
+  });
+
+  it("delete raced by another device: unknown_item after notification_removed is swallowed", () => {
+    const t = inbox([item("n-1"), item("n-2")]);
+    t.controller.notificationAction("n-1", "delete");
+    t.receive({ type: "notification_removed", notificationId: "n-1" }); // the other device was first
+    t.receive({ type: "error", id: "t2", code: "unknown_item", message: "gone" });
+    const s = t.controller.getState();
+    expect(s.notice).toBeNull();
+    expect(s.notifications).toMatchObject({ status: "ready", acting: null, errorCode: null });
+    expect(s.notifications.items?.map((i) => i.id)).toEqual(["n-2"]);
+  });
+
+  it("other inbox errors stay in the panel (no chat notice) and keep the list", () => {
+    const t = inbox([item("n-1")]);
+    t.controller.notificationAction("n-1", "delete");
+    t.receive({ type: "error", id: "t2", code: "unknown_item", message: "gone" }); // still listed: a real error
+    expect(t.controller.getState().notice).toBeNull();
+    expect(t.controller.getState().notifications).toMatchObject({ status: "error", errorCode: "unknown_item" });
+    expect(t.controller.getState().notifications.items).toHaveLength(1);
+    expect(t.controller.requestNotifications()).toBe(true);
+    t.receive({ type: "error", id: "t3", code: "internal", message: "boom" });
+    expect(t.controller.getState().notifications).toMatchObject({ status: "error", errorCode: "internal" });
+    expect(t.controller.getState().notice).toBeNull();
+  });
+
+  it("urgent with speak: title + body spoken once through `speak`; never read, never again", async () => {
+    const t = inbox([]);
+    t.sent.length = 0;
+    const urgent = item("n-9", { urgency: "urgent", title: "Kapı açık", body: "Bahçe kapısı açık kaldı" });
+    t.receive({ type: "notification", item: urgent, speak: true });
+    await flush();
+    expect(t.sent).toEqual([{ type: "speak", id: "t2", text: "Kapı açık. Bahçe kapısı açık kaldı" }]);
+    t.receive({ type: "speech", id: "t2", mime: "audio/wav", data: "AAAA" });
+    expect(t.adapter.playback.play).toHaveBeenCalledTimes(1);
+    expect(t.phase()).toBe("speaking");
+    // Changed later without `speak` (e.g. read elsewhere), and after a reconnect: silent.
+    t.receive({ type: "notification", item: { ...urgent, readAt: READ } });
+    t.reconnect([urgent]);
+    await flush();
+    expect(t.sentTypes().filter((x) => x === "speak")).toEqual([]);
+    expect(t.sentTypes()).not.toContain("notification_action");
+    expect(t.controller.getState().notifications.items?.[0].readAt).toBeNull();
+  });
+
+  it("urgent speech waits for a running turn and follows once it is idle", async () => {
+    const t = inbox([]);
+    t.controller.sendText("merhaba");
+    t.sent.length = 0;
+    t.receive({ type: "notification", item: item("n-9", { urgency: "urgent", body: "" }), speak: true });
+    await flush();
+    expect(t.sentTypes()).toEqual([]);
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "state", state: "idle" });
+    await flush();
+    expect(t.sent).toEqual([{ type: "speak", id: "t3", text: "Başlık n-9" }]);
+  });
+
+  it("urgent speech is skipped with voice replies off; a normal item is never spoken", async () => {
+    const t = inbox([]);
+    t.sent.length = 0;
+    t.receive({ type: "notification", item: item("n-1") });
+    t.controller.setVoiceReplies(false);
+    t.receive({ type: "notification", item: item("n-2", { urgency: "urgent" }), speak: true });
+    await flush();
+    expect(t.sentTypes()).not.toContain("speak");
+  });
+
+  it("queued urgent items: voice replies off or Durdur drops them; push-to-talk keeps the mic clear", async () => {
+    const urgent = (id: string): ServerMessage => ({ type: "notification", item: item(id, { urgency: "urgent" }), speak: true });
+    const t = inbox([]);
+    t.controller.sendText("merhaba"); // t2: the queue waits behind it
+    t.receive(urgent("n-1"));
+    t.controller.setVoiceReplies(false);
+    t.controller.setVoiceReplies(true);
+    t.receive({ type: "state", state: "thinking" });
+    t.receive({ type: "state", state: "idle" });
+    await flush();
+    expect(t.sentTypes()).not.toContain("speak");
+
+    // Two queued while one plays: Durdur stops it and drops the rest.
+    t.sent.length = 0;
+    t.receive(urgent("n-2"));
+    t.receive(urgent("n-3"));
+    await flush();
+    expect(t.sentTypes()).toEqual(["speak"]);
+    t.receive({ type: "speech", id: t.sent[0] && "id" in t.sent[0] ? (t.sent[0].id as string) : "", mime: "audio/wav", data: "AAAA" });
+    t.controller.stop();
+    await flush();
+    expect(t.sentTypes().filter((x) => x === "speak")).toHaveLength(1);
+
+    // Push-to-talk while one plays: the next one does not start under the open mic.
+    t.sent.length = 0;
+    t.receive(urgent("n-4"));
+    t.receive(urgent("n-5"));
+    await flush();
+    const first = t.sent.find((m) => m.type === "speak");
+    t.receive({ type: "speech", id: first && "id" in first ? (first.id as string) : "", mime: "audio/wav", data: "AAAA" });
+    const talk = t.controller.startTalk();
+    await flush();
+    expect(t.sentTypes().filter((x) => x === "speak")).toHaveLength(1);
+    await talk;
+    expect(t.controller.getState().capture).toBe("recording");
+  });
+
+  it("streamed speech: an empty answer does not hold the queue; a silent final wakes it", async () => {
+    const t = inbox([], ["speech_stream"]);
+    // An empty streamed answer: no chunk will come for it.
+    t.controller.sendText("merhaba"); // t2
+    t.receive({ type: "assistant_done", id: "t2", text: "" });
+    t.receive({ type: "state", state: "idle" });
+    t.sent.length = 0;
+    t.receive({ type: "notification", item: item("n-1", { urgency: "urgent" }), speak: true });
+    await flush();
+    expect(t.sentTypes()).toEqual(["speak"]);
+    t.receive({ type: "error", id: t.sent[0] && "id" in t.sent[0] ? (t.sent[0].id as string) : "", code: "tts_unavailable", message: "x" });
+
+    // An answer with text waits for its chunks; a final without audio releases the queue.
+    t.controller.sendText("ikinci"); // a new turn
+    const turn = [...t.sent].reverse().find((m) => m.type === "user_text");
+    const turnId = turn && "id" in turn ? (turn.id as string) : "";
+    t.receive({ type: "assistant_done", id: turnId, text: "Yanıt." });
+    t.receive({ type: "state", state: "idle" });
+    t.sent.length = 0;
+    t.receive({ type: "notification", item: item("n-2", { urgency: "urgent" }), speak: true });
+    await flush();
+    expect(t.sentTypes()).toEqual([]);
+    t.receive({ type: "speech_chunk", id: turnId, seq: 0, final: true });
+    await flush();
+    expect(t.sentTypes()).toEqual(["speak"]);
+  });
+
+  it("phone: a new item while hidden goes to notify (own id, urgency); in front it only counts as shown", () => {
+    const t = inbox([]);
+    t.setVisible(false);
+    t.receive({ type: "notification", item: item("n-1") });
+    t.receive({ type: "notification", item: item("n-2", { urgency: "urgent" }) });
+    expect(t.notified()).toEqual([
+      ["Başlık n-1", "Metin n-1", { id: "n-1", urgent: false }],
+      ["Başlık n-2", "Metin n-2", { id: "n-2", urgent: true }],
+    ]);
+    t.receive({ type: "notification", item: item("n-1", { readAt: READ }) }); // read elsewhere
+    t.receive({ type: "notification", item: item("n-1") }); // marked unread again: not a new raise
+    expect(t.notified()).toHaveLength(2);
+    t.receive({ type: "notification", item: item("n-1", { raised: 2 }) }); // raised again (renotify)
+    expect(t.notified()).toHaveLength(3);
+    t.setVisible(true);
+    t.receive({ type: "notification", item: item("n-3") });
+    expect(t.notified()).toHaveLength(3);
+    t.reconnect([item("n-3"), item("n-2", { urgency: "urgent" }), item("n-1", { raised: 2 })]);
+    expect(t.notified()).toHaveLength(3); // all of them were shown here already
+  });
+
+  it("catch-up on connect: each unread item not yet shown here, once, oldest first", () => {
+    const store = new Map<string, string>();
+    const items = [item("n-3"), item("n-2", { readAt: READ }), item("n-1", { urgency: "urgent" })];
+    const t = inbox(items, [], store);
+    expect(t.notified()).toEqual([
+      ["Başlık n-1", "Metin n-1", { id: "n-1", urgent: true }],
+      ["Başlık n-3", "Metin n-3", { id: "n-3", urgent: false }],
+    ]);
+    t.reconnect(items);
+    expect(t.notified()).toHaveLength(2);
+    // A new controller on the same device (app restarted): the record is kept.
+    const again = inbox(items, [], store);
+    expect(again.notified()).toEqual([]);
+    // Raised again while away -> once more; the record keeps only listed items.
+    t.reconnect([item("n-3", { raised: 2 })]);
+    expect(t.notified()).toHaveLength(3);
+    expect(JSON.parse(store.get("shadow.notificationsShown") ?? "{}")).toEqual({ "n-3": 2 });
+    // Only the first list of a connection is a catch-up ("Yenile" is not).
+    t.controller.requestNotifications();
+    t.receive(list(t.listId(), [item("n-5")]));
+    expect(t.notified()).toHaveLength(3);
+  });
+
+  it("a damaged shown record reads as empty", () => {
+    const store = new Map([["shadow.notificationsShown", "{not json"]]);
+    const t = inbox([item("n-1")], [], store);
+    expect(t.notified()).toHaveLength(1);
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("no answer -> timeout error; a late answer still fills the inbox and runs the catch-up", () => {
+      const t = inbox(null);
+      vi.advanceTimersByTime(NOTIFICATIONS_TIMEOUT_MS);
+      expect(t.controller.getState().notifications).toMatchObject({ status: "error", errorCode: "timeout" });
+      t.receive(list(t.listId(), [item("n-1")]));
+      expect(t.controller.getState().notifications.status).toBe("ready");
+      expect(t.notified()).toHaveLength(1);
+    });
+
+    it("a dropped connection fails the request and drops pending urgent speech", () => {
+      const t = inbox([]);
+      t.controller.sendText("merhaba");
+      t.receive({ type: "notification", item: item("n-9", { urgency: "urgent" }), speak: true });
+      t.controller.requestNotifications();
+      t.drop();
+      expect(t.controller.getState().notifications).toMatchObject({ status: "error", errorCode: "connection" });
+      t.sent.length = 0;
+      t.connect(["notifications"]);
+      t.receive(list(t.listId(), []));
+      expect(t.sentTypes()).not.toContain("speak");
     });
   });
 });

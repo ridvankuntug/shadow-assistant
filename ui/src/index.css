@@ -903,3 +903,41 @@ input {
   flex-basis: 100%;
   margin: 0;
 }
+
+/* ------------------------------------------------------- notification inbox */
+
+/* Topbar bell: shown with the `notifications` feature, the unread count on it. */
+.notifications-badge {
+  gap: 4px;
+  grid-auto-flow: column;
+  font-size: 12px;
+  color: var(--muted);
+}
+.notifications-badge svg {
+  width: 18px;
+  height: 18px;
+}
+.notification-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+.notification-title strong {
+  overflow-wrap: anywhere;
+}
+.notification-entry:not(.notification-unread) .notification-title strong {
+  font-weight: 500;
+  color: var(--muted);
+}
+.notification-unread {
+  border-left: 3px solid color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.notification-urgent {
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, transparent);
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 16px;
+}

@@ -8,6 +8,8 @@ import {
   devBadgeCount,
   hasFeature,
   memoryAvailable,
+  notificationsAvailable,
+  notificationsBadgeCount,
 } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
@@ -19,20 +21,24 @@ import { ConnectScreen } from "./ui/ConnectScreen.tsx";
 import { Conversation } from "./ui/Conversation.tsx";
 import { DevPanel } from "./ui/DevPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
+import { NotificationsPanel } from "./ui/NotificationsPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { sttStatus } from "./ui/serviceHealth.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
-import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, resolvedText } from "./ui/strings.ts";
+import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, notificationsUnreadText, resolvedText } from "./ui/strings.ts";
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "memory" | "dev" | "connect";
+type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect";
 
-/** The tray opens the UI at `#dev` (docs/08 §T7.w.4). */
+/** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5). */
 const DEV_HASH = "#dev";
-const atDevHash = () => typeof window !== "undefined" && window.location.hash === DEV_HASH;
+const NOTIFICATIONS_HASH = "#notifications";
+const atHash = (hash: string) => typeof window !== "undefined" && window.location.hash === hash;
+const atDevHash = () => atHash(DEV_HASH);
+const atNotificationsHash = () => atHash(NOTIFICATIONS_HASH);
 
 export default function App({ adapter, controller }: Props) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState);
@@ -61,6 +67,8 @@ export default function App({ adapter, controller }: Props) {
   const closeDev = useCallback(() => setPanel(devFrom), [devFrom]);
   // `#dev` asked for the Development panel; it opens once the Core offers it.
   const [devWanted, setDevWanted] = useState(atDevHash);
+  // `#notifications` asked for the inbox; it opens once the Core offers it.
+  const [notificationsWanted, setNotificationsWanted] = useState(atNotificationsHash);
 
   // Connect on start when a configuration is stored; reconnect when it changes.
   useEffect(() => {
@@ -99,16 +107,24 @@ export default function App({ adapter, controller }: Props) {
     if (panel === "dev" && devOn) controller.requestDev();
   }, [controller, panel, devOn]);
 
+  // The inbox asks for the list each time it opens (the badge comes from the
+  // list sent after welcome and the broadcasts).
+  const notificationsOn = notificationsAvailable(state);
+  useEffect(() => {
+    if (panel === "notifications" && notificationsOn) controller.requestNotifications();
+  }, [controller, panel, notificationsOn]);
+
   useEffect(() => {
     const onHash = () => {
       if (atDevHash()) setDevWanted(true);
+      if (atNotificationsHash()) setNotificationsWanted(true);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  // Drop a consumed `#dev` so the tray can target it again in this tab (hashchange).
+  // Drop a consumed `#dev` / `#notifications` so the tray can target it again in this tab (hashchange).
   useEffect(() => {
-    if (panel === "dev" && atDevHash()) {
+    if ((panel === "dev" && atDevHash()) || (panel === "notifications" && atNotificationsHash())) {
       window.history.replaceState(null, "", window.location.pathname + window.location.search);
     }
   }, [panel]);
@@ -117,6 +133,10 @@ export default function App({ adapter, controller }: Props) {
     setDevWanted(false);
     setDevFrom("none");
     setPanel("dev");
+  }
+  if (notificationsWanted && notificationsOn) {
+    setNotificationsWanted(false);
+    setPanel("notifications");
   }
 
   // Back in the foreground: skip the remaining reconnect backoff. Visibility
@@ -171,6 +191,7 @@ export default function App({ adapter, controller }: Props) {
     setPanel("dev");
   };
   const devCount = devBadgeCount(state);
+  const unreadCount = notificationsBadgeCount(state);
 
   const status = state.connection.status;
   const unauthorized = status === "unauthorized";
@@ -219,6 +240,24 @@ export default function App({ adapter, controller }: Props) {
               <span className="dev-count" aria-hidden="true">
                 {devCount > 99 ? "99+" : devCount}
               </span>
+            </button>
+          )}
+          {/* Inbox: always reachable with the Core feature; the count only while something is unread. */}
+          {notificationsOn && (
+            <button
+              type="button"
+              className="btn btn-icon notifications-badge"
+              aria-label={unreadCount > 0 ? `Bildirimler: ${notificationsUnreadText(unreadCount)}` : "Bildirimler"}
+              onClick={() => setPanel("notifications")}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2Zm6-6V11a6 6 0 0 0-4.5-5.8V4.5a1.5 1.5 0 0 0-3 0v.7A6 6 0 0 0 6 11v5l-2 2v1h16v-1l-2-2Z" />
+              </svg>
+              {unreadCount > 0 && (
+                <span className="dev-count" aria-hidden="true">
+                  {unreadCount > 99 ? "99+" : unreadCount}
+                </span>
+              )}
             </button>
           )}
           <button
@@ -344,6 +383,16 @@ export default function App({ adapter, controller }: Props) {
           onRefresh={() => controller.requestDev()}
           onAction={(itemId, action) => controller.devAction(itemId, action)}
           onClose={closeDev}
+        />
+      )}
+      {/* Hidden without the Core feature `notifications`. */}
+      {panel === "notifications" && hasFeature(state, "notifications") && (
+        <NotificationsPanel
+          notifications={state.notifications}
+          connected={connected}
+          onRefresh={() => controller.requestNotifications()}
+          onAction={(id, action) => controller.notificationAction(id, action)}
+          onClose={closePanel}
         />
       )}
     </div>
