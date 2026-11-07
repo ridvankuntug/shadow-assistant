@@ -1,13 +1,16 @@
 /**
  * T7.w.2b: pattern extraction (pure, no I/O). Generic names only.
+ * T7.w.9: the cross-check (the `<ad>` span is the model's one target) and
+ * name words before device words (the "prizma" / "lambada" residual).
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { runDirectPlan } from "../src/direct.js";
 import { checkTurn, extractPattern, learnPolicy, learnTargetFilter, type LearnPolicy, type ObservedCall, type ObservedTurn } from "../src/learn/extract.js";
 import type { LiveEntity } from "../src/live-context.js";
 import { prepareNumbers } from "../src/numbers.js";
-import { LEARNED_WORD, NEVER_LEARNABLE_DOMAINS, parseRouterConfig, type DirectPlan, type MatchText } from "../src/router-config.js";
+import { LEARNED_WORD, loadRouterFile, NEVER_LEARNABLE_DOMAINS, parseRouterConfig, type DirectPlan, type MatchText } from "../src/router-config.js";
 import { parseServices } from "../src/services.js";
 import { prepareText } from "../src/turkish.js";
 
@@ -19,7 +22,7 @@ direct:
   name_stop_words: [ve]
 learning:
   keywords:
-    light: [ışık, lamba]
+    light: [ışık, lamba, lambası]
     switch: [priz]
 `;
 const config = parseRouterConfig(YAML);
@@ -140,8 +143,16 @@ describe("extractPattern: slots", () => {
     assert.equal(rejected("yüzde elli yap", setLevel("Salon Lamba", 50)), "name_not_in_text");
   });
 
-  test("name span ambiguous: two spans give the same call", () => {
-    assert.equal(rejected("kitaplık lamba açılsın", turnOn("Kitaplık Lamba", "light")), "name_ambiguous");
+  test("nested spans of the same target: the widest one is <ad>", () => {
+    // "kitaplık" alone also resolves (keyword), leaving "lamba" as a literal; the whole name wins.
+    assert.deepEqual(learned("kitaplık lamba açılsın", turnOn("Kitaplık Lamba", "light")).tokens, ["<ad>", "açılsın"]);
+  });
+
+  test("name span ambiguous: two spans side by side give the same call", () => {
+    // Both names are device words, so neither is a name word in the other's pattern.
+    const both = [ent("Lamba, Işık", "light")];
+    const r = extractPattern(textOf("lamba ışık açılsın"), turnOn("Lamba", "light"), both, policy);
+    assert.ok(!r.ok && r.reason === "name_ambiguous", r.ok ? r.value.tokens.join(" ") : r.reason);
   });
 
   test("a stop name is never a name span", () => {
@@ -150,7 +161,8 @@ describe("extractPattern: slots", () => {
 
   test("the model's call must be the executor's call: other name, other domain", () => {
     assert.equal(rejected("salon lambası açılsın", turnOn("Mutfak Lamba", "light")), "name_not_in_text");
-    assert.equal(rejected("kahve prizi açılsın", turnOn("Kahve Prizi", "light")), "name_not_in_text");
+    // No light is called "Kahve Prizi": the model's call names no entity of the home (T7.w.9).
+    assert.equal(rejected("kahve prizi açılsın", turnOn("Kahve Prizi", "light")), "model_target_unresolved");
   });
 
   test("media on/off and an outlet are learnable", () => {
@@ -318,6 +330,59 @@ describe("extractPattern: name words (review round 3)", () => {
     assert.equal(reason(run("salon lambasını oturma tarafında yak", turnOn("Salon Lamba", "light"))), "name_word_in_pattern");
     // Without the alias the same word is plain phrasing (nothing in the home is called that).
     assert.ok(home([])("salon lambasını oturma tarafında yak", turnOn("Salon Lamba", "light")).ok);
+  });
+});
+
+describe("extractPattern: cross-check (T7.w.9)", () => {
+  // The shipped router.yaml: its keyword lists are what a real home runs with.
+  const shipped = learnPolicy(loadRouterFile(fileURLToPath(new URL("../../router.yaml", import.meta.url))), services);
+  const shippedText = (s: string) => {
+    const prepared = prepareText(s, shipped.config.fillers);
+    return prepareNumbers(prepared) ?? prepared;
+  };
+  const HOME: LiveEntity[] = [
+    ent("Salon Lamba", "light", { areas: ["Salon"] }),
+    ent("Tavan Lambası", "light"),
+    ent("Prizma", "light"),
+    ent("Lambada", "switch", { attributes: { device_class: "outlet" } }),
+  ];
+  const run = (s: string, call: ObservedCall, home: LiveEntity[] = HOME) => extractPattern(shippedText(s), call, home, shipped);
+  const outcome = (r: ReturnType<typeof run>) => (r.ok ? r.value.tokens.join(" ") : r.reason);
+
+  test("a device word plus a suffix that is a home name is never a literal word ('prizma', 'lambada')", () => {
+    for (const t of ["salon lambasını prizma gibi yak", "salon lambasını lambada gibi yak", "salon lambasını prizmadaki gibi yak"]) {
+      assert.equal(outcome(run(t, turnOn("Salon Lamba", "light"))), "name_word_in_pattern", t);
+    }
+    // Control: in a home with no such name, the same word is plain phrasing.
+    const plain = [ent("Salon Lamba", "light", { areas: ["Salon"] })];
+    assert.equal(outcome(run("salon lambasını prizma gibi yak", turnOn("Salon Lamba", "light"), plain)), "<ad> lambasını prizma gibi yak");
+    // Spoken as the target, the name is the slot, not a literal.
+    assert.equal(outcome(run("prizmayı açıver", turnOn("Prizma", "light"))), "<ad> açıver");
+    assert.equal(outcome(run("lambadayı açıver", turnOn("Lambada", "switch"))), "<ad> açıver");
+  });
+
+  test("'tavan lambasını …' for a device called 'Tavan Lambası' stays learnable; 'lambası' is no name word", () => {
+    const v = run("tavan lambasını açıver", turnOn("Tavan Lambası", "light"));
+    assert.equal(outcome(v), "<ad> açıver");
+    assert.ok(v.ok && !/tavan/i.test(JSON.stringify(v.value)));
+    assert.equal(outcome(run("tavan lambasını yüzde 40 yap", setLevel("Tavan Lambası", 40))), "<ad> yüzde <sayi> yap");
+    // The device word "lambası" is still learned as a literal for another lamp in the same home.
+    assert.equal(outcome(run("salon lambasını açıver", turnOn("Salon Lamba", "light"))), "<ad> lambasını açıver");
+  });
+
+  test("the model's call must name exactly one entity of the home", () => {
+    // Not in the live context at all.
+    assert.equal(outcome(run("salon lambasını açıver", turnOn("Yok Lamba", "light"))), "model_target_unresolved");
+    // Two lights share the name and the call gives no area: HA's target is not one entity.
+    const twins = [ent("Masa Lamba", "light", { areas: ["Salon"] }), ent("Masa Lamba", "light", { areas: ["Mutfak"] })];
+    assert.equal(outcome(run("masa lamba açıver", turnOn("Masa Lamba", "light"), twins)), "model_target_unresolved");
+    // An area that is not the entity's.
+    assert.equal(outcome(run("salon lambasını açıver", action("intent__HassTurnOn", { name: "Salon Lamba", area: "Mutfak", domain: ["light"] }))), "model_target_unresolved");
+  });
+
+  test("the <ad> span must resolve to the model's target, not to another entity", () => {
+    // "salon" resolves to "Salon Lamba"; the model switched "Tavan Lambası".
+    assert.equal(outcome(run("salon lambasını açıver", turnOn("Tavan Lambası", "light"))), "name_not_in_text");
   });
 });
 

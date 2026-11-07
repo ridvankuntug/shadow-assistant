@@ -231,8 +231,15 @@ is the same read tier 0 does).
    argument building as `runDirectPlan()`, without calling anything. A span is
    good when the produced `(name, area, domain)` equals the model's arguments
    (folded strings, `domain` as a set) and resolves to exactly one entity.
-   Exactly one good span → it becomes `<ad>`. None (the target is not in the
-   utterance, e.g. "yüzde elli yap") or more than one → no observation
+   **Cross-check (T7.w.9):** that entity must be the one entity the model's call
+   targeted — the live-context entity of the call's domain with a name or alias
+   equal to its `name` (and an area equal to its `area`, if given). A call that
+   names no entity or several (two lights called "Masa Lamba", no area) is no
+   observation (`model_target_unresolved`). Of the spans that also pass steps
+   3-5, the widest becomes `<ad>` when it contains all the others (nested spans
+   of one target differ only in whether a device word is inside the slot:
+   "tavan" + "lambasını" vs "tavan lambasını"); none (the target is not in the
+   utterance, e.g. "yüzde elli yap") or spans side by side → no observation
    (`name_not_in_text` / `name_ambiguous`). If the call has no `name`, the
    pattern has no `<ad>`. Names are found before numbers so the digit in a name
    like "Lamba 2" is never taken for a brightness.
@@ -249,9 +256,15 @@ is the same read tier 0 does).
    areas and every `direct.area_aliases` name) in any suffixed form — a stem
    match, or the word starting with a name word of 3+ letters with k/ğ, t/d, p/b
    folded ("odamızdaki", "mutfağımızdaki") — refuses the pattern
-   (`name_word_in_pattern`). Only a `learning.keywords` device word and its
-   inflected forms (plural, possessive, case, `-ki`: "lambası", "ışığını") are
-   exempt; "lambaderin" is not. Refusing too much is the safe side.
+   (`name_word_in_pattern`). **Name words first (T7.w.9):** a literal that
+   looks like a device word plus a suffix has no exemption of its own, since
+   "prizma" or "lambada" can be a home name; the only exemption is on the name
+   side — a name word that *is* a `learning.keywords` word ("lamba" in "Salon
+   Lamba", "lambası" in "Tavan Lambası") names nothing and is not a name word.
+   So "lambasını" stays a learnable literal for "Salon Lamba", "tavan lambasını
+   açıver" for "Tavan Lambası" learns `[<ad>, açıver]`, and "lambaderin" /
+   "prizma" / "lambada" next to such home names are refused. Refusing too much is
+   the safe side.
 5. **Round trip.** Compile the pattern and match it against the same prepared
    text with the learned-rule matcher; it must match and capture the same span
    and number. Otherwise drop (`round_trip`).
@@ -305,6 +318,10 @@ observing ──(N same outcomes)──▶ candidate ──"Kuralı ekle"──�
   Denials (declined confirmation, read-only, timeout of a confirmation), cancels
   and an unreachable service are neutral. Suspension writes a `rule_suspended`
   dev-note (badge, no push).
+- **At run time `<ad>` must resolve to exactly one entity** (the executor's
+  resolution, with the rule's stored domains and keywords): none
+  (`name_not_found`) or several (`name_ambiguous`) is a fallback that counts
+  toward suspension like any other own failure; a success in between resets it.
 - **The fallback itself is silent**: the turn goes to tier 1 exactly like a static
   tier-0 fallback; the user hears the model's answer. Such a recovery turn is
   never an observation (`source` is not `default`).
@@ -817,6 +834,7 @@ task may touch. Two tasks that share a file are never run in parallel; the
 | T7.w.5d | `android/app/src/main/java/app/shadowassistant/android/Notifier.kt`, `.../MainActivity.kt` (bridge), `android/app/src/main/res/values/strings.xml` | 5c | – |
 | T7.w.4d | `deploy/windows/tray/src/ShadowTray/CoreHealth.cs`, `TrayApp.cs`, `TrayIcons.cs`, tray tests | 4b, 5b | – |
 | T7.w.6a | `core/test/agent.test.ts`, `core/test/gateway-sdk.test.ts`, `core/test/permissions.test.ts` | – | – |
+| T7.w.9 | `core/src/learn/extract.ts`, `core/test/learn-extract.test.ts`, `core/test/session-learn.test.ts` | 2b, 2d | – |
 
 Parallel lanes: {3a, 4a, 5a, 6a} can start at once; 2a starts when T7.w.1 has
 landed (both touch the router). 2b and 2c run in parallel after 2a. 4c runs in
@@ -894,6 +912,12 @@ T7.w.7 has no task (deferred).
   [T7.w.6](#t7w6-built-in-tools-closed). Acceptance: the tests fail if `tools`,
   `mcpServers`, `settingSources` or the guard of `buildOneShotOptions()` is
   loosened, or if an unknown non-`mcp__` name is allowed.
+- [x] **T7.w.9 — Learning cross-check (closes Y1).** The `<ad>` span must resolve to
+  exactly one entity, and it must be the one entity the model's call targeted; name words
+  are checked before device words. Acceptance: a device word plus a valid suffix that is a
+  home name ("prizma", "lambada") never becomes a literal word; "tavan lambasını …" for a
+  device "Tavan Lambası" stays learnable; a learned rule whose `<ad>` matches nothing or
+  several entities falls back silently and counts one failure.
 
 ## Progress log
 
@@ -1014,3 +1038,16 @@ T7.w.7 has no task (deferred).
   replaces the confirmation (id 1, no tag) or another item. Bridge `notifyItem(id, title, body,
   urgent)` (trusted page only, id checked, lengths capped as `notify`). No new permission or
   dependency. docs/03 (bridge table) not updated: outside the 5c/5d files.
+- 2026-11-07: T7.w.9 implemented (senior-dev; review and tester pending): cross-check — the
+  model's call must name exactly one live-context entity (`model_target_unresolved`) and the
+  `<ad>` span must resolve to it; name words before device words, the known residual (Y1) is
+  closed. Narrowest readings: only a name word that equals a `learning.keywords` word is no name
+  word (inflected forms of it are, unless listed); nested surviving spans → the widest is `<ad>`
+  (was `name_ambiguous`), spans side by side stay ambiguous; "exactly one" is counted among the
+  learnable domains the executor resolves in, not the whole live context. Run time unchanged
+  (0 or several matches already fell back and counted); tests added. Protocol unchanged.
+- 2026-11-07: T7.w.9 done (senior-code-reviewer 1 round, no critical or high finding; tester:
+  core 1190/1190, lint, build, 9 of 11 mutations killed; the two survivors are the explicit
+  `entity === target` checks, equivalent once the model's target is unique, kept as defense in
+  depth). Left open (related findings): `name_ambiguous` also reports nested spans that all fail
+  for another reason; the keywords exemption assumes `learning.keywords` holds generic words only.

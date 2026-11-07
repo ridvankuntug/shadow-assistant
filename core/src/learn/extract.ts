@@ -8,9 +8,12 @@
  *
  * The core idea is a dry run: a span of the utterance only becomes `<ad>`
  * when the existing tier-0 executor (direct.ts), replayed on this utterance,
- * would have made exactly the call the model made; exactly one span may
- * survive steps 3-5 (more → `name_ambiguous`). Everything else is
- * default deny:
+ * would have made exactly the call the model made; of the spans that survive
+ * steps 3-5 the widest is `<ad>` when it holds all the others, else
+ * `name_ambiguous`. Cross-check (T7.w.9): the
+ * span resolves to exactly one live-context entity and that entity is the
+ * one the model's call targeted (the call itself must identify exactly one).
+ * Everything else is default deny:
  *   layer 1  tool ceiling (LEARNABLE_TOOLS on LEARNABLE_SERVICE, router.yaml narrows)
  *   layer 2  domain ceiling (LEARNABLE_DOMAINS, NEVER_LEARNABLE_DOMAINS first;
  *            brightness on lights only)
@@ -92,6 +95,7 @@ export type RejectReason =
   | "bad_domain"
   | "domain_not_learnable"
   | "target_refused"
+  | "model_target_unresolved"
   | "name_not_in_text"
   | "name_ambiguous"
   | "number_not_in_text"
@@ -239,6 +243,9 @@ export function extractPattern(text: MatchText, action: ObservedCall, entities: 
   const parsed = readArgs(tool, action.args, policy);
   if (!parsed.ok) return parsed;
   const want = parsed.value;
+  // Cross-check (T7.w.9): the entity the model's call targeted; every `<ad>` span must resolve to this one.
+  const target = modelTarget(entities, want);
+  if (!target) return reject("model_target_unresolved");
 
   // Step 2: the name slot, by dry-running the executor on every span.
   const words = text.display.split(" ");
@@ -281,7 +288,7 @@ export function extractPattern(text: MatchText, action: ObservedCall, entities: 
       const args = directCallArgs(p, res);
       const sameName = key(String(args.name)) === key(want.name);
       const sameArea = args.area === undefined ? want.area === undefined : want.area !== undefined && key(String(args.area)) === key(want.area);
-      if (!sameName || !sameArea || res.entity.domain !== want.domain) continue;
+      if (!sameName || !sameArea || res.entity.domain !== want.domain || res.entity !== target) continue;
       if (!filter(res.entity)) {
         refused = true;
         continue;
@@ -293,16 +300,36 @@ export function extractPattern(text: MatchText, action: ObservedCall, entities: 
   // A span that cannot become a whole pattern (steps 3-5) is not a candidate:
   // for "lamba 2 … yüzde 40 …" the span "lamba" leaves a stray "2", so only
   // "lamba 2" counts — the digit of a name is never taken for a level.
-  const done: Extracted[] = [];
+  const done: Array<{ start: number; end: number; value: Extracted }> = [];
   let firstFailure: RejectReason | undefined;
   for (const span of good) {
-    const r = completePattern(text, words, span, tool, want, keywords, entities, policy, filter, nameWords);
-    if (r.ok) done.push(r.value);
+    const r = completePattern(text, words, span, tool, want, keywords, entities, policy, filter, nameWords, target);
+    if (r.ok) done.push({ start: span.start, end: span.end, value: r.value });
     else firstFailure ??= r.reason;
   }
-  if (done.length > 1) return reject("name_ambiguous");
   if (done.length === 0) return reject(good.length > 1 ? "name_ambiguous" : (firstFailure as RejectReason));
-  return { ok: true, value: done[0] as Extracted };
+  // Every surviving span names the model's target (cross-check). Spans nested
+  // in one another differ only in whether a device word is inside the slot
+  // ("tavan" + "lambasını" vs "tavan lambasını"): the longest one is `<ad>`,
+  // as the executor reads the whole name. Spans side by side stay ambiguous.
+  const widest = done.reduce((a, b) => (b.end - b.start > a.end - a.start ? b : a));
+  if (done.some((d) => d.start < widest.start || d.end > widest.end)) return reject("name_ambiguous");
+  return { ok: true, value: widest.value };
+}
+
+/**
+ * The one live-context entity the model's call names (T7.w.9): the call's
+ * domain, a name or alias equal to its `name` and, when the call carries an
+ * `area`, an area equal to it. Zero or several such entities → undefined: the
+ * call does not identify one entity, so nothing is learned from it.
+ */
+function modelTarget(entities: readonly LiveEntity[], want: { name: string; area?: string; domain: string }): LiveEntity | undefined {
+  const name = key(want.name);
+  const area = want.area === undefined ? undefined : key(want.area);
+  const hits = entities.filter(
+    (e) => e.domain === want.domain && e.names.some((n) => key(n) === name) && (area === undefined || e.areas.some((a) => key(a) === area)),
+  );
+  return hits.length === 1 ? hits[0] : undefined;
 }
 
 /**
@@ -319,47 +346,37 @@ const unsoften = (folded: string) => folded.replace(/g/g, "k").replace(/d/g, "t"
  * name the live context does not spell). A literal pattern word that is one
  * of these (any case-suffix form) would put a room or device name into
  * rules.json ("salon tavan lambasını aç" with the target "Tavan Lambası"), so
- * such a pattern is refused. `keywords`: the folded, unsoftened device words
- * (`learning.keywords`, any domain); their inflected forms are exempt from that check.
+ * such a pattern is refused.
+ *
+ * Name words first (T7.w.9): a literal that looks like a device word plus a
+ * suffix gets no exemption of its own — "prizma" and "lambada" have that form
+ * yet can be home names. Only a name word that *is* a configured device word
+ * (`learning.keywords`, any domain, e.g. "lamba" in "Salon Lamba", "lambası"
+ * in "Tavan Lambası") is left out, because it names nothing: the generic
+ * words of the committed router.yaml are not the home's names.
  */
-function homeNameWords(entities: readonly LiveEntity[], cfg: CompiledRouterConfig): { words: ReadonlySet<string>; keywords: ReadonlySet<string> } {
+function homeNameWords(entities: readonly LiveEntity[], cfg: CompiledRouterConfig): ReadonlySet<string> {
+  const deviceWords = new Set(Object.values(cfg.learning.keywords).flat().map(key));
   const words = new Set<string>();
   const add = (n: string) => {
-    for (const w of key(n).split(" ")) if (w !== "" && !/^\d+$/.test(w)) words.add(w);
+    for (const w of key(n).split(" ")) if (w !== "" && !/^\d+$/.test(w) && !deviceWords.has(w)) words.add(w);
   };
   for (const e of entities) for (const n of [...e.names, ...e.areas]) add(n);
   for (const group of cfg.direct.areaAliases) for (const n of group) add(n);
-  const keywords = new Set(Object.values(cfg.learning.keywords).flat().map((k) => unsoften(key(k))).filter((k) => k !== ""));
-  return { words, keywords };
+  return words;
 }
 
 /** Shortest name word compared as a prefix ("oda" in "odamızdaki"); shorter ones only by stem. */
 const MIN_PREFIX = 3;
 
-/**
- * What may follow a device word in one of its inflected forms, on the folded,
- * unsoftened text (so `d` is already `t`): plural, possessive, case, `-ki`
- * ("lambası", "lambalarını", "lambasındaki", "lambaya", "ışığını"). Nothing
- * else: "lambaderin" (a name that starts with "lamba") is no device word.
- */
-const DEVICE_WORD_SUFFIX = /^(?:l[ae]r)?(?:[iu]m(?:[iu]z)?|[iu]n(?:[iu]z)?|m(?:[iu]z)?|n(?:[iu]z)?|s?[iu])?(?:n?[iu]n?|y?[iu]|y?[ae]|n?t[ae](?:ki|n)?|y?l[ae])?$/;
-
-/** A configured device word itself or one of its inflected forms. */
-function isDeviceWord(soft: string, keywords: ReadonlySet<string>): boolean {
-  for (const k of keywords) if (soft.startsWith(k) && DEVICE_WORD_SUFFIX.test(soft.slice(k.length))) return true;
-  return false;
-}
-
-function isHomeNameWord(word: string, home: { words: ReadonlySet<string>; keywords: ReadonlySet<string> }): boolean {
+function isHomeNameWord(word: string, home: ReadonlySet<string>): boolean {
   const soft = unsoften(key(word));
-  // Device words ("lambası", "ışığını") are the phrasing, not a name.
-  if (isDeviceWord(soft, home.keywords)) return false;
   // Stems before folding: the softened-consonant table works on Turkish letters ("mutfağı" → "mutfak").
-  if (stemCandidates(cleanTurkish(word)).some((c) => home.words.has(fold(c)))) return true;
+  if (stemCandidates(cleanTurkish(word)).some((c) => home.has(fold(c)))) return true;
   // Suffixes stemCandidates does not strip ("kahvesi", "salonumuzun",
-  // "odamızdaki", "mutfağımızdaki"): a name word of 3+ letters the word
-  // starts with, softening folded on both sides.
-  for (const w of home.words) if (w.length >= MIN_PREFIX && soft.startsWith(unsoften(w))) return true;
+  // "odamızdaki", "mutfağımızdaki", "lambaderin"): a name word of 3+ letters
+  // the word starts with, softening folded on both sides.
+  for (const w of home) if (w.length >= MIN_PREFIX && soft.startsWith(unsoften(w))) return true;
   return false;
 }
 
@@ -374,7 +391,8 @@ function completePattern(
   entities: readonly LiveEntity[],
   policy: LearnPolicy,
   filter: (entity: LiveEntity) => boolean,
-  home: { words: ReadonlySet<string>; keywords: ReadonlySet<string> },
+  home: ReadonlySet<string>,
+  target: LiveEntity,
 ): Result<Extracted> {
   const cfg = policy.config;
   // Step 3: the number slot, outside the name.
@@ -426,6 +444,6 @@ function completePattern(
   }
   if (!hit || hit.plan.name !== span.name || hit.plan.brightness !== want.brightness) return reject("round_trip");
   const replay = resolveWithAliases(entities, hit.plan);
-  if (replay.status !== "ok" || replay.entity !== span.entity || !filter(replay.entity)) return reject("round_trip");
+  if (replay.status !== "ok" || replay.entity !== span.entity || replay.entity !== target || !filter(replay.entity)) return reject("round_trip");
   return { ok: true, value };
 }

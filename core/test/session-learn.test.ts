@@ -88,9 +88,10 @@ function servicesYaml(extra: string[] = []) {
 class MockHa implements DirectToolClient {
   calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
   writeResult: DirectToolResult = { text: "ok", isError: false };
+  live = LIVE;
   async callTool(_service: string, tool: string, args: Record<string, unknown>): Promise<DirectToolResult> {
     this.calls.push({ tool, args });
-    if (tool === "homeassistant__GetLiveContext") return { text: LIVE, isError: false };
+    if (tool === "homeassistant__GetLiveContext") return { text: this.live, isError: false };
     return this.writeResult;
   }
   get reads() {
@@ -515,6 +516,62 @@ test("a learned-rule fallback reaches tier 1 silently and counts; three in a row
   h.agent.queue.push({});
   await h.say("salon lambası parlaklığı yüzde 30 olsun");
   assert.equal(h.agent.calls.length, 4);
+});
+
+test("a learned rule whose <ad> matches several entities falls back silently and counts (T7.w.9)", async () => {
+  const { h, id } = await withActiveRule();
+  // A second "Salon Lamba" in the same area: the name no longer picks one entity.
+  h.ha.live = JSON.stringify({
+    result: [
+      "Live Context:",
+      "- names: Salon Lamba",
+      "  domain: light",
+      "  state: 'off'",
+      "  areas: Salon",
+      "- names: Salon Lamba",
+      "  domain: light",
+      "  state: 'off'",
+      "  areas: Salon",
+    ].join("\n"),
+  });
+  for (let i = 1; i <= 3; i++) {
+    h.agent.queue.push({ text: "Model cevabı." });
+    await h.say("salon lambası parlaklığı yüzde 30 olsun");
+    assert.equal(h.lastDone(), "Model cevabı.");
+    assert.equal(h.agent.calls.length, i);
+    await until(() => h.outcomes.length === i);
+  }
+  assert.deepEqual(
+    h.outcomes.map(([, o, r]) => [o, r]),
+    [
+      ["failure", "name_ambiguous"],
+      ["failure", "name_ambiguous"],
+      ["failure", "name_ambiguous"],
+    ],
+  );
+  assert.equal(h.ha.writes.length, 0, "an ambiguous name is never called");
+  assert.equal((await h.store.list()).find((r) => r.id === id)?.status, "suspended");
+});
+
+test("a success between fallbacks resets the count: no suspension", async () => {
+  const { h, id } = await withActiveRule();
+  const say = async (text: string, model: boolean) => {
+    if (model) h.agent.queue.push({ text: "Model cevabı." });
+    const before = h.outcomes.length;
+    await h.say(text);
+    await until(() => h.outcomes.length === before + 1);
+  };
+  await say("bilinmeyen lambası parlaklığı yüzde 30 olsun", true); // 0 matches
+  await say("bilinmeyen lambası parlaklığı yüzde 30 olsun", true);
+  await say("salon lambası parlaklığı yüzde 30 olsun", false); // exactly one: runs
+  await say("bilinmeyen lambası parlaklığı yüzde 30 olsun", true);
+  await say("bilinmeyen lambası parlaklığı yüzde 30 olsun", true);
+  assert.deepEqual(
+    h.outcomes.map(([, o, r]) => [o, r]),
+    [["failure", "name_not_found"], ["failure", "name_not_found"], ["success", undefined], ["failure", "name_not_found"], ["failure", "name_not_found"]],
+  );
+  assert.equal(h.ha.writes.length, 1, "only the one-match turn called HA");
+  assert.equal((await h.store.list()).find((r) => r.id === id)?.status, "active");
 });
 
 test("an unreachable service after a learned match replies, no fallback, neutral", async () => {
