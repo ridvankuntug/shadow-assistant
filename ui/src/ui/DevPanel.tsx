@@ -3,7 +3,8 @@ import { devItemActions, type DevView } from "../assistant/state.ts";
 import type { DevAction, DevItem } from "../protocol/types.ts";
 import { Drawer } from "./Panels.tsx";
 import {
-  DEV_ACTION_LABEL,
+  devActionLabel,
+  devConfirmText,
   devErrorText,
   devKindText,
   devOpenText,
@@ -33,42 +34,44 @@ const seenText = (iso: string) => {
 /**
  * "Geliştirme": learned rule candidates (pattern, action, domains, number
  * range, observations — how far the rule generalizes) and dev-notes by kind,
- * with "Kuralı ekle" (asks "Bu kural etkinleşsin mi?" first), "Yok say" and
- * "Düzeltildi". Display only: never a notification or a sound. The caller
- * sends `dev_list` when the panel opens and renders it only with the Core
- * feature `dev`.
+ * with "Kuralı ekle" (asks "Bu kural etkinleşsin mi?" first), "Yeniden aç" on
+ * a suspended rule and "Kaldır" on an active one (both ask first, T7.w.8),
+ * "Yok say" and "Düzeltildi". Display only: never a notification or a sound.
+ * The caller sends `dev_list` when the panel opens and renders it only with
+ * the Core feature `dev`.
  */
 export function DevPanel({ dev, connected, onRefresh, onAction, onClose }: Props) {
-  /** Rule whose "Bu kural etkinleşsin mi?" question is shown. */
-  const [confirming, setConfirming] = useState<string | null>(null);
+  /** Rule and action whose question (`devConfirmText`) is shown. */
+  const [confirming, setConfirming] = useState<{ itemId: string; action: DevAction } | null>(null);
   const busy = dev.status === "loading";
   const usable = connected && !busy;
   const items = dev.items ?? [];
   const rules = items.filter((i) => i.type === "rule").sort((a, b) => ruleRank(a) - ruleRank(b));
   const notes = items.filter((i) => i.type === "note");
   const kinds = [...new Set(notes.map((n) => n.kind))];
-  const hasCandidate = rules.some((r) => r.status === "candidate");
+  /** Rules whose actions need CORE_DEV_DEVICES (add, re-open, remove). */
+  const hasManageable = rules.some((r) => r.status === "candidate" || r.status === "suspended" || r.status === "active");
 
   const actionButtons = (item: DevItem) => {
     const actions = devItemActions(item, dev.canManage);
     if (actions.length === 0) return null;
-    // Only while "Kuralı ekle" is still offered (a refresh may have changed the item or canManage).
-    if (confirming === item.itemId && actions.includes("add_rule")) {
+    // Only while the action is still offered (a refresh may have changed the item or canManage).
+    const asked = confirming?.itemId === item.itemId && actions.includes(confirming.action) ? confirming.action : null;
+    const question = asked ? devConfirmText(asked, item.status) : null;
+    if (asked && question) {
       return (
-        <div className="memory-actions dev-confirm" role="group" aria-label="Kural ekleme onayı">
-          <p className="hint">
-            Bu kural etkinleşsin mi? Bu kalıba uyan cümleler artık modele sorulmadan doğrudan çalışır.
-          </p>
+        <div className="memory-actions dev-confirm" role="group" aria-label={question.label}>
+          <p className="hint">{question.question}</p>
           <button
             type="button"
             className="btn btn-primary"
             disabled={!usable}
             onClick={() => {
               setConfirming(null);
-              onAction(item.itemId, "add_rule");
+              onAction(item.itemId, asked);
             }}
           >
-            Evet, ekle
+            {question.yes}
           </button>
           <button type="button" className="btn btn-ghost" onClick={() => setConfirming(null)}>
             Vazgeç
@@ -84,9 +87,9 @@ export function DevPanel({ dev, connected, onRefresh, onAction, onClose }: Props
             type="button"
             className="btn btn-ghost"
             disabled={!usable}
-            onClick={() => (a === "add_rule" ? setConfirming(item.itemId) : onAction(item.itemId, a))}
+            onClick={() => (devConfirmText(a, item.status) ? setConfirming({ itemId: item.itemId, action: a }) : onAction(item.itemId, a))}
           >
-            {dev.acting?.itemId === item.itemId && dev.acting.action === a ? "İşleniyor…" : DEV_ACTION_LABEL[a]}
+            {dev.acting?.itemId === item.itemId && dev.acting.action === a ? "İşleniyor…" : devActionLabel(a, item.status)}
           </button>
         ))}
       </div>
@@ -118,9 +121,9 @@ export function DevPanel({ dev, connected, onRefresh, onAction, onClose }: Props
           Öğrenilen kurallar ve geliştirme notları; bildirim gönderilmez.
         </p>
       )}
-      {dev.items !== null && hasCandidate && !dev.canManage && (
+      {dev.items !== null && hasManageable && !dev.canManage && (
         <p className="hint">
-          Bu cihaz kural ekleyemez. Çekirdekte CORE_DEV_DEVICES ayarına bu cihazın adı eklenmeli.
+          Bu cihaz kural ekleyemez veya kaldıramaz. Çekirdekte CORE_DEV_DEVICES ayarına bu cihazın adı eklenmeli.
         </p>
       )}
       {dev.items !== null && items.length === 0 && <p className="hint">Geliştirme öğesi yok.</p>}

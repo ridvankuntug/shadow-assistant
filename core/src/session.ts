@@ -1647,12 +1647,12 @@ export function memoryFrame(id: string, snap: MemorySnapshot): MemoryFrame {
 
 /** Where the tab's items come from; each source is optional (learning off = no rules). */
 export interface DevelopmentSources {
-  rules?: Pick<LearnedRuleStore, "list" | "activate" | "reject">;
+  rules?: Pick<LearnedRuleStore, "list" | "activate" | "reject" | "remove">;
   /** `dev-notes/tools.json` (MCP gateway's tool lists). */
   toolNotes?: Pick<DevNotes, "read" | "setStatus">;
   /** `dev-notes/turns.json` (T7.w.3). */
   turnNotes?: Pick<TurnNotes, "read" | "setStatus">;
-  /** CORE_DEV_DEVICES: devices that may `add_rule`; empty = nobody (fail closed). */
+  /** CORE_DEV_DEVICES: devices that may `add_rule` / `remove_rule`; empty = nobody (fail closed). */
   managers: readonly string[];
   logger: Logger;
   /** Delay that coalesces `changed()` calls into one recount. Default DEV_RECOUNT_MS. */
@@ -1661,7 +1661,7 @@ export interface DevelopmentSources {
 
 export type DevActResult = { ok: true } | { ok: false; code: Extract<ErrorCode, "unknown_item" | "not_allowed" | "internal">; message: string };
 
-/** Device names `LearnedRuleStore.activate()` stores as `activatedBy` (its NAME_RE). */
+/** Device names `LearnedRuleStore.activate()` / `remove()` store as `activatedBy` / `removedBy` (its NAME_RE). */
 const ACTIVATING_DEVICE_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 
 /** `changed()` calls within this many ms cause one recount (and at most one `dev_count`). */
@@ -1718,8 +1718,8 @@ function ruleItem(r: LearnedRuleRecord): DevItem {
 
 /**
  * The Development tab over the learned-rule store and both dev-note files:
- * listing, the three actions, and the badge count (`open` = rule candidates
- * + suspended rules + open notes). One instance serves every socket; the
+ * listing, the four actions, and the badge count (`open` = rule candidates
+ * + suspended rules + open notes; active rules are listed, not counted). One instance serves every socket; the
  * count goes to `subscribe()` listeners (the server's `dev_count` broadcast)
  * whenever it changes. Display only: items carry the fields of the files.
  */
@@ -1736,7 +1736,7 @@ export class DevelopmentTab {
     this.managers = new Set(o.managers);
   }
 
-  /** Whether `device` may use `add_rule` (CORE_DEV_DEVICES; unset = nobody). */
+  /** Whether `device` may use `add_rule` / `remove_rule` (CORE_DEV_DEVICES; unset = nobody). */
   canManage(device: string): boolean {
     return this.managers.has(device);
   }
@@ -1783,13 +1783,17 @@ export class DevelopmentTab {
 
   /**
    * One action by `device` (from its token). Idempotent: an action whose
-   * result is already in place (`add_rule` on an active rule, `ignore` on a
-   * rejected one, the same note status again) succeeds without a change.
-   * `ignore` rejects a candidate or a suspended rule, never an active one.
+   * result is already in place (`add_rule` on an active rule, `ignore` or
+   * `remove_rule` on a rejected one, the same note status again) succeeds
+   * without a change. `ignore` rejects a candidate or a suspended rule, never
+   * an active one; `remove_rule` rejects an active rule only (T7.w.8).
    */
   async act(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
     if (action === "add_rule" && !this.canManage(device)) {
       return { ok: false, code: "not_allowed", message: "this device may not add rules (CORE_DEV_DEVICES)" };
+    }
+    if (action === "remove_rule" && !this.canManage(device)) {
+      return { ok: false, code: "not_allowed", message: "this device may not remove rules (CORE_DEV_DEVICES)" };
     }
     if (itemId.startsWith("r-")) return this.actOnRule(device, itemId, action);
     if (itemId.startsWith("t-") || itemId.startsWith("n-")) return this.actOnNote(device, itemId, action);
@@ -1807,15 +1811,16 @@ export class DevelopmentTab {
     switch (action) {
       case "add_rule": {
         if (rule.status === "active") return { ok: true };
-        // Suspended rules cannot come back from the tab (docs/08 decision 4).
-        if (rule.status !== "candidate") return notValid();
+        // A candidate ("Kuralı ekle") or a suspended rule ("Yeniden aç", T7.w.8); both re-validated by the store.
+        if (rule.status !== "candidate" && rule.status !== "suspended") return notValid();
         // The store keeps `activatedBy` only in this form; say so instead of blaming router.yaml.
         if (!ACTIVATING_DEVICE_RE.test(device)) {
           return { ok: false, code: "not_allowed", message: "this device name cannot be stored as the approving device" };
         }
         const r = await rules.activate(rule.id, device);
         if (r.ok) {
-          this.o.logger.info(`[shadow-core] learned rule ${rule.id} activated by device ${device}`);
+          const verb = rule.status === "suspended" ? "re-opened" : "activated";
+          this.o.logger.info(`[shadow-core] learned rule ${rule.id} ${verb} by device ${device}`);
           return { ok: true };
         }
         if (r.reason === "not_candidate") return (await find())?.status === "active" ? { ok: true } : notAllowed();
@@ -1825,13 +1830,33 @@ export class DevelopmentTab {
       }
       case "ignore": {
         if (rule.status === "rejected") return { ok: true };
-        // Candidates and suspended rules; an active rule is not removed from the tab (decision 4).
+        // Candidates and suspended rules; an active rule is removed with `remove_rule` (CORE_DEV_DEVICES only).
         if (rule.status !== "candidate" && rule.status !== "suspended") return notValid();
         if (await rules.reject(rule.id)) {
           this.o.logger.info(`[shadow-core] learned rule ${rule.id} rejected by device ${device}`);
           return { ok: true };
         }
         return (await find())?.status === "rejected" ? { ok: true } : notAllowed();
+      }
+      case "remove_rule": {
+        // Already rejected (removed, or ignored earlier): the result is in place.
+        if (rule.status === "rejected") return { ok: true };
+        // Active rules only; a candidate or a suspended rule is "Yok say" (`ignore`).
+        if (rule.status !== "active") return notValid();
+        if (!ACTIVATING_DEVICE_RE.test(device)) {
+          return { ok: false, code: "not_allowed", message: "this device name cannot be stored as the removing device" };
+        }
+        const r = await rules.remove(rule.id, device);
+        if (r.ok) {
+          this.o.logger.info(`[shadow-core] learned rule ${rule.id} removed by device ${device}`);
+          return { ok: true };
+        }
+        if (r.reason === "not_active") return (await find())?.status === "rejected" ? { ok: true } : notAllowed();
+        if (r.reason === "unknown") return unknownItem();
+        if (r.reason === "not_allowed") {
+          return { ok: false, code: "not_allowed", message: "this device name cannot be stored as the removing device" };
+        }
+        return { ok: false, code: "internal", message: "the rule could not be stored" };
       }
       case "fixed":
         return notValid();
@@ -1841,7 +1866,7 @@ export class DevelopmentTab {
   private async actOnNote(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
     const found = await this.findNote(itemId);
     if (!found) return unknownItem();
-    if (action === "add_rule") return notAllowed();
+    if (action === "add_rule" || action === "remove_rule") return notAllowed();
     const status: NoteStatus = action === "ignore" ? "ignored" : "fixed";
     if (!(await found.set(status))) return unknownItem();
     this.o.logger.info(`[shadow-core] dev-note ${itemId} marked ${status} by device ${device}`);

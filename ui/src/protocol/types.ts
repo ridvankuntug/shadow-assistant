@@ -47,7 +47,7 @@ export type MemoryListMessage = { type: "memory_list"; id: string };
 /** Deletes one memory entry; answered by a fresh `memory` frame. */
 export type MemoryDeleteMessage = { type: "memory_delete"; id: string; entryId: string };
 /** Development-tab actions (Core feature `dev`). */
-export type DevAction = "add_rule" | "ignore" | "fixed";
+export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule";
 /** Asks for the Development items (Core feature `dev`). */
 export type DevListMessage = { type: "dev_list"; id: string };
 /** One action on one Development item; answered by a fresh `dev` frame or `error`. */

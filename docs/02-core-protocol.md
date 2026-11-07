@@ -52,7 +52,7 @@ refuses to start.
 | `{"type":"memory_list","id":"m1"}` | Ask for the memory contents (feature `memory`). See *Memory*. |
 | `{"type":"memory_delete","id":"m2","entryId":"m-7f3a9c"}` | Delete one memory entry (feature `memory`). See *Memory*. |
 | `{"type":"dev_list","id":"d1"}` | Ask for the Development items (feature `dev`). See *Development*. |
-| `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"}` | One action on one Development item (feature `dev`). See *Development*. |
+| `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"\|"remove_rule"}` | One action on one Development item (feature `dev`). See *Development*. |
 | `{"type":"notifications_list","id":"q1"}` | Ask for the notification inbox (feature `notifications`). See *Notifications*. |
 | `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"}` | One action on one notification (feature `notifications`). See *Notifications*. |
 
@@ -119,7 +119,7 @@ Agent SDK's `mcp__<service>__` prefix.
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
 | `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted). |
-| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` outside `CORE_DEV_DEVICES`). |
+| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
@@ -214,21 +214,27 @@ actions, never a push or a sound.
 | `count`, `firstSeen`, `lastSeen` | Occurrences / observations and ISO 8601 times, as stored. |
 | `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange` (not sent today: the rule file keeps no range), `observations`. |
 | `open` | Badge count: rule candidates + suspended rules + open notes. |
-| `canManage` | Whether this device may use `add_rule`. |
+| `canManage` | Whether this device may use `add_rule` and `remove_rule`. |
 
 Items are display only: they carry the fields of the files, never user text,
 arguments, entity or room names, error messages, URLs or tokens.
 
 - `dev_list` is answered with `dev` (same `id`).
-- `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active,
+- `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active;
+  "Yeniden aç": suspended rule → active with its failure count reset; both
   re-validated first), `ignore` ("Yok say": a rule candidate or a suspended rule →
-  rejected, a note → `ignored`; an active rule answers `not_allowed`) and `fixed`
-  ("Düzeltildi": notes only). It is answered with a fresh
+  rejected, a note → `ignored`; an active rule answers `not_allowed`), `fixed`
+  ("Düzeltildi": notes only) and `remove_rule` ("Kaldır": active rule → rejected;
+  it stops running and its phrasing is not suggested again; added later, still
+  protocol 1, a Core without it answers `bad_request`). It is answered with a fresh
   `dev` frame (same `id`). Actions are idempotent: repeating one (e.g.
-  `add_rule` on an active rule) is answered with the fresh list.
+  `add_rule` on an active rule, `remove_rule` on a rule already removed, which is
+  no longer listed) is answered with the fresh list.
 - Errors (with `id`): an unknown `itemId` → `unknown_item`; an action not valid
-  for the item, or `add_rule` from a device not listed in `CORE_DEV_DEVICES`
-  (unset = nobody) → `not_allowed`; a malformed frame (missing `itemId`, unknown
+  for the item (e.g. `remove_rule` on a candidate, a suspended rule or a note),
+  `add_rule` / `remove_rule` from a device not listed in `CORE_DEV_DEVICES`
+  (unset = nobody), or a suspended rule the current router.yaml no longer
+  allows → `not_allowed`; a malformed frame (missing `itemId`, unknown
   `action`) → `bad_request`.
 - The device is the one from the token, never `hello.client`.
 - `dev_count` is sent to every authenticated socket when the badge count

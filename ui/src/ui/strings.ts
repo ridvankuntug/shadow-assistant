@@ -192,7 +192,39 @@ export const DEV_ACTION_LABEL: Record<DevAction, string> = {
   add_rule: "Kuralı ekle",
   ignore: "Yok say",
   fixed: "Düzeltildi",
+  remove_rule: "Kaldır",
 };
+
+/** Button label for an action on an item: `add_rule` on a suspended rule is "Yeniden aç". */
+export function devActionLabel(action: DevAction, status: string): string {
+  return action === "add_rule" && status === "suspended" ? "Yeniden aç" : DEV_ACTION_LABEL[action];
+}
+
+/** The question asked before an action that changes how the home is controlled; null = no question. */
+export function devConfirmText(action: DevAction, status: string): { question: string; yes: string; label: string } | null {
+  if (action === "add_rule" && status === "suspended") {
+    return {
+      question: "Bu kural yeniden etkinleşsin mi? Hata sayacı sıfırlanır; bu kalıba uyan cümleler yine modele sorulmadan doğrudan çalışır.",
+      yes: "Evet, yeniden aç",
+      label: "Kuralı yeniden açma onayı",
+    };
+  }
+  if (action === "add_rule") {
+    return {
+      question: "Bu kural etkinleşsin mi? Bu kalıba uyan cümleler artık modele sorulmadan doğrudan çalışır.",
+      yes: "Evet, ekle",
+      label: "Kural ekleme onayı",
+    };
+  }
+  if (action === "remove_rule") {
+    return {
+      question: "Bu kural kaldırılsın mı? Bu kalıba uyan cümleler yine modele sorulur ve bu kalıp bir daha önerilmez.",
+      yes: "Evet, kaldır",
+      label: "Kural kaldırma onayı",
+    };
+  }
+  return null;
+}
 
 const DEV_STATUS: Record<string, string> = {
   candidate: "aday",

@@ -556,8 +556,8 @@ export class AssistantController {
   /**
    * One action on one listed item; the Core answers with the fresh list. Only
    * actions `devItemActions` offers for the item as last listed are sent (so
-   * `add_rule` needs `canManage`); the Core checks again and may still answer
-   * `not_allowed` / `unknown_item`. "Kuralı ekle" is confirmed in the panel
+   * `add_rule` / `remove_rule` need `canManage`); the Core checks again and may still answer
+   * `not_allowed` / `unknown_item`. "Kuralı ekle", "Yeniden aç" and "Kaldır" are confirmed in the panel
    * before this is called.
    */
   devAction(itemId: string, action: DevAction): boolean {

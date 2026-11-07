@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   DEV_ACTION_LABEL,
+  devActionLabel,
+  devConfirmText,
   devDomainsText,
   devErrorText,
   devKindText,
@@ -66,7 +68,20 @@ describe("development panel texts", () => {
     expect(devStatusText("brand_new")).toBe("brand_new");
     expect(devKindText("missing_capability")).toBe("Eksik yetenek");
     expect(devKindText("future_kind")).toBe("future_kind");
-    expect(DEV_ACTION_LABEL).toEqual({ add_rule: "Kuralı ekle", ignore: "Yok say", fixed: "Düzeltildi" });
+    expect(DEV_ACTION_LABEL).toEqual({ add_rule: "Kuralı ekle", ignore: "Yok say", fixed: "Düzeltildi", remove_rule: "Kaldır" });
+  });
+
+  it("T7.w.8: \"Yeniden aç\" on a suspended rule; add, re-open and remove ask first, the others do not", () => {
+    expect(devActionLabel("add_rule", "candidate")).toBe("Kuralı ekle");
+    expect(devActionLabel("add_rule", "suspended")).toBe("Yeniden aç");
+    expect(devActionLabel("remove_rule", "active")).toBe("Kaldır");
+    expect(devActionLabel("ignore", "suspended")).toBe("Yok say");
+    expect(devConfirmText("add_rule", "candidate")?.yes).toBe("Evet, ekle");
+    expect(devConfirmText("add_rule", "suspended")?.yes).toBe("Evet, yeniden aç");
+    expect(devConfirmText("remove_rule", "active")).toMatchObject({ yes: "Evet, kaldır" });
+    expect(devConfirmText("remove_rule", "active")?.question).toMatch(/kaldırılsın mı/);
+    expect(devConfirmText("ignore", "candidate")).toBeNull();
+    expect(devConfirmText("fixed", "open")).toBeNull();
   });
 
   it("errors: local timeout/connection, unknown_item, not_allowed, otherwise the notice text", () => {

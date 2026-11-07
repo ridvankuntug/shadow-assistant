@@ -2,22 +2,24 @@
  * Learned-rule store (T7.w.2c; docs/08 §Lifecycle, §Data file):
  * `<SHADOW_DATA_DIR>/fast-path/rules.json`.
  *
- *   observing ──(min_observations same outcomes)──▶ candidate ──activate()──▶ active
- *       │                                              │                       │
- *       └─(2 conflicts)─▶ blocked                      └─reject()─▶ rejected   │ max_failures
- *                                                                              ▼ fallbacks in a row,
+ *   observing ──(min_observations same outcomes)──▶ candidate ──activate()──▶ active ──remove()──▶ rejected
+ *       │                                              │                       │  ▲
+ *       └─(2 conflicts)─▶ blocked                      └─reject()─▶ rejected   │  │ activate() (re-validated)
+ *                                                                              ▼  │ max_failures fallbacks in a row,
  *                                                                          suspended   or not allowed at load (reject() → rejected)
  *
  * - A phrasing (token array) has one entry; its signature (service + tool +
  *   domain + binding) is fixed until a conflicting observation restarts the
  *   count. `id` = hash of tokens + signature.
  * - Nothing becomes `active` except through `activate()` (the user's "Kuralı
- *   ekle", wired in T7.w.4b), which re-validates the rule against the current
- *   ceilings and applies only after the new file is on disk. Suspension, by
- *   contrast, takes effect in memory at once even if its write fails.
- * - There is no way back from `suspended` / `rejected` / `blocked` to
- *   `active` here, and no active → rejected (docs/08 decision 4: not built
- *   until decided); a suspended rule can only be rejected ("Yok say").
+ *   ekle" on a candidate, T7.w.4b, or "Yeniden aç" on a suspended rule,
+ *   T7.w.8), which re-validates the rule against the current ceilings and
+ *   applies only after the new file is on disk. `remove()` ("Kaldır", T7.w.8:
+ *   active → rejected) is all or nothing the same way, so a removed rule leaves
+ *   the snapshot only once the file says so. Suspension, by contrast, takes
+ *   effect in memory at once even if its write fails.
+ * - There is no way back from `rejected` / `blocked`; a suspended rule can be
+ *   re-opened (`activate()`) or rejected ("Yok say").
  * - Load re-validates: an active rule whose tool, service or domain the
  *   current `learning` block (or the code ceiling) no longer allows becomes
  *   `suspended` (`not_allowed`); observing / candidate counts made under
@@ -34,7 +36,7 @@
  *
  * The file holds the literal words of the user's phrasings (never room or
  * device names: those are the `<ad>` slot), tool and domain names, counters
- * and times; `activatedBy` is a device name. It is never logged.
+ * and times; `activatedBy` / `removedBy` are device names. It is never logged.
  */
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -78,6 +80,11 @@ export interface LearnedRuleRecord {
   consecutiveFailures: number;
   /** Last fallback reason, or `not_allowed` for a load-time suspension. */
   lastFailure: string | null;
+  /**
+   * Device name that removed the active rule ("Kaldır", T7.w.8). Absent on
+   * every other entry (files written before T7.w.8 have no such field).
+   */
+  removedBy?: string;
 }
 
 export interface LearnedRulesFile {
@@ -102,11 +109,21 @@ export type ObserveResult = { id: string; status: LearnedStatus; observations: n
 export type ActivateResult =
   | { ok: true; rule: LearnedRuleRecord }
   /**
-   * `unknown`: no such id; `not_candidate`: not a candidate (already active,
-   * rejected, …); `not_allowed`: outside the current ceilings or stale;
+   * `unknown`: no such id; `not_candidate`: neither a candidate nor a
+   * suspended rule (already active, rejected, …); `not_allowed`: outside the
+   * current ceilings, or a candidate counted under another normalizer;
    * `unavailable`: the file cannot be read; `write_failed`: not on disk, so not applied.
    */
   | { ok: false; reason: "unknown" | "not_candidate" | "not_allowed" | "unavailable" | "write_failed" };
+
+export type RemoveResult =
+  | { ok: true; rule: LearnedRuleRecord }
+  /**
+   * `unknown`: no such id; `not_active`: not an active rule (already removed,
+   * a candidate, …); `not_allowed`: the device name cannot be stored;
+   * `unavailable`: the file cannot be read; `write_failed`: not on disk, so not applied.
+   */
+  | { ok: false; reason: "unknown" | "not_active" | "not_allowed" | "unavailable" | "write_failed" };
 
 export type RuleOutcome = "success" | "failure" | "neutral";
 
@@ -215,30 +232,59 @@ export class LearnedRuleStore {
   }
 
   /**
-   * candidate → active ("Kuralı ekle"). Re-validated against the current
-   * ceilings; applied (file, then snapshot) only once the file is written.
-   * `by`: the device name that approved it.
+   * candidate → active ("Kuralı ekle") or suspended → active ("Yeniden aç",
+   * T7.w.8). Re-validated against the current ceilings; applied (file, then
+   * snapshot) only once the file is written. The failure count restarts.
+   * `by`: the device name that approved it (replaces an earlier one).
+   *
+   * A candidate must also have been counted under the current normalizer (at
+   * load an older one goes back to observing anyway). A suspended rule was
+   * active, and active rules stay across a normalizer change (§Data file), so
+   * it is checked like an active rule at load: the ceilings and its tokens.
    */
   activate(id: string, by: string): Promise<ActivateResult> {
     if (!NAME_RE.test(by)) return Promise.resolve({ ok: false, reason: "not_allowed" });
     return this.transaction<ActivateResult>({ ok: false, reason: "unavailable" }, (data) => {
       const entry = data.rules.find((r) => r.id === id);
       if (!entry) return { ok: false, reason: "unknown" };
-      if (entry.status !== "candidate") return { ok: false, reason: "not_candidate" };
-      if (entry.normalizer !== this.normalizer || !this.allowed(entry)) return { ok: false, reason: "not_allowed" };
+      if (entry.status !== "candidate" && entry.status !== "suspended") return { ok: false, reason: "not_candidate" };
+      if (entry.status === "candidate" && entry.normalizer !== this.normalizer) return { ok: false, reason: "not_allowed" };
+      if (!this.allowed(entry)) return { ok: false, reason: "not_allowed" };
       entry.status = "active";
       entry.activatedAt = this.stamp();
       entry.activatedBy = by;
       entry.consecutiveFailures = 0;
       entry.lastFailure = null;
+      delete entry.removedBy;
       return { ok: true, rule: structuredClone(entry) };
     });
   }
 
   /**
+   * active → rejected ("Kaldır", T7.w.8): the rule stops running and the
+   * phrasing is not suggested again (the entry keeps its pattern and
+   * signature). Applied (file, then snapshot) only once the file is written.
+   * `by`: the device name that removed it, stored as `removedBy`.
+   */
+  remove(id: string, by: string): Promise<RemoveResult> {
+    if (!NAME_RE.test(by)) return Promise.resolve({ ok: false, reason: "not_allowed" });
+    return this.transaction<RemoveResult>({ ok: false, reason: "unavailable" }, (data) => {
+      const entry = data.rules.find((r) => r.id === id);
+      if (!entry) return { ok: false, reason: "unknown" };
+      if (entry.status !== "active") return { ok: false, reason: "not_active" };
+      entry.status = "rejected";
+      entry.lastSeen = this.stamp(); // fresh, so prune() does not drop the just-removed rule first
+      entry.removedBy = by;
+      const rule = structuredClone(entry);
+      this.prune(data);
+      return { ok: true, rule };
+    });
+  }
+
+  /**
    * candidate or suspended → rejected ("Yok say"): the phrasing is not
-   * suggested again. An active rule is never rejected here (removing it is
-   * docs/08 decision 4). Resolves whether it changed.
+   * suggested again. An active rule is never rejected here (that is
+   * `remove()`, limited to CORE_DEV_DEVICES). Resolves whether it changed.
    */
   reject(id: string): Promise<boolean> {
     return this.change(false, (data) => {
@@ -492,6 +538,7 @@ function validateRule(v: unknown): LearnedRuleRecord | undefined {
   if (o.activatedAt !== null && !isIso(o.activatedAt)) return undefined;
   if (o.activatedBy !== null && (typeof o.activatedBy !== "string" || !NAME_RE.test(o.activatedBy))) return undefined;
   if (o.lastFailure !== null && (typeof o.lastFailure !== "string" || !REASON_RE.test(o.lastFailure))) return undefined;
+  if (o.removedBy !== undefined && (typeof o.removedBy !== "string" || !NAME_RE.test(o.removedBy))) return undefined;
   if (o.status === "active" && (o.activatedAt === null || o.activatedBy === null)) return undefined;
   return {
     id: o.id,
@@ -512,6 +559,7 @@ function validateRule(v: unknown): LearnedRuleRecord | undefined {
     uses: o.uses,
     consecutiveFailures: o.consecutiveFailures,
     lastFailure: o.lastFailure as string | null,
+    ...(typeof o.removedBy === "string" ? { removedBy: o.removedBy } : {}),
   };
 }
 

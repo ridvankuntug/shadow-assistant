@@ -1450,12 +1450,29 @@ describe("development panel (T7.w.4c)", () => {
     expect(t.controller.devAction("r-1", "add_rule")).toBe(false); // already active
     expect(t.controller.devAction("r-1", "ignore")).toBe(false);
     expect(t.controller.devAction("n-1", "ignore")).toBe(false); // already fixed
+    expect(t.controller.devAction("n-1", "remove_rule")).toBe(false); // rules only
     expect(t.controller.devAction("r-2", "fixed")).toBe(false); // fixed is for notes
-    expect(t.controller.devAction("r-2", "add_rule")).toBe(false); // suspended: decision 4
+    expect(t.controller.devAction("r-2", "remove_rule")).toBe(false); // suspended: "Yok say", not "Kaldır"
     expect(t.controller.devAction("nope", "ignore")).toBe(false);
     expect(t.controller.devAction("", "ignore")).toBe(false);
     expect(t.sent).toEqual([]);
     expect(t.controller.devAction("r-2", "ignore")).toBe(true);
+  });
+
+  it("T7.w.8: remove_rule on an active rule and add_rule on a suspended one are sent only with canManage", () => {
+    const items = [rule("active"), { ...rule("suspended"), itemId: "r-2" }];
+    const t = ready(frame("t1", false, items));
+    expect(t.controller.devAction("r-1", "remove_rule")).toBe(false);
+    expect(t.controller.devAction("r-2", "add_rule")).toBe(false);
+    expect(t.sent).toEqual([]);
+    const m = ready(frame("t1", true, items));
+    expect(m.controller.devAction("r-1", "remove_rule")).toBe(true);
+    expect(m.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "r-1", action: "remove_rule" }]);
+    expect(m.controller.getState().dev).toMatchObject({ status: "loading", acting: { itemId: "r-1", action: "remove_rule" } });
+    m.receive(frame("t2", true, [{ ...rule("suspended"), itemId: "r-2" }], 1));
+    expect(m.controller.getState().dev).toMatchObject({ status: "ready", acting: null });
+    expect(m.controller.devAction("r-2", "add_rule")).toBe(true);
+    expect(m.sent[1]).toEqual({ type: "dev_action", id: "t3", itemId: "r-2", action: "add_rule" });
   });
 
   it("not_allowed / unknown_item stay in the panel (no chat notice) and keep the list", () => {

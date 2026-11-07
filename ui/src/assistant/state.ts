@@ -122,7 +122,7 @@ export type DevView = {
   acting: { itemId: string; action: DevAction } | null;
   items: DevItem[] | null;
   open: number | null;
-  /** This device may use `add_rule` (from the last `dev` answer; false until then). */
+  /** This device may use `add_rule` / `remove_rule` (from the last `dev` answer; false until then). */
   canManage: boolean;
   errorCode: string | null;
   errorMessage: string | null;
@@ -381,14 +381,15 @@ export function devBadgeCount(s: AssistantState): number {
 
 /**
  * The actions offered for an item, per the docs/08 action table: a rule
- * candidate can be added (only when this device may: `canManage`) or ignored,
- * a suspended rule ignored, an open note fixed or ignored. Active rules,
- * ignored / fixed notes and unknown statuses get none.
+ * candidate or a suspended rule can be added / re-opened (only when this
+ * device may: `canManage`) or ignored, an active rule removed (`canManage`
+ * only), an open note fixed or ignored. Ignored / fixed notes and unknown
+ * statuses get none.
  */
 export function devItemActions(item: DevItem, canManage: boolean): DevAction[] {
   if (item.type === "rule") {
-    if (item.status === "candidate") return canManage ? ["add_rule", "ignore"] : ["ignore"];
-    return item.status === "suspended" ? ["ignore"] : [];
+    if (item.status === "candidate" || item.status === "suspended") return canManage ? ["add_rule", "ignore"] : ["ignore"];
+    return item.status === "active" && canManage ? ["remove_rule"] : [];
   }
   return item.status === "open" ? ["fixed", "ignore"] : [];
 }

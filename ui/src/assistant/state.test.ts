@@ -623,8 +623,12 @@ describe("development panel (T7.w.4c)", () => {
   it("actions per item follow the docs/08 table; add_rule needs canManage", () => {
     expect(devItemActions(item("rule", "candidate"), true)).toEqual(["add_rule", "ignore"]);
     expect(devItemActions(item("rule", "candidate"), false)).toEqual(["ignore"]);
-    expect(devItemActions(item("rule", "suspended"), true)).toEqual(["ignore"]);
-    expect(devItemActions(item("rule", "active"), true)).toEqual([]);
+    // T7.w.8: a suspended rule can be re-opened, an active one removed — both only with canManage.
+    expect(devItemActions(item("rule", "suspended"), true)).toEqual(["add_rule", "ignore"]);
+    expect(devItemActions(item("rule", "suspended"), false)).toEqual(["ignore"]);
+    expect(devItemActions(item("rule", "active"), true)).toEqual(["remove_rule"]);
+    expect(devItemActions(item("rule", "active"), false)).toEqual([]);
+    expect(devItemActions(item("rule", "rejected"), true)).toEqual([]);
     expect(devItemActions(item("note", "open"), true)).toEqual(["fixed", "ignore"]);
     expect(devItemActions(item("note", "ignored"), true)).toEqual([]);
     expect(devItemActions(item("note", "fixed"), true)).toEqual([]);

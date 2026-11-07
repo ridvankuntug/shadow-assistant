@@ -220,8 +220,7 @@ describe("outcomes and suspension", () => {
     assert.equal(r.status, "suspended");
     assert.equal(r.lastFailure, "tool_error");
     assert.ok(logs.some((l) => /suspended after 3 fallbacks/.test(l)));
-    // No way back here (decision 4).
-    assert.deepEqual(await s.activate(id, "phone"), { ok: false, reason: "not_candidate" });
+    // A suspended rule no longer counts runs (re-opening it is activate(), T7.w.8).
     assert.deepEqual(await s.recordOutcome(id, "success"), { suspended: false });
     assert.equal((await s.list())[0]?.status, "suspended");
   });
@@ -259,6 +258,139 @@ describe("outcomes and suspension", () => {
     assert.equal(s.snapshot().length, 0);
     assert.equal(await s.reject(id), false);
     assert.deepEqual(await s.activate(id, "phone"), { ok: false, reason: "not_candidate" });
+  });
+
+  async function suspendedRule(dir = freshDir(), over: Partial<ConstructorParameters<typeof LearnedRuleStore>[0]> = {}) {
+    const h = await activeRule(dir, over);
+    for (let i = 0; i < 3; i++) await h.s.recordOutcome(h.id, "failure", "name_not_found");
+    assert.equal((await h.s.list())[0]?.status, "suspended");
+    return h;
+  }
+
+  test("T7.w.8 re-open: suspended → active by activate(); counter reset, new approver, on disk, in the snapshot", async () => {
+    const { s, c, id, dir } = await suspendedRule();
+    assert.equal(s.snapshot().length, 0);
+    c.tick();
+    const res = await s.activate(id, "tablet");
+    assert.ok(res.ok);
+    assert.equal(res.rule.status, "active");
+    assert.equal(res.rule.consecutiveFailures, 0);
+    assert.equal(res.rule.lastFailure, null);
+    assert.equal(res.rule.activatedBy, "tablet");
+    assert.equal(res.rule.activatedAt, new Date(c.now()).toISOString());
+    assert.equal(s.snapshot()[0]?.def.id, id);
+    const r = disk(dir).rules[0] as LearnedRuleRecord;
+    assert.deepEqual([r.status, r.consecutiveFailures, r.lastFailure, r.activatedBy], ["active", 0, null, "tablet"]);
+    // One failure after re-opening does not suspend it again at once.
+    assert.deepEqual(await s.recordOutcome(id, "failure", "name_not_found"), { suspended: false });
+    // Idempotence is the caller's: a second activate() on the active rule changes nothing.
+    assert.deepEqual(await s.activate(id, "tablet"), { ok: false, reason: "not_candidate" });
+  });
+
+  test("T7.w.8 re-open is re-validated: outside the current ceilings → not_allowed, still suspended", async () => {
+    const { id, dir } = await suspendedRule();
+    const narrow = store(dir, { config: parseRouterConfig("version: 1\nlearning: { tools: [intent__HassTurnOn] }") }).s;
+    assert.deepEqual(await narrow.activate(id, "phone"), { ok: false, reason: "not_allowed" });
+    assert.equal((await narrow.list())[0]?.status, "suspended");
+    assert.equal(narrow.snapshot().length, 0);
+  });
+
+  test("T7.w.8 re-open: a suspended rule counted under an older normalizer can come back (active rules stay across it)", async () => {
+    const { id, dir } = await suspendedRule();
+    const { s } = store(dir, { normalizer: 99 });
+    assert.ok((await s.activate(id, "phone")).ok);
+    assert.equal(s.snapshot()[0]?.def.id, id);
+  });
+
+  test("T7.w.8 remove(): active → rejected with removedBy; out of the snapshot, after a restart too; never suggested again", async () => {
+    const { s, id, dir } = await activeRule();
+    assert.equal(s.snapshot().length, 1);
+    const res = await s.remove(id, "tablet");
+    assert.ok(res.ok);
+    assert.equal(res.rule.status, "rejected");
+    assert.equal(res.rule.removedBy, "tablet");
+    assert.equal(s.snapshot().length, 0);
+    const r = disk(dir).rules[0] as LearnedRuleRecord;
+    assert.deepEqual([r.status, r.removedBy, r.activatedBy], ["rejected", "tablet", "phone"]);
+    const again = store(dir).s;
+    await again.load();
+    assert.equal(again.snapshot().length, 0);
+    assert.equal((await again.list())[0]?.removedBy, "tablet");
+    await candidate(again, LEVEL, 5);
+    assert.equal((await byTokens(again, LEVEL))?.status, "rejected");
+    // Nothing brings it back, and repeating the removal changes nothing.
+    assert.deepEqual(await again.activate(id, "phone"), { ok: false, reason: "not_candidate" });
+    assert.deepEqual(await again.remove(id, "tablet"), { ok: false, reason: "not_active" });
+  });
+
+  test("T7.w.8 remove(): a full discarded set drops its oldest other entry, not the just-removed rule", async () => {
+    const { s, c, id } = await activeRule(freshDir(), { maxDiscarded: 2 });
+    for (const w of ["bir", "iki"]) {
+      c.tick();
+      await s.reject(await candidate(s, pattern(["<ad>", w], "intent__HassTurnOn")));
+    }
+    c.tick();
+    assert.ok((await s.remove(id, "phone")).ok);
+    const kept = (await s.list()).filter((r) => r.status === "rejected");
+    assert.equal(kept.length, 2);
+    assert.ok(kept.some((r) => r.id === id));
+    assert.ok(!kept.some((r) => r.tokens[1] === "bir"));
+  });
+
+  test("T7.w.8 remove(): only active rules; unknown id, bad device name", async () => {
+    const { s } = store(freshDir());
+    const id = await candidate(s, LEVEL);
+    assert.deepEqual(await s.remove(id, "phone"), { ok: false, reason: "not_active" });
+    assert.deepEqual(await s.remove("lr-00000000", "phone"), { ok: false, reason: "unknown" });
+    assert.ok((await s.activate(id, "phone")).ok);
+    assert.deepEqual(await s.remove(id, "bad device name!"), { ok: false, reason: "not_allowed" });
+    assert.equal((await s.list())[0]?.status, "active");
+    const sus = await suspendedRule();
+    assert.deepEqual(await sus.s.remove(sus.id, "phone"), { ok: false, reason: "not_active" });
+  });
+
+  test("T7.w.8 remove() is applied only after the write: the rule keeps running while the file says active", async () => {
+    const dir = freshDir();
+    const { fs, state } = flakyFs();
+    const { s, id, logs } = await activeRule(dir, { fs });
+    const before = readFileSync(join(dir, LEARNED_RULES_FILE), "utf8");
+    state.failRename = true;
+    assert.deepEqual(await s.remove(id, "phone"), { ok: false, reason: "write_failed" });
+    assert.equal(s.snapshot()[0]?.def.id, id);
+    assert.equal((await s.list())[0]?.status, "active");
+    assert.equal(readFileSync(join(dir, LEARNED_RULES_FILE), "utf8"), before);
+    assert.ok(logs.some((l) => /change not applied: EIO/.test(l)));
+    state.failRename = false;
+    assert.ok((await s.remove(id, "phone")).ok);
+    assert.equal(s.snapshot().length, 0);
+  });
+
+  test("T7.w.8 a removed rule leaves the snapshot only after the file is on disk", async () => {
+    const dir = freshDir();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    let hold = false;
+    const fs: AtomicFs = {
+      mkdir: (p, o) => nodeFs.mkdir(p, o),
+      open: (p, f, m) => nodeFs.open(p, f, m),
+      rename: async (a, b) => {
+        if (hold) await gate;
+        return nodeFs.rename(a, b);
+      },
+      unlink: (p) => nodeFs.unlink(p),
+      readFile: (p, e) => nodeFs.readFile(p, e),
+      readdir: (p) => nodeFs.readdir(p),
+    };
+    const { s, id } = await activeRule(dir, { fs });
+    hold = true;
+    const pending = s.remove(id, "phone");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(s.snapshot()[0]?.def.id, id, "still active while the write is in flight");
+    assert.equal(disk(dir).rules[0]?.status, "active");
+    release();
+    assert.ok((await pending).ok);
+    assert.equal(disk(dir).rules[0]?.status, "rejected");
+    assert.equal(s.snapshot().length, 0);
   });
 
   test("a rule router.yaml no longer allows is suspended (not_allowed) at load", async () => {
@@ -330,6 +462,8 @@ describe("file", () => {
     ["active without activatedBy", { version: 1, rules: [record({ status: "active", activatedAt: "2026-11-07T18:00:00.000Z" })] }],
     ["duplicate phrasing", { version: 1, rules: [record(), record({ id: "lr-0000000b" })] }],
     ["a bad binding", { version: 1, rules: [record({ binding: { name: "ad", floor: "x" } as never })] }],
+    ["a removedBy the store cannot have written", { version: 1, rules: [record({ status: "rejected", removedBy: "bad device name!" })] }],
+    ["a removedBy that is not a string", { version: 1, rules: [record({ status: "rejected", removedBy: null as never })] }],
   ];
   for (const [label, body] of bad) {
     test(`quarantined, starts empty with one warning: ${label}`, async () => {

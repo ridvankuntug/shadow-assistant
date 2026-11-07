@@ -111,9 +111,9 @@ export interface MemoryDeleteFrame {
   entryId: string;
 }
 
-/** Development-tab actions (docs/08-learning-fast-path.md, T7.w.4). */
-export type DevAction = "add_rule" | "ignore" | "fixed";
-export const DEV_ACTIONS: readonly DevAction[] = ["add_rule", "ignore", "fixed"];
+/** Development-tab actions (docs/08-learning-fast-path.md, T7.w.4; `remove_rule` T7.w.8). */
+export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule";
+export const DEV_ACTIONS: readonly DevAction[] = ["add_rule", "ignore", "fixed", "remove_rule"];
 
 /** Asks for the Development items (feature `dev`); answered by `dev` or `error`. */
 export interface DevListFrame {
@@ -312,7 +312,7 @@ export interface DevFrame {
   items: DevItem[];
   /** Badge count: rule candidates + suspended rules + open notes. */
   open: number;
-  /** Whether this device may use `add_rule` (CORE_DEV_DEVICES). */
+  /** Whether this device may use `add_rule` / `remove_rule` (CORE_DEV_DEVICES). */
   canManage: boolean;
 }
 

@@ -311,15 +311,20 @@ signature and a counter:
 ### Lifecycle
 
 ```
-observing ──(N same outcomes)──▶ candidate ──"Kuralı ekle"──▶ active
-    │                               │                          │
-    └─(2 conflicts)─▶ blocked       └─"Yok say"─▶ rejected     │ K fallbacks in a row,
-                                                               ▼ or no longer allowed
-                                                           suspended ──▶ (decision 4)
+observing ──(N same outcomes)──▶ candidate ──"Kuralı ekle"──▶ active ──"Kaldır"──▶ rejected
+    │                               │                          │  ▲
+    └─(2 conflicts)─▶ blocked       └─"Yok say"─▶ rejected     │  │ "Yeniden aç" (re-validated,
+                                                               │  │  failure count reset)
+                                                               ▼  │ K fallbacks in a row,
+                                                           suspended   or no longer allowed
+                                                               └─"Yok say"─▶ rejected
 ```
 
-- `rejected` and `blocked` entries keep pattern + signature only, so the same
-  phrasing is not suggested again.
+- `rejected` and `blocked` entries keep pattern + signature (and a removed rule
+  its `removedBy`), so the same phrasing is not suggested again.
+- "Kaldır" and "Yeniden aç" are decision 4 (T7.w.8): both limited to
+  `CORE_DEV_DEVICES`, both written to disk before the active-rule snapshot
+  changes.
 - **Suspension.** An `active` rule whose run ends in `fallback` (name not found,
   ambiguous, `isError`, live context error) `max_failures` times in a row (default
   3) becomes `suspended` with the last reason. A success resets the counter.
@@ -446,7 +451,10 @@ is unaffected). Read-modify-write serialized on one promise chain.
   `observing` counts restart (they were counted under another normalization);
   `active` rules stay, since their round trip is re-checked by the next
   observation of the same phrasing.
-- `activatedBy` is the device name from the token (never the token).
+- `activatedBy` is the device name from the token (never the token); a
+  re-opened rule gets the re-opening device. `removedBy` (T7.w.8) is the device
+  that removed an active rule; the field is absent on every other entry, so files
+  written before T7.w.8 load unchanged.
 - Caps: at most 200 `observing` entries (least recently seen dropped first) and
   200 `rejected` / `blocked`; `candidate`, `active` and `suspended` are never
   dropped.
@@ -559,7 +567,7 @@ Behind a new feature flag `dev` in `welcome.features`, mirroring the memory fram
 | Direction | Frame | Fields |
 |---|---|---|
 | client → Core | `dev_list` | `id` |
-| client → Core | `dev_action` | `id`, `itemId`, `action`: `add_rule` \| `ignore` \| `fixed` |
+| client → Core | `dev_action` | `id`, `itemId`, `action`: `add_rule` \| `ignore` \| `fixed` \| `remove_rule` (T7.w.8) |
 | Core → client | `dev` | `id` (request id), `items[]`, `open` (badge count), `canManage` |
 | Core → all authenticated sockets | `dev_count` | `open` (sent when it changes; clients do not announce features, so a client that does not know the frame ignores it) |
 
@@ -567,16 +575,18 @@ Behind a new feature flag `dev` in `welcome.features`, mirroring the memory fram
 firstSeen, lastSeen, rule?: { tokens, tool, domains, numberRange?, observations } }`.
 Display only; it carries the fields of the files, nothing more. Errors:
 `unknown_item`, `not_allowed` (action not valid for the item, or the device may
-not do it), `bad_request` (malformed frame; the existing code, no new `bad_frame`). Actions are idempotent (`add_rule` on an active rule is a
-no-op answered with the fresh list).
+not do it), `bad_request` (malformed frame; the existing code, no new `bad_frame`). Actions are idempotent (`add_rule` on an active rule and
+`remove_rule` on a rejected one are no-ops answered with the fresh list).
 
-| Action | Rule candidate | Suspended rule | Note |
-|---|---|---|---|
-| `add_rule` ("Kuralı ekle") | → `active` (re-validated first) | – ([decision 4](#kullanıcı-kararı-gerekli-decisions-for-the-user)) | – |
-| `ignore` ("Yok say") | → `rejected` | → `rejected` (`LearnedRuleStore.reject()` takes candidates and suspended rules, never active ones) | `status: ignored` |
-| `fixed` ("Düzeltildi") | – | – | `status: fixed` (does not change rules or services.yaml) |
+| Action | Rule candidate | Active rule | Suspended rule | Note |
+|---|---|---|---|---|
+| `add_rule` ("Kuralı ekle" / "Yeniden aç") | → `active` (re-validated first) | no-op | → `active` ("Yeniden aç", T7.w.8; re-validated first, failure count reset) | – |
+| `remove_rule` ("Kaldır", T7.w.8) | – | → `rejected` (`removedBy`; leaves the snapshot after the write) | – | – |
+| `ignore` ("Yok say") | → `rejected` | – | → `rejected` (`LearnedRuleStore.reject()` takes candidates and suspended rules, never active ones) | `status: ignored` |
+| `fixed` ("Düzeltildi") | – | – | – | `status: fixed` (does not change rules or services.yaml) |
 
-Badge count `open` = candidates + suspended rules + open notes.
+Badge count `open` = candidates + suspended rules + open notes. Active rules are
+listed (so "Kaldır" can be offered) but never counted.
 
 ### Authorization
 
@@ -585,11 +595,13 @@ device name from the token (never from `hello.client`).
 
 - Listing, `ignore` and `fixed`: every authenticated device (they cannot change
   how the home is controlled).
-- `add_rule` changes how the home is controlled, so it is limited to the devices
+- `add_rule` (also "Yeniden aç") and `remove_rule` change how the home is
+  controlled, so they are limited to the devices
   in `CORE_DEV_DEVICES` (comma-separated device names). **Unset = nobody**
   (fail closed; the tab shows a short hint), [decision 3](#kullanıcı-kararı-gerekli-decisions-for-the-user).
-  `dev.canManage` tells the UI whether to show the button. The activating device
-  is stored in `activatedBy` and logged.
+  `dev.canManage` tells the UI whether to show the buttons. The activating (or
+  re-opening) device is stored in `activatedBy`, the removing one in `removedBy`;
+  each is logged.
 - No new HTTP route for the UI.
 
 ### UI
@@ -599,7 +611,9 @@ pattern), opened from Settings and from a badge, shown only when `dev` is in
 `features`. Rule candidates first: the pattern with slots as "‹cihaz›" / "‹sayı›",
 the action as a Turkish label ("parlaklık ayarla"), the domains, the number range
 and the observation count, so the user sees how far the rule generalizes before
-pressing "Kuralı ekle". Then notes by kind with their count. No sound, no
+pressing "Kuralı ekle". With `canManage`, an active rule offers "Kaldır" and a
+suspended rule "Yeniden aç" (T7.w.8); like "Kuralı ekle", both ask first. Then
+notes by kind with their count. No sound, no
 `adapter.notify`. `App.tsx` opens the panel for the URL hash `#dev` (used by the
 tray).
 
@@ -792,7 +806,8 @@ block.
    "Kuralı ekle / Yok say / Düzeltildi". Without a "Kaldır" action an active rule
    can only be removed by editing `rules.json`, and a suspended rule cannot come
    back. Recommended: add `remove_rule` (active → rejected) and allow `add_rule` on
-   suspended rules (same device limit). Default until decided: not built.
+   suspended rules (same device limit). **Kararlaştırıldı (kullanıcı, 2026-11-07):**
+   the recommended form, built in T7.w.8.
 5. **Notification titles in the tray** (balloon text) or a native tray tab would
    need a token for the tray. Default: counts only.
 6. **"Missing capability" from the model's answer** through a prompt marker (like
@@ -855,6 +870,7 @@ task may touch. Two tasks that share a file are never run in parallel; the
 | T7.w.6a | `core/test/agent.test.ts`, `core/test/gateway-sdk.test.ts`, `core/test/permissions.test.ts` | – | – |
 | T7.w.9 | `core/src/learn/extract.ts`, `core/test/learn-extract.test.ts`, `core/test/session-learn.test.ts` | 2b, 2d | – |
 | T7.w.10 | `core/src/router-config.ts`, `core/src/direct.ts`, `core/src/learn/extract.ts`, `core/src/turkish.ts`, `router.yaml`, `docs/04-router.md`, `core/test/router-tier0.test.ts`, `core/test/tiers.test.ts`, `core/test/learn-extract.test.ts`, `core/test/numbers.test.ts` | T7.w.9 | – |
+| T7.w.8 | `core/src/learn/store.ts`, `core/src/session.ts`, `core/src/protocol.ts`, `docs/02-core-protocol.md`, `core/test/learn-store.test.ts`, `core/test/session-dev.test.ts`, `core/test/protocol.test.ts`, `ui/src/protocol/types.ts`, `ui/src/ui/DevPanel.tsx`, `ui/src/ui/strings.ts`, `ui/src/assistant/state.ts`, `ui/src/assistant/controller.ts`, `ui/src/**/*.test.ts` | 4b, 4c, T7.w.10 | `fast-path/rules.json` |
 
 Parallel lanes: {3a, 4a, 5a, 6a} can start at once; 2a starts when T7.w.1 has
 landed (both touch the router). 2b and 2c run in parallel after 2a. 4c runs in
@@ -944,6 +960,12 @@ T7.w.7 has no task (deferred).
   - [x] T7.w.10c — apostrophe in "yüz'de" ignored in number expressions
   - [x] T7.w.10d — relative timing in the "linear on long input" test
   - [x] T7.w.10e — UI: closing the memory panel abandons its request; a tray hash for the open panel is cleared; catch-up summary above three normal items
+- [x] **T7.w.8 — Remove and re-open learned rules (decision 4).** `remove_rule` (active →
+  rejected) and `add_rule` on a suspended rule (re-validated → active), both limited to
+  `CORE_DEV_DEVICES`; "Kaldır" / "Yeniden aç" in the panel. Acceptance: a removed rule leaves the
+  snapshot only after the new file is on disk and is not suggested again; a re-opened rule runs
+  again with its failure count reset; both answer `not_allowed` outside `CORE_DEV_DEVICES`;
+  `open` is unchanged by active rules.
 
 ## Progress log
 
@@ -1099,3 +1121,18 @@ T7.w.7 has no task (deferred).
   ≥ 15 ms (no 1 ms floor); a test pins `TEXT_NORMALIZER_VERSION` 2. Left open (related findings):
   turn-off rules still unfiltered; static turn-on has no name check (an outlet named after a door
   is still switched on); a multi-word `deny_name_words` entry never matches.
+- 2026-11-07: T7.w.8 implemented (senior-dev; review and tester pending). Decision 4 as
+  recommended. Narrowest readings: one new action value `remove_rule`, no new frame or feature
+  flag; `remove_rule` on a rejected rule (removed, or ignored earlier) answers the fresh list, on a
+  candidate / suspended rule / note `not_allowed`, on an unlisted rule `unknown_item`; re-opening
+  re-checks the ceilings and tokens like a load-time active rule, not the normalizer (active rules
+  stay across a normalizer change); one optional `removedBy` field in rules.json (absent unless
+  removed, so older files load unchanged; a re-open clears it); UI "Yeniden aç" is the existing
+  `add_rule` button relabelled on suspended rules; the no-`canManage` hint also covers suspended
+  and active rules.
+- 2026-11-07: T7.w.8 done (senior-code-reviewer 1 round, no critical or high finding; tester:
+  core 1239/1239, ui 388/388, lint, build, 6 of 6 mutations killed). Round 1 fixed: `remove()`
+  refreshes `lastSeen`, so the discarded cap does not drop a just-removed rule first (an active
+  rule is not observed, its `lastSeen` was stale). Left open (related findings): a re-open refused
+  by router.yaml shows the generic `not_allowed` text, not the Core's reason; a new UI on an older
+  Core answers "Kaldır" with `bad_request`; `.env.example` mentions only "Kuralı ekle".

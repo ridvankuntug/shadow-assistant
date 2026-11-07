@@ -128,7 +128,8 @@ test("dev_list / dev_action (feature dev): ids and action required; unknown fiel
       action,
     });
   }
-  assert.deepEqual([...DEV_ACTIONS], ["add_rule", "ignore", "fixed"]);
+  // `remove_rule` added by T7.w.8 (additive, protocol stays 1).
+  assert.deepEqual([...DEV_ACTIONS], ["add_rule", "ignore", "fixed", "remove_rule"]);
   bad({ type: "dev_list" });
   bad({ type: "dev_list", id: "" });
   bad({ type: "dev_list", id: 5 });
@@ -138,7 +139,8 @@ test("dev_list / dev_action (feature dev): ids and action required; unknown fiel
   bad({ type: "dev_action", id: "d2", itemId: "x".repeat(129), action: "ignore" });
   bad({ type: "dev_action", id: "d2", itemId: 7, action: "ignore" });
   bad({ type: "dev_action", id: "d2", itemId: "n-1" });
-  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "remove_rule" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "delete_rule" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "REMOVE_RULE" });
   bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "IGNORE" });
   bad({ type: "dev_action", id: "d2", itemId: "n-1", action: ["ignore"] });
   bad({ type: "dev_action", itemId: "n-1", action: "ignore" });

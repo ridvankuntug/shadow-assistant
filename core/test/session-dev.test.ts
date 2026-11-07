@@ -6,12 +6,14 @@
  * - "Kuralı ekle" only from a device in CORE_DEV_DEVICES (unset = nobody);
  *   the rule is re-validated, becomes active, and the next matching
  *   utterance runs at tier 0 without a model;
+ * - "Kaldır" (`remove_rule`) and "Yeniden aç" (`add_rule` on a suspended
+ *   rule) with the same device limit (T7.w.8);
  * - "Yok say" / "Düzeltildi" from every device; actions are idempotent;
  * - errors: unknown_item, not_allowed, bad_request (tab disabled);
  * - items carry no user text, arguments or names; the count is published on change.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, promises as nodeFs, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -20,6 +22,7 @@ import { ConversationLog } from "../src/conversation-log.js";
 import { DevNotes, TurnNotes } from "../src/dev-notes.js";
 import { learnPolicy, learnTargetFilter, type Extracted } from "../src/learn/extract.js";
 import { LearnedRuleStore } from "../src/learn/store.js";
+import type { AtomicFs } from "../src/atomic-file.js";
 import type { DirectToolClient, DirectToolResult } from "../src/mcp-direct.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import type { DevItem, ServerFrame } from "../src/protocol.js";
@@ -52,7 +55,7 @@ const LIVE = JSON.stringify({
   ].join("\n"),
 });
 
-const routerYaml = (tools = "[intent__HassTurnOn, intent__HassTurnOff, light__HassLightSet]") => `
+const routerYaml = (tools = "[intent__HassTurnOn, intent__HassTurnOff, light__HassLightSet]", domains?: string) => `
 version: 1
 rules:
   - id: light-on
@@ -65,7 +68,8 @@ rules:
     reply: "Tamam, {ad} ışığı açıldı."
 learning:
   tools: ${tools}
-  keywords:
+${domains ? `  domains: ${domains}
+` : ""}  keywords:
     light: [ışık, lamba]
 `;
 
@@ -114,10 +118,10 @@ class MockAgent implements AgentRunner {
 }
 
 let counter = 0;
-async function harness(o: { managers?: string[]; device?: string; withTab?: boolean; dir?: string; tools?: string } = {}) {
+async function harness(o: { managers?: string[]; device?: string; withTab?: boolean; dir?: string; tools?: string; domains?: string; fs?: AtomicFs } = {}) {
   const dir = o.dir ?? join(base, `d${++counter}`);
-  const config = parseRouterConfig(routerYaml(o.tools));
-  const store = new LearnedRuleStore({ dir: join(dir, "fast-path"), config, log: () => {} });
+  const config = parseRouterConfig(routerYaml(o.tools, o.domains));
+  const store = new LearnedRuleStore({ dir: join(dir, "fast-path"), config, log: () => {}, ...(o.fs ? { fs: o.fs, retryDelaysMs: [] } : {}) });
   await store.load();
   const toolNotes = new DevNotes({ dir: join(dir, "dev-notes") });
   const turnNotes = new TurnNotes({ dir: join(dir, "dev-notes"), coalesceMs: 0 });
@@ -156,7 +160,7 @@ async function harness(o: { managers?: string[]; device?: string; withTab?: bool
   open.push(session);
   let req = 0;
   /** Sends a frame, returns the reply (`dev` or `error`) with its id. */
-  const ask = async (frame: { type: "dev_list" } | { type: "dev_action"; itemId: string; action: "add_rule" | "ignore" | "fixed" }) => {
+  const ask = async (frame: { type: "dev_list" } | { type: "dev_action"; itemId: string; action: "add_rule" | "ignore" | "fixed" | "remove_rule" }) => {
     const id = `d${++req}`;
     await session.handle({ ...frame, id } as Parameters<Session["handle"]>[0]);
     const reply = frames.find((f) => (f.type === "dev" || f.type === "error") && "id" in f && f.id === id);
@@ -315,7 +319,7 @@ test("ignore: a candidate is rejected and leaves the list (repeat answers the li
   assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "fixed" })), "unknown_item");
 });
 
-test("a suspended rule is listed and counted; add_rule and fixed on it are not_allowed (docs/08 decision 4)", async () => {
+test("a suspended rule is listed and counted; fixed and remove_rule on it are not_allowed", async () => {
   const h = await harness({ managers: ["browser"] });
   const id = await candidate(h);
   assert.ok((await h.store.activate(id, "browser")).ok);
@@ -323,7 +327,7 @@ test("a suspended rule is listed and counted; add_rule and fixed on it are not_a
   const v = await h.list();
   assert.equal(ruleOf(v.items, id)?.status, "suspended");
   assert.equal(v.open, 1);
-  for (const action of ["add_rule", "fixed"] as const) {
+  for (const action of ["fixed", "remove_rule"] as const) {
     assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action })), "not_allowed", action);
   }
   assert.equal((await h.store.list())[0]?.status, "suspended");
@@ -344,7 +348,7 @@ test("ignore on a suspended rule rejects it: it leaves the list and the badge dr
   assert.equal((await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" })).type, "dev");
 });
 
-test("ignore on an active rule is not_allowed and the rule stays active (no removal from the tab, decision 4)", async () => {
+test("ignore on an active rule is not_allowed and the rule stays active (removal is remove_rule)", async () => {
   const h = await harness({ managers: ["browser"] });
   const id = await candidate(h);
   assert.ok((await h.store.activate(id, "browser")).ok);
@@ -395,6 +399,165 @@ test("unknown item ids are unknown_item (rules, notes, other prefixes)", async (
   for (const itemId of ["r-lr-00000000", `r-${observing}`, "n-0000000000000000", "t-0000000000000000", "x-1", "lr-00000000"]) {
     assert.equal(errorCode(await h.ask({ type: "dev_action", itemId, action: "ignore" })), "unknown_item", itemId);
   }
+});
+
+// ------------------------------------------------------------------ remove_rule / re-open (T7.w.8)
+
+async function activeRule(h: Awaited<ReturnType<typeof harness>>): Promise<string> {
+  const id = await candidate(h);
+  assert.ok((await h.store.activate(id, "browser")).ok);
+  return id;
+}
+
+async function suspendedRule(h: Awaited<ReturnType<typeof harness>>): Promise<string> {
+  const id = await activeRule(h);
+  for (let i = 0; i < 3; i++) await h.store.recordOutcome(id, "failure", "name_not_found");
+  assert.equal((await h.store.list()).find((e) => e.id === id)?.status, "suspended");
+  return id;
+}
+
+test("an active rule is listed but not counted in open", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await activeRule(h);
+  const v = await h.list();
+  assert.equal(ruleOf(v.items, id)?.status, "active");
+  assert.equal(ruleOf(v.items, id)?.message, "öğrenilen kural etkin");
+  assert.equal(v.open, 0);
+});
+
+test("remove_rule from a listed device: active → rejected, leaves the list and the snapshot, the model answers again", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await activeRule(h);
+  await h.say("salon lambası parlaklığı yüzde 40 olsun");
+  assert.equal(h.agent.calls, 0, "tier 0 while active");
+  assert.equal((await h.list()).open, 0);
+
+  const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "remove_rule" });
+  assert.equal(r.type, "dev");
+  const frame = r as Extract<ServerFrame, { type: "dev" }>;
+  assert.equal(ruleOf(frame.items, id), undefined);
+  assert.equal(frame.open, 0, "an active rule was never an open item");
+  const stored = (await h.store.list()).find((e) => e.id === id);
+  assert.equal(stored?.status, "rejected");
+  assert.equal(stored?.removedBy, "browser");
+  assert.equal(h.store.snapshot().length, 0);
+  assert.ok(h.infos.some((m) => m.includes(`learned rule ${id} removed by device browser`)));
+
+  await h.say("mutfak lambası parlaklığı yüzde 55 olsun");
+  assert.equal(h.agent.calls, 1, "the model again after removal");
+  // Never suggested again: more observations of the phrasing keep it rejected.
+  for (let i = 0; i < 3; i++) await h.store.observe(PATTERN);
+  assert.equal((await h.store.list()).find((e) => e.id === id)?.status, "rejected");
+  assert.equal(ruleOf((await h.list()).items, id), undefined);
+
+  // Idempotent: removing again answers with the fresh list; add_rule cannot bring it back.
+  assert.equal((await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "remove_rule" })).type, "dev");
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "add_rule" })), "unknown_item");
+});
+
+test("remove_rule and re-open with CORE_DEV_DEVICES unset or from another device are not_allowed; nothing changes", async () => {
+  for (const managers of [[], ["phone"]]) {
+    const h = await harness({ managers, device: "browser" });
+    const active = await activeRule(h);
+    const r = await h.ask({ type: "dev_action", itemId: `r-${active}`, action: "remove_rule" });
+    assert.equal(errorCode(r), "not_allowed");
+    assert.match((r as { message: string }).message, /may not remove rules/);
+    assert.equal((await h.store.list()).find((e) => e.id === active)?.status, "active");
+    assert.equal(h.store.snapshot().length, 1);
+    for (let i = 0; i < 3; i++) await h.store.recordOutcome(active, "failure", "name_not_found");
+    const again = await h.ask({ type: "dev_action", itemId: `r-${active}`, action: "add_rule" });
+    assert.equal(errorCode(again), "not_allowed");
+    assert.equal((await h.store.list()).find((e) => e.id === active)?.status, "suspended");
+  }
+});
+
+test("remove_rule on a candidate or a note is not_allowed; on a rule never listed it is unknown_item", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await candidate(h);
+  await h.turnNotes.record({ kind: "tool_error", service: "home-assistant", tool: "intent__HassTurnOn", errorClass: "error" });
+  const note = (await h.list()).items.find((i) => i.type === "note") as DevItem;
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "remove_rule" })), "not_allowed");
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: note.itemId, action: "remove_rule" })), "not_allowed");
+  assert.equal((await h.store.list())[0]?.status, "candidate");
+  await h.store.observe(OTHER); // observing: exists but not listed
+  const observing = (await h.store.list()).find((e) => e.status === "observing")?.id as string;
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: `r-${observing}`, action: "remove_rule" })), "unknown_item");
+  assert.equal(errorCode(await h.ask({ type: "dev_action", itemId: "r-lr-00000000", action: "remove_rule" })), "unknown_item");
+});
+
+test("add_rule on a suspended rule re-opens it: active, failures reset, the badge drops, the next utterance runs at tier 0", async () => {
+  const h = await harness({ managers: ["browser"] });
+  const id = await suspendedRule(h);
+  assert.equal((await h.list()).open, 1);
+  assert.equal(h.store.snapshot().length, 0);
+  const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "add_rule" });
+  assert.equal(r.type, "dev");
+  const frame = r as Extract<ServerFrame, { type: "dev" }>;
+  assert.equal(ruleOf(frame.items, id)?.status, "active");
+  assert.equal(frame.open, 0);
+  const stored = (await h.store.list()).find((e) => e.id === id);
+  assert.deepEqual([stored?.status, stored?.consecutiveFailures, stored?.lastFailure, stored?.activatedBy], ["active", 0, null, "browser"]);
+  assert.ok(h.infos.some((m) => m.includes(`learned rule ${id} re-opened by device browser`)));
+  await h.say("mutfak lambası parlaklığı yüzde 55 olsun");
+  assert.equal(h.agent.calls, 0, "no model call after re-opening");
+  assert.deepEqual(h.ha.writes.at(-1), { tool: "light__HassLightSet", args: { name: "Mutfak Lamba", domain: ["light"], brightness: 55 } });
+  // Idempotent: a second add_rule answers with the list.
+  assert.equal((await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "add_rule" })).type, "dev");
+});
+
+test("re-open is re-validated: a suspended rule the current router.yaml no longer allows is not_allowed", async () => {
+  const learned = await harness({ managers: ["browser"] });
+  const id = await suspendedRule(learned);
+  const narrowed = await harness({ managers: ["browser"], dir: learned.dir, tools: "[intent__HassTurnOn, intent__HassTurnOff]" });
+  const r = await narrowed.ask({ type: "dev_action", itemId: `r-${id}`, action: "add_rule" });
+  assert.equal(errorCode(r), "not_allowed");
+  assert.match((r as { message: string }).message, /no longer allowed/);
+  assert.equal((await narrowed.store.list()).find((e) => e.id === id)?.status, "suspended");
+  assert.equal(narrowed.store.snapshot().length, 0);
+});
+
+test("remove_rule when the rule file cannot be written: internal error, the rule stays active and listed", async () => {
+  let failRename = false;
+  const fs: AtomicFs = {
+    mkdir: (p, o) => nodeFs.mkdir(p, o),
+    open: (p, f, m) => nodeFs.open(p, f, m),
+    rename: (a, b) => (failRename ? Promise.reject(Object.assign(new Error("simulated"), { code: "EIO" })) : nodeFs.rename(a, b)),
+    unlink: (p) => nodeFs.unlink(p),
+    readFile: (p, e) => nodeFs.readFile(p, e),
+    readdir: (p) => nodeFs.readdir(p),
+  };
+  const h = await harness({ managers: ["browser"], fs });
+  const id = await activeRule(h);
+  const before = (await h.list()).items;
+  failRename = true;
+  const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "remove_rule" });
+  assert.equal(errorCode(r), "internal");
+  assert.equal((await h.store.list()).find((e) => e.id === id)?.status, "active");
+  assert.equal(h.store.snapshot().length, 1);
+  assert.deepEqual((await h.list()).items, before);
+  await h.say("salon lambası parlaklığı yüzde 40 olsun");
+  assert.equal(h.agent.calls, 0, "still tier 0");
+});
+
+test("re-open is re-validated against domains: router.yaml learning.domains no longer lists the rule's domain → not_allowed", async () => {
+  const learned = await harness({ managers: ["browser"] });
+  const id = await suspendedRule(learned);
+  const narrowed = await harness({ managers: ["browser"], dir: learned.dir, domains: "[switch]" });
+  const r = await narrowed.ask({ type: "dev_action", itemId: `r-${id}`, action: "add_rule" });
+  assert.equal(errorCode(r), "not_allowed");
+  assert.match((r as { message: string }).message, /no longer allowed/);
+  assert.equal((await narrowed.store.list()).find((e) => e.id === id)?.status, "suspended");
+  assert.equal(narrowed.store.snapshot().length, 0);
+});
+
+test("remove_rule from a listed device whose name the rule file cannot store is not_allowed with its own message", async () => {
+  const h = await harness({ managers: ["gerät"], device: "gerät" });
+  const id = await candidate(h);
+  assert.ok((await h.store.activate(id, "browser")).ok);
+  const r = await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "remove_rule" });
+  assert.equal(errorCode(r), "not_allowed");
+  assert.match((r as { message: string }).message, /removing device/);
+  assert.equal((await h.store.list())[0]?.status, "active");
 });
 
 // ------------------------------------------------------------------ badge count
