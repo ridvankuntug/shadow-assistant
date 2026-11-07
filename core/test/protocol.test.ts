@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_TEXT_CHARS, parseClientFrame } from "../src/protocol.js";
+import { DEV_ACTIONS, MAX_TEXT_CHARS, parseClientFrame } from "../src/protocol.js";
 
 const ok = (raw: unknown) => {
   const r = parseClientFrame(JSON.stringify(raw));
@@ -116,4 +116,38 @@ test("memory_list / memory_delete need ids; unknown fields ignored", () => {
   bad({ type: "memory_delete", id: "m2", entryId: 7 });
   bad({ type: "memory_delete", id: "m2", entryId: "x".repeat(129) });
   bad({ type: "memory_delete", entryId: "m-1" });
+});
+
+test("dev_list / dev_action (feature dev): ids and action required; unknown fields ignored", () => {
+  assert.deepEqual(ok({ type: "dev_list", id: "d1", extra: true }), { type: "dev_list", id: "d1" });
+  for (const action of DEV_ACTIONS) {
+    assert.deepEqual(ok({ type: "dev_action", id: "d2", itemId: "r-lr-3f9a", action, extra: { x: 1 } }), {
+      type: "dev_action",
+      id: "d2",
+      itemId: "r-lr-3f9a",
+      action,
+    });
+  }
+  assert.deepEqual([...DEV_ACTIONS], ["add_rule", "ignore", "fixed"]);
+  bad({ type: "dev_list" });
+  bad({ type: "dev_list", id: "" });
+  bad({ type: "dev_list", id: 5 });
+  // The request id comes back with the rejection.
+  assert.equal(bad({ type: "dev_action", id: "d2", action: "ignore" }).id, "d2");
+  bad({ type: "dev_action", id: "d2", itemId: "", action: "ignore" });
+  bad({ type: "dev_action", id: "d2", itemId: "x".repeat(129), action: "ignore" });
+  bad({ type: "dev_action", id: "d2", itemId: 7, action: "ignore" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "remove_rule" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: "IGNORE" });
+  bad({ type: "dev_action", id: "d2", itemId: "n-1", action: ["ignore"] });
+  bad({ type: "dev_action", itemId: "n-1", action: "ignore" });
+});
+
+test("existing frames are unchanged by the dev frames", () => {
+  assert.deepEqual(ok({ type: "memory_list", id: "m1" }), { type: "memory_list", id: "m1" });
+  assert.deepEqual(ok({ type: "user_text", id: "t1", text: "merhaba" }), { type: "user_text", id: "t1", text: "merhaba" });
+  assert.deepEqual(ok({ type: "cancel", id: "t1" }), { type: "cancel", id: "t1" });
+  bad({ type: "dev" });
+  bad({ type: "dev_count", open: 1 });
 });

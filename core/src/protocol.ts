@@ -111,6 +111,25 @@ export interface MemoryDeleteFrame {
   entryId: string;
 }
 
+/** Development-tab actions (docs/08-learning-fast-path.md, T7.w.4). */
+export type DevAction = "add_rule" | "ignore" | "fixed";
+export const DEV_ACTIONS: readonly DevAction[] = ["add_rule", "ignore", "fixed"];
+
+/** Asks for the Development items (feature `dev`); answered by `dev` or `error`. */
+export interface DevListFrame {
+  type: "dev_list";
+  id: string;
+}
+
+/** Applies one action to one Development item; answered by a fresh `dev` frame or `error`. */
+export interface DevActionFrame {
+  type: "dev_action";
+  id: string;
+  /** `items[].itemId` of a `dev` frame. */
+  itemId: string;
+  action: DevAction;
+}
+
 export type ClientFrame =
   | HelloFrame
   | UserTextFrame
@@ -123,7 +142,9 @@ export type ClientFrame =
   | PingFrame
   | SpeechPrefsFrame
   | MemoryListFrame
-  | MemoryDeleteFrame;
+  | MemoryDeleteFrame
+  | DevListFrame
+  | DevActionFrame;
 
 // ---------------------------------------------------------------- core → client
 
@@ -138,13 +159,17 @@ export type ErrorCode =
   | "model_error"
   | "busy"
   | "usage_limit"
+  /** Development: the `itemId` is not (or no longer) listed. */
+  | "unknown_item"
+  /** Development: the action is not valid for the item, or this device may not do it. */
+  | "not_allowed"
   | "internal";
 
 /**
  * Optional capabilities a Core lists in `welcome.features`. Clients must
  * ignore names they do not know; a missing name means the feature is off.
  */
-export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit";
+export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev";
 
 export interface HistoryItem {
   id: string;
@@ -226,6 +251,56 @@ export interface MemoryFrame {
   warnings: MemoryWarning[];
 }
 
+/** `rule`: a learned fast-path rule; `note`: a dev-note (tools.json / turns.json). */
+export type DevItemType = "rule" | "note";
+
+/** The generalization of a learned rule, shown before "Kuralı ekle". */
+export interface DevRuleInfo {
+  /** Pattern tokens; slots are `<ad>` (device name) and `<sayi>` (number). */
+  tokens: string[];
+  tool: string;
+  domains: string[];
+  /** Range of the numbers observed for `<sayi>`, if the pattern has one. */
+  numberRange?: { min: number; max: number };
+  observations: number;
+}
+
+/** One Development item. Display only: the fields of the files, nothing more. */
+export interface DevItem {
+  /** Opaque id; send it back as `dev_action.itemId`. */
+  itemId: string;
+  type: DevItemType;
+  /** Note kind (e.g. `new_tool`, `wandering`) or, for rules, `learned_rule`. */
+  kind: string;
+  /** Rules: `candidate` | `active` | `suspended`; notes: `open` | `ignored` | `fixed`. Clients show unknown values as-is. */
+  status: string;
+  /** Short Turkish text. */
+  message: string;
+  count: number;
+  /** ISO 8601 times, as stored in the files. */
+  firstSeen: string;
+  lastSeen: string;
+  /** Only for `type: "rule"`. */
+  rule?: DevRuleInfo;
+}
+
+export interface DevFrame {
+  type: "dev";
+  /** The `dev_list` / `dev_action` request id. */
+  id: string;
+  items: DevItem[];
+  /** Badge count: rule candidates + suspended rules + open notes. */
+  open: number;
+  /** Whether this device may use `add_rule` (CORE_DEV_DEVICES). */
+  canManage: boolean;
+}
+
+/** Sent to every authenticated socket of a client with the `dev` feature when the badge count changes. */
+export interface DevCountFrame {
+  type: "dev_count";
+  open: number;
+}
+
 export type ServerFrame =
   | {
       type: "welcome";
@@ -253,6 +328,8 @@ export type ServerFrame =
   | { type: "history"; items: HistoryItem[] }
   | SpeechChunkFrame
   | MemoryFrame
+  | DevFrame
+  | DevCountFrame
   /** `retryAt` (epoch ms): only on `usage_limit`, when the reset time is known. */
   | { type: "error"; id?: string; code: ErrorCode; message: string; retryAt?: number }
   | { type: "services"; items: ServiceHealth[] }
@@ -377,6 +454,18 @@ export function parseClientFrame(raw: string): ParseResult {
       if (!isId(data.id)) return bad("memory_delete.id must be a non-empty string");
       if (!isId(data.entryId)) return bad("memory_delete.entryId must be a non-empty string");
       return { ok: true, frame: { type: "memory_delete", id: data.id, entryId: data.entryId } };
+    case "dev_list":
+      if (!isId(data.id)) return bad("dev_list.id must be a non-empty string");
+      return { ok: true, frame: { type: "dev_list", id: data.id } };
+    case "dev_action": {
+      if (!isId(data.id)) return bad("dev_action.id must be a non-empty string");
+      if (!isId(data.itemId)) return bad("dev_action.itemId must be a non-empty string");
+      const action = data.action;
+      if (typeof action !== "string" || !(DEV_ACTIONS as readonly string[]).includes(action)) {
+        return bad(`dev_action.action must be one of ${DEV_ACTIONS.join(", ")}`);
+      }
+      return { ok: true, frame: { type: "dev_action", id: data.id, itemId: data.itemId, action: action as DevAction } };
+    }
     default:
       return bad(`unknown frame type`);
   }

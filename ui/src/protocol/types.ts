@@ -46,6 +46,12 @@ export type SpeechPrefsMessage = { type: "speech_prefs"; enabled: boolean; mode:
 export type MemoryListMessage = { type: "memory_list"; id: string };
 /** Deletes one memory entry; answered by a fresh `memory` frame. */
 export type MemoryDeleteMessage = { type: "memory_delete"; id: string; entryId: string };
+/** Development-tab actions (Core feature `dev`). */
+export type DevAction = "add_rule" | "ignore" | "fixed";
+/** Asks for the Development items (Core feature `dev`). */
+export type DevListMessage = { type: "dev_list"; id: string };
+/** One action on one Development item; answered by a fresh `dev` frame or `error`. */
+export type DevActionMessage = { type: "dev_action"; id: string; itemId: string; action: DevAction };
 
 export type ClientMessage =
   | HelloMessage
@@ -59,13 +65,15 @@ export type ClientMessage =
   | PingMessage
   | SpeechPrefsMessage
   | MemoryListMessage
-  | MemoryDeleteMessage;
+  | MemoryDeleteMessage
+  | DevListMessage
+  | DevActionMessage;
 
 // ---------------------------------------------------------------------------
 // Core -> Client
 
 /** Optional Core capabilities this client uses (`welcome.features`). */
-export type CoreFeature = "speech_stream" | "memory" | "usage_limit";
+export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;
@@ -144,6 +152,35 @@ export type MemoryMessage = {
   topics: MemoryTopic[];
   warnings: MemoryWarning[];
 };
+/** `rule`: a learned fast-path rule; `note`: a dev-note. */
+export type DevItemType = "rule" | "note";
+/** How far a learned rule generalizes; tokens use the slots `<ad>` / `<sayi>`. */
+export type DevRuleInfo = {
+  tokens: string[];
+  tool: string;
+  domains: string[];
+  numberRange?: { min: number; max: number };
+  observations: number;
+};
+/**
+ * One Development item (display only). `status`: rules `candidate` | `active` |
+ * `suspended`, notes `open` | `ignored` | `fixed`; unknown values are shown as-is.
+ * `firstSeen` / `lastSeen` are ISO 8601 strings.
+ */
+export type DevItem = {
+  itemId: string;
+  type: DevItemType;
+  kind: string;
+  status: string;
+  message: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  rule?: DevRuleInfo;
+};
+export type DevMessage = { type: "dev"; id: string; items: DevItem[]; open: number; canManage: boolean };
+/** Badge count change, broadcast to every authenticated socket. */
+export type DevCountMessage = { type: "dev_count"; open: number };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -161,6 +198,8 @@ export type ServerMessage =
   | VoicesMessage
   | SpeechChunkMessage
   | MemoryMessage
+  | DevMessage
+  | DevCountMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -181,6 +220,7 @@ const SERVER_STATES = ["idle", "thinking", "awaiting_confirm"] as const;
 const TOOL_STATUSES = ["started", "done", "denied", "error"] as const;
 const RESOLVED_BY = ["button", "voice", "timeout"] as const;
 const SERVICE_STATUSES = ["ok", "loading", "down", "disabled"] as const;
+const DEV_ITEM_TYPES = ["rule", "note"] as const;
 
 function isHistoryItem(v: unknown): v is HistoryItem {
   return (
@@ -302,6 +342,62 @@ function toMemory(o: Obj): MemoryMessage | null {
   };
 }
 
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const strings = (v: unknown): string[] | null =>
+  Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
+
+function toDevRule(v: unknown): DevRuleInfo | null {
+  if (!isObj(v) || !str(v, "tool") || !isCount(v.observations)) return null;
+  const tokens = strings(v.tokens);
+  const domains = strings(v.domains);
+  if (!tokens || tokens.length === 0 || !domains) return null;
+  const rule: DevRuleInfo = { tokens, tool: v.tool as string, domains, observations: v.observations };
+  if (v.numberRange !== undefined) {
+    const r = v.numberRange;
+    if (!isObj(r) || !num(r, "min") || !num(r, "max")) return null;
+    rule.numberRange = { min: r.min as number, max: r.max as number };
+  }
+  return rule;
+}
+
+/**
+ * A valid item with only the known fields, or null. A `rule` item needs a valid
+ * `rule` (the user must see how far it generalizes before adding it); a
+ * malformed `rule` drops the item.
+ */
+function toDevItem(v: unknown): DevItem | null {
+  if (!isObj(v) || !str(v, "itemId") || !v.itemId || !oneOf(v, "type", DEV_ITEM_TYPES)) return null;
+  for (const k of ["kind", "status", "message", "firstSeen", "lastSeen"]) if (!str(v, k)) return null;
+  if (!isCount(v.count)) return null;
+  const item: DevItem = {
+    itemId: v.itemId as string,
+    type: v.type as DevItemType,
+    kind: v.kind as string,
+    status: v.status as string,
+    message: v.message as string,
+    count: v.count,
+    firstSeen: v.firstSeen as string,
+    lastSeen: v.lastSeen as string,
+  };
+  if (item.type === "rule") {
+    const rule = toDevRule(v.rule);
+    if (!rule) return null;
+    item.rule = rule;
+  }
+  return item;
+}
+
+function toDev(o: Obj): DevMessage | null {
+  if (!str(o, "id") || !isCount(o.open) || !bool(o, "canManage") || !Array.isArray(o.items)) return null;
+  return {
+    type: "dev",
+    id: o.id as string,
+    items: o.items.map(toDevItem).filter((i): i is DevItem => i !== null),
+    open: o.open,
+    canManage: o.canManage as boolean,
+  };
+}
+
 /**
  * Parses one raw text frame. Returns null for anything that is not a valid,
  * known v1 server message (unknown types are ignored for forward
@@ -373,6 +469,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       return toSpeechChunk(o);
     case "memory":
       return toMemory(o);
+    case "dev":
+      return toDev(o);
+    case "dev_count":
+      return isCount(o.open) ? { type: "dev_count", open: o.open } : null;
     case "pong":
       return { type: "pong" };
     default:

@@ -47,6 +47,8 @@ refuses to start.
 | `{"type":"speech_prefs","enabled":true,"mode":"audio"\|"text","voice"?:"tr_TR-dfki-medium"}` | Opt in to streamed speech for this socket's turns (feature `speech_stream`). See *Streamed speech*. |
 | `{"type":"memory_list","id":"m1"}` | Ask for the memory contents (feature `memory`). See *Memory*. |
 | `{"type":"memory_delete","id":"m2","entryId":"m-7f3a9c"}` | Delete one memory entry (feature `memory`). See *Memory*. |
+| `{"type":"dev_list","id":"d1"}` | Ask for the Development items (feature `dev`). See *Development*. |
+| `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"}` | One action on one Development item (feature `dev`). See *Development*. |
 
 ## Core → Client
 
@@ -63,6 +65,8 @@ refuses to start.
 | `{"type":"speech","id":"t1","mime":"audio/wav","data":"<base64>"}` | Synthesized audio for a `speak` request. |
 | `{"type":"speech_chunk","id":"t1","seq":0,"final":false,"mime"?:"audio/wav","data"?:"<base64>","text"?:"…"}` | One sentence of a turn's spoken answer, only after `speech_prefs` with `enabled:true`. See *Streamed speech*. |
 | `{"type":"memory","id":"m1","brief":{…},"topics":[…],"warnings":[…]}` | Reply to `memory_list` / `memory_delete`. See *Memory*. |
+| `{"type":"dev","id":"d1","items":[…],"open":3,"canManage":false}` | Reply to `dev_list` / `dev_action`. See *Development*. |
+| `{"type":"dev_count","open":3}` | The Development badge count changed (every authenticated socket; feature `dev`). See *Development*. |
 | `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…","retryAt"?:<epoch ms>}` | See *Errors*. `retryAt` only with `usage_limit`. |
@@ -84,6 +88,7 @@ The protocol number stays 1.
 | `speech_stream` | The Core understands `speech_prefs` and sends `speech_chunk` frames to clients that opted in. Without it a client speaks the answer itself after `assistant_done` (`speak`). |
 | `memory` | Memory is enabled: `memory_list` / `memory_delete` are answered. Without it clients hide the memory settings. |
 | `usage_limit` | The Core reports a reached subscription usage limit as `error usage_limit` (+ `retryAt`). |
+| `dev` | The Development tab is available: `dev_list` / `dev_action` are answered and `dev_count` is sent. Without it clients hide the tab and its badge. |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -103,6 +108,8 @@ Agent SDK's `mcp__<service>__` prefix.
 | `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
+| `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed. |
+| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` outside `CORE_DEV_DEVICES`). |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
@@ -170,6 +177,52 @@ With the feature `memory`. Design: [`docs/06-memory.md`](06-memory.md).
   `note_over_budget`, `note_full` (both with `topic`) and `memory_full`; clients
   show unknown codes as free text.
 - Memory frames go only to the requesting socket.
+
+## Development
+
+With the feature `dev`. Design:
+[`docs/08-learning-fast-path.md` §T7.w.4](08-learning-fast-path.md#t7w4-development-tab-ui-and-tray).
+The tab lists learned fast-path rules and dev-notes; it is display plus three
+actions, never a push or a sound.
+
+```json
+{"type":"dev","id":"d1","open":2,"canManage":false,
+ "items":[{"itemId":"r-lr-3f9a1c2e","type":"rule","kind":"learned_rule","status":"candidate",
+           "message":"…","count":3,"firstSeen":"2026-11-07T18:00:00.000Z","lastSeen":"2026-11-08T07:30:00.000Z",
+           "rule":{"tokens":["<ad>","yüzde","<sayi>","yap"],"tool":"light__HassLightSet",
+                   "domains":["light"],"numberRange"?:{"min":20,"max":80},"observations":3}},
+          {"itemId":"…","type":"note","kind":"wandering","status":"open","message":"…","count":2,
+           "firstSeen":"…","lastSeen":"…"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `itemId` | Opaque id; send it back as `dev_action.itemId`. |
+| `type` | `rule` (learned rule) or `note` (dev-note). |
+| `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`) or `learned_rule`. |
+| `status` | Rules: `candidate`, `active`, `suspended`. Notes: `open`, `ignored`, `fixed`. Clients show unknown values as-is. |
+| `count`, `firstSeen`, `lastSeen` | Occurrences / observations and ISO 8601 times, as stored. |
+| `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange`, `observations`. |
+| `open` | Badge count: rule candidates + suspended rules + open notes. |
+| `canManage` | Whether this device may use `add_rule`. |
+
+Items are display only: they carry the fields of the files, never user text,
+arguments, entity or room names, error messages, URLs or tokens.
+
+- `dev_list` is answered with `dev` (same `id`).
+- `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active,
+  re-validated first), `ignore` ("Yok say": a rule → rejected, a note →
+  `ignored`) and `fixed` ("Düzeltildi": notes only). It is answered with a fresh
+  `dev` frame (same `id`). Actions are idempotent: repeating one (e.g.
+  `add_rule` on an active rule) is answered with the fresh list.
+- Errors (with `id`): an unknown `itemId` → `unknown_item`; an action not valid
+  for the item, or `add_rule` from a device not listed in `CORE_DEV_DEVICES`
+  (unset = nobody) → `not_allowed`; a malformed frame (missing `itemId`, unknown
+  `action`) → `bad_request`.
+- The device is the one from the token, never `hello.client`.
+- `dev_count` is sent to every authenticated socket when the badge count
+  changes, only by a Core with the feature `dev` (clients that do not know the
+  frame ignore it). `dev` frames go only to the requesting socket.
 
 ## Voices
 

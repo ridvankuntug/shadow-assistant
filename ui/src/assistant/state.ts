@@ -652,5 +652,10 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
 
     case "pong":
       return s;
+
+    // Development frames (feature `dev`): parsed since T7.w.4a, handled by the panel in T7.w.4c.
+    case "dev":
+    case "dev_count":
+      return s;
   }
 }

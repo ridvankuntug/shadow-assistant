@@ -79,6 +79,45 @@ const VALID: ServerMessage[] = [
     warnings: [{ code: "note_over_budget", topic: "tercihler" }, { code: "memory_full" }],
   },
   { type: "memory", id: "m2", brief: { chars: 0, budget: 800, entries: [] }, topics: [], warnings: [] },
+  { type: "welcome", protocol: 1, sessionId: "s1", device: "browser", features: ["memory", "dev"] },
+  {
+    type: "dev",
+    id: "d1",
+    items: [
+      {
+        itemId: "r-lr-3f9a1c2e",
+        type: "rule",
+        kind: "learned_rule",
+        status: "candidate",
+        message: "kural önerisi",
+        count: 3,
+        firstSeen: "2026-11-07T18:00:00.000Z",
+        lastSeen: "2026-11-08T07:30:00.000Z",
+        rule: {
+          tokens: ["<ad>", "yüzde", "<sayi>", "yap"],
+          tool: "light__HassLightSet",
+          domains: ["light"],
+          numberRange: { min: 20, max: 80 },
+          observations: 3,
+        },
+      },
+      {
+        itemId: "n-turns-1",
+        type: "note",
+        kind: "wandering",
+        status: "open",
+        message: "tur dağıldı: çok fazla araç çağrısı",
+        count: 2,
+        firstSeen: "2026-11-07T18:00:00.000Z",
+        lastSeen: "2026-11-07T19:00:00.000Z",
+      },
+    ],
+    open: 2,
+    canManage: false,
+  },
+  { type: "dev", id: "d2", items: [], open: 0, canManage: true },
+  { type: "dev_count", open: 0 },
+  { type: "dev_count", open: 7 },
 ];
 
 describe("parseServerMessage", () => {
@@ -115,6 +154,17 @@ describe("parseServerMessage", () => {
     ["memory without brief", '{"type":"memory","id":"m","topics":[],"warnings":[]}'],
     ["memory brief without budget", '{"type":"memory","id":"m","brief":{"chars":0,"entries":[]}}'],
     ["memory brief entries not array", '{"type":"memory","id":"m","brief":{"chars":0,"budget":1,"entries":{}}}'],
+    ["dev without id", '{"type":"dev","items":[],"open":0,"canManage":false}'],
+    ["dev without items", '{"type":"dev","id":"d","open":0,"canManage":false}'],
+    ["dev items not array", '{"type":"dev","id":"d","items":{},"open":0,"canManage":false}'],
+    ["dev without open", '{"type":"dev","id":"d","items":[],"canManage":false}'],
+    ["dev negative open", '{"type":"dev","id":"d","items":[],"open":-1,"canManage":false}'],
+    ["dev fractional open", '{"type":"dev","id":"d","items":[],"open":1.5,"canManage":false}'],
+    ["dev canManage not boolean", '{"type":"dev","id":"d","items":[],"open":0,"canManage":"yes"}'],
+    ["dev without canManage", '{"type":"dev","id":"d","items":[],"open":0}'],
+    ["dev_count without open", '{"type":"dev_count"}'],
+    ["dev_count open not a count", '{"type":"dev_count","open":"3"}'],
+    ["dev_count negative", '{"type":"dev_count","open":-2}'],
   ])("rejects %s", (_name, raw) => {
     expect(parseServerMessage(raw)).toBeNull();
   });
@@ -184,6 +234,59 @@ describe("parseServerMessage voices", () => {
 });
 
 describe("parseServerMessage protocol additions (speech_stream, memory, usage_limit)", () => {
+  it("dev: keeps known fields only, drops malformed items; a rule item needs a valid rule", () => {
+    const base = {
+      kind: "tool_error",
+      status: "open",
+      message: "araç hata döndürdü",
+      count: 1,
+      firstSeen: "2026-11-07T18:00:00.000Z",
+      lastSeen: "2026-11-07T18:00:00.000Z",
+    };
+    const rule = { tokens: ["<ad>", "aç"], tool: "light__HassTurnOn", domains: ["light"], observations: 3 };
+    const msg = parseServerMessage(
+      JSON.stringify({
+        type: "dev",
+        id: "d1",
+        open: 1,
+        canManage: true,
+        extra: "dropped",
+        items: [
+          { ...base, itemId: "n-1", type: "note", extra: 1, rule: "ignored on notes" },
+          { ...base, itemId: "r-1", type: "rule", status: "candidate", rule: { ...rule, extra: true } },
+          { ...base, itemId: "r-2", type: "rule" },
+          { ...base, itemId: "r-3", type: "rule", rule: { ...rule, tokens: [] } },
+          { ...base, itemId: "r-4", type: "rule", rule: { ...rule, domains: [1] } },
+          { ...base, itemId: "r-5", type: "rule", rule: { ...rule, numberRange: { min: 1 } } },
+          { ...base, itemId: "r-6", type: "rule", rule: { ...rule, observations: -1 } },
+          { ...base, itemId: "", type: "note" },
+          { ...base, itemId: "n-2", type: "other" },
+          { ...base, itemId: "n-3", type: "note", count: "1" },
+          { ...base, itemId: "n-4", type: "note", message: 5 },
+          { ...base, itemId: "n-5", type: "note", lastSeen: undefined },
+          "junk",
+        ],
+      }),
+    );
+    expect(msg).toEqual({
+      type: "dev",
+      id: "d1",
+      open: 1,
+      canManage: true,
+      items: [
+        { ...base, itemId: "n-1", type: "note" },
+        { ...base, itemId: "r-1", type: "rule", status: "candidate", rule },
+      ],
+    });
+    // Unknown statuses and kinds pass through (shown as-is).
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: "dev", id: "d", open: 0, canManage: false, items: [{ ...base, itemId: "n", type: "note", kind: "future", status: "later" }] }),
+      ),
+    ).toEqual({ type: "dev", id: "d", open: 0, canManage: false, items: [{ ...base, itemId: "n", type: "note", kind: "future", status: "later" }] });
+    expect(parseServerMessage(JSON.stringify({ type: "dev_count", open: 3, extra: 1 }))).toEqual({ type: "dev_count", open: 3 });
+  });
+
   it("welcome: keeps only string features, ignores a malformed features field and unknown fields", () => {
     expect(
       parseServerMessage(
