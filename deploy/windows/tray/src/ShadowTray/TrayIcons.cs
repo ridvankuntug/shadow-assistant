@@ -6,26 +6,28 @@ namespace ShadowTray;
 
 /// <summary>
 /// Coloured circle icons drawn at start-up (no icon files in the repo); each
-/// colour also with a dark pause mark for game mode (whisper-svc paused).
+/// colour also with a dark pause mark for game mode (whisper-svc paused), and
+/// each of those also with a notification dot (unread notifications; docs/08 "Tray").
 /// </summary>
 public sealed class TrayIcons : IDisposable
 {
-    private readonly Dictionary<(TrayColour, bool), Icon> _icons = new();
+    private readonly Dictionary<(TrayColour, bool, bool), Icon> _icons = new();
 
     public TrayIcons(int size)
     {
         foreach (var gameMode in new[] { false, true })
+        foreach (var dot in new[] { false, true })
         {
-            _icons[(TrayColour.Green, gameMode)] = Circle(size, Color.FromArgb(46, 194, 96), gameMode);
-            _icons[(TrayColour.Yellow, gameMode)] = Circle(size, Color.FromArgb(245, 190, 30), gameMode);
-            _icons[(TrayColour.Red, gameMode)] = Circle(size, Color.FromArgb(220, 50, 50), gameMode);
-            _icons[(TrayColour.Blue, gameMode)] = Circle(size, Color.FromArgb(50, 130, 220), gameMode);
+            _icons[(TrayColour.Green, gameMode, dot)] = Circle(size, Color.FromArgb(46, 194, 96), gameMode, dot);
+            _icons[(TrayColour.Yellow, gameMode, dot)] = Circle(size, Color.FromArgb(245, 190, 30), gameMode, dot);
+            _icons[(TrayColour.Red, gameMode, dot)] = Circle(size, Color.FromArgb(220, 50, 50), gameMode, dot);
+            _icons[(TrayColour.Blue, gameMode, dot)] = Circle(size, Color.FromArgb(50, 130, 220), gameMode, dot);
         }
     }
 
-    public Icon this[TrayColour colour, bool gameMode = false] => _icons[(colour, gameMode)];
+    public Icon this[TrayColour colour, bool gameMode = false, bool notificationDot = false] => _icons[(colour, gameMode, notificationDot)];
 
-    private static Icon Circle(int size, Color fill, bool pauseMark)
+    private static Icon Circle(int size, Color fill, bool pauseMark, bool dot)
     {
         using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bmp))
@@ -47,6 +49,17 @@ public sealed class TrayIcons : IDisposable
                 var top = (size - h) / 2f;
                 g.FillRectangle(bars, size / 2f - w * 1.5f, top, w, h);
                 g.FillRectangle(bars, size / 2f + w * 0.5f, top, w, h);
+            }
+            if (dot)
+            {
+                // Top-right corner, white with a dark ring so it shows on every
+                // colour and over the pause mark's corner.
+                var d = Math.Max(5f, size * 0.42f);
+                var dotRect = new RectangleF(size - d - 0.5f, 0.5f, d, d);
+                using var dotFill = new SolidBrush(Color.White);
+                g.FillEllipse(dotFill, dotRect);
+                using var ring = new Pen(Color.FromArgb(230, 20, 20, 20), Math.Max(1f, size / 16f));
+                g.DrawEllipse(ring, dotRect);
             }
         }
         var handle = bmp.GetHicon();

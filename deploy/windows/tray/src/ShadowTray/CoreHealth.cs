@@ -10,8 +10,19 @@ namespace ShadowTray;
 /// </param>
 public sealed record ServiceHealth(string Name, bool Enabled, string Status, string? Detail = null);
 
+/// <summary>
+/// The Core's <c>GET /health</c> <c>inbox</c> counts (docs/08 "Tray"), sent only
+/// to loopback callers: numbers only, never titles or contents. Each count is
+/// null when the Core did not send it (older Core, feature off) or sent
+/// something that is not a non-negative integer.
+/// </summary>
+/// <param name="Dev">Open development items.</param>
+/// <param name="Notifications">Unread notifications.</param>
+public sealed record InboxCounts(int? Dev, int? Notifications);
+
 /// <summary>Result of one poll of the Core's <c>GET /health</c>.</summary>
-public sealed record CoreHealth(bool Reachable, IReadOnlyList<ServiceHealth> Services)
+/// <param name="Inbox">Null when the body has no <c>inbox</c> object (remote caller, older Core, malformed).</param>
+public sealed record CoreHealth(bool Reachable, IReadOnlyList<ServiceHealth> Services, InboxCounts? Inbox = null)
 {
     /// <summary>Longest <see cref="ServiceHealth.Detail"/> kept; the Core's codes are much shorter.</summary>
     public const int MaxDetailLength = 32;
@@ -20,8 +31,9 @@ public sealed record CoreHealth(bool Reachable, IReadOnlyList<ServiceHealth> Ser
 
     /// <summary>
     /// Parses the Core's /health body:
-    /// <c>{"status":"ok","service":"core",...,"services":[{"name","enabled","status","detail"?}]}</c>
-    /// (see docs/02-core-protocol.md). Anything else counts as unreachable.
+    /// <c>{"status":"ok","service":"core",...,"services":[{"name","enabled","status","detail"?}],"inbox"?:{"dev"?,"notifications"?}}</c>
+    /// (see docs/02-core-protocol.md, docs/08 "Tray"). Anything else counts as
+    /// unreachable; a malformed <c>inbox</c> only loses its counts.
     /// </summary>
     public static CoreHealth Parse(string json)
     {
@@ -51,13 +63,25 @@ public sealed record CoreHealth(bool Reachable, IReadOnlyList<ServiceHealth> Ser
                     list.Add(new ServiceHealth(name, enabled, status, detail));
                 }
             }
-            return new CoreHealth(true, list);
+            return new CoreHealth(true, list, ParseInbox(root));
         }
         catch (JsonException)
         {
             return Unreachable;
         }
     }
+
+    private static InboxCounts? ParseInbox(JsonElement root)
+    {
+        if (!root.TryGetProperty("inbox", out var inbox) || inbox.ValueKind != JsonValueKind.Object) return null;
+        return new InboxCounts(Count(inbox, "dev"), Count(inbox, "notifications"));
+    }
+
+    /// <summary>A non-negative integer that fits an int; anything else (string, 1.5, -1, 1e20) is no count.</summary>
+    private static int? Count(JsonElement inbox, string name) =>
+        inbox.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) && n >= 0
+            ? n
+            : null;
 
     /// <summary>
     /// The detail goes into a menu line and the tooltip: no control characters,
@@ -80,8 +104,9 @@ public interface ICoreHealthProbe
 }
 
 /// <summary>
-/// <c>GET &lt;core&gt;/health</c> over loopback HTTP (unauthenticated; names,
-/// enabled flags, statuses and short detail codes only — see docs/02-core-protocol.md).
+/// <c>GET &lt;core&gt;/health</c> over loopback HTTP (unauthenticated: no token,
+/// no Authorization header; names, enabled flags, statuses, short detail codes
+/// and the loopback-only inbox counts — see docs/02-core-protocol.md, docs/08 "Tray").
 /// </summary>
 public sealed class HttpCoreHealthProbe : ICoreHealthProbe, IDisposable
 {

@@ -73,6 +73,18 @@ The tooltip has a one-line summary. Menu (right click):
   Breaking away from the job (`CREATE_BREAKAWAY_FROM_JOB`) depends on the
   task's job allowing it; the shell route does not. If there is no desktop
   shell, the tray falls back to starting the browser itself (logged).
+- **Geliştirme (N)** / **Bildirimler (M)**: open the UI at `#dev` /
+  `#notifications` (the UI's notification panel comes with T7.w.5c; until
+  then that address opens the start page). N (open development items) and M (unread notifications)
+  are the `inbox` counts the Core adds to `GET /health` for loopback callers
+  only (numbers, no titles or contents; docs/08 "Tray"). Without a count
+  (Core not answering, an older Core, or a malformed `inbox`) the items read
+  just "Geliştirme" / "Bildirimler". The tray reads no token for this: the
+  request is the same unauthenticated `/health`, and every action happens in
+  the UI, which has a device token. While M > 0 the icon carries a white dot
+  (top right). When M rises, one balloon says "K yeni bildirim" (K = the rise;
+  the first count after the tray starts is only the baseline, and a Core that
+  is down or restarting keeps it). Development counts never show a balloon.
 - **Yeniden başlat / Durdur / Başlat**: the Core. Başlat during a restart
   wait restarts now; after "gave up" it starts over with fresh counters.
   All three are disabled while an external Core runs (not the tray's to

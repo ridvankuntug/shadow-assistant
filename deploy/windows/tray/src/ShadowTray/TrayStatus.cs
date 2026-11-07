@@ -47,7 +47,16 @@ public enum TrayColour
 
 /// <summary>What the tray shows: icon colour, tooltip and the status lines of the menu.</summary>
 /// <param name="GameMode">Game mode is on: the icon gets a pause mark (<see cref="TrayIcons"/>).</param>
-public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList<string> Lines, bool GameMode = false);
+/// <param name="Inbox">
+/// The Core's inbox counts while its /health answers (own or external Core);
+/// null otherwise. Menu items and the notification dot come from it (<see cref="TrayInbox"/>).
+/// </param>
+public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList<string> Lines, bool GameMode = false,
+    InboxCounts? Inbox = null)
+{
+    /// <summary>The icon gets a dot while there are unread notifications (never for development counts).</summary>
+    public bool NotificationDot => Inbox?.Notifications > 0;
+}
 
 /// <summary>
 /// Maps supervisor state + Core health to what the tray shows. Pure: no
@@ -137,7 +146,8 @@ public static class TrayStatusEvaluator
                 break;
         }
 
-        return new TrayStatus(colour, Truncate((gameMode ? GameModePrefix : Prefix) + summary, MaxTooltipLength), lines, gameMode);
+        return new TrayStatus(colour, Truncate((gameMode ? GameModePrefix : Prefix) + summary, MaxTooltipLength), lines, gameMode,
+            reachable ? health!.Inbox : null);
     }
 
     /// <summary>"sorun: whisper-svc kapalı (timeout), …" or null when no enabled service has a problem.</summary>

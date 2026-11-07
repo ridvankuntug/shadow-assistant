@@ -33,9 +33,10 @@ public sealed class TrayApp : ApplicationContext
     private readonly TrayIcons _icons;
     private readonly NotifyIcon _notify;
     private readonly ContextMenuStrip _menu;
-    private readonly ToolStripMenuItem _startItem, _stopItem, _restartItem, _dockerUpItem, _dockerDownItem, _gameModeItem, _uiItem;
+    private readonly ToolStripMenuItem _startItem, _stopItem, _restartItem, _dockerUpItem, _dockerDownItem, _gameModeItem, _uiItem, _devItem, _notificationsItem;
     private readonly ToolStripSeparator _statusEnd;
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly NotificationBalloon _notificationBalloon = new();
     private UiServer? _uiServer;
     private string? _uiError;
     private TrayStatus? _shown;
@@ -64,6 +65,10 @@ public sealed class TrayApp : ApplicationContext
         _menu = new ContextMenuStrip { ShowImageMargin = false };
         _statusEnd = new ToolStripSeparator();
         _uiItem = new ToolStripMenuItem("Arayüzü aç", null, (_, _) => OpenUi()) { Font = new Font(_menu.Font, FontStyle.Bold) };
+        // Counts from the Core's loopback /health inbox (docs/08 "Tray"); the
+        // actions happen in the UI, which has a device token. The tray has none.
+        _devItem = new ToolStripMenuItem(TrayInbox.DevMenuText(null), null, (_, _) => OpenUi(TrayInbox.DevHash));
+        _notificationsItem = new ToolStripMenuItem(TrayInbox.NotificationsMenuText(null), null, (_, _) => OpenUi(TrayInbox.NotificationsHash));
         _restartItem = new ToolStripMenuItem("Yeniden başlat", null, async (_, _) => await RunGuarded(() => _supervisor.RestartAsync(StopGrace)));
         _stopItem = new ToolStripMenuItem("Durdur", null, async (_, _) => await RunGuarded(() => _supervisor.StopAsync(StopGrace)));
         _startItem = new ToolStripMenuItem("Başlat", null, (_, _) => _supervisor.Start());
@@ -78,6 +83,8 @@ public sealed class TrayApp : ApplicationContext
         _menu.Items.AddRange([
             _statusEnd,
             _uiItem,
+            _devItem,
+            _notificationsItem,
             new ToolStripSeparator(),
             _restartItem,
             _stopItem,
@@ -127,6 +134,12 @@ public sealed class TrayApp : ApplicationContext
         var health = TrayStatusEvaluator.CurrentHealth(snap, _poller.Latest);
         var status = TrayStatusEvaluator.Evaluate(snap, health, DateTimeOffset.UtcNow, _gameMode.On);
 
+        // Only a rise in unread notifications shows a balloon; development counts never do.
+        // No clash with the GaveUp / Failed balloons below: counts exist only
+        // while a Core answers (Running / External).
+        if (_notificationBalloon.Observe(status.Inbox) is { } news && !_exiting)
+            _notify.ShowBalloonTip(5000, "Shadow Assistant", news, ToolTipIcon.Info);
+
         if (snap.State != _lastState)
         {
             if (snap.State == CoreRunState.GaveUp)
@@ -149,11 +162,14 @@ public sealed class TrayApp : ApplicationContext
         _gameModeItem.Enabled = !_dockerBusy && !_exiting && (_docker.Available || _gameMode.On);
 
         if (!force && !_menu.Visible && _shown is not null && _shown.Colour == status.Colour && _shown.GameMode == status.GameMode
-            && _shown.Tooltip == status.Tooltip)
+            && _shown.Tooltip == status.Tooltip && _shown.Inbox == status.Inbox)
             return;
 
-        if (_shown is null || _shown.Colour != status.Colour || _shown.GameMode != status.GameMode)
-            _notify.Icon = _icons[status.Colour, status.GameMode];
+        if (_shown is null || _shown.Colour != status.Colour || _shown.GameMode != status.GameMode
+            || _shown.NotificationDot != status.NotificationDot)
+            _notify.Icon = _icons[status.Colour, status.GameMode, status.NotificationDot];
+        _devItem.Text = TrayInbox.DevMenuText(status.Inbox);
+        _notificationsItem.Text = TrayInbox.NotificationsMenuText(status.Inbox);
         if (_shown is null || _shown.Tooltip != status.Tooltip) _notify.Text = status.Tooltip;
         if (_shown is null || force || _menu.Visible) RebuildStatusLines(status.Lines);
         _shown = status;
@@ -204,14 +220,15 @@ public sealed class TrayApp : ApplicationContext
         Refresh(force: true);
     }
 
-    private void OpenUi()
+    /// <param name="hash">UI panel to open (<see cref="TrayInbox.DevHash"/>, …); null for the start page.</param>
+    private void OpenUi(string? hash = null)
     {
         if (_uiServer is null)
         {
             _notify.ShowBalloonTip(5000, "Shadow Assistant", "Arayüz açılamıyor: " + (_uiError ?? "bilinmeyen hata"), ToolTipIcon.Warning);
             return;
         }
-        var url = _uiServer.Url.ToString();
+        var url = TrayInbox.UiUrl(_uiServer.Url, hash);
         try
         {
             // Through explorer.exe, so the browser is not in the tray's (Task
