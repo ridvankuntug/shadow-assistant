@@ -15,6 +15,8 @@ import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
+import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
+import { LEARNED_RULES_DIR, LearnedRuleStore } from "./learn/store.js";
 import { MemoryExtractor } from "./memory/extractor.js";
 import { DeviceMaintenance, formatBrief } from "./memory/lifecycle.js";
 import { MemoryStore } from "./memory/store.js";
@@ -24,10 +26,10 @@ import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
-import { PassthroughRouter, TieredRouter, type Router } from "./router.js";
+import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
-import { Session, type Logger } from "./session.js";
+import { Session, type Logger, type SessionLearning } from "./session.js";
 import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
@@ -286,10 +288,22 @@ export async function main(): Promise<void> {
   maintenance?.startup([...tokens.digests.keys()]);
   let router: Router;
   let direct: McpDirectClient | undefined;
+  // Learned tier-0 rules (docs/08 T7.w.2): only with the tiered router, direct calls and router.yaml `learning.enabled`.
+  let learnedRules: LearnedRuleStore | undefined;
+  let learning: SessionLearning | undefined;
   if (cfg.router) {
     const enabled = cfg.services.services.filter((s) => s.enabled).map((s) => s.name);
     for (const w of checkRouterServices(cfg.router, enabled)) logger.warn(`[shadow-core] router.yaml: ${w}`);
-    router = new TieredRouter({ config: cfg.router, models: cfg.models, onUsage: (u) => void usageLog.append(u) });
+    let learned: TieredRouterOptions["learned"];
+    if (cfg.router.direct.enabled && cfg.router.learning.enabled) {
+      const store = new LearnedRuleStore({ dir: join(cfg.dataDir, LEARNED_RULES_DIR), config: cfg.router, log: (m) => logger.warn(m) });
+      await store.load();
+      const policy = learnPolicy(cfg.router, cfg.services.services);
+      learned = { rules: () => store.snapshot(), targetFilter: learnTargetFilter(policy) };
+      learning = { store, policy, minObservations: cfg.router.learning.minObservations };
+      learnedRules = store;
+    }
+    router = new TieredRouter({ config: cfg.router, models: cfg.models, onUsage: (u) => void usageLog.append(u), learned });
     direct = cfg.router.direct.enabled ? mcpClient : undefined;
   } else {
     const passthrough = new PassthroughRouter(cfg.model);
@@ -332,6 +346,7 @@ export async function main(): Promise<void> {
           pronunciations,
           memory,
           maintenance,
+          learning,
         },
         info,
         send,
@@ -361,6 +376,7 @@ export async function main(): Promise<void> {
   logger.info(
     `[shadow-core] memory: ${memory ? `on (model ${cfg.memory.model}, idle ${cfg.memory.idleMin} min, every ${cfg.memory.everyTurns} turns)` : "off"}; compaction: ${cfg.memory.compactAtTokens > 0 && registry ? `at ${cfg.memory.compactAtTokens} tokens` : "off"}`,
   );
+  logger.info(`[shadow-core] learning: ${learnedRules ? `on (${learnedRules.snapshot().length} active learned rules)` : "off"}`);
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
   // List the remote services once now, so the first session gets their tools and instructions.
@@ -380,6 +396,7 @@ export async function main(): Promise<void> {
       .then(() => gateway.close())
       .then(() => mcpClient.close())
       .then(() => usageLog.flush())
+      .then(() => learnedRules?.flush())
       .then(() => process.exit(0));
   });
 }

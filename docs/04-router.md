@@ -229,6 +229,62 @@ only before any write succeeded (or when HA rejected the write), and the model's
 own tool calls pass the same gate. `reply` suits setups that want zero model
 calls for home commands.
 
+## Learned tier-0 rules (T7.w.2)
+
+Design and lifecycle: [08](08-learning-fast-path.md#t7w2-pattern-learning). A
+learned rule is an ordinary tier-0 rule written by the Core: one token array
+(literal words, `<ad>`, and `<sayi>` for brightness), one of the tools tier 0
+already runs, the target domain and device words it was learned with. It is
+compiled with the same `compilePattern()` and captured by the same matcher as
+a static rule (`compileLearnedTokens()` / `matchLearnedRules()` in
+[`router-config.ts`](../core/src/router-config.ts)), runs through
+`runDirectPlan()` and the same permission gate, and has no `permission` key,
+so approving a rule never lowers a level.
+
+Order: router.yaml rules (as said, then with number words as digits) → active
+learned rules (oldest activation first) → `long_input` / `default`. A request
+any static rule claims today is never taken over by a learned rule. Learned
+rules match the text with number words as digits (the same text they were
+learned from), always fall back to the model when they fail (independent of
+`direct.on_tool_error`) and are off with `CORE_ROUTER=off`,
+`direct.enabled: false` or `learning.enabled: false`.
+
+```yaml
+learning:
+  enabled: true               # off: nothing is observed, active rules are not used
+  min_observations: 3         # same outcomes before a phrasing is suggested (2..20)
+  max_failures: 3             # fallbacks in a row that suspend an active rule (1..20)
+  tools: [intent__HassTurnOn, intent__HassTurnOff, light__HassLightSet]   # ⊆ code ceiling
+  domains: [light, switch, media_player]                                    # ⊆ code ceiling
+  deny_name_words: [kapı, kilit, …]   # added to the Core's own list, never replaces it
+  keywords: { light: [ışık, lamba, …], switch: [priz, …] }   # per learnable domain
+  replies: { intent__HassTurnOn: "Tamam, {ad} açıldı.", … }  # light__HassLightSet also {seviye}
+```
+
+The block can only narrow the code ceilings: a tool outside
+`LEARNABLE_TOOLS`, a domain outside `LEARNABLE_DOMAINS` or any
+`NEVER_LEARNABLE_DOMAINS` entry (`lock`, `alarm_control_panel`, `cover`,
+`valve`, `garage_door`, `siren`, `climate`, …) in `tools`, `domains` or
+`keywords` stops the Core at startup with the path, e.g.
+`learning.domains.0: 'lock' is never learnable`. `deny_name_words` is added to
+`BASE_DENY_NAME_WORDS` (kapı, kilit, garaj, alarm, kepenk, panjur, vana, siren,
+door, lock, garage, gate, valve, shutter), so an empty list cannot re-allow
+those; a deny word refuses a target when it occurs anywhere inside a word of
+its name, alias or area ("Bahçekapısı" too). A learned pattern never stores a
+word that is a name or area word of the home (live context names, aliases and
+areas, and every `direct.area_aliases` name), in any suffixed form: a stem match,
+or the word starting with a name word of 3+ letters, with k/ğ, t/d, p/b folded
+("odamızdaki", "mutfağımızdaki"). Only a `keywords` device word and its
+inflected forms ("lambası", "ışığını") are exempt; a word that merely starts
+with one ("lambaderin") is not. Such a phrasing is not learned. Each
+`keywords` entry must be a single word of at most 64 characters (the rules.json
+check); anything else stops the Core at startup. Brightness is learnable on lights only; a
+`switch` only with `device_class: outlet`.
+
+`TEXT_NORMALIZER_VERSION` (router-config.ts) is the version of the text the
+matcher runs on (`prepareText` and the number words of `numbers.ts`); bump it
+whenever their output changes. Learned rules record it.
+
 ## Tiers 1 to 3 and escalation
 
 ### Decision (no model call)

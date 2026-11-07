@@ -93,6 +93,35 @@ direct:
     declined: Tamam, yapmıyorum.
     read_only: Şu an salt okuma modundayım, bunu yapamam.
 
+# Learned tier-0 rules (docs/08 T7.w.2). After ~3 model turns that solved the
+# same phrasing with the same single call, the Core suggests a rule; it runs
+# only after the user approves it ("Kuralı ekle"). Learned rules come after
+# every rule below, go through the same permission gate, and fall back to the
+# model silently when they fail. They live in the data dir, never in this file.
+# This block can only narrow what the Core allows in code: tools outside
+# HassTurnOn / HassTurnOff / HassLightSet or domains outside light / switch /
+# media_player are a startup error; locks, alarms, covers, valves and the like
+# are never learnable; a switch is learnable only with device_class: outlet.
+learning:
+  enabled: true
+  min_observations: 3
+  max_failures: 3
+  tools: [intent__HassTurnOn, intent__HassTurnOff, light__HassLightSet]
+  domains: [light, switch, media_player]
+  # Added to the Core's own list (kapı, kilit, garaj, alarm, kepenk, panjur,
+  # vana, siren, door, lock, garage, gate, valve, shutter): a target whose name,
+  # alias or area contains one is never learned or run. Generic words only.
+  deny_name_words: [kapı, kilit, garaj, alarm, kepenk, panjur, vana, kombi, ocak, fırın]
+  # Device words that may follow the spoken name in the entity name, per domain.
+  keywords:
+    light: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
+    switch: [priz, prizi, prizler, prizleri]
+    media_player: [televizyon, televizyonu, tv, hoparlör, hoparlörü]
+  replies:
+    intent__HassTurnOn: "Tamam, {ad} açıldı."
+    intent__HassTurnOff: "Tamam, {ad} kapatıldı."
+    light__HassLightSet: "Tamam, {ad} yüzde {seviye} yapıldı."
+
 rules:
   # ---------------------------------------------------------------- tier 0: lights
   # Name first ("salonun ışığını yak"), verb first ("yak salonun ışığını") or

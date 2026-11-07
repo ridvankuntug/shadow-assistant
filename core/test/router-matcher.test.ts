@@ -2,12 +2,23 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  BASE_DENY_NAME_WORDS,
   checkRouterServices,
+  compileLearnedRule,
+  compileLearnedTokens,
   compilePattern,
+  LEARNABLE_DOMAINS,
+  LEARNABLE_TOOLS,
+  learnableDomainsFor,
   loadRouterFile,
+  matchLearnedRules,
   matchRules,
+  NEVER_LEARNABLE_DOMAINS,
   parseRouterConfig,
   RouterConfigError,
+  TIER0_MAX_CHARS,
+  type CompiledLearnedRule,
+  type LearnableTool,
 } from "../src/router-config.js";
 import { TieredRouter } from "../src/router.js";
 import { cleanTurkish, fold, prepareText, stemCandidates } from "../src/turkish.js";
@@ -520,5 +531,147 @@ describe("checkRouterServices", () => {
     const warnings = checkRouterServices(c, ["home-assistant"]);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0] ?? "", /tier1\.services.*nope/);
+  });
+});
+
+// ------------------------------------------------------------------ I) learning block and learned patterns (T7.w.2a)
+
+describe("learning config (T7.w.2a)", () => {
+  const learn = (learning: Record<string, unknown>) => JSON.stringify({ version: 1, learning });
+
+  const bad: [string, string, RegExp][] = [
+    ["a tool outside the ceiling", learn({ tools: ["intent__HassTurnOn", "lock__HassLock"] }), /learning\.tools\.1: 'lock__HassLock' is not learnable/],
+    ["GetLiveContext as a learnable tool", learn({ tools: ["homeassistant__GetLiveContext"] }), /learning\.tools\.0/],
+    ["a never-learnable domain", learn({ domains: ["light", "lock"] }), /learning\.domains\.1: 'lock' is never learnable/],
+    ["alarm_control_panel", learn({ domains: ["alarm_control_panel"] }), /never learnable/],
+    ["cover (garage doors, blinds)", learn({ domains: ["cover"] }), /never learnable/],
+    ["valve", learn({ domains: ["valve"] }), /never learnable/],
+    ["fan (static tier 0, not learnable)", learn({ domains: ["fan"] }), /learning\.domains\.0: 'fan' is not a learnable domain/],
+    ["keywords for a never-learnable domain", learn({ keywords: { lock: ["kilit"] } }), /learning\.keywords\.lock/],
+    // rules.json accepts only single words of at most 64 characters; a keyword it would refuse
+    // must fail here, not quarantine every stored rule at the next start.
+    ["a keyword with a space", learn({ keywords: { light: ["ışık", "tavan lambası"] } }), /learning\.keywords\.light\.1: must be a single word/],
+    ["a keyword longer than 64 characters", learn({ keywords: { light: ["a".repeat(65)] } }), /learning\.keywords\.light\.0: must be a single word/],
+    ["unknown key", learn({ auto_activate: true }), /auto_activate/],
+    ["unknown reply tool", learn({ replies: { lock__HassLock: "x" } }), /lock__HassLock/],
+    ["min_observations 1", learn({ min_observations: 1 }), /min_observations/],
+    ["max_failures 0", learn({ max_failures: 0 }), /max_failures/],
+  ];
+  for (const [label, text, re] of bad) {
+    test(`startup fails: ${label}`, () => {
+      assert.throws(
+        () => parseRouterConfig(text),
+        (err: unknown) => {
+          assert.ok(err instanceof RouterConfigError, String(err));
+          assert.match(err.message, re);
+          return true;
+        },
+      );
+    });
+  }
+
+  test("defaults: on, the full ceiling, 3 / 3, base deny words always present", () => {
+    const c = parseRouterConfig("version: 1");
+    assert.equal(c.learning.enabled, true);
+    assert.equal(c.learning.minObservations, 3);
+    assert.equal(c.learning.maxFailures, 3);
+    assert.deepEqual([...c.learning.tools], [...LEARNABLE_TOOLS]);
+    assert.deepEqual([...c.learning.domains], [...LEARNABLE_DOMAINS]);
+    for (const w of BASE_DENY_NAME_WORDS) assert.ok(c.learning.denyNameWords.has(fold(w)), w);
+    assert.match(c.learning.replies.light__HassLightSet, /\{seviye\}/);
+  });
+
+  test("router.yaml can narrow; an empty deny list never removes the base words", () => {
+    const c = parseRouterConfig(learn({ tools: ["intent__HassTurnOn"], domains: ["light"], deny_name_words: [] }));
+    assert.deepEqual([...c.learning.tools], ["intent__HassTurnOn"]);
+    assert.deepEqual([...c.learning.domains], ["light"]);
+    assert.ok(c.learning.denyNameWords.has("kapi"));
+    assert.ok(c.learning.denyNameWords.has("kilit"));
+  });
+
+  test("extra deny words are folded and added", () => {
+    const c = parseRouterConfig(learn({ deny_name_words: ["Şofben"] }));
+    assert.ok(c.learning.denyNameWords.has("sofben"));
+    assert.ok(c.learning.denyNameWords.has("garaj"));
+  });
+
+  test("brightness is learnable on lights only; never-learnable domains never come back", () => {
+    const all = new Set(["light", "switch", "media_player", "lock", "cover"]);
+    assert.deepEqual(learnableDomainsFor("light__HassLightSet", all), ["light"]);
+    assert.deepEqual(learnableDomainsFor("intent__HassTurnOn", all), ["light", "switch", "media_player"]);
+    assert.deepEqual(learnableDomainsFor("intent__HassTurnOn", new Set(["switch"])), ["switch"]);
+    assert.deepEqual(learnableDomainsFor("lock__HassLock", all), []);
+    for (const d of ["lock", "alarm_control_panel", "cover", "valve", "garage_door", "siren", "climate"]) assert.ok(NEVER_LEARNABLE_DOMAINS.has(d), d);
+  });
+
+  test("the shipped router.yaml learning block stays inside the ceiling", () => {
+    assert.equal(cfg.learning.enabled, true);
+    for (const d of cfg.learning.domains) assert.ok(!NEVER_LEARNABLE_DOMAINS.has(d), d);
+    assert.ok(cfg.learning.keywords.light && cfg.learning.keywords.light.length > 0);
+  });
+});
+
+describe("learned patterns (T7.w.2a)", () => {
+  const rule = (tokens: string[], tool: LearnableTool = "light__HassLightSet", domains = ["light"]): CompiledLearnedRule =>
+    compileLearnedRule({ id: "lr-00000001", tokens, service: "home-assistant", tool, domains, keywords: ["lamba"] }, cfg.direct.maxNameWords);
+  const textOf = (s: string) => prepareText(s, cfg.fillers);
+
+  test("compiles and matches like the equivalent static pattern", () => {
+    const learned = rule(["<ad>", "parlaklığı", "yüzde", "<sayi>", "olsun"]);
+    const stat = compilePattern("<ad> parlaklığı yüzde <sayi> olsun", cfg.direct.maxNameWords);
+    assert.equal(learned.pattern.regex.source, stat.regex.source);
+    const hit = matchLearnedRules(cfg, [learned], textOf("Salon lambası parlaklığı yüzde 40 olsun"));
+    assert.ok(hit);
+    assert.equal(hit.plan.rule, "learned:lr-00000001");
+    assert.equal(hit.plan.name, "salon lambası");
+    assert.equal(hit.plan.brightness, 40);
+    assert.equal(hit.plan.tool, "light__HassLightSet");
+    assert.deepEqual(hit.plan.domains, ["light"]);
+    assert.equal(hit.plan.permission, undefined);
+    assert.match(hit.plan.reply, /\{seviye\}/);
+  });
+
+  test("the shared capture checks apply: stop names, name stop words, level over 100, TIER0_MAX_CHARS", () => {
+    const learned = rule(["<ad>", "parlaklığı", "yüzde", "<sayi>", "olsun"]);
+    assert.equal(matchLearnedRules(cfg, [learned], textOf("şunu parlaklığı yüzde 40 olsun")), undefined);
+    assert.equal(matchLearnedRules(cfg, [learned], textOf("salon ve mutfak parlaklığı yüzde 40 olsun")), undefined);
+    assert.equal(matchLearnedRules(cfg, [learned], textOf("salon parlaklığı yüzde 150 olsun")), undefined);
+    const long = `${"a".repeat(TIER0_MAX_CHARS)} parlaklığı yüzde 40 olsun`;
+    assert.equal(matchLearnedRules(cfg, [learned], textOf(long)), undefined);
+  });
+
+  test("a narrowed learning block disables a stored rule (tool or domain) instead of widening", () => {
+    const narrowed = parseRouterConfig(JSON.stringify({ version: 1, learning: { tools: ["intent__HassTurnOn"], domains: ["light"] } }));
+    const set = rule(["<ad>", "parlaklığı", "yüzde", "<sayi>", "olsun"]);
+    assert.equal(matchLearnedRules(narrowed, [set], textOf("salon parlaklığı yüzde 40 olsun")), undefined);
+    const plug = rule(["<ad>", "fişini", "tak"], "intent__HassTurnOn", ["switch"]);
+    assert.equal(matchLearnedRules(narrowed, [plug], textOf("mutfak fişini tak")), undefined);
+    assert.ok(matchLearnedRules(cfg, [plug], textOf("mutfak fişini tak")));
+  });
+
+  test("invalid token arrays never compile", () => {
+    const bad: [string[], string][] = [
+      [[], "light__HassLightSet"],
+      [["parlaklığı", "<sayi>"], "light__HassLightSet"],
+      [["<ad>", "<ad>", "<sayi>"], "light__HassLightSet"],
+      [["<ad>", "aç"], "light__HassLightSet"],
+      [["<ad>", "<sayi>", "aç"], "intent__HassTurnOn"],
+      [["<ad>", "{aç|kapat}"], "intent__HassTurnOn"],
+      [["<ad>", "*"], "intent__HassTurnOn"],
+      [["<ad>", "a|b"], "intent__HassTurnOn"],
+      [["<ad>", "@open"], "intent__HassTurnOn"],
+      [["<ad>", "Aç"], "intent__HassTurnOn"],
+      [["<ad>", "aç kapat"], "intent__HassTurnOn"],
+      [["<ad>", "<isim>"], "intent__HassTurnOn"],
+    ];
+    for (const [tokens, tool] of bad) assert.throws(() => compileLearnedTokens(tokens, tool, 4), Error, JSON.stringify(tokens));
+    assert.doesNotThrow(() => compileLearnedTokens(["<ad>", "fişini", "tak"], "intent__HassTurnOn", 4));
+  });
+
+  test("first active rule in the given order wins", () => {
+    const def = { tokens: ["<ad>", "fişini", "tak"], service: "home-assistant", domains: ["switch"], keywords: [] };
+    const a = compileLearnedRule({ ...def, id: "lr-0000000a", tool: "intent__HassTurnOn" }, 4);
+    const b = compileLearnedRule({ ...def, id: "lr-0000000b", tool: "intent__HassTurnOff" }, 4);
+    assert.equal(matchLearnedRules(cfg, [a, b], textOf("mutfak fişini tak"))?.plan.rule, "learned:lr-0000000a");
   });
 });

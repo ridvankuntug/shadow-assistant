@@ -14,6 +14,10 @@
  * "oturma odası"). Light-set rules resolve the same way and call
  * HassLightSet with `brightness`. Sensor rules read the live context and
  * summarise it with a template.
+ *
+ * Learned rules (T7.w.2) run through the same code; their plan carries a
+ * `targetFilter` (safety layer 3, docs/08): a resolved entity it refuses is
+ * not called and the turn falls back to the model.
  */
 import { LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import {
@@ -89,23 +93,42 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
 
   // 2b) switch: resolve the name, then call the intent
   if (plan.name === undefined) return failOr("no_name", m.not_found);
-  const res = resolveWithAliases(entities, plan);
+  const res = resolvePlanTarget(entities, plan);
   if (res.status === "none") return failOr("name_not_found", m.not_found);
   if (res.status === "ambiguous") return failOr("name_ambiguous", m.ambiguous);
+  if (res.status === "refused") return failOr("target_refused", m.not_found);
   if (plan.tool === LIGHT_SET_TOOL && plan.brightness === undefined) return failOr("no_brightness", m.failed);
 
-  const act = await call(plan.tool, {
-    name: res.callName,
-    ...(res.area ? { area: res.area } : {}),
-    domain: [res.entity.domain],
-    ...(plan.tool === LIGHT_SET_TOOL ? { brightness: plan.brightness } : {}),
-  });
+  const act = await call(plan.tool, directCallArgs(plan, res));
   if (act.status === "denied") return denied(act.reason);
   if (act.status === "unavailable") return { kind: "reply", text: m.unavailable, status: "error" };
   if (act.result.isError) return failOr("tool_error", m.failed);
   const vars: Record<string, string> = { ad: res.label };
   if (plan.brightness !== undefined) vars.seviye = String(plan.brightness);
   return { kind: "reply", text: fillTemplate(plan.reply, vars), status: "done" };
+}
+
+/** The arguments of a switch / light-set call for a resolved target (also replayed by the learner, learn/extract.ts). */
+export function directCallArgs(plan: DirectPlan, res: Extract<Resolution, { status: "ok" }>): Record<string, unknown> {
+  return {
+    name: res.callName,
+    ...(res.area ? { area: res.area } : {}),
+    domain: [res.entity.domain],
+    ...(plan.tool === LIGHT_SET_TOOL ? { brightness: plan.brightness } : {}),
+  };
+}
+
+export type TargetResolution = Resolution | { status: "refused" };
+
+/**
+ * `resolveWithAliases()`, then the plan's `targetFilter` (learned rules only)
+ * on the one resolved entity: a refused target is never called. Without a
+ * filter this is exactly `resolveWithAliases()`.
+ */
+export function resolvePlanTarget(entities: readonly LiveEntity[], plan: DirectPlan): TargetResolution {
+  const res = resolveWithAliases(entities, plan);
+  if (res.status === "ok" && plan.targetFilter && !plan.targetFilter(res.entity)) return { status: "refused" };
+  return res;
 }
 
 /**

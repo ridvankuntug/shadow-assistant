@@ -15,8 +15,8 @@ import { findReadings, parseLiveContext, resolveDevice } from "../src/live-conte
 import { DirectUnavailableError, type DirectToolClient, type DirectToolResult } from "../src/mcp-direct.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import type { ServerFrame } from "../src/protocol.js";
-import { parseRouterConfig } from "../src/router-config.js";
-import { ESCALATION_MARKER, TieredRouter, type UsageRecord } from "../src/router.js";
+import { compileLearnedRule, parseRouterConfig } from "../src/router-config.js";
+import { ESCALATION_MARKER, PassthroughRouter, TieredRouter, type UsageRecord } from "../src/router.js";
 import { parseServices } from "../src/services.js";
 import { Session } from "../src/session.js";
 import { ESCALATION_CONTINUE } from "../src/turn-envelope.js";
@@ -647,4 +647,101 @@ test("McpDirectClient: a server that never sends the SSE endpoint times out and 
   await client.close();
   server.closeAllConnections();
   await new Promise<void>((r) => server.close(() => r()));
+});
+
+// ------------------------------------------------------------------ learned rules in the router (T7.w.2d)
+
+const LEARN_YAML = `
+version: 1
+direct:
+  on_tool_error: reply
+rules:
+  - id: light-on
+    tier: 0
+    patterns: ["<ad> ışığını aç"]
+    service: home-assistant
+    tool: intent__HassTurnOn
+    domains: [light]
+    reply: "Tamam."
+  - id: deep
+    tier: 3
+    patterns: ["* derin analiz *"]
+  - id: compare
+    tier: 2
+    patterns: ["* karşılaştır *"]
+`;
+
+function learnedRouter(yaml = LEARN_YAML, rules: string[][] = [["<ad>", "ışığını", "aç"], ["<ad>", "derin", "analiz", "et"], ["<ad>", "karşılaştır"], ["<ad>", "parlaklığı", "yüzde", "<sayi>", "olsun"]]) {
+  const config = parseRouterConfig(yaml);
+  const compiled = rules.map((tokens, i) =>
+    compileLearnedRule(
+      {
+        id: `lr-0000000${i}`,
+        tokens,
+        service: "home-assistant",
+        tool: tokens.includes("<sayi>") ? "light__HassLightSet" : "intent__HassTurnOn",
+        domains: ["light"],
+        keywords: ["lamba"],
+      },
+      config.direct.maxNameWords,
+    ),
+  );
+  let active = compiled;
+  const router = new TieredRouter({ config, models: MODELS, learned: { rules: () => active, targetFilter: () => true } });
+  return { router, setActive: (r: typeof compiled) => (active = r), compiled };
+}
+const route = (r: TieredRouter, text: string) => r.route({ text, source: "text", device: "browser" });
+
+test("router: a static rule of any tier always wins over a learned rule", () => {
+  const { router } = learnedRouter();
+  const t0 = route(router, "salon ışığını aç");
+  assert.equal(t0.source, "static");
+  assert.equal(t0.rule, "light-on");
+  assert.equal(route(router, "bunu derin analiz et").source, "static");
+  assert.equal(route(router, "bunu derin analiz et").tier, 3);
+  assert.equal(route(router, "ikisini karşılaştır").tier, 2);
+  assert.equal(route(router, "ikisini karşılaştır").rule, "compare");
+});
+
+test("router: an active learned rule matches after the static rules, always with fallback", () => {
+  const { router } = learnedRouter();
+  const d = route(router, "Salon lambası parlaklığı yüzde elli olsun");
+  assert.equal(d.tier, 0);
+  assert.equal(d.source, "learned");
+  assert.equal(d.learnedId, "lr-00000003");
+  assert.equal(d.rule, "learned:lr-00000003");
+  assert.equal(d.fallbackOnError, true); // even with on_tool_error: reply
+  assert.equal(d.direct?.brightness, 50);
+  assert.equal(d.direct?.name, "salon lambası");
+  assert.equal(typeof d.direct?.targetFilter, "function");
+  assert.equal(d.direct?.permission, undefined);
+});
+
+test("router: learned rules are off when not active, learning or direct is off, or the text is too long", () => {
+  const text = "salon lambası parlaklığı yüzde 40 olsun";
+  const a = learnedRouter();
+  a.setActive([]);
+  assert.equal(route(a.router, text).source, "default");
+  assert.equal(route(learnedRouter(`${LEARN_YAML}learning: { enabled: false }\n`).router, text).source, "default");
+  const noDirect = route(learnedRouter(LEARN_YAML.replace("direct:\n", "direct:\n  enabled: false\n")).router, text);
+  assert.equal(noDirect.source, "default");
+  assert.equal(noDirect.tier, 1);
+  // A four-word name (inside max_name_words) that makes the text longer than TIER0_MAX_CHARS.
+  a.setActive(a.compiled);
+  const longName = ["a", "b", "c", "d"].map((c) => c.repeat(50)).join(" ");
+  assert.equal(route(a.router, `${longName.slice(0, 20)} parlaklığı yüzde 40 olsun`).source, "learned");
+  assert.equal(route(a.router, `${longName} parlaklığı yüzde 40 olsun`).source, "default");
+  assert.equal(new PassthroughRouter("m").route().source, undefined);
+});
+
+test("router: default and long_input sources; the default decision carries the matched text", () => {
+  const { router } = learnedRouter();
+  const d = route(router, "lütfen yüzde elli olsun");
+  assert.equal(d.source, "default");
+  assert.equal(d.rule, "default");
+  assert.equal(d.text?.display, "lütfen yüzde 50 olsun");
+  assert.equal(route(router, "merhaba").text?.display, "merhaba");
+  const long = route(router, "kelime ".repeat(31));
+  assert.equal(long.source, "long_input");
+  assert.equal(long.text, undefined);
 });

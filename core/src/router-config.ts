@@ -17,10 +17,16 @@
  *   *           any number of words (also none)
  *
  * Rules are tried in file order; the first matching pattern wins.
+ *
+ * Learned rules (T7.w.2, docs/08): the `learning` block and its code ceilings
+ * (LEARNABLE_TOOLS / LEARNABLE_DOMAINS / NEVER_LEARNABLE_DOMAINS) live here
+ * too, and a learned rule's token array is compiled with the same
+ * `compilePattern()` and captured by the same matcher as a static rule.
  */
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import type { LiveEntity } from "./live-context.js";
 import type { PermissionLevel } from "./services.js";
 import { cleanTurkish, fold, type PreparedText } from "./turkish.js";
 
@@ -35,6 +41,14 @@ export type SensorKind = "temperature" | "humidity";
 const level = z.enum(["read", "write", "confirm"]);
 const nonEmpty = z.string().trim().min(1);
 const kebab = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be lowercase kebab-case");
+/**
+ * One device word of `learning.keywords`: a single word of at most 64
+ * characters. A learned rule stores these words and rules.json validation
+ * (learn/store.ts) applies the same rule, so a word the file would refuse is
+ * refused here, at startup, instead of quarantining every stored rule later.
+ */
+export const LEARNED_KEYWORD = /^\S{1,64}$/u;
+const learnedKeyword = nonEmpty.regex(LEARNED_KEYWORD, "must be a single word of at most 64 characters");
 
 const messagesSchema = z
   .object({
@@ -66,6 +80,115 @@ const ruleSchema = z
     permission: level.optional(),
     reply: nonEmpty.optional(),
     reply_many: nonEmpty.optional(),
+  })
+  .strict();
+
+// ---------------------------------------------------------------- learning ceilings (T7.w.2)
+
+/** The only service a learned rule may call (the tools runDirectPlan() can execute live there). */
+export const LEARNABLE_SERVICE = "home-assistant";
+/** Code ceiling of learnable tools: router.yaml `learning.tools` may narrow it, never widen it. */
+export const LEARNABLE_TOOLS = ["intent__HassTurnOn", "intent__HassTurnOff", LIGHT_SET_TOOL] as const;
+export type LearnableTool = (typeof LEARNABLE_TOOLS)[number];
+/** Code ceiling of target domains (light, brightness, plug, media on/off); router.yaml may narrow it. */
+export const LEARNABLE_DOMAINS = ["light", "switch", "media_player"] as const;
+/**
+ * Checked before the ceiling, so a later edit of LEARNABLE_DOMAINS cannot let
+ * these in. `fan` is not low-risk in the plan's sense and is simply not in the
+ * ceiling.
+ */
+export const NEVER_LEARNABLE_DOMAINS: ReadonlySet<string> = new Set([
+  "lock",
+  "alarm_control_panel",
+  "cover",
+  "valve",
+  "garage_door",
+  "siren",
+  "climate",
+  "water_heater",
+  "camera",
+  "vacuum",
+  "lawn_mower",
+  "button",
+  "scene",
+  "script",
+  "automation",
+]);
+/**
+ * Name words that always refuse a target (its name, aliases or areas; matched
+ * as a substring of a folded word, so compounds count too). The
+ * router.yaml `learning.deny_name_words` list is added to these: an empty or
+ * shorter list there can never re-allow a door or an alarm.
+ */
+export const BASE_DENY_NAME_WORDS = [
+  "kapı",
+  "kilit",
+  "garaj",
+  "alarm",
+  "kepenk",
+  "panjur",
+  "vana",
+  "siren",
+  // HA entity names are often English.
+  "door",
+  "lock",
+  "garage",
+  "gate",
+  "valve",
+  "shutter",
+] as const;
+/**
+ * Version of the text the matcher runs on (cleanTurkish / prepareText in
+ * turkish.ts and the number words of numbers.ts, T7.w.1). Bump it whenever
+ * their output changes: learned rules record it, and observations counted
+ * under another version restart (docs/08 §Data file).
+ */
+export const TEXT_NORMALIZER_VERSION = 1;
+
+export const isLearnableTool = (t: string): t is LearnableTool => (LEARNABLE_TOOLS as readonly string[]).includes(t);
+/** In the code ceiling and not never-learnable (router.yaml narrowing is applied separately). */
+export const isLearnableDomain = (d: string): boolean => !NEVER_LEARNABLE_DOMAINS.has(d) && (LEARNABLE_DOMAINS as readonly string[]).includes(d);
+
+/**
+ * Domains a learned rule of `tool` may touch, within `allowed`: brightness
+ * (light__HassLightSet) only on lights; never a NEVER_LEARNABLE domain.
+ */
+export function learnableDomainsFor(tool: string, allowed: ReadonlySet<string>): string[] {
+  if (!isLearnableTool(tool)) return [];
+  const ceiling: readonly string[] = tool === LIGHT_SET_TOOL ? ["light"] : LEARNABLE_DOMAINS;
+  return ceiling.filter((d) => isLearnableDomain(d) && allowed.has(d));
+}
+
+const DEFAULT_LEARN_REPLIES: Record<LearnableTool, string> = {
+  intent__HassTurnOn: "Tamam, {ad} açıldı.",
+  intent__HassTurnOff: "Tamam, {ad} kapatıldı.",
+  light__HassLightSet: "Tamam, {ad} yüzde {seviye} yapıldı.",
+};
+
+const learningSchema = z
+  .object({
+    /** Off: nothing is observed and active learned rules are not used. */
+    enabled: z.boolean().default(true),
+    /** Same-outcome observations before a phrasing becomes a candidate (never active without approval). */
+    min_observations: z.number().int().min(2).max(20).default(3),
+    /** Fallbacks in a row that suspend an active learned rule. */
+    max_failures: z.number().int().min(1).max(20).default(3),
+    /** Must lie inside LEARNABLE_TOOLS (checked below). */
+    tools: z.array(nonEmpty).default([...LEARNABLE_TOOLS]),
+    /** Must lie inside LEARNABLE_DOMAINS (checked below). */
+    domains: z.array(nonEmpty).default([...LEARNABLE_DOMAINS]),
+    /** Added to BASE_DENY_NAME_WORDS. */
+    deny_name_words: z.array(nonEmpty).default([]),
+    /** Device words for <ad> resolution, per learnable domain. */
+    keywords: z.record(z.string(), z.array(learnedKeyword)).default({}),
+    replies: z
+      .object({
+        intent__HassTurnOn: nonEmpty.optional(),
+        intent__HassTurnOff: nonEmpty.optional(),
+        light__HassLightSet: nonEmpty.optional(),
+      })
+      .strict()
+      .default({}),
   })
   .strict();
 
@@ -112,9 +235,30 @@ export const routerFileSchema = z
         messages: messagesSchema.parse({}),
       }),
     rules: z.array(ruleSchema).default([]),
+    learning: learningSchema.default(learningSchema.parse({})),
   })
   .strict()
   .superRefine((cfg, ctx) => {
+    // The learning block may only narrow the code ceilings (docs/08 §Safety).
+    cfg.learning.tools.forEach((t, j) => {
+      if (!isLearnableTool(t)) {
+        ctx.addIssue({ code: "custom", path: ["learning", "tools", j], message: `'${t}' is not learnable (allowed: ${LEARNABLE_TOOLS.join(", ")})` });
+      }
+    });
+    const domainProblem = (d: string) =>
+      NEVER_LEARNABLE_DOMAINS.has(d)
+        ? `'${d}' is never learnable`
+        : !isLearnableDomain(d)
+          ? `'${d}' is not a learnable domain (allowed: ${LEARNABLE_DOMAINS.join(", ")})`
+          : undefined;
+    cfg.learning.domains.forEach((d, j) => {
+      const problem = domainProblem(d);
+      if (problem) ctx.addIssue({ code: "custom", path: ["learning", "domains", j], message: problem });
+    });
+    for (const d of Object.keys(cfg.learning.keywords)) {
+      const problem = domainProblem(d);
+      if (problem) ctx.addIssue({ code: "custom", path: ["learning", "keywords", d], message: problem });
+    }
     const ids = new Set<string>();
     cfg.rules.forEach((r, i) => {
       const at = (key: string) => ["rules", i, key];
@@ -263,6 +407,11 @@ export interface DirectPlan {
   replyMany?: string;
   maxItems: number;
   messages: DirectMessages;
+  /**
+   * Learned rules only (safety layer 3, docs/08): the resolved entity must
+   * pass this check, else the plan falls back to the model. Static rules have none.
+   */
+  targetFilter?: (entity: LiveEntity) => boolean;
 }
 
 export interface CompiledRule {
@@ -278,6 +427,8 @@ export interface CompiledRouterConfig {
   direct: {
     enabled: boolean;
     onToolError: "fallback" | "reply";
+    /** `direct.max_name_words`: longest `<ad>` capture (static and learned rules). */
+    maxNameWords: number;
     stopNames: Set<string>;
     /** Folded `name_stop_words`. */
     nameStopWords: Set<string>;
@@ -286,6 +437,21 @@ export interface CompiledRouterConfig {
     messages: DirectMessages;
   };
   rules: CompiledRule[];
+  learning: CompiledLearning;
+}
+
+/** router.yaml `learning`, inside the code ceilings. */
+export interface CompiledLearning {
+  enabled: boolean;
+  minObservations: number;
+  maxFailures: number;
+  tools: ReadonlySet<string>;
+  domains: ReadonlySet<string>;
+  /** Folded; BASE_DENY_NAME_WORDS plus router.yaml `deny_name_words`. */
+  denyNameWords: ReadonlySet<string>;
+  /** Per learnable domain. */
+  keywords: Readonly<Record<string, readonly string[]>>;
+  replies: Readonly<Record<LearnableTool, string>>;
 }
 
 function zodProblems(err: z.ZodError): string[] {
@@ -318,6 +484,7 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
     direct: {
       enabled: cfg.direct.enabled,
       onToolError: cfg.direct.on_tool_error,
+      maxNameWords: cfg.direct.max_name_words,
       stopNames: new Set(cfg.direct.stop_names.map(normWord)),
       nameStopWords: new Set(cfg.direct.name_stop_words.map(normWord)),
       areaAliases: cfg.direct.area_aliases,
@@ -325,6 +492,17 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
       messages: cfg.direct.messages,
     },
     rules,
+    learning: {
+      enabled: cfg.learning.enabled,
+      minObservations: cfg.learning.min_observations,
+      maxFailures: cfg.learning.max_failures,
+      // Validated above to lie inside the ceilings; filtered again so the sets can never hold more.
+      tools: new Set(cfg.learning.tools.filter(isLearnableTool)),
+      domains: new Set(cfg.learning.domains.filter(isLearnableDomain)),
+      denyNameWords: new Set([...BASE_DENY_NAME_WORDS, ...cfg.learning.deny_name_words].map(normWord).filter((w) => w !== "")),
+      keywords: Object.fromEntries(Object.entries(cfg.learning.keywords).filter(([d]) => isLearnableDomain(d))),
+      replies: { ...DEFAULT_LEARN_REPLIES, ...cfg.learning.replies },
+    },
   };
 }
 
@@ -376,40 +554,62 @@ export type RuleMatch = { rule: string; tier: 0; plan: DirectPlan } | { rule: st
  */
 export const TIER0_MAX_CHARS = 200;
 
+/** A prepared text as the matcher sees it (see router.ts: as said, or with number words as digits). */
+export type MatchText = PreparedText & {
+  /**
+   * Set for a text whose number words were converted (numbers.ts): gives back
+   * the words as said behind a span of `display`, so `<ad>` is captured as
+   * said ("oda iki", not "oda 2").
+   */
+  original?: (start: number, end: number) => string;
+};
+
+interface Capture {
+  name?: string;
+  brightness?: number;
+}
+
 /**
- * `original`: set for a text whose number words were converted (numbers.ts):
- * gives back the words as said behind a span of `display`, so `<ad>` is
- * captured as said ("oda iki", not "oda 2").
+ * Runs one compiled pattern on `subject` (= `text.folded + " "`) and applies
+ * the capture checks every rule shares: a stop name or a name holding a
+ * name-stop word is not a name, a number over 100 is not a level. Undefined
+ * when the pattern does not match or a check refuses the capture.
  */
-export function matchRules(
-  cfg: CompiledRouterConfig,
-  text: PreparedText & { original?: (start: number, end: number) => string },
-): RuleMatch | undefined {
+function capture(cfg: CompiledRouterConfig, p: CompiledPattern, subject: string, text: MatchText): Capture | undefined {
+  const m = p.regex.exec(subject);
+  if (!m) return undefined;
+  let name: string | undefined;
+  const span = m.indices?.groups?.ad;
+  if (span) {
+    name = text.original ? text.original(span[0], span[1]) : text.display.slice(span[0], span[1]);
+    const folded = fold(name);
+    if (cfg.direct.stopNames.has(folded)) return undefined;
+    // "ışığı kapat ve mutfağı aç": the capture spans a second clause, not a name.
+    if (folded.split(" ").some((w) => cfg.direct.nameStopWords.has(w))) return undefined;
+  }
+  let brightness: number | undefined;
+  const num = m.groups?.sayi;
+  if (num !== undefined) {
+    brightness = Number(num);
+    // "150'ye" is far more often a mis-heard "%50'ye" than a request: leave it to the model.
+    if (brightness > 100) return undefined;
+  }
+  return { ...(name !== undefined ? { name } : {}), ...(brightness !== undefined ? { brightness } : {}) };
+}
+
+export function matchRules(cfg: CompiledRouterConfig, text: MatchText): RuleMatch | undefined {
   if (text.folded === "") return undefined;
   const subject = `${text.folded} `;
   const tier0Allowed = text.folded.length <= TIER0_MAX_CHARS;
   for (const { rule, patterns } of cfg.rules) {
     if (rule.tier === 0 && !tier0Allowed) continue;
     for (const p of patterns) {
-      const m = p.regex.exec(subject);
-      if (!m) continue;
-      if (rule.tier !== 0) return { rule: rule.id, tier: rule.tier };
-      let name: string | undefined;
-      const span = m.indices?.groups?.ad;
-      if (span) {
-        name = text.original ? text.original(span[0], span[1]) : text.display.slice(span[0], span[1]);
-        const folded = fold(name);
-        if (cfg.direct.stopNames.has(folded)) continue;
-        // "ışığı kapat ve mutfağı aç": the capture spans a second clause, not a name.
-        if (folded.split(" ").some((w) => cfg.direct.nameStopWords.has(w))) continue;
+      if (rule.tier !== 0) {
+        if (p.regex.test(subject)) return { rule: rule.id, tier: rule.tier };
+        continue;
       }
-      let brightness: number | undefined;
-      const num = m.groups?.sayi;
-      if (num !== undefined) {
-        brightness = Number(num);
-        // "150'ye" is far more often a mis-heard "%50'ye" than a request: leave it to the model.
-        if (brightness > 100) continue;
-      }
+      const cap = capture(cfg, p, subject, text);
+      if (!cap) continue;
       return {
         rule: rule.id,
         tier: 0,
@@ -417,8 +617,7 @@ export function matchRules(
           rule: rule.id,
           service: rule.service as string,
           tool: rule.tool as DirectTool,
-          ...(name !== undefined ? { name } : {}),
-          ...(brightness !== undefined ? { brightness } : {}),
+          ...cap,
           areaAliases: cfg.direct.areaAliases,
           domains: rule.domains ?? [],
           keywords: rule.keywords ?? [],
@@ -432,6 +631,107 @@ export function matchRules(
         },
       };
     }
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------- learned rules (T7.w.2)
+
+/**
+ * A literal word of a learned pattern (display form). Nothing else may be
+ * stored, so no pattern metacharacter (`{ } | * < > @`) ever reaches
+ * compilePattern() from rules.json.
+ */
+export const LEARNED_WORD = /^[a-z0-9çğıöşü]+$/;
+export const NAME_SLOT = "<ad>";
+export const NUMBER_SLOT = "<sayi>";
+
+/** What compiling and matching a learned rule needs (the store keeps the rest). */
+export interface LearnedRuleDef {
+  /** `lr-<hash>`; the plan's rule id is `learned:<id>`. */
+  id: string;
+  tokens: readonly string[];
+  service: string;
+  tool: LearnableTool;
+  /** Target domains the rule was learned with (stored, never widened by a later router.yaml). */
+  domains: readonly string[];
+  /** Device words the rule was learned with. */
+  keywords: readonly string[];
+}
+
+export interface CompiledLearnedRule {
+  def: LearnedRuleDef;
+  pattern: CompiledPattern;
+}
+
+/**
+ * Compiles a learned token array: literal words (LEARNED_WORD), exactly one
+ * `<ad>`, and `<sayi>` exactly when the tool is light__HassLightSet — the
+ * same shape router.yaml demands of a static switch / light-set pattern.
+ * Throws on anything else.
+ */
+export function compileLearnedTokens(tokens: readonly string[], tool: string, maxNameWords: number): CompiledPattern {
+  if (tokens.length === 0) throw new Error("empty learned pattern");
+  for (const t of tokens) {
+    if (t !== NAME_SLOT && t !== NUMBER_SLOT && !LEARNED_WORD.test(t)) throw new Error("learned pattern holds a token that is not a plain word");
+  }
+  if (tokens.filter((t) => t === NAME_SLOT).length !== 1) throw new Error("a learned pattern needs exactly one <ad>");
+  const numbers = tokens.filter((t) => t === NUMBER_SLOT).length;
+  if (numbers !== (tool === LIGHT_SET_TOOL ? 1 : 0)) throw new Error(`<sayi> is required with ${LIGHT_SET_TOOL} and allowed nowhere else`);
+  return compilePattern(tokens.join(" "), maxNameWords);
+}
+
+export function compileLearnedRule(def: LearnedRuleDef, maxNameWords: number): CompiledLearnedRule {
+  return { def, pattern: compileLearnedTokens(def.tokens, def.tool, maxNameWords) };
+}
+
+export interface LearnedMatch {
+  rule: CompiledLearnedRule;
+  plan: DirectPlan;
+}
+
+/**
+ * Tries learned rules (already `active`, in the caller's order) on a text no
+ * static rule matched. Uses the static matcher's capture checks and limits
+ * (TIER0_MAX_CHARS); a rule whose tool or domains the current `learning`
+ * block no longer allows is skipped, and its domains are intersected with the
+ * allowed ones (never widened). `targetFilter` is safety layer 3 at run time.
+ * The plan has no `permission`: the services.yaml level applies unchanged.
+ */
+export function matchLearnedRules(
+  cfg: CompiledRouterConfig,
+  rules: readonly CompiledLearnedRule[],
+  text: MatchText,
+  targetFilter?: (entity: LiveEntity) => boolean,
+): LearnedMatch | undefined {
+  if (text.folded === "" || text.folded.length > TIER0_MAX_CHARS) return undefined;
+  const subject = `${text.folded} `;
+  for (const rule of rules) {
+    const { def } = rule;
+    if (def.service !== LEARNABLE_SERVICE || !cfg.learning.tools.has(def.tool)) continue;
+    const allowed = new Set(learnableDomainsFor(def.tool, cfg.learning.domains));
+    const domains = def.domains.filter((d) => allowed.has(d));
+    if (domains.length === 0) continue;
+    const cap = capture(cfg, rule.pattern, subject, text);
+    if (!cap || cap.name === undefined) continue;
+    if ((def.tool === LIGHT_SET_TOOL) !== (cap.brightness !== undefined)) continue;
+    const id = `learned:${def.id}`;
+    return {
+      rule,
+      plan: {
+        rule: id,
+        service: def.service,
+        tool: def.tool,
+        ...cap,
+        areaAliases: cfg.direct.areaAliases,
+        domains,
+        keywords: [...def.keywords],
+        reply: cfg.learning.replies[def.tool],
+        maxItems: cfg.direct.maxItems,
+        messages: cfg.direct.messages,
+        ...(targetFilter ? { targetFilter } : {}),
+      },
+    };
   }
   return undefined;
 }

@@ -243,7 +243,14 @@ is the same read tier 0 does).
 4. **Literal words.** Every other word stays a literal word. Each must match
    `^[a-z0-9çğıöşü]+$` after folding (always true after `prepareText()`; the check
    guarantees no pattern metacharacter `{ } | * < > @` is ever stored). Patterns
-   are stored as a token array and only joined for `compilePattern()`.
+   are stored as a token array and only joined for `compilePattern()`. A literal
+   word that is a name or area word of the home (live context names, aliases,
+   areas and every `direct.area_aliases` name) in any suffixed form — a stem
+   match, or the word starting with a name word of 3+ letters with k/ğ, t/d, p/b
+   folded ("odamızdaki", "mutfağımızdaki") — refuses the pattern
+   (`name_word_in_pattern`). Only a `learning.keywords` device word and its
+   inflected forms (plural, possessive, case, `-ki`: "lambası", "ışığını") are
+   exempt; "lambaderin" is not. Refusing too much is the safe side.
 5. **Round trip.** Compile the pattern and match it against the same prepared
    text with the learned-rule matcher; it must match and capture the same span
    and number. Otherwise drop (`round_trip`).
@@ -352,7 +359,7 @@ learning:
   tools: [intent__HassTurnOn, intent__HassTurnOff, light__HassLightSet]   # ⊆ code ceiling
   domains: [light, switch, media_player]                                    # ⊆ code ceiling
   deny_name_words: [kapı, kilit, garaj, alarm, kepenk, panjur, vana]
-  keywords:                # device words for <ad> resolution, per domain
+  keywords:                # device words for <ad> resolution, per domain; single words, ≤ 64 chars
     light: [ışık, ışığı, ışıklar, ışıkları, lamba, lambası, lambalar, lambaları, aydınlatma]
   replies:
     intent__HassTurnOn: "Tamam, {ad} açıldı."
@@ -801,24 +808,24 @@ parallel with the Core work after 4a. `session.ts` serializes 2d → 3b → 4b �
 `App.tsx` serializes 4c → 5c; 4d waits for both `/health` changes (4b, 5b).
 T7.w.7 has no task (deferred).
 
-- [ ] **T7.w.2a — `learning` config and ceilings.** zod schema for the `learning`
+- [x] **T7.w.2a — `learning` config and ceilings.** zod schema for the `learning`
   block; `LEARNABLE_TOOLS` / `LEARNABLE_DOMAINS` / `NEVER_LEARNABLE_DOMAINS`;
   narrowing check; a compile function for learned token arrays on top of
   `compilePattern()`, sharing the matcher with static rules; the router.yaml block
   with generic words only; a docs/04 section. Acceptance: a value outside the
   ceiling fails startup with a clear message; a learned pattern compiles and
   matches like the equivalent static one; all existing router tests pass.
-- [ ] **T7.w.2b — Extractor.** Eligibility, steps 1-5, safety layers 1-3, signature,
+- [x] **T7.w.2b — Extractor.** Eligibility, steps 1-5, safety layers 1-3, signature,
   reject reasons; the target filter in `direct.ts`. Acceptance: the extractor
   tests in [Tests](#tests) pass; it never returns a pattern for a never-learnable
   domain, a deny word, a `device_class` from `confirm_inputs`, a switch without
   `outlet`, an area-only call, a call whose target is not in the text, or a
   confirm-level call.
-- [ ] **T7.w.2c — Rule store.** `rules.json` with lifecycle, counters, caps,
+- [x] **T7.w.2c — Rule store.** `rules.json` with lifecycle, counters, caps,
   quarantine, normalizer version, load-time re-validation, active snapshot.
   Acceptance: the store tests in [Tests](#tests); a write interrupted before the
   rename leaves the previous file intact.
-- [ ] **T7.w.2d — Router and session wiring.** `RouteDecision.source`; learned rules
+- [x] **T7.w.2d — Router and session wiring.** `RouteDecision.source`; learned rules
   after static rules; per-turn gated-call capture across attempts; observation at
   settle, off the turn path; learned-rule outcome reporting and suspension.
   Acceptance: the router and session tests in [Tests](#tests); a static tier-0
@@ -843,7 +850,7 @@ T7.w.7 has no task (deferred).
   a candidate (re-validated) and the next matching utterance runs at tier 0;
   `add_rule` with `CORE_DEV_DEVICES` unset or from another device → `not_allowed`;
   `/health` from a non-loopback address has no `inbox`.
-- [ ] **T7.w.4c — UI Development panel.** As in [UI](#ui). Acceptance: controller
+- [x] **T7.w.4c — UI Development panel.** As in [UI](#ui). Acceptance: controller
   tests for list, actions, badge and `canManage`; panel hidden without the `dev`
   feature; no `notify` or sound for development items.
 - [ ] **T7.w.4d — Tray counts.** As in [Tray](#tray). Acceptance: tray tests parse
@@ -883,3 +890,47 @@ T7.w.7 has no task (deferred).
   (unknown non-`mcp__` names) done; gap 1 blocked: `buildOneShotOptions()` lives
   in `index.ts`, which runs `main()` on import, so it cannot be tested without a
   source change (move it to its own module) — awaiting a decision.
+- 2026-11-07: T7.w.2a done (senior-dev): `learning` block + ceilings in router-config.ts,
+  shared capture for static and learned patterns, router.yaml block, docs/04 section.
+  Narrowest readings: router.yaml `deny_name_words` is added to a code base list
+  (`BASE_DENY_NAME_WORDS`), never replaces it; the normalizer version is
+  `TEXT_NORMALIZER_VERSION` in router-config.ts (numbers.ts is outside the 2a-2d files).
+- 2026-11-07: T7.w.2b done (senior-dev): `learn/extract.ts` (eligibility, steps 1-5,
+  layers 1-3, signature) and the `targetFilter` in direct.ts (`resolvePlanTarget`,
+  `directCallArgs`). Narrowest readings: the model's call must carry exactly one
+  `domain` (the executor always passes one) and a `name`; a name span counts only
+  if steps 3-5 also succeed for it (so "Lamba 2" + a brightness is learnable).
+- 2026-11-07: T7.w.2c done (senior-dev): `learn/store.ts` (`observe`, `activate` = the
+  candidate → active step for T7.w.4b, `reject`, `recordOutcome`, `list`, snapshot).
+  Readings: a candidate whose normalizer differs at load goes back to observing (0);
+  activation is a copy-write-swap, suspension applies in memory even if its write fails.
+- 2026-11-07: T7.w.2d implemented (senior-dev): `RouteDecision.source` / `learnedId` / `text`,
+  learned rules after static ones, per-turn gated-call capture (paired by tool use id),
+  observation after every attempt settled, learned-rule outcomes and suspension; index.ts wiring.
+  Review round 1 (senior-code-reviewer): fixed — a literal pattern word that is a name or
+  area word of the home is refused (`name_word_in_pattern`; else a room name could land in
+  rules.json); deny words match as a substring and the base list got English words; an
+  unpairable tool result is logged once. Kept by choice: a normalizer change also resets
+  `conflicts` of observing / candidate entries (they were counted on other text); built-in
+  tool attempts the SDK guard denies before the Core gate are not seen by the learner (the
+  learned action is still the one allowed call).
+- 2026-11-07: Review round 2 (senior-code-reviewer) left findings open; stopped after two rounds
+  for a decision. 2b back to [~]: a home name word can still reach rules.json as a literal
+  (keyword-prefix exemption "lambader", compound/softened suffixes "odamızdaki"/"mutfağımızdaki",
+  names only in `direct.area_aliases`). 2a back to [~]: `learning.keywords` accepts words with
+  spaces / > 64 chars that the rules.json validator rejects (the whole file would be quarantined
+  at the next start). 2d acceptance met (router + session tests); tester not run yet.
+- 2026-11-07: Review round 3 (targeted, last; senior-dev fix, senior-code-reviewer, tester with
+  mutation checks). Closed: device-word exemption only for a `keywords` word plus an inflection
+  suffix (`DEVICE_WORD_SUFFIX`, "lambaderin" refused); name words compared by stem or 3+ letter
+  prefix with k/ğ, t/d, p/b folded ("odamızdaki", "mutfağımızdaki"); `direct.area_aliases` names
+  are name words; `learning.keywords` uses the rules.json rule (`LEARNED_KEYWORD`, single word
+  ≤ 64 chars) and fails startup otherwise. 2a [x]. 2b stays [~]: one low residual awaits a
+  decision — a real word that is a keyword plus a valid suffix ("prizma", "lambada") is still
+  exempt even when it is a home name. npm test 1139/1139, lint, build clean.
+- 2026-11-07: known residual after the third (last) review round, left open for
+  a user decision: the device-word exemption runs before the name-word check, so
+  a real word that is a device word plus a valid suffix ("prizma", "lambada")
+  can still be stored as a literal even when it is also a home name. Option:
+  check name words first (blocks more phrasings, e.g. "lambası" when a device is
+  called "Tavan Lambası").

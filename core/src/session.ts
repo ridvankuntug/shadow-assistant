@@ -10,6 +10,9 @@ import type { AgentRunner, TurnResult } from "./agent.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
 import type { DeviceRegistry } from "./device-registry.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
+import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
+import type { LearnedRuleStore } from "./learn/store.js";
+import { parseLiveContext } from "./live-context.js";
 import type { DirectToolClient } from "./mcp-direct.js";
 import type { DeviceMaintenance } from "./memory/lifecycle.js";
 import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
@@ -33,7 +36,7 @@ import {
   type PermissionPolicy,
 } from "./permissions.js";
 import type { ClientFrame, ErrorCode, MemoryFrame, ServerFrame, SpeechMode } from "./protocol.js";
-import type { DirectPlan } from "./router-config.js";
+import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
 import { EMPTY_LEXICON, type Lexicon } from "./pronunciation.js";
@@ -53,6 +56,25 @@ interface DirectNote {
   seq: number;
   text: string;
 }
+
+/** Gated calls kept per model turn for learning; a turn with more is never learned from (one action is the limit anyway). */
+export const MAX_OBSERVED_CALLS = 8;
+
+/**
+ * Learned-rule fallbacks that count toward suspension (docs/08 §Lifecycle):
+ * the rule's own failures. Anything else (no client, service disabled,
+ * denial, cancel, unreachable service) is neutral.
+ */
+const LEARNED_FAILURES: ReadonlySet<string> = new Set([
+  "name_not_found",
+  "name_ambiguous",
+  "target_refused",
+  "tool_error",
+  "live_context_error",
+  "live_context_unparseable",
+  "no_name",
+  "no_brightness",
+]);
 
 /** close() waits at most this long for turn tails (usage at `settled`, timing, speech) before session_end. */
 export const TAIL_WAIT_MS = 3_000;
@@ -114,6 +136,24 @@ export interface SessionDeps {
   memory?: SessionMemory;
   /** Extraction triggers and compaction; absent = none. */
   maintenance?: SessionMaintenance;
+  /** Pattern learning (T7.w.2, docs/08); absent = nothing observed, learned outcomes not counted. */
+  learning?: SessionLearning;
+}
+
+/** What a session needs for pattern learning. */
+export interface SessionLearning {
+  store: Pick<LearnedRuleStore, "observe" | "recordOutcome">;
+  policy: LearnPolicy;
+  /** router.yaml `learning.min_observations` (only for the "candidate" log line). */
+  minObservations?: number;
+}
+
+/** The gated calls of one model turn, for the learner (arguments in memory for the turn only). */
+interface TurnObservation {
+  calls: ObservedCall[];
+  byUseId: Map<string, ObservedCall>;
+  /** More than MAX_OBSERVED_CALLS: never learned from. */
+  overflow: boolean;
 }
 
 export interface SessionInfo {
@@ -140,6 +180,8 @@ interface ActiveTurn {
   cancelled?: boolean;
   /** Time the turn waited for a running compaction (docs/06), for the `timing` record. */
   waitedForCompactMs?: number;
+  /** Set for a turn the learner may look at (`source: "default"`, learning on). */
+  observed?: TurnObservation;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -150,6 +192,8 @@ interface SpeechPrefs {
 
 /** Messages the model gets for gate denials. */
 type GateDeny = DenyReason | "tier_service";
+/** The level the gate applied (`deny`: built-in tool). */
+type GateLevel = PermissionLevel | "deny";
 
 export class Session {
   private turn: ActiveTurn | null = null;
@@ -175,6 +219,8 @@ export class Session {
   private readonly tails = new Set<Promise<unknown>>();
   /** Memory entries already sent in this socket's conversation, when no registry keeps them per device (legacy mode). */
   private readonly sentHere = new SentEntries();
+  /** The "result not paired" learning note is logged once per session. */
+  private unpairedLogged = false;
 
   constructor(
     private readonly deps: SessionDeps,
@@ -449,8 +495,17 @@ export class Session {
         await this.waitHold(turn);
         if (await this.runDirect(turn, text, decision, decision.direct)) return;
         // Fallback: the cheap model takes over (nothing was changed in the home).
-        await this.runModel(turn, text, { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule }, routeMs);
+        // Silent for a learned rule too; such a recovery turn is never learned from.
+        await this.runModel(
+          turn,
+          text,
+          { model: decision.model, tier: 1, escalateTo: decision.escalateTo, rule: decision.rule, source: decision.source },
+          routeMs,
+        );
         return;
+      }
+      if (decision.source === "default" && decision.text && this.deps.learning) {
+        turn.observed = { calls: [], byUseId: new Map(), overflow: false };
       }
       await this.runModel(turn, text, decision, routeMs);
     } catch (err) {
@@ -602,6 +657,7 @@ export class Session {
       outcome = await runDirectPlan(plan, call, { fallbackOnError: decision.fallbackOnError === true });
     }
     if (turn.abort.signal.aborted) outcome = { kind: "cancelled" };
+    if (decision.source === "learned" && decision.learnedId !== undefined) this.reportLearned(decision.learnedId, outcome);
 
     const usage = (o: UsageOutcome): UsageRecord => ({
       turnId: id,
@@ -638,6 +694,97 @@ export class Session {
     this.addDirectNote(`Kullanıcı: ${text}\nShadow: ${outcome.text}`);
     this.recordUsage(usage(outcome.status === "done" ? "done" : outcome.status));
     return true;
+  }
+
+  /**
+   * Counts one run of an active learned rule (off the turn path): a success,
+   * a fallback of the rule's own (toward suspension) or neutral.
+   */
+  private reportLearned(id: string, outcome: DirectOutcome): void {
+    const store = this.deps.learning?.store;
+    if (!store) return;
+    let p: Promise<unknown> | undefined;
+    if (outcome.kind === "reply" && outcome.status === "done") p = store.recordOutcome(id, "success");
+    else if (outcome.kind === "fallback" && LEARNED_FAILURES.has(outcome.reason)) p = store.recordOutcome(id, "failure", outcome.reason);
+    if (p) this.track(p);
+  }
+
+  // ------------------------------------------------------------ pattern learning (T7.w.2)
+
+  /** Keeps one gated call of an observed model turn. */
+  private observeCall(turn: ActiveTurn, toolName: string, input: Record<string, unknown>, toolUseId: string, allowed: boolean, level: ObservedCall["level"]): void {
+    const obs = turn.observed;
+    if (!obs || obs.overflow) return;
+    if (obs.calls.length >= MAX_OBSERVED_CALLS) {
+      obs.overflow = true;
+      obs.calls.length = 0;
+      obs.byUseId.clear();
+      return;
+    }
+    const { identity } = this.deps.policy.levelFor(toolName);
+    const call: ObservedCall = {
+      ...(identity.service !== undefined ? { service: identity.service } : {}),
+      tool: identity.tool,
+      args: { ...input },
+      level,
+      allowed,
+    };
+    obs.calls.push(call);
+    // A tool use id seen twice is not a call we can pair with its result.
+    if (obs.byUseId.has(toolUseId)) obs.overflow = true;
+    obs.byUseId.set(toolUseId, call);
+  }
+
+  /** Pairs a tool result with its observed call. */
+  private observeResult(turn: ActiveTurn, toolUseId: string, isError: boolean): void {
+    const call = turn.observed?.byUseId.get(toolUseId);
+    if (call) call.isError = call.isError === true || isError;
+  }
+
+  /**
+   * Hands an observed model turn to the learner once every attempt has
+   * settled (docs/07 §Turn boundaries), off the turn path. `completed` is
+   * read then: the turn ended `done` (not cancelled, no error, no limit).
+   */
+  private learnAtSettle(turn: ActiveTurn, decision: RouteDecision, settled: Promise<unknown>, completed: () => boolean): void {
+    const obs = turn.observed;
+    turn.observed = undefined;
+    const learning = this.deps.learning;
+    const text = decision.text;
+    if (!obs || !learning || !text || decision.source !== "default") return;
+    this.track(settled.then(() => this.learnFrom(learning, obs, text, completed())));
+  }
+
+  private async learnFrom(learning: SessionLearning, obs: TurnObservation, text: NonNullable<RouteDecision["text"]>, completed: boolean): Promise<void> {
+    if (obs.overflow) return;
+    const policy = this.deps.policy;
+    const check = checkTurn({ routedByDefault: true, completed, readOnly: policy.options.readOnly === true, text, calls: obs.calls }, learning.policy);
+    if (!check.ok) {
+      // Fail closed, but visible: a result the gate's tool use id could not be paired with means nothing is ever learned.
+      if (check.reason === "no_result" && !this.unpairedLogged) {
+        this.unpairedLogged = true;
+        this.deps.logger.info("[shadow-core] learning: a tool result could not be paired with its call; the turn is not learned from");
+      }
+      return;
+    }
+    // The learner's own live-context read: only through the direct client and only while it is a `read` tool (no prompt possible).
+    const client = this.deps.direct;
+    if (!client || !policy.serviceNames.includes(LEARNABLE_SERVICE)) return;
+    if (policy.levelFor(`mcp__${LEARNABLE_SERVICE}__${LIVE_CONTEXT_TOOL}`).level !== "read") return;
+    let entities;
+    try {
+      const ctx = await client.callTool(LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, {}, this.side.signal);
+      if (ctx.isError) return;
+      entities = parseLiveContext(ctx.text);
+    } catch {
+      return; // unreachable or unparseable: the observation is dropped silently
+    }
+    const x = extractPattern(text, check.value, entities, learning.policy);
+    if (!x.ok) return;
+    const r = await learning.store.observe(x.value);
+    if (r?.status === "candidate" && r.observations === learning.minObservations) {
+      this.deps.logger.info(`[shadow-core] learned rule ${r.id} is a candidate (waits for approval)`);
+    }
   }
 
   /**
@@ -813,6 +960,8 @@ export class Session {
     }
     this.recordModelUsage(turn, callTier, model, result, cancelled ? "cancelled" : result.error ? "error" : "done");
     this.writeTiming(turn, callTier, routeMs, doneAt, Promise.resolve({ sdkDurationMs: result.durationMs, warm: false, queryAgeMs: 0 }));
+    // Legacy results are final on return.
+    this.learnAtSettle(turn, decision, Promise.resolve(), () => !cancelled && !result.error);
     return result;
   }
 
@@ -844,7 +993,10 @@ export class Session {
           if (o.escalatable) buffer += chunk;
           else this.live(turn, chunk);
         },
-        onToolResult: (_toolUseId, name, isError) => this.toolFinished(id, name, isError),
+        onToolResult: (toolUseId, name, isError) => {
+          this.toolFinished(id, name, isError);
+          this.observeResult(turn, toolUseId, isError);
+        },
       },
     );
     if (!o.escalatable) return { result, escalate: false };
@@ -913,6 +1065,8 @@ export class Session {
       this.bufferDirectNotes(notes);
     }
     let call = first;
+    /** Every attempt's `settled`: the learner waits for all of them. */
+    const attemptsSettled: Promise<AttemptOutcome>[] = [first.settled];
     let out = await call.done;
     /** The escalation attempt could not start: the turn ends as an error of the first attempt. */
     let escalationFailed = false;
@@ -928,6 +1082,7 @@ export class Session {
         model = escalateTo.model;
         callTier = escalateTo.tier;
         call = next;
+        attemptsSettled.push(next.settled);
         out = await call.done;
       }
     }
@@ -970,7 +1125,17 @@ export class Session {
     const registry = this.deps.registry;
     const device = this.info.device;
     // An unsent turn did not move the conversation: no continuity update, no model turn counted.
-    if (!sent) return true;
+    if (!sent) {
+      turn.observed = undefined;
+      return true;
+    }
+    let lastStatus: AttemptOutcome["status"] | undefined;
+    this.learnAtSettle(
+      turn,
+      decision,
+      Promise.all(attemptsSettled).then((all) => (lastStatus = all[all.length - 1]?.status)),
+      () => !cancelled && !escalationFailed && out.status === "ok" && lastStatus === "ok",
+    );
     this.track(
       settled.then(async (o) => {
         if (registry) await registry.turnEnded(device);
@@ -1006,7 +1171,10 @@ export class Session {
             if (o.escalatable) buffer += chunk;
             else this.live(turn, chunk);
           },
-          onToolResult: (_toolUseId, name, isError) => this.toolFinished(turn.id, name, isError),
+          onToolResult: (toolUseId, name, isError) => {
+            this.toolFinished(turn.id, name, isError);
+            this.observeResult(turn, toolUseId, isError);
+          },
         },
       });
     } catch (err) {
@@ -1110,6 +1278,7 @@ export class Session {
       const r = services && !this.inTierServices(toolName, services)
         ? this.denyOutsideTier(turn, toolName, input)
         : await this.authorize(turn, toolName, input, opts.signal);
+      this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
         : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
@@ -1122,14 +1291,14 @@ export class Session {
   }
 
   /** Same records as a gate denial, for a tool of a service outside the current tier. */
-  private denyOutsideTier(turn: ActiveTurn, toolName: string, input: Record<string, unknown>): { allowed: false; reason: GateDeny } {
+  private denyOutsideTier(turn: ActiveTurn, toolName: string, input: Record<string, unknown>): { allowed: false; reason: GateDeny; level: "deny" } {
     const { identity } = this.deps.policy.levelFor(toolName, input);
     const id = turn.id;
     void this.slog.append({ kind: "tool_call", id, tool: identity.full, level: "deny", reason: "tier_service", input });
     this.emit({ type: "tool", id, name: identity.tool, status: "denied" });
     void this.slog.append({ kind: "permission", id, tool: identity.full, decision: "deny", level: "deny" });
     this.deps.logger.info(`[shadow-core] denied ${identity.full} (not in this tier's services)`);
-    return { allowed: false, reason: "tier_service" };
+    return { allowed: false, reason: "tier_service", level: "deny" };
   }
 
   /**
@@ -1143,7 +1312,7 @@ export class Session {
     input: Record<string, unknown>,
     signal: AbortSignal,
     minLevel?: PermissionLevel,
-  ): Promise<{ allowed: true } | { allowed: false; reason: DenyReason }> {
+  ): Promise<{ allowed: true; level: GateLevel } | { allowed: false; reason: DenyReason; level: GateLevel }> {
     const decision = this.deps.policy.levelFor(toolName, input);
     const { identity } = decision;
     let level = decision.level;
@@ -1156,7 +1325,7 @@ export class Session {
     const id = turn.id;
     void this.slog.append({ kind: "tool_call", id, tool: identity.full, level, reason, input });
 
-    const deny = (why: DenyReason, by?: string, requestId?: string): { allowed: false; reason: DenyReason } => {
+    const deny = (why: DenyReason, by?: string, requestId?: string): { allowed: false; reason: DenyReason; level: GateLevel } => {
       this.emit({ type: "tool", id, name: tool, status: "denied" });
       void this.slog.append({
         kind: "permission",
@@ -1168,9 +1337,9 @@ export class Session {
         ...(requestId ? { requestId } : {}),
       });
       this.deps.logger.info(`[shadow-core] denied ${identity.full} (${reason}${by ? `, by ${by}` : ""})`);
-      return { allowed: false, reason: why };
+      return { allowed: false, reason: why, level };
     };
-    const allow = (by?: string, requestId?: string): { allowed: true } => {
+    const allow = (by?: string, requestId?: string): { allowed: true; level: GateLevel } => {
       this.emit({ type: "tool", id, name: tool, status: "started" });
       void this.slog.append({
         kind: "permission",
@@ -1186,7 +1355,7 @@ export class Session {
           `[shadow-core] ${level} tool ${identity.full} allowed for device ${this.info.device}${by ? ` (by ${by})` : ""}`,
         );
       }
-      return { allowed: true };
+      return { allowed: true, level };
     };
 
     if (turn.abort.signal.aborted) return deny("cancelled");
