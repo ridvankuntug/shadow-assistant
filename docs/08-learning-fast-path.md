@@ -677,6 +677,18 @@ notifications (no push, no sound) and stay in their own stores.
   shared across devices.
 - **Kept until deleted or resolved; no silent pruning.** A hard limit (5000 items)
   only refuses new keyless raises (logged); recurring conditions must use a key.
+- **Unreadable file (T7.w.10f).** A file that cannot be read (other than missing),
+  or an invalid one that could not be moved aside, is never overwritten: `raise`
+  answers `unavailable`, every other store call rejects
+  (`NotificationsUnavailableError`) and clients get `error`
+  `notifications_unavailable` ([docs/02](02-core-protocol.md#notifications)); the
+  UI shows "Bildirimler okunamadı" and a "!" bell badge instead of an empty inbox.
+  An invalid file that could be moved aside keeps the T7.w.5a behaviour
+  (`.corrupt-<ts>` copy, empty inbox, one warning).
+- **Store internals (T7.w.10g).** Items are held in a Map by id (file order) with a
+  source + key index, so an action finds and copies one item; only the list reply
+  builds the whole list, once. Writes are coalesced (at most one per second,
+  `DEFAULT_COALESCE_MS`), as `turns.json`; shutdown flushes the pending write.
 
 **T11-B fit (not designed here):** the reminder is one keyed item
 (`source: "device-state"`, `key: "case-battery-low"`, `urgency: "normal"`). At
@@ -786,6 +798,9 @@ ever learned from such a turn.
 | services.yaml raises the tool to `confirm` | the learned rule asks for confirmation (gate) |
 | router.yaml narrows `learning` | affected rules `suspended` (`not_allowed`) at load |
 | a store write fails | logged; in-memory state kept; next write retries; a rule activation is not applied |
+| notifications file unreadable | `notifications_unavailable` to list / actions, `unavailable` to `raise`; the file is not overwritten; "Bildirimler okunamadı", bell "!" |
+| a flush fails or hangs at shutdown | logged by name; the other flushes still run; exit after 5 s at the latest (T7.w.10h) |
+| a close step hangs at shutdown | after the 3 s close budget the steps still closing are logged (the remaining closes skipped) and the flushes start anyway; exit after 5 s in total (T7.w.10h) |
 | a client that does not know `dev` / `notifications` | it ignores the broadcast count frames (they go to every authenticated socket; clients do not announce features); request frames are only sent by clients that saw the feature; badges hidden without the feature |
 
 ## Kullanıcı kararı gerekli (decisions for the user)
@@ -960,6 +975,9 @@ T7.w.7 has no task (deferred).
   - [x] T7.w.10c — apostrophe in "yüz'de" ignored in number expressions
   - [x] T7.w.10d — relative timing in the "linear on long input" test
   - [x] T7.w.10e — UI: closing the memory panel abandons its request; a tray hash for the open panel is cleared; catch-up summary above three normal items
+  - [x] T7.w.10f — unreadable notifications file reported (`notifications_unavailable`), "Bildirimler okunamadı" and a "!" bell badge; the file is never overwritten
+  - [x] T7.w.10g — NotificationStore: items by id, no list copy per action, coalesced writes flushed on shutdown
+  - [x] T7.w.10h — shutdown chain: every flush runs (`Promise.allSettled`), each failure logged, close budget 3 s (the flushes start even after a hanging close), forced exit after 5 s
 - [x] **T7.w.8 — Remove and re-open learned rules (decision 4).** `remove_rule` (active →
   rejected) and `add_rule` on a suspended rule (re-validated → active), both limited to
   `CORE_DEV_DEVICES`; "Kaldır" / "Yeniden aç" in the panel. Acceptance: a removed rule leaves the
@@ -1136,3 +1154,29 @@ T7.w.7 has no task (deferred).
   rule is not observed, its `lastSeen` was stale). Left open (related findings): a re-open refused
   by router.yaml shows the generic `not_allowed` text, not the Core's reason; a new UI on an older
   Core answers "Kaldır" with `bad_request`; `.env.example` mentions only "Kuralı ekle".
+- 2026-11-08: T7.w.10f-h implemented (senior-dev; review and tester pending). f: one new error
+  code `notifications_unavailable` (protocol 1, no new frame or field) for `notifications_list` /
+  `notification_action` while the file cannot be read or an invalid one cannot be moved aside;
+  `raise` keeps `unavailable`, `resolve` rejects, `refresh()` keeps the last count; the UI flag is
+  set only by that code, kept through later timeouts and cleared by the next `notifications`
+  reply or a reconnect; a quarantined (moved-aside) file keeps the T7.w.5a empty start. g: Map by
+  id + source/key index, `get()`, `resolve()` returns the removed item, `list(map)` copies once
+  (the list reply itself stays, it is the protocol); coalesced writes 1 s (`coalesceMs` 0 = old
+  behaviour), unref'd timer, flushed on shutdown; no pruning (the 5000 limit still only refuses
+  keyless raises). h: `runShutdown` in shutdown.ts: the closes in the old order, each failure
+  logged and the next still run, then usage log, learned rules, turn notes and notifications
+  flushed together (`Promise.allSettled`), forced exit after 5 s; exit code 0 in both cases (a
+  non-zero code makes run-core.ps1 and the tray restart the Core); the conversation log has no
+  Core-level flush (each session flushes its lines in `server.close()`). Review fix: the closes
+  get their own 3 s budget (`SHUTDOWN_CLOSE_BUDGET_MS`; still-closing steps logged, the rest
+  skipped) so the flushes always start within the 5 s total, and the store's coalescing timer is
+  injectable (`setTimer`) so its tests no longer sleep.
+- 2026-11-08: T7.w.10f-h done (senior-code-reviewer 2 rounds, no critical or high finding;
+  tester: core 1250/1250, ui 390/390, lint, build, 5 of 8 mutations killed, 2 equivalent, 1 needs
+  a UI render test (T13)). Round 1 fixed: a hanging close step no longer keeps the flushes from
+  running (3 s close budget); the coalescing tests use an injected timer. Left open (related
+  findings): when the close budget runs out the device registry step is skipped, so continuity
+  pointers are not written (no regression: nothing was flushed before); a timer-triggered write
+  that fails is not rescheduled; `/health` `inbox.notifications` reads 0 while the file is
+  unreadable; the UI "!" stays until the next `notifications` reply; a corrupt file that can be
+  moved aside still starts as an empty inbox without telling the UI.

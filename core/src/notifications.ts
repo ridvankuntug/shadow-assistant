@@ -9,6 +9,7 @@
  * Producers inside the Core (backup, service health, HA events, T11-B) call
  * `raise()` / `resolve()`; the user marks items read / unread or deletes them.
  * Clients reach it through `NotificationCenter` (session.ts, T7.w.5b); no producer yet.
+ * T7.w.10f/g: unavailable reported, id access, coalesced writes.
  *
  * - `key` (optional, unique per `source`) dedupes a recurring condition: a
  *   raise on an existing key replaces title / body / urgency and bumps
@@ -17,14 +18,19 @@
  * - Items are kept until deleted or resolved; nothing is pruned. The hard limit
  *   (MAX_ITEMS) only refuses new keyless raises (logged).
  * - `readAt` is shared across devices.
- * - Writes are atomic (writeFileAtomic) and serialized. A corrupt file (not
+ * - Items are held by id (a Map in file order, plus a source + key index):
+ *   an action touches one item and copies only that one.
+ * - Writes are atomic (writeFileAtomic), serialized and coalesced: changes
+ *   are kept in memory and written at most once per `coalesceMs` (default
+ *   DEFAULT_COALESCE_MS) and on `flush()` (shutdown). A corrupt file (not
  *   JSON, wrong version, or any malformed item) is quarantined as a whole
  *   (`.corrupt-<ts>` copy kept) and the store starts empty with one warning,
  *   so a bad item is never dropped silently by the next write. A file that
  *   cannot be read (other than missing), or an invalid one that could not be
- *   moved aside, is never overwritten: operations fail
- *   until it can be read. A failed write keeps the in-memory state and is
- *   retried by the next change (or `flush()`).
+ *   moved aside, is never overwritten: `raise()` answers `unavailable`, the
+ *   other operations reject with NotificationsUnavailableError (never an
+ *   empty inbox), until it can be read. A failed write keeps the in-memory
+ *   state and is retried by the next operation (or `flush()`).
  */
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
@@ -87,6 +93,9 @@ const SOURCE_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const ID_RE = /^n-[0-9a-f]{16}$/;
 const URGENCIES: ReadonlySet<string> = new Set<NotificationUrgency>(["normal", "urgent"]);
 
+/** Changes are written at most this often (and on `flush()`, at shutdown). */
+export const DEFAULT_COALESCE_MS = 1_000;
+
 export interface NotificationStoreOptions {
   /** `<SHADOW_DATA_DIR>/notifications`. */
   dir: string;
@@ -98,68 +107,141 @@ export interface NotificationStoreOptions {
   fs?: AtomicFs;
   /** Rename retry delays (tests: none). */
   retryDelaysMs?: readonly number[];
+  /**
+   * Default DEFAULT_COALESCE_MS: changes are kept in memory and written at
+   * most once per this many ms (and on `flush()`). 0 writes every change
+   * before its promise settles.
+   */
+  coalesceMs?: number;
+  /**
+   * Timer for the coalesced write (tests: a fake fired by hand). Returns a
+   * cancel function. Default: setTimeout, unref'd.
+   */
+  setTimer?: (fn: () => void, ms: number) => () => void;
 }
+
+/** A pending write never keeps the process alive; shutdown calls flush(). */
+const unrefTimer = (fn: () => void, ms: number): (() => void) => {
+  const t = setTimeout(fn, ms);
+  t.unref?.();
+  return () => clearTimeout(t);
+};
+
+/**
+ * The notifications file cannot be read (other than missing), or an invalid
+ * one could not be moved aside. The store then changes nothing and writes
+ * nothing; the next call tries to read the file again.
+ */
+export class NotificationsUnavailableError extends Error {
+  readonly code = "NOTIFICATIONS_UNAVAILABLE";
+  constructor() {
+    super("notifications file could not be read");
+    this.name = "NotificationsUnavailableError";
+  }
+}
+
+/** The loaded inbox: items by id (insertion order = file order) and the dedupe index. */
+interface Inbox {
+  items: Map<string, NotificationItem>;
+  /** `keyOf(source, key)` → item id. */
+  byKey: Map<string, string>;
+}
+
+const keyOf = (source: string, key: string) => `${source}\u0000${key}`;
+
+/** A copy of one item: every field is a primitive, so a spread copies it fully. */
+const copy = (item: NotificationItem): NotificationItem => ({ ...item });
 
 export class NotificationStore {
   readonly file: string;
   private readonly now: () => number;
   private readonly maxItems: number;
-  private data: NotificationsFile | undefined;
+  private readonly coalesceMs: number;
+  private inbox: Inbox | undefined;
   /** Serializes load + change + write. */
   private chain: Promise<unknown> = Promise.resolve();
-  /** In-memory changes a failed write did not persist. */
+  /** In-memory changes not yet on disk (a coalesced change, or a failed write). */
   private pending = false;
+  private readonly setTimer: (fn: () => void, ms: number) => () => void;
+  /** Cancels the scheduled coalesced write; undefined when none is scheduled. */
+  private cancelScheduled: (() => void) | undefined;
 
   constructor(private readonly o: NotificationStoreOptions) {
     this.file = join(o.dir, NOTIFICATIONS_FILE);
     this.now = o.now ?? Date.now;
     this.maxItems = o.maxItems ?? MAX_ITEMS;
+    this.coalesceMs = o.coalesceMs ?? DEFAULT_COALESCE_MS;
+    this.setTimer = o.setTimer ?? unrefTimer;
   }
 
-  /** Creates an item or updates the keyed one. Never rejects. */
-  raise(input: RaiseInput): Promise<RaiseResult> {
+  /** Creates an item or updates the keyed one. Never rejects (`unavailable` when the file cannot be read). */
+  async raise(input: RaiseInput): Promise<RaiseResult> {
     const clean = normalizeInput(input);
     if (!clean) {
       this.o.log?.("[shadow-core] notifications: invalid raise ignored");
-      return Promise.resolve({ ok: false, reason: "invalid" });
+      return { ok: false, reason: "invalid" };
     }
-    return this.change<RaiseResult>({ ok: false, reason: "unavailable" }, (data) => {
-      const stamp = this.stamp();
-      if (clean.key !== undefined) {
-        const existing = data.items.find((i) => i.source === clean.source && i.key === clean.key);
-        if (existing) {
-          existing.title = clean.title;
-          existing.body = clean.body;
-          existing.urgency = clean.urgency;
-          existing.updatedAt = stamp;
-          existing.raised++;
-          if (clean.renotify) existing.readAt = null;
-          return { result: { ok: true, item: structuredClone(existing), created: false }, changed: true };
+    try {
+      return await this.change<RaiseResult>((inbox) => {
+        const stamp = this.stamp();
+        if (clean.key !== undefined) {
+          const id = inbox.byKey.get(keyOf(clean.source, clean.key));
+          const existing = id === undefined ? undefined : inbox.items.get(id);
+          if (existing) {
+            existing.title = clean.title;
+            existing.body = clean.body;
+            existing.urgency = clean.urgency;
+            existing.updatedAt = stamp;
+            existing.raised++;
+            if (clean.renotify) existing.readAt = null;
+            return { result: { ok: true, item: copy(existing), created: false }, changed: true };
+          }
+        } else if (inbox.items.size >= this.maxItems) {
+          this.o.log?.(`[shadow-core] notifications: limit of ${this.maxItems} items reached; keyless raise from "${clean.source}" refused`);
+          return { result: { ok: false, reason: "full" }, changed: false };
         }
-      } else if (data.items.length >= this.maxItems) {
-        this.o.log?.(`[shadow-core] notifications: limit of ${this.maxItems} items reached; keyless raise from "${clean.source}" refused`);
-        return { result: { ok: false, reason: "full" }, changed: false };
-      }
-      const item: NotificationItem = {
-        id: newId(data.items),
-        ...(clean.key !== undefined ? { key: clean.key } : {}),
-        source: clean.source,
-        urgency: clean.urgency,
-        title: clean.title,
-        body: clean.body,
-        createdAt: stamp,
-        updatedAt: stamp,
-        readAt: null,
-        raised: 1,
-      };
-      data.items.push(item);
-      return { result: { ok: true, item: structuredClone(item), created: true }, changed: true };
+        const item: NotificationItem = {
+          id: newId(inbox.items),
+          ...(clean.key !== undefined ? { key: clean.key } : {}),
+          source: clean.source,
+          urgency: clean.urgency,
+          title: clean.title,
+          body: clean.body,
+          createdAt: stamp,
+          updatedAt: stamp,
+          readAt: null,
+          raised: 1,
+        };
+        add(inbox, item);
+        return { result: { ok: true, item: copy(item), created: true }, changed: true };
+      });
+    } catch (err) {
+      if (err instanceof NotificationsUnavailableError) return { ok: false, reason: "unavailable" };
+      throw err;
+    }
+  }
+
+  /**
+   * The producer removes its keyed item (the condition is over). Resolves the
+   * removed item, or undefined if there was none. Rejects with
+   * NotificationsUnavailableError when the file cannot be read.
+   */
+  resolve(source: string, key: string): Promise<NotificationItem | undefined> {
+    return this.change((inbox) => {
+      const id = inbox.byKey.get(keyOf(source, key));
+      const item = id === undefined ? undefined : inbox.items.get(id);
+      if (!item) return { result: undefined, changed: false };
+      remove(inbox, item);
+      return { result: copy(item), changed: true };
     });
   }
 
-  /** The producer removes its keyed item (the condition is over). Resolves whether one was removed. */
-  resolve(source: string, key: string): Promise<boolean> {
-    return this.removeWhere((i) => i.source === source && i.key === key);
+  /** One item (a copy), or undefined if unknown. Rejects with NotificationsUnavailableError when the file cannot be read. */
+  get(id: string): Promise<NotificationItem | undefined> {
+    return this.change((inbox) => {
+      const item = inbox.items.get(id);
+      return { result: item && copy(item), changed: false };
+    });
   }
 
   /** Marks an item read (shared across devices). An already read item keeps its `readAt`. Undefined if unknown. */
@@ -182,77 +264,85 @@ export class NotificationStore {
 
   /** Deletes an item (the user). Resolves whether it existed. */
   delete(id: string): Promise<boolean> {
-    return this.removeWhere((i) => i.id === id);
+    return this.change((inbox) => {
+      const item = inbox.items.get(id);
+      if (!item) return { result: false, changed: false };
+      remove(inbox, item);
+      return { result: true, changed: true };
+    });
   }
 
-  /** All items, most recently updated first (copies). Empty if the file cannot be read. */
-  async list(): Promise<NotificationItem[]> {
-    const items = await this.change<NotificationItem[]>([], (data) => ({
-      result: structuredClone(data.items),
+  /**
+   * All items, most recently updated first, each passed through `map`
+   * (default: a copy; a caller that builds its own objects passes its mapper,
+   * so the list is copied once). Rejects with NotificationsUnavailableError
+   * when the file cannot be read: an unreadable inbox is never reported as an
+   * empty one.
+   */
+  list(): Promise<NotificationItem[]>;
+  list<T>(map: (item: Readonly<NotificationItem>) => T): Promise<T[]>;
+  list<T>(map?: (item: Readonly<NotificationItem>) => T): Promise<Array<T | NotificationItem>> {
+    const out: (item: NotificationItem) => T | NotificationItem = map ?? copy;
+    return this.change((inbox) => ({
+      result: [...inbox.items.values()].sort(byUpdated).map((item) => out(item)),
       changed: false,
     }));
-    return items.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? -1 : 1));
   }
 
-  /** Number of unread items. */
-  async unreadCount(): Promise<number> {
-    return this.change(0, (data) => ({ result: data.items.filter((i) => i.readAt === null).length, changed: false }));
+  /** Number of unread items. Rejects with NotificationsUnavailableError when the file cannot be read. */
+  unreadCount(): Promise<number> {
+    return this.change((inbox) => {
+      let n = 0;
+      for (const item of inbox.items.values()) if (item.readAt === null) n++;
+      return { result: n, changed: false };
+    });
   }
 
-  /** Retries a failed write now (shutdown). Never rejects. */
-  async flush(): Promise<void> {
-    await this.change(undefined, () => ({ result: undefined, changed: false }));
+  /** Writes pending changes now (coalesced, or a failed write; shutdown). Never rejects. */
+  flush(): Promise<void> {
+    this.cancelTimer();
+    const run = this.chain.then(async () => {
+      if (this.pending && this.inbox) await this.write(this.inbox);
+    });
+    this.chain = run.catch(() => {});
+    return run.catch(() => {});
   }
 
   private stamp(): string {
     return new Date(this.now()).toISOString();
   }
 
-  private async changeItem(id: string, fn: (item: NotificationItem) => boolean): Promise<NotificationItem | undefined> {
-    return this.change<NotificationItem | undefined>(undefined, (data) => {
-      const item = data.items.find((i) => i.id === id);
+  private changeItem(id: string, fn: (item: NotificationItem) => boolean): Promise<NotificationItem | undefined> {
+    return this.change((inbox) => {
+      const item = inbox.items.get(id);
       if (!item) return { result: undefined, changed: false };
       const changed = fn(item);
-      return { result: structuredClone(item), changed };
-    });
-  }
-
-  private removeWhere(match: (i: NotificationItem) => boolean): Promise<boolean> {
-    return this.change(false, (data) => {
-      const index = data.items.findIndex(match);
-      if (index < 0) return { result: false, changed: false };
-      data.items.splice(index, 1);
-      return { result: true, changed: true };
+      return { result: copy(item), changed };
     });
   }
 
   /**
-   * Runs `fn` on the loaded data under the chain and writes if it changed
-   * anything (or a previous write failed). `fallback` is returned if the file
-   * cannot be loaded. A write failure is logged; `fn`'s result still stands
-   * (the change is kept in memory and retried by the next write).
+   * Runs `fn` on the loaded inbox under the chain. A change (or a pending one
+   * from a failed write) is written at once with `coalesceMs` 0, else within
+   * `coalesceMs`. Rejects with NotificationsUnavailableError when the file
+   * cannot be loaded; nothing is then written, so the file on disk is never
+   * replaced by an empty inbox. A write failure is logged; `fn`'s result
+   * still stands (the change is kept in memory and retried by the next write).
    */
-  private change<T>(fallback: T, fn: (data: NotificationsFile) => { result: T; changed: boolean }): Promise<T> {
+  private change<T>(fn: (inbox: Inbox) => { result: T; changed: boolean }): Promise<T> {
     const run = this.chain.then(async () => {
-      let data: NotificationsFile;
+      let inbox: Inbox;
       try {
-        data = await this.load();
+        inbox = await this.load();
       } catch (err) {
         this.o.log?.(`[shadow-core] notifications file could not be read: ${errName(err)}`);
-        return fallback;
+        throw new NotificationsUnavailableError();
       }
-      const { result, changed } = fn(data);
-      if (changed || this.pending) {
-        try {
-          await writeFileAtomic(this.file, `${JSON.stringify(data, null, 2)}\n`, {
-            fs: this.o.fs,
-            retryDelaysMs: this.o.retryDelaysMs,
-          });
-          this.pending = false;
-        } catch (err) {
-          this.pending = true;
-          this.o.log?.(`[shadow-core] notifications write failed: ${errName(err)}`);
-        }
+      const { result, changed } = fn(inbox);
+      if (changed) this.pending = true;
+      if (this.pending) {
+        if (this.coalesceMs > 0) this.schedule();
+        else await this.write(inbox);
       }
       return result;
     });
@@ -260,8 +350,36 @@ export class NotificationStore {
     return run;
   }
 
-  private async load(): Promise<NotificationsFile> {
-    if (!this.data) {
+  /** Writes the inbox; on success clears `pending`, on failure keeps it and logs. Never throws. */
+  private async write(inbox: Inbox): Promise<void> {
+    const file: NotificationsFile = { version: 1, items: [...inbox.items.values()] };
+    try {
+      await writeFileAtomic(this.file, `${JSON.stringify(file, null, 2)}\n`, {
+        fs: this.o.fs,
+        retryDelaysMs: this.o.retryDelaysMs,
+      });
+      this.pending = false;
+    } catch (err) {
+      this.pending = true;
+      this.o.log?.(`[shadow-core] notifications write failed: ${errName(err)}`);
+    }
+  }
+
+  private schedule(): void {
+    if (this.cancelScheduled) return;
+    this.cancelScheduled = this.setTimer(() => {
+      this.cancelScheduled = undefined;
+      void this.flush();
+    }, this.coalesceMs);
+  }
+
+  private cancelTimer(): void {
+    this.cancelScheduled?.();
+    this.cancelScheduled = undefined;
+  }
+
+  private async load(): Promise<Inbox> {
+    if (!this.inbox) {
       let leftInPlace = false;
       const loaded = await readJsonOrQuarantine(this.file, validateFile, {
         fs: this.o.fs,
@@ -275,10 +393,28 @@ export class NotificationStore {
       // An invalid file that could not be moved aside must not be replaced by
       // an empty store on the next write: stay unavailable and retry later.
       if (leftInPlace) throw Object.assign(new Error("invalid file could not be moved aside"), { code: "QUARANTINE_FAILED" });
-      this.data = loaded ?? { version: 1, items: [] };
+      const inbox: Inbox = { items: new Map(), byKey: new Map() };
+      // validateFile already refused duplicate ids and keys.
+      for (const item of loaded?.items ?? []) add(inbox, item);
+      this.inbox = inbox;
     }
-    return this.data;
+    return this.inbox;
   }
+}
+
+/** Most recently updated first, then by id. */
+function byUpdated(a: NotificationItem, b: NotificationItem): number {
+  return Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? -1 : 1);
+}
+
+function add(inbox: Inbox, item: NotificationItem): void {
+  inbox.items.set(item.id, item);
+  if (item.key !== undefined) inbox.byKey.set(keyOf(item.source, item.key), item.id);
+}
+
+function remove(inbox: Inbox, item: NotificationItem): void {
+  inbox.items.delete(item.id);
+  if (item.key !== undefined) inbox.byKey.delete(keyOf(item.source, item.key));
 }
 
 /** Error code or name only: an fs message holds the path, never needed in the log line. */
@@ -291,10 +427,10 @@ function errName(err: unknown): string {
   return String(err);
 }
 
-function newId(items: readonly NotificationItem[]): string {
+function newId(items: ReadonlyMap<string, NotificationItem>): string {
   for (;;) {
     const id = `n-${randomBytes(8).toString("hex")}`;
-    if (!items.some((i) => i.id === id)) return id;
+    if (!items.has(id)) return id;
   }
 }
 

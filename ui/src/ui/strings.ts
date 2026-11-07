@@ -356,6 +356,8 @@ export function notificationsErrorText(code: string, message?: string | null): s
       return "Bu bildirim artık yok. Listeyi yenile.";
     case "bad_request":
       return "Çekirdek isteği reddetti. Listeyi yenile.";
+    case "notifications_unavailable":
+      return "Bildirimler okunamadı.";
     default:
       return noticeText(code, message ?? undefined);
   }

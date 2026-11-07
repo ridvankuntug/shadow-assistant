@@ -91,7 +91,13 @@ export function NotificationsPanel({ notifications, connected, onRefresh, onActi
           </p>
         )
       )}
-      {notifications.status === "error" && notifications.errorCode && (
+      {/* The Core cannot read its notifications file: the inbox is unknown, never shown as empty. */}
+      {notifications.unavailable && (
+        <p className="hint memory-error" role="alert">
+          {notificationsErrorText("notifications_unavailable")}
+        </p>
+      )}
+      {notifications.status === "error" && notifications.errorCode && notifications.errorCode !== "notifications_unavailable" && (
         <p className="hint memory-error" role="alert">
           {notificationsErrorText(notifications.errorCode, notifications.errorMessage)}
         </p>
@@ -99,7 +105,7 @@ export function NotificationsPanel({ notifications, connected, onRefresh, onActi
       {notifications.items !== null && notifications.unread !== null && notifications.unread > 0 && (
         <p className="hint">{notificationsUnreadText(notifications.unread)}.</p>
       )}
-      {notifications.items !== null && items.length === 0 && <p className="hint">Bildirim yok.</p>}
+      {notifications.items !== null && items.length === 0 && !notifications.unavailable && <p className="hint">Bildirim yok.</p>}
       {items.length > 0 && (
         <ul className="memory-list">
           {items.map((n) => (

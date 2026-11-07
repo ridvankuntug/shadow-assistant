@@ -124,7 +124,11 @@ export type HistoryItem = {
   ts: number;
 };
 export type HistoryMessage = { type: "history"; items: HistoryItem[] };
-/** `retryAt` (epoch ms): when a `usage_limit` resets, if the Core knows it. */
+/**
+ * `code` as in docs/02 §Errors, kept a string: unknown codes are generic errors.
+ * `retryAt` (epoch ms): when a `usage_limit` resets, if the Core knows it.
+ * `notifications_unavailable`: the Core cannot read its notifications file (inbox unknown, not empty).
+ */
 export type ErrorMessage = { type: "error"; id?: string; code: string; message?: string; retryAt?: number };
 export type PongMessage = { type: "pong" };
 /** Health of one Core service (docs/02-core-protocol.md, "Service health"). */

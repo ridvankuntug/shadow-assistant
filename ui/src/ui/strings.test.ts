@@ -101,5 +101,6 @@ describe("notification inbox texts", () => {
     expect(notificationsUnreadText(3)).toBe("3 okunmamış bildirim");
     expect(notificationsErrorText("timeout")).toContain("yanıt vermedi");
     expect(notificationsErrorText("unknown_item")).toContain("artık yok");
+    expect(notificationsErrorText("notifications_unavailable")).toBe("Bildirimler okunamadı.");
   });
 });

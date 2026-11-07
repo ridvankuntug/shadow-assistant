@@ -184,6 +184,8 @@ export type ErrorCode =
   | "unknown_item"
   /** Development: the action is not valid for the item, or this device may not do it. */
   | "not_allowed"
+  /** Notifications: the Core cannot read its notifications file; the inbox is not known (never "empty"). */
+  | "notifications_unavailable"
   | "internal";
 
 /**

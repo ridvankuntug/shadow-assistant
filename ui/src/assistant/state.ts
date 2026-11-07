@@ -141,6 +141,9 @@ export type DevView = {
  * `items` is the whole inbox (most recently updated first) once a list
  * arrived; the `notification` / `notification_removed` broadcasts keep it
  * current. `unread` is the badge count, null until the Core told one.
+ * `unavailable`: the Core answered the latest request with
+ * `notifications_unavailable` (it cannot read its notifications file): the
+ * inbox is unknown, not empty; cleared by the next `notifications` reply.
  */
 export type NotificationsView = {
   status: "idle" | "loading" | "ready" | "error";
@@ -148,6 +151,7 @@ export type NotificationsView = {
   acting: { notificationId: string; action: NotificationAction } | null;
   items: NotificationInfo[] | null;
   unread: number | null;
+  unavailable: boolean;
   errorCode: string | null;
   errorMessage: string | null;
   /** Replaced request ids whose late errors are dropped (as `DevView.staleIds`). */
@@ -276,6 +280,7 @@ export const initialState: AssistantState = {
     acting: null,
     items: null,
     unread: null,
+    unavailable: false,
     errorCode: null,
     errorMessage: null,
     staleIds: [],
@@ -404,6 +409,11 @@ export function notificationsBadgeCount(s: AssistantState): number {
   return notificationsAvailable(s) ? (s.notifications.unread ?? 0) : 0;
 }
 
+/** The Core could not read its notifications file (badge "!", panel "Bildirimler okunamadı"): only while the inbox is available. */
+export function notificationsUnavailable(s: AssistantState): boolean {
+  return notificationsAvailable(s) && s.notifications.unavailable;
+}
+
 /** The action that toggles an item: `read` while unread, `unread` once read. */
 export function notificationToggleAction(item: NotificationInfo): "read" | "unread" {
   return item.readAt === null ? "read" : "unread";
@@ -437,9 +447,16 @@ function removeNotification(n: NotificationsView, id: string): NotificationsView
   return { ...n, items: n.items.filter((i) => i.id !== id), unread };
 }
 
-/** A failed or unanswered inbox request (keeps the shown items). */
+/** A failed or unanswered inbox request (keeps the shown items). Only the Core's `notifications_unavailable` sets `unavailable`. */
 function notificationsFailed(n: NotificationsView, code: string, message?: string): NotificationsView {
-  return { ...n, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
+  return {
+    ...n,
+    status: "error",
+    acting: null,
+    unavailable: n.unavailable || code === "notifications_unavailable",
+    errorCode: code,
+    errorMessage: message ?? null,
+  };
 }
 
 /** A failed or unanswered Development request (keeps the shown items). */
@@ -929,6 +946,7 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
           acting: null,
           items: msg.items,
           unread: msg.unread,
+          unavailable: false,
           errorCode: null,
           errorMessage: null,
           staleIds: s.notifications.staleIds,

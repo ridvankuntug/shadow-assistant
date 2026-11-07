@@ -12,13 +12,15 @@
  * - the producer's dedupe key never leaves the Core.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import * as nodeFs from "node:fs/promises";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { AgentRunner, TurnResult } from "../src/agent.js";
 import { ConversationLog } from "../src/conversation-log.js";
-import { NotificationStore } from "../src/notifications.js";
+import type { AtomicFs } from "../src/atomic-file.js";
+import { NOTIFICATIONS_FILE, NotificationStore, NotificationsUnavailableError } from "../src/notifications.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import type { ClientFrame, ServerFrame } from "../src/protocol.js";
 import { parseServices } from "../src/services.js";
@@ -44,11 +46,12 @@ type Frame<T extends ServerFrame["type"]> = Extract<ServerFrame, { type: T }>;
 let counter = 0;
 
 /** One home: a store, a center, and sockets (sessions) attached to it. */
-function home(o: { withCenter?: boolean } = {}) {
+function home(o: { withCenter?: boolean; fs?: AtomicFs } = {}) {
   const dir = join(base, `h${++counter}`);
-  const store = new NotificationStore({ dir: join(dir, "notifications"), log: () => {} });
+  const store = new NotificationStore({ dir: join(dir, "notifications"), log: () => {}, ...(o.fs ? { fs: o.fs, retryDelaysMs: [] } : {}) });
   const infos: string[] = [];
-  const center = new NotificationCenter({ store, logger: { info: (m) => infos.push(m), warn: () => {} } });
+  const warns: string[] = [];
+  const center = new NotificationCenter({ store, logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) } });
   let sessions = 0;
   let req = 0;
 
@@ -95,7 +98,7 @@ function home(o: { withCenter?: boolean } = {}) {
       spoken: () => frames.filter((f) => f.type === "notification" && f.speak === true) as Frame<"notification">[],
     };
   }
-  return { dir, store, center, infos, connect };
+  return { dir, store, center, infos, warns, connect };
 }
 
 const errorCode = (r: { type: string; code?: string }) => (r.type === "error" ? r.code : r.type);
@@ -314,6 +317,7 @@ test("refresh() reads the unread count of items already on disk (startup)", asyn
   const h = home();
   await h.store.raise({ source: "test", title: "Önceden" });
   await h.store.raise({ source: "test", title: "Önceden 2" });
+  await h.store.flush(); // coalesced writes: on disk now
   const fresh = new NotificationCenter({ store: new NotificationStore({ dir: join(h.dir, "notifications") }), logger: { info: () => {}, warn: () => {} } });
   assert.equal(fresh.unread, 0);
   assert.equal(await fresh.refresh(), 2);
@@ -331,4 +335,49 @@ test("urgent: a closed socket is detached and no longer the speaker (the next so
   await h.center.raise({ source: "test", urgency: "urgent", title: "Acil" });
   assert.equal(phone.spoken().length, 0);
   assert.equal(browser.spoken().length, 1, "the urgent item must not be lost on a dead socket");
+});
+
+test("an unreadable notifications file: list and actions answer notifications_unavailable, the file is not overwritten, the Core recovers", async () => {
+  const state = { failRead: false };
+  const fs: AtomicFs = {
+    mkdir: (p, o) => nodeFs.mkdir(p, o),
+    open: (p, f, m) => nodeFs.open(p, f, m),
+    rename: (a, b) => nodeFs.rename(a, b),
+    unlink: (p) => nodeFs.unlink(p),
+    readFile: (p, e) => (state.failRead ? Promise.reject(Object.assign(new Error("simulated"), { code: "EBUSY" })) : nodeFs.readFile(p, e)),
+    readdir: (p) => nodeFs.readdir(p),
+  };
+  // Items already on disk from an earlier run.
+  const h = home({ fs });
+  const seeded = new NotificationStore({ dir: join(h.dir, "notifications"), coalesceMs: 0 });
+  const kept = await seeded.raise({ source: "test", key: "k", title: "Korunan" });
+  assert.ok(kept.ok);
+  const file = join(h.dir, "notifications", NOTIFICATIONS_FILE);
+  const content = readFileSync(file, "utf8");
+
+  state.failRead = true;
+  // Startup does not fail: the count stays 0.
+  assert.equal(await h.center.refresh(), 0);
+  const a = h.connect("phone");
+  const b = h.connect("browser");
+  const listed = await a.ask({ type: "notifications_list" });
+  assert.equal(errorCode(listed), "notifications_unavailable");
+  for (const action of ["read", "unread", "delete"] as const) {
+    assert.equal(errorCode(await a.ask({ type: "notification_action", notificationId: kept.item.id, action })), "notifications_unavailable", action);
+  }
+  // Producers: raise answers unavailable, resolve rejects; nothing is broadcast.
+  assert.deepEqual(await h.center.raise({ source: "test", title: "Yeni" }), { ok: false, reason: "unavailable" });
+  await assert.rejects(h.center.resolve("test", "k"), NotificationsUnavailableError);
+  assert.equal(b.of("notification").length + b.of("notification_removed").length, 0);
+  // The center's chain keeps working and logs nothing of its own (the store logs the cause).
+  assert.deepEqual(h.warns, []);
+  await h.center.flush();
+  assert.equal(readFileSync(file, "utf8"), content, "the file must not be replaced by an empty inbox");
+  assert.deepEqual(readdirSync(join(h.dir, "notifications")), [NOTIFICATIONS_FILE]);
+
+  state.failRead = false;
+  const back = await a.list();
+  assert.deepEqual(back.items.map((i) => i.title), ["Korunan"]);
+  assert.equal(back.unread, 1);
+  assert.equal(await h.center.refresh(), 1);
 });

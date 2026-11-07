@@ -120,6 +120,7 @@ Agent SDK's `mcp__<service>__` prefix.
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
 | `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted). |
 | `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). |
+| `notifications_unavailable` | `notifications_list` / `notification_action` while the Core cannot read its notifications file (see *Notifications*): the inbox is unknown, not empty. |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
@@ -292,9 +293,17 @@ them or the producer resolves them.
   without a new reminder. Being spoken does not mark an item read.
 - There is no push to a phone whose app is not connected; it sees the items in
   `notifications_list` on its next connect.
-- While the Core cannot read its notifications file (locked, or invalid and not
-  movable aside) the inbox reads as empty (`unread: 0`) and actions answer
-  `unknown_item`; the Core logs the cause and retries on the next request.
+- While the Core cannot read its notifications file (locked or otherwise
+  unreadable, or invalid and not movable aside), `notifications_list` and every
+  `notification_action` answer `error` `notifications_unavailable` (with `id`):
+  nothing is changed or broadcast, and the file is never replaced by an empty
+  inbox. Clients show the inbox as unknown, not as empty (the UI: "Bildirimler
+  okunamadı" in the panel, "!" on the bell) until a `notifications` reply
+  arrives. The Core logs the cause and reads the file again on the next
+  request. Added within protocol 1: an older client shows it as a generic
+  error. An invalid file that could be moved aside is kept as
+  `notifications.json.corrupt-<ts>` and the inbox starts empty (one warning in
+  the Core log).
 
 ## Voices
 

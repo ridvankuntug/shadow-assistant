@@ -37,7 +37,7 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import type { NotificationItem, NotificationStore, RaiseInput, RaiseResult } from "./notifications.js";
+import { NotificationsUnavailableError, type NotificationItem, type NotificationStore, type RaiseInput, type RaiseResult } from "./notifications.js";
 import type {
   ClientFrame,
   DevAction,
@@ -395,6 +395,11 @@ export class Session {
       const v = await center.list();
       this.emit({ type: "notifications", id, items: v.items, unread: v.unread });
     } catch (err) {
+      // The store already logged why the file could not be read.
+      if (err instanceof NotificationsUnavailableError) {
+        this.error("notifications_unavailable", "notifications could not be read", id);
+        return;
+      }
       this.deps.logger.warn(`[shadow-core] notifications request failed: ${(err as Error)?.name ?? "error"}`);
       this.error("internal", "notifications are unavailable", id);
     }
@@ -1943,7 +1948,7 @@ export interface NotificationListener {
 }
 
 export interface NotificationCenterOptions {
-  store: Pick<NotificationStore, "raise" | "resolve" | "markRead" | "markUnread" | "delete" | "list" | "unreadCount" | "flush">;
+  store: Pick<NotificationStore, "raise" | "resolve" | "get" | "markRead" | "markUnread" | "delete" | "list" | "unreadCount" | "flush">;
   logger: Logger;
 }
 
@@ -1977,6 +1982,11 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * socket's own latest turn, then the newest socket). Nothing is spoken when
  * no socket has speech on, and nothing is spoken again later: a reconnect or
  * a `notifications` list never carries `speak`.
+ *
+ * While the store cannot read its file, `list()`, `act()` and `resolve()`
+ * reject with NotificationsUnavailableError (the session answers
+ * `notifications_unavailable`), `raise()` answers `unavailable`, and
+ * `unread` keeps its last value.
  */
 export class NotificationCenter {
   /** Attached sockets → attach order. */
@@ -1997,9 +2007,9 @@ export class NotificationCenter {
     return this.lastUnread;
   }
 
-  /** Re-reads the unread count from the store. */
+  /** Re-reads the unread count from the store. Never rejects: an unreadable file keeps the last count (startup: 0). */
   refresh(): Promise<number> {
-    return this.serial(() => this.recount());
+    return this.serial(() => this.recount()).catch(() => this.lastUnread);
   }
 
   /** Starts the broadcasts to one socket. Returns the detach function (socket closed). */
@@ -2034,12 +2044,14 @@ export class NotificationCenter {
     });
   }
 
-  /** Producer API: removes the keyed item (the condition is over) and broadcasts the removal. Resolves whether one was removed. */
+  /**
+   * Producer API: removes the keyed item (the condition is over) and broadcasts the removal. Resolves whether one was removed;
+   * rejects with NotificationsUnavailableError when the file cannot be read (the producer retries later).
+   */
   resolve(source: string, key: string): Promise<boolean> {
     return this.serial(async () => {
-      // On the same chain as every other change: the item found here is the one resolve() removes.
-      const item = (await this.o.store.list()).find((i) => i.source === source && i.key === key);
-      if (!item || !(await this.o.store.resolve(source, key))) return false;
+      const item = await this.o.store.resolve(source, key);
+      if (!item) return false;
       this.broadcast({ type: "notification_removed", notificationId: item.id });
       await this.recount();
       return true;
@@ -2049,8 +2061,8 @@ export class NotificationCenter {
   /** All items (most recently updated first) and the unread count. */
   list(): Promise<{ items: NotificationInfo[]; unread: number }> {
     return this.serial(async () => {
-      const items = await this.o.store.list();
-      return { items: items.map(notificationInfo), unread: items.filter((i) => i.readAt === null).length };
+      const items = await this.o.store.list(notificationInfo);
+      return { items, unread: items.filter((i) => i.readAt === null).length };
     });
   }
 
@@ -2068,7 +2080,7 @@ export class NotificationCenter {
         await this.recount();
         return { ok: true };
       }
-      const before = (await this.o.store.list()).find((i) => i.id === notificationId);
+      const before = await this.o.store.get(notificationId);
       if (!before) return unknownNotification();
       const after = action === "read" ? await this.o.store.markRead(notificationId) : await this.o.store.markUnread(notificationId);
       if (!after) return unknownNotification();
@@ -2110,7 +2122,10 @@ export class NotificationCenter {
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.chain.then(fn);
-    this.chain = run.catch((err: unknown) => this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`));
+    this.chain = run.catch((err: unknown) => {
+      // An unreadable file is logged by the store, once per call.
+      if (!(err instanceof NotificationsUnavailableError)) this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`);
+    });
     return run;
   }
 }

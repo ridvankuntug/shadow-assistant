@@ -32,7 +32,7 @@ import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions 
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
 import { DevelopmentTab, NotificationCenter, Session, type Logger, type SessionLearning } from "./session.js";
-import { onShutdownSignal, SHUTDOWN_SIGNALS } from "./shutdown.js";
+import { onShutdownSignal, runShutdown, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
 import { VaultReader, vaultTools } from "./vault.js";
@@ -401,24 +401,36 @@ export async function main(): Promise<void> {
   logger.info(`[shadow-core] health checks every ${cfg.healthIntervalMs} ms (timeout ${cfg.healthTimeoutMs} ms)`);
 
   // SIGBREAK is Windows Ctrl+Break; onShutdownSignal runs the shutdown only once.
+  // runShutdown: the closes in order (new work stops first) within
+  // SHUTDOWN_CLOSE_BUDGET_MS, then every flush at once (even after a hanging
+  // close), each failure logged; forced exit after SHUTDOWN_TIMEOUT_MS (T7.w.10h).
   onShutdownSignal(process, SHUTDOWN_SIGNALS, (signal) => {
     logger.info(`[shadow-core] shutting down (${signal})`);
-    maintenance?.close();
-    background.abort();
-    void monitor
-      .close()
-      .then(() => server.close())
-      .then(() => registry?.close())
-      .then(() => gateway.close())
-      .then(() => mcpClient.close())
-      .then(() => devTab?.close())
-      .then(() => usageLog.flush())
-      .then(() => learnedRules?.flush())
-      // Coalesced turn notes not yet on disk (never rejects).
-      .then(() => turnNotes.flush())
-      // After the inbox changes in flight, a failed notification write is retried once more (never rejects).
-      .then(() => notificationCenter.flush())
-      .then(() => process.exit(0));
+    void runShutdown(
+      {
+        close: [
+          { name: "maintenance", run: () => maintenance?.close() },
+          { name: "background", run: () => background.abort() },
+          { name: "health monitor", run: () => monitor.close() },
+          // Closes every socket; each session flushes its conversation log lines.
+          { name: "server", run: () => server.close() },
+          // Closes the model sessions and flushes the continuity pointers.
+          { name: "device registry", run: () => registry?.close() },
+          { name: "mcp gateway", run: () => gateway.close() },
+          { name: "mcp client", run: () => mcpClient.close() },
+          { name: "development tab", run: () => devTab?.close() },
+        ],
+        flush: [
+          { name: "usage log", run: () => usageLog.flush() },
+          { name: "learned rules", run: () => learnedRules?.flush() },
+          // Coalesced turn notes not yet on disk.
+          { name: "turn notes", run: () => turnNotes.flush() },
+          // After the inbox changes in flight: coalesced or failed notification writes.
+          { name: "notifications", run: () => notificationCenter.flush() },
+        ],
+      },
+      { log: (m) => logger.warn(m), exit: (code) => process.exit(code) },
+    );
   });
 }
 

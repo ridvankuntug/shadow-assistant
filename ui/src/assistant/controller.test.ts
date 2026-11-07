@@ -16,7 +16,7 @@ import {
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
-import { derivePhase, devBadgeCount, notificationsBadgeCount } from "./state.ts";
+import { derivePhase, devBadgeCount, notificationsBadgeCount, notificationsUnavailable } from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -1868,6 +1868,47 @@ describe("notification inbox (T7.w.5c)", () => {
   describe("with fake timers", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
+
+    it("notifications_unavailable: the inbox is unknown (\"!\" badge, not empty); a later list clears it; a timeout does not set it", () => {
+      // The first list after welcome fails: nothing listed, no count, "!".
+      const t = inbox(null);
+      t.receive({ type: "error", id: t.listId(), code: "notifications_unavailable", message: "notifications could not be read" });
+      let s = t.controller.getState();
+      expect(s.notice).toBeNull();
+      expect(s.notifications).toMatchObject({ status: "error", unavailable: true, items: null, unread: null });
+      expect(notificationsUnavailable(s)).toBe(true);
+      expect(t.badge()).toBe(0);
+      // Still unknown while the next request runs, and after it times out.
+      expect(t.controller.requestNotifications()).toBe(true);
+      expect(notificationsUnavailable(t.controller.getState())).toBe(true);
+      vi.advanceTimersByTime(NOTIFICATIONS_TIMEOUT_MS);
+      expect(t.controller.getState().notifications).toMatchObject({ errorCode: "timeout", unavailable: true });
+      // The Core can read it again: the list clears the flag and runs the catch-up.
+      expect(t.controller.requestNotifications()).toBe(true);
+      t.receive(list(t.listId(), [item("n-1")]));
+      s = t.controller.getState();
+      expect(s.notifications).toMatchObject({ status: "ready", unavailable: false, unread: 1 });
+      expect(notificationsUnavailable(s)).toBe(false);
+      expect(t.badge()).toBe(1);
+      // An action answered the same way sets it again and keeps the shown items.
+      t.controller.notificationAction("n-1", "read");
+      t.receive({ type: "error", id: t.controller.getState().notifications.requestId ?? "", code: "notifications_unavailable" });
+      s = t.controller.getState();
+      expect(s.notifications).toMatchObject({ status: "error", unavailable: true, acting: null });
+      expect(s.notifications.items?.map((i) => i.id)).toEqual(["n-1"]);
+      // A reconnect starts from scratch (the list after welcome decides again).
+      t.drop();
+      expect(notificationsUnavailable(t.controller.getState())).toBe(false);
+    });
+
+    it("a timeout or another error never marks the inbox unavailable", () => {
+      const t = inbox(null);
+      vi.advanceTimersByTime(NOTIFICATIONS_TIMEOUT_MS);
+      expect(t.controller.getState().notifications).toMatchObject({ errorCode: "timeout", unavailable: false });
+      expect(t.controller.requestNotifications()).toBe(true);
+      t.receive({ type: "error", id: t.listId(), code: "internal" });
+      expect(t.controller.getState().notifications).toMatchObject({ errorCode: "internal", unavailable: false });
+    });
 
     it("no answer -> timeout error; a late answer still fills the inbox and runs the catch-up", () => {
       const t = inbox(null);
