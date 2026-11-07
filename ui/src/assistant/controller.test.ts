@@ -5,6 +5,7 @@ import { PlatformError, type PlatformAdapter, type TtsCapability, type Utterance
 import {
   AssistantController,
   CANCEL_SETTLE_MS,
+  CATCH_UP_SUMMARY_ID,
   DEV_TIMEOUT_MS,
   MAX_UTTERANCE_MS,
   MEMORY_TIMEOUT_MS,
@@ -1243,6 +1244,36 @@ describe("memory panel (M8)", () => {
     expect(t.controller.requestMemory()).toBe(true); // can retry
   });
 
+  it("closing the panel abandons the request: its late answer and error change nothing", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.requestMemory();
+    t.controller.closeMemory();
+    expect(t.controller.getState().memory).toMatchObject({ status: "idle", requestId: null, contents: null });
+    t.receive(frame("t1"));
+    t.receive({ type: "error", id: "t1", code: "internal", message: "late" });
+    expect(t.controller.getState().memory).toMatchObject({ status: "idle", requestId: null, contents: null, errorCode: null });
+    expect(t.controller.getState().notice).toBeNull();
+    // Opened again: a new request, whose answer counts.
+    expect(t.controller.requestMemory()).toBe(true);
+    t.receive(frame("t2"));
+    expect(t.controller.getState().memory.status).toBe("ready");
+  });
+
+  it("closing during a delete keeps the shown contents and drops the delete's answer", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.requestMemory();
+    t.receive(frame("t1"));
+    t.controller.deleteMemoryEntry("m-1");
+    t.controller.closeMemory();
+    expect(t.controller.getState().memory).toMatchObject({ status: "ready", deleting: null, requestId: null });
+    t.receive(frame("t2", []));
+    expect(t.controller.getState().memory.contents?.brief.entries.map((e) => e.id)).toEqual(["m-1"]);
+    // Nothing in flight: closing again is a no-op.
+    const before = t.controller.getState();
+    t.controller.closeMemory();
+    expect(t.controller.getState()).toBe(before);
+  });
+
   describe("with fake timers", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
@@ -1258,12 +1289,50 @@ describe("memory panel (M8)", () => {
       expect(t.controller.getState().memory.status).toBe("ready");
     });
 
+    it("a newer request after a timeout: the old request's late answer and error are ignored", () => {
+      const t = setup(undefined, ["memory"]);
+      t.controller.requestMemory();
+      vi.advanceTimersByTime(MEMORY_TIMEOUT_MS);
+      expect(t.controller.requestMemory()).toBe(true); // "Yenile"
+      t.receive({ type: "error", id: "t1", code: "internal", message: "late" });
+      t.receive(frame("t1"));
+      expect(t.controller.getState().notice).toBeNull();
+      expect(t.controller.getState().memory).toMatchObject({ status: "loading", requestId: "t2" });
+      t.receive(frame("t2", []));
+      expect(t.controller.getState().memory).toMatchObject({ status: "ready", requestId: "t2" });
+    });
+
+    it("closing the panel stops the timeout of the abandoned request", () => {
+      const t = setup(undefined, ["memory"]);
+      t.controller.requestMemory();
+      t.controller.closeMemory();
+      vi.advanceTimersByTime(MEMORY_TIMEOUT_MS * 2);
+      expect(t.controller.getState().memory).toMatchObject({ status: "idle", errorCode: null });
+    });
+
     it("an answer in time cancels the timeout", () => {
       const t = setup(undefined, ["memory"]);
       t.controller.requestMemory();
       t.receive(frame("t1"));
       vi.advanceTimersByTime(MEMORY_TIMEOUT_MS * 2);
       expect(t.controller.getState().memory.status).toBe("ready");
+    });
+
+    it("a late error of a closed panel's request does not touch the streamed speech of the last turn", async () => {
+      const t = setup(undefined, ["speech_stream", "memory"]);
+      t.controller.sendText("anlat"); // t1
+      t.receive({ type: "assistant_done", id: "t1", text: "A" }); // no chunk yet: t1 pending
+      t.receive({ type: "state", state: "idle" });
+      t.controller.requestMemory(); // t2
+      t.controller.closeMemory();
+      t.receive({ type: "error", id: "t2", code: "internal", message: "late" });
+      expect(t.controller.getState().notice).toBeNull();
+      // t1's first chunk (no final) still belongs to the finished turn: the queue ends by timeout.
+      t.receive({ type: "speech_chunk", id: "t1", seq: 0, final: false, mime: "audio/wav", data: "A" });
+      t.finishPlayback();
+      await vi.advanceTimersByTimeAsync(SPEECH_FINAL_TIMEOUT_MS);
+      expect(t.controller.getState().playing).toBeNull();
+      expect(t.phase()).toBe("idle");
     });
   });
 });
@@ -1725,6 +1794,52 @@ describe("notification inbox (T7.w.5c)", () => {
     t.controller.requestNotifications();
     t.receive(list(t.listId(), [item("n-5")]));
     expect(t.notified()).toHaveLength(3);
+  });
+
+  it("catch-up: more than 3 normal items -> one summary; urgent ones on their own, on top, never spoken", () => {
+    const store = new Map<string, string>();
+    const items = [
+      item("n-6", { urgency: "urgent" }),
+      item("n-5"),
+      item("n-4"),
+      item("n-3", { readAt: READ }),
+      item("n-2"),
+      item("n-1"),
+      item("n-0", { urgency: "urgent" }),
+    ];
+    const t = inbox(items, ["speech_stream"], store);
+    expect(t.notified()).toEqual([
+      ["4 yeni bildirim", "Ayrıntılar Bildirimler panelinde.", { id: CATCH_UP_SUMMARY_ID, urgent: false }],
+      ["Başlık n-0", "Metin n-0", { id: "n-0", urgent: true }],
+      ["Başlık n-6", "Metin n-6", { id: "n-6", urgent: true }],
+    ]);
+    expect(t.sentTypes()).not.toContain("speak");
+    // The summarized items count as shown.
+    expect(JSON.parse(store.get("shadow.notificationsShown") ?? "{}")).toEqual({
+      "n-0": 1,
+      "n-1": 1,
+      "n-2": 1,
+      "n-3": 1,
+      "n-4": 1,
+      "n-5": 1,
+      "n-6": 1,
+    });
+    t.reconnect(items);
+    expect(t.notified()).toHaveLength(3);
+  });
+
+  it("catch-up: 3 normal items (urgent ones not counted) are shown one by one", () => {
+    const items = [item("n-4", { urgency: "urgent" }), item("n-3"), item("n-2"), item("n-1")];
+    const t = inbox(items);
+    expect(t.notified().map((c) => c[2])).toEqual([
+      { id: "n-1", urgent: false },
+      { id: "n-2", urgent: false },
+      { id: "n-3", urgent: false },
+      { id: "n-4", urgent: true },
+    ]);
+    // Only items not shown yet count: one new normal item later is shown on its own.
+    t.reconnect([item("n-9"), ...items]);
+    expect(t.notified().slice(4).map((c) => c[2])).toEqual([{ id: "n-9", urgent: false }]);
   });
 
   it("a damaged shown record reads as empty", () => {

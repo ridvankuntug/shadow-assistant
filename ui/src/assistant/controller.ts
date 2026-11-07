@@ -65,6 +65,20 @@ export const MEMORY_TIMEOUT_MS = 8_000;
 export const DEV_TIMEOUT_MS = 8_000;
 /** Same for `notifications_list` / `notification_action` in the inbox. */
 export const NOTIFICATIONS_TIMEOUT_MS = 8_000;
+/**
+ * Catch-up on connect: up to this many normal items are shown one by one;
+ * more become one summary notification (urgent items are always separate).
+ */
+export const MAX_SEPARATE_CATCH_UP = 3;
+/**
+ * `NotifyItem.id` of the catch-up summary. Core item ids start with `n-`, so
+ * it never replaces an item; the next summary replaces this one.
+ */
+export const CATCH_UP_SUMMARY_ID = "summary";
+/** Title / body of the catch-up summary notification. */
+export function catchUpSummaryText(count: number): { title: string; body: string } {
+  return { title: `${count} yeni bildirim`, body: "Ayrıntılar Bildirimler panelinde." };
+}
 /** Urgent items waiting to be spoken (the UI was busy); more are not queued. */
 const MAX_ANNOUNCEMENTS = 5;
 /**
@@ -506,6 +520,17 @@ export class AssistantController {
     return this.sendMemory((id) => ({ type: "memory_delete", id, entryId }), entryId);
   }
 
+  /**
+   * The memory panel was closed (close button, Escape, backdrop): the
+   * request in flight is abandoned, so its late answer or error is ignored
+   * and no timeout fires for it. A delete already sent stays done on the
+   * Core; the next open lists the contents anew.
+   */
+  closeMemory(): void {
+    this.clearMemoryTimer();
+    this.dispatch({ type: "memory_closed" });
+  }
+
   private sendMemory(frame: (id: string) => Extract<ClientMessage, { type: "memory_list" | "memory_delete" }>, entryId?: string): boolean {
     if (!memoryAvailable(this.state) || this.state.memory.status === "loading") return false;
     const id = this.newId();
@@ -760,6 +785,8 @@ export class AssistantController {
           this.clearMemoryTimer();
           break;
         }
+        // A late error for a closed/replaced memory request: not about a turn.
+        if (msg.id !== undefined && this.state.memory.staleIds.includes(msg.id)) break;
         if (msg.id !== undefined && msg.id === this.state.dev.requestId) {
           this.clearDevTimer();
           break;
@@ -822,14 +849,28 @@ export class AssistantController {
   /**
    * The first inbox list of a connection: every unread item whose current
    * raise was not shown on this device yet is shown once (oldest first, so
-   * the newest ends on top). The record is then cut to the listed items.
+   * the newest ends on top). More than MAX_SEPARATE_CATCH_UP normal items
+   * become one summary notification instead; urgent items are always shown
+   * on their own, after it (on top). The catch-up never speaks: an urgent
+   * item is spoken once, when the Core raises it (`notification.speak`).
+   * Summarized items count as shown. The record is then cut to the listed
+   * items.
    */
   private catchUp(items: NotificationInfo[]): void {
     const shown = this.loadShown();
     const next: Record<string, number> = {};
+    const fresh: NotificationInfo[] = [];
     for (const item of [...items].reverse()) {
-      if (item.readAt === null && shown[item.id] !== item.raised) this.showItem(item);
+      if (item.readAt === null && shown[item.id] !== item.raised) fresh.push(item);
       next[item.id] = item.raised;
+    }
+    const normal = fresh.filter((i) => i.urgency !== "urgent");
+    if (normal.length > MAX_SEPARATE_CATCH_UP) {
+      const { title, body } = catchUpSummaryText(normal.length);
+      this.adapter.notify(title, body, { id: CATCH_UP_SUMMARY_ID, urgent: false });
+      for (const item of fresh) if (item.urgency === "urgent") this.showItem(item);
+    } else {
+      for (const item of fresh) this.showItem(item);
     }
     this.saveShown(next);
   }

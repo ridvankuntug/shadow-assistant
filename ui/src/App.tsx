@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
   canPreviewVoice,
   canStop,
@@ -25,6 +25,7 @@ import { NotificationsPanel } from "./ui/NotificationsPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { sttStatus } from "./ui/serviceHealth.ts";
+import { clearTrayHash, trayTarget, watchTrayHash } from "./ui/trayHash.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
 import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, notificationsUnreadText, resolvedText } from "./ui/strings.ts";
@@ -33,12 +34,10 @@ type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
 type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect";
 
-/** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5). */
-const DEV_HASH = "#dev";
-const NOTIFICATIONS_HASH = "#notifications";
-const atHash = (hash: string) => typeof window !== "undefined" && window.location.hash === hash;
-const atDevHash = () => atHash(DEV_HASH);
-const atNotificationsHash = () => atHash(NOTIFICATIONS_HASH);
+/** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5; ui/trayHash.ts). */
+const atHash = (panel: "dev" | "notifications") => typeof window !== "undefined" && trayTarget(window.location.hash) === panel;
+const atDevHash = () => atHash("dev");
+const atNotificationsHash = () => atHash("notifications");
 
 export default function App({ adapter, controller }: Props) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState);
@@ -99,6 +98,12 @@ export default function App({ adapter, controller }: Props) {
   useEffect(() => {
     if (panel === "memory" && memoryOn) controller.requestMemory();
   }, [controller, panel, memoryOn]);
+  // Leaving the panel (closed, or replaced by another one, e.g. through
+  // `#dev`) abandons its request: a late answer must not change anything.
+  useEffect(() => {
+    if (panel !== "memory") return;
+    return () => controller.closeMemory();
+  }, [controller, panel]);
 
   // The Development panel asks for the items each time it opens, and again
   // after a reconnect (the welcome resets them).
@@ -114,19 +119,23 @@ export default function App({ adapter, controller }: Props) {
     if (panel === "notifications" && notificationsOn) controller.requestNotifications();
   }, [controller, panel, notificationsOn]);
 
+  // The open panel for the hash listener (a hash for the open panel is dropped there).
+  const panelRef = useRef<Panel>(panel);
   useEffect(() => {
-    const onHash = () => {
-      if (atDevHash()) setDevWanted(true);
-      if (atNotificationsHash()) setNotificationsWanted(true);
-    };
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
-  }, []);
-  // Drop a consumed `#dev` / `#notifications` so the tray can target it again in this tab (hashchange).
+    panelRef.current = panel;
+  }, [panel]);
+  useEffect(
+    () =>
+      watchTrayHash(
+        window,
+        () => panelRef.current,
+        (target) => (target === "dev" ? setDevWanted(true) : setNotificationsWanted(true)),
+      ),
+    [],
+  );
+  // Drop a consumed `#dev` / `#notifications` once its panel opens, so the tray can target it again in this tab.
   useEffect(() => {
-    if ((panel === "dev" && atDevHash()) || (panel === "notifications" && atNotificationsHash())) {
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
+    clearTrayHash(window, panel);
   }, [panel]);
   // Open it once the Core offers it (state adjusted during render, no effect needed).
   if (devWanted && devOn) {

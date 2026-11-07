@@ -556,6 +556,18 @@ describe("memory panel (M8)", () => {
     expect(s.memory.contents?.brief.entries).toHaveLength(1);
   });
 
+  it("memory_closed: the request becomes stale; its answer and error are dropped; ready contents stay", () => {
+    const idle = run([{ type: "memory_closed" }]);
+    expect(idle).toBe(run([])); // nothing asked yet: no change
+    const s = run([{ type: "memory_requested", id: "m1" }, srv(frame("m1")), { type: "memory_requested", id: "m2", entryId: "m-1" }, { type: "memory_closed" }]);
+    expect(s.memory).toMatchObject({ status: "ready", requestId: null, deleting: null, staleIds: ["m1", "m2"] });
+    const late = run([srv(frame("m2", [])), srv({ type: "error", id: "m2", code: "internal", message: "x" })], s);
+    expect(late.notice).toBeNull();
+    expect(late.memory).toEqual(s.memory);
+    const empty = run([{ type: "memory_requested", id: "m1" }, { type: "memory_closed" }]);
+    expect(empty.memory).toMatchObject({ status: "idle", requestId: null, contents: null });
+  });
+
   it("timeout only for the request still loading; a late answer still fills the panel", () => {
     const s = run([{ type: "memory_requested", id: "m1" }]);
     expect(run([{ type: "memory_timeout", id: "old" }], s)).toBe(s);

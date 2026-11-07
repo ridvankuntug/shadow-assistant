@@ -89,7 +89,8 @@ export type MemoryContents = Pick<MemoryMessage, "brief" | "topics" | "warnings"
  * The memory settings panel (Core feature `memory`). One request at a time:
  * `memory_list` (refresh) or `memory_delete` (`deleting` = its entry id).
  * `error` keeps the last contents; `errorCode` is the Core error code or
- * `timeout` / `connection` (local).
+ * `timeout` / `connection` (local). Closing the panel abandons the request
+ * in flight (`memory_closed`): its late answer or error changes nothing.
  */
 export type MemoryView = {
   status: "idle" | "loading" | "ready" | "error";
@@ -99,6 +100,12 @@ export type MemoryView = {
   contents: MemoryContents | null;
   errorCode: string | null;
   errorMessage: string | null;
+  /**
+   * Earlier request ids replaced by a newer one or abandoned by closing the
+   * panel. A late error for one of them is dropped instead of becoming a
+   * chat notice (as `DevView.staleIds`).
+   */
+  staleIds: string[];
 };
 
 /**
@@ -218,6 +225,7 @@ export type Action =
   | { type: "voice_preview_requested"; id: string }
   | { type: "memory_requested"; id: string; entryId?: string }
   | { type: "memory_timeout"; id: string }
+  | { type: "memory_closed" }
   | { type: "dev_requested"; id: string; acting?: { itemId: string; action: DevAction } }
   | { type: "dev_timeout"; id: string }
   | { type: "notifications_requested"; id: string; acting?: { notificationId: string; action: NotificationAction } }
@@ -225,6 +233,7 @@ export type Action =
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
+const MAX_STALE_MEMORY = 8;
 const MAX_STALE_DEV = 8;
 const MAX_STALE_NOTIFICATIONS = 8;
 
@@ -249,7 +258,7 @@ export const initialState: AssistantState = {
   services: [],
   voices: { status: "idle", requestId: null, defaultVoice: null, voices: [] },
   voicePreview: null,
-  memory: { status: "idle", requestId: null, deleting: null, contents: null, errorCode: null, errorMessage: null },
+  memory: { status: "idle", requestId: null, deleting: null, contents: null, errorCode: null, errorMessage: null, staleIds: [] },
   dev: {
     status: "idle",
     requestId: null,
@@ -604,16 +613,39 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
     case "voice_preview_requested":
       return { ...s, voicePreview: { id: a.id, failed: false }, awaitingSpeech: a.id };
 
-    case "memory_requested":
+    case "memory_requested": {
+      const prev = s.memory.requestId;
+      const staleIds = prev && prev !== a.id ? [...s.memory.staleIds, prev].slice(-MAX_STALE_MEMORY) : s.memory.staleIds;
       return {
         ...s,
-        memory: { ...s.memory, status: "loading", requestId: a.id, deleting: a.entryId ?? null, errorCode: null, errorMessage: null },
+        memory: { ...s.memory, status: "loading", requestId: a.id, deleting: a.entryId ?? null, errorCode: null, errorMessage: null, staleIds },
       };
+    }
 
     case "memory_timeout":
       return s.memory.status === "loading" && s.memory.requestId === a.id
         ? { ...s, memory: memoryFailed(s.memory, "timeout") }
         : s;
+
+    case "memory_closed": {
+      // The panel was closed: the request in flight (or its late answer after
+      // a timeout) no longer belongs to anything shown. A delete already sent
+      // cannot be taken back (no frame for it); the next open lists anew.
+      const m = s.memory;
+      if (m.requestId === null) return s;
+      return {
+        ...s,
+        memory: {
+          ...m,
+          status: m.contents ? "ready" : "idle",
+          requestId: null,
+          deleting: null,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: [...m.staleIds, m.requestId].slice(-MAX_STALE_MEMORY),
+        },
+      };
+    }
 
     case "dev_requested": {
       const prev = s.dev.requestId;
@@ -765,9 +797,10 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       return s;
 
     case "memory":
-      // Only the answer to the latest request; it still counts after the
-      // local timeout (a slow Core).
-      if (msg.id !== s.memory.requestId) return s;
+      // Only the answer to the latest request of the open panel; it still
+      // counts after the local timeout (a slow Core). Closing the panel or a
+      // newer request makes it stale.
+      if (s.memory.requestId === null || msg.id !== s.memory.requestId) return s;
       return {
         ...s,
         memory: {
@@ -777,6 +810,7 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
           contents: { brief: msg.brief, topics: msg.topics, warnings: msg.warnings },
           errorCode: null,
           errorMessage: null,
+          staleIds: s.memory.staleIds,
         },
       };
 
@@ -792,6 +826,7 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       if (msg.id !== undefined && msg.id === s.memory.requestId) {
         return s.memory.status === "loading" ? { ...s, memory: memoryFailed(s.memory, msg.code, msg.message) } : s;
       }
+      if (msg.id !== undefined && s.memory.staleIds.includes(msg.id)) return s;
       // So do errors of the Development panel (unknown_item, not_allowed, …).
       if (msg.id !== undefined && msg.id === s.dev.requestId) {
         return s.dev.status === "loading" ? { ...s, dev: devFailed(s.dev, msg.code, msg.message) } : s;
