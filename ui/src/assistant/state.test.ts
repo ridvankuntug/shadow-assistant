@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { noticeText, timeLocativeSuffix, usageLimitText } from "../ui/strings.ts";
-import type { ServerMessage, ServiceHealth } from "../protocol/types.ts";
+import type { DevItem, ServerMessage, ServiceHealth } from "../protocol/types.ts";
 import {
   bargeInTarget,
   canStop,
   currentConfirm,
   derivePhase,
+  devAvailable,
+  devBadgeCount,
+  devItemActions,
   hasFeature,
   initialState,
   memoryAvailable,
@@ -566,5 +569,95 @@ describe("memory panel (M8)", () => {
     expect(s.memory).toMatchObject({ status: "error", errorCode: "connection" });
     const ready = run([{ type: "memory_requested", id: "m2" }, srv(frame("m2"))]);
     expect(run([srv(welcome(["memory"]))], ready).memory).toEqual(initialState.memory);
+  });
+});
+
+describe("development panel (T7.w.4c)", () => {
+  const welcome = (features?: string[]): ServerMessage =>
+    features
+      ? { type: "welcome", protocol: 1, sessionId: "s", device: "d", features }
+      : { type: "welcome", protocol: 1, sessionId: "s", device: "d" };
+  const item = (type: "rule" | "note", status: string): DevItem => ({
+    itemId: `${type}-${status}`,
+    type,
+    kind: type === "rule" ? "learned_rule" : "tool_error",
+    status,
+    message: "m",
+    count: 1,
+    firstSeen: "2026-11-07T18:00:00.000Z",
+    lastSeen: "2026-11-07T18:00:00.000Z",
+    ...(type === "rule" ? { rule: { tokens: ["<ad>", "aç"], tool: "intent__HassTurnOn", domains: ["light"], observations: 3 } } : {}),
+  });
+  const frame = (id: string, open = 1, canManage = false): ServerMessage => ({
+    type: "dev",
+    id,
+    items: [item("rule", "candidate")],
+    open,
+    canManage,
+  });
+
+  it("is available (and has a badge) only while connected to a Core with the dev feature", () => {
+    const on = run([srv(welcome(["dev"])), srv({ type: "dev_count", open: 3 })]);
+    expect(devAvailable(on)).toBe(true);
+    expect(devBadgeCount(on)).toBe(3);
+    expect(devAvailable(run([srv(welcome(["memory"]))]))).toBe(false);
+    const older = run([srv(welcome())], on);
+    expect(devAvailable(older)).toBe(false);
+    expect(devBadgeCount(older)).toBe(0);
+    const dropped = run([{ type: "status", ev: { status: "reconnecting", attempt: 1 } }], on);
+    expect(devBadgeCount(dropped)).toBe(0);
+  });
+
+  it("actions per item follow the docs/08 table; add_rule needs canManage", () => {
+    expect(devItemActions(item("rule", "candidate"), true)).toEqual(["add_rule", "ignore"]);
+    expect(devItemActions(item("rule", "candidate"), false)).toEqual(["ignore"]);
+    expect(devItemActions(item("rule", "suspended"), true)).toEqual(["ignore"]);
+    expect(devItemActions(item("rule", "active"), true)).toEqual([]);
+    expect(devItemActions(item("note", "open"), true)).toEqual(["fixed", "ignore"]);
+    expect(devItemActions(item("note", "ignored"), true)).toEqual([]);
+    expect(devItemActions(item("note", "fixed"), true)).toEqual([]);
+    expect(devItemActions(item("note", "weird"), true)).toEqual([]);
+  });
+
+  it("list and action: loading, then the answer to that request only", () => {
+    const s = run([srv(welcome(["dev"])), { type: "dev_requested", id: "d1" }]);
+    expect(s.dev).toMatchObject({ status: "loading", requestId: "d1", acting: null });
+    expect(run([srv(frame("other"))], s)).toBe(s);
+    const ready = run([srv(frame("d1", 1, true))], s);
+    expect(ready.dev).toMatchObject({ status: "ready", open: 1, canManage: true, acting: null });
+    const acting = run([{ type: "dev_requested", id: "d2", acting: { itemId: "rule-candidate", action: "add_rule" } }], ready);
+    expect(acting.dev).toMatchObject({ status: "loading", acting: { itemId: "rule-candidate", action: "add_rule" } });
+    expect(acting.dev.items).toHaveLength(1); // kept while acting
+  });
+
+  it("dev_count only changes the badge; a dev answer sets it too", () => {
+    const s = run([srv(welcome(["dev"])), srv({ type: "dev_count", open: 2 })]);
+    expect(s.dev).toMatchObject({ open: 2, status: "idle", items: null });
+    expect(run([srv({ type: "dev_count", open: 2 })], s)).toBe(s);
+    const answered = run([{ type: "dev_requested", id: "d1" }, srv(frame("d1", 4))], s);
+    expect(answered.dev.open).toBe(4);
+  });
+
+  it("an error for the request stays in the panel (no chat notice) and keeps the items", () => {
+    const s = run([
+      srv(welcome(["dev"])),
+      { type: "dev_requested", id: "d1" },
+      srv(frame("d1")),
+      { type: "dev_requested", id: "d2", acting: { itemId: "rule-candidate", action: "ignore" } },
+      srv({ type: "error", id: "d2", code: "unknown_item", message: "gone" }),
+    ]);
+    expect(s.notice).toBeNull();
+    expect(s.dev).toMatchObject({ status: "error", acting: null, errorCode: "unknown_item", errorMessage: "gone" });
+    expect(s.dev.items).toHaveLength(1);
+  });
+
+  it("timeout only for the request still loading; a dropped connection fails it; welcome resets", () => {
+    const s = run([srv(welcome(["dev"])), { type: "dev_requested", id: "d1" }]);
+    expect(run([{ type: "dev_timeout", id: "old" }], s)).toBe(s);
+    expect(run([{ type: "dev_timeout", id: "d1" }], s).dev).toMatchObject({ status: "error", errorCode: "timeout" });
+    const dropped = run([{ type: "status", ev: { status: "reconnecting", attempt: 1 } }], s);
+    expect(dropped.dev).toMatchObject({ status: "error", errorCode: "connection" });
+    const ready = run([srv(frame("d1"))], s);
+    expect(run([srv(welcome(["dev"]))], ready).dev).toEqual(initialState.dev);
   });
 });

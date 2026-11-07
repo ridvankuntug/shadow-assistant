@@ -1,7 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import type { HistoryItem } from "../protocol/types.ts";
 import { QUALITIES, type Quality } from "../scene/quality.ts";
-import { QUALITY_LABEL, formatTime } from "./strings.ts";
+import { QUALITY_LABEL, devOpenText, formatTime } from "./strings.ts";
 
 /** Slide-in side panel (modal on phones, docked look on wide screens). */
 export function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
@@ -78,6 +78,8 @@ export function SettingsPanel({
   coreUrl,
   voicePicker,
   onOpenMemory,
+  onOpenDev,
+  devOpen = 0,
   onQuality,
   onVoiceReplies,
   onChangeConnection,
@@ -91,6 +93,10 @@ export function SettingsPanel({
   voicePicker?: ReactNode;
   /** Opens the "Hafıza" panel; absent (section hidden) without the Core feature `memory`. */
   onOpenMemory?: () => void;
+  /** Opens the "Geliştirme" panel; absent (section hidden) without the Core feature `dev`. */
+  onOpenDev?: () => void;
+  /** Development badge count shown on that button. */
+  devOpen?: number;
   onQuality: (q: Quality) => void;
   onVoiceReplies: (v: boolean) => void;
   onChangeConnection: () => void;
@@ -130,6 +136,15 @@ export function SettingsPanel({
           <p className="hint">Shadow'un konuşmalardan hatırladıkları. Yanlış ya da gereksiz olanları silebilirsin.</p>
           <button type="button" className="btn btn-ghost" onClick={onOpenMemory}>
             Hafızayı göster
+          </button>
+        </div>
+      )}
+      {onOpenDev && (
+        <div className="field">
+          <span className="field-label">Geliştirme</span>
+          <p className="hint">Shadow'un öğrendiği kural önerileri ve geliştirme notları.</p>
+          <button type="button" className="btn btn-ghost" onClick={onOpenDev}>
+            {devOpen > 0 ? `Geliştirmeyi göster (${devOpenText(devOpen)})` : "Geliştirmeyi göster"}
           </button>
         </div>
       )}

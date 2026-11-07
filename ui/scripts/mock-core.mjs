@@ -12,7 +12,9 @@
 //               MOCK_STT_IDLE=1 (whisper-svc reported `ok` with detail `idle`),
 //               MOCK_SPEECH_STREAM=0 (behave like an older Core: no `features`, no speech_chunk),
 //               MOCK_MEMORY=0 (no `memory` feature; memory_list/memory_delete get bad_request),
-//               MOCK_MEMORY_SILENT=1 (memory frames are never answered, to see the UI timeout).
+//               MOCK_MEMORY_SILENT=1 (memory frames are never answered, to see the UI timeout),
+//               MOCK_DEV=0 (no `dev` feature; dev_list/dev_action get bad_request),
+//               MOCK_DEV_MANAGE=0 (canManage false: "Kuralı ekle" hidden, add_rule gets not_allowed).
 // With speech_stream (default) a client that sent speech_prefs gets one speech_chunk per
 // sentence while the answer streams (a sine tone in audio mode, the sentence in text mode).
 // A message containing "limit" is answered with `error usage_limit` (retryAt in 2 hours).
@@ -26,6 +28,8 @@ const CONFIRM_MS = Number(process.env.MOCK_CONFIRM_MS ?? 60000);
 const AUTH_TIMEOUT_MS = 5000;
 const SPEECH_STREAM = process.env.MOCK_SPEECH_STREAM !== "0";
 const MEMORY = process.env.MOCK_MEMORY !== "0";
+const DEV = process.env.MOCK_DEV !== "0";
+const DEV_MANAGE = process.env.MOCK_DEV_MANAGE !== "0";
 // Like the real Core: service tool names without the Agent SDK's mcp__<service>__ prefix.
 const LOCK_TOOL = "intent__HassTurnOff";
 
@@ -362,6 +366,78 @@ function handleMemory(ctx, msg) {
   });
 }
 
+// --------------------------------------------------------------- development
+// Shared across connections; actions last until the mock restarts. Item
+// statuses follow docs/02 *Development*; `add_rule` needs MOCK_DEV_MANAGE.
+const devDay = new Date(Date.now() - 86400000).toISOString();
+const devNow = new Date().toISOString();
+const devStore = [
+  {
+    itemId: "r-lr-3f9a1c2e",
+    type: "rule",
+    kind: "learned_rule",
+    status: "candidate",
+    message: "Bu kalıp 3 kez aynı araca gitti.",
+    count: 3,
+    firstSeen: devDay,
+    lastSeen: devNow,
+    rule: { tokens: ["<ad>", "yüzde", "<sayi>", "yap"], tool: "light__HassLightSet", domains: ["light"], numberRange: { min: 20, max: 80 }, observations: 3 },
+  },
+  {
+    itemId: "r-lr-77b0d4aa",
+    type: "rule",
+    kind: "learned_rule",
+    status: "suspended",
+    message: "Kural iki kez başarısız oldu; askıya alındı.",
+    count: 4,
+    firstSeen: devDay,
+    lastSeen: devNow,
+    rule: { tokens: ["<ad>", "kapat"], tool: "intent__HassTurnOff", domains: ["light", "switch"], observations: 4 },
+  },
+  { itemId: "n-wander-1", type: "note", kind: "wandering", status: "open", message: "Bir tur 6 araç çağrısı yaptı.", count: 2, firstSeen: devDay, lastSeen: devNow },
+  { itemId: "n-tool-err-1", type: "note", kind: "tool_error", status: "open", message: "home-assistant aracı hata döndü.", count: 1, firstSeen: devDay, lastSeen: devNow },
+  { itemId: "n-new-tool-1", type: "note", kind: "new_tool", status: "fixed", message: "Yeni araç görüldü.", count: 1, firstSeen: devDay, lastSeen: devDay },
+];
+
+const devOpen = () =>
+  devStore.filter((i) => (i.type === "rule" ? i.status === "candidate" || i.status === "suspended" : i.status === "open")).length;
+
+function devFrame(id) {
+  return { type: "dev", id, items: devStore, open: devOpen(), canManage: DEV_MANAGE };
+}
+
+/** Next status for an action, or null when the action is not valid for the item (docs/08 action table). */
+function devNextStatus(item, action) {
+  if (item.type === "rule") {
+    if (action === "add_rule") return item.status === "candidate" || item.status === "active" ? "active" : null;
+    if (action === "ignore") return item.status === "candidate" || item.status === "suspended" || item.status === "rejected" ? "rejected" : null;
+    return null;
+  }
+  if (action === "ignore") return "ignored";
+  if (action === "fixed") return "fixed";
+  return null;
+}
+
+function handleDev(ctx, msg) {
+  if (!DEV) return sendError(ctx.ws, "bad_request", `Bilinmeyen tür: ${msg.type}`, msg.id);
+  // Not `later()`: cancelling a turn clears ctx.timers, and the real Core answers dev frames regardless
+  // (send() drops the answer if the socket closed meanwhile).
+  setTimeout(() => {
+    if (msg.type === "dev_action") {
+      const item = devStore.find((i) => i.itemId === msg.itemId);
+      if (!item) return sendError(ctx.ws, "unknown_item", "unknown itemId", msg.id);
+      if (msg.action === "add_rule" && !DEV_MANAGE) return sendError(ctx.ws, "not_allowed", "device may not add rules", msg.id);
+      const next = devNextStatus(item, msg.action);
+      if (!next) return sendError(ctx.ws, "not_allowed", "action not valid for the item", msg.id);
+      const before = devOpen();
+      item.status = next;
+      console.log(`[mock-core] dev_action: ${msg.action} ${msg.itemId} -> ${next}`);
+      if (devOpen() !== before) for (const ws of authedSockets) send(ws, { type: "dev_count", open: devOpen() });
+    }
+    send(ctx.ws, devFrame(msg.id));
+  }, 300);
+}
+
 const MOCK_VOICES = [
   { id: "tr_TR-dfki-medium", label: "DFKI (kadın)", quality: "medium" },
   { id: "tr_TR-fahrettin-medium", label: "Fahrettin (erkek)", quality: "medium" },
@@ -424,6 +500,9 @@ function handleFrame(ctx, msg) {
     case "memory_list":
     case "memory_delete":
       return handleMemory(ctx, msg);
+    case "dev_list":
+    case "dev_action":
+      return handleDev(ctx, msg);
     case "speech_prefs":
       if (!SPEECH_STREAM) return sendError(ws, "bad_request", "Bilinmeyen tür: speech_prefs");
       if (typeof msg.enabled !== "boolean" || (msg.mode !== "audio" && msg.mode !== "text")) {
@@ -466,7 +545,7 @@ function onMessage(ctx, raw) {
     ctx.authed = true;
     clearTimeout(ctx.authTimer);
     const welcome = { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" };
-    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : [])];
+    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : []), ...(DEV ? ["dev"] : [])];
     if (features.length > 0) welcome.features = features;
     send(ctx.ws, welcome);
     send(ctx.ws, { type: "state", state: "idle" });

@@ -9,6 +9,8 @@ import type { StatusEvent } from "../protocol/client.ts";
 import type {
   ConfirmResolvedBy,
   CoreFeature,
+  DevAction,
+  DevItem,
   HistoryItem,
   MemoryMessage,
   ServerMessage,
@@ -97,6 +99,32 @@ export type MemoryView = {
   errorMessage: string | null;
 };
 
+/**
+ * The Development panel (Core feature `dev`). One request at a time:
+ * `dev_list` (refresh) or `dev_action` (`acting` = its item and action).
+ * `error` keeps the last items; `errorCode` is the Core error code or
+ * `timeout` / `connection` (local). `open` is the badge count, null until the
+ * Core told one (a `dev` answer or a `dev_count` broadcast).
+ */
+export type DevView = {
+  status: "idle" | "loading" | "ready" | "error";
+  /** Id of the request in flight (or last answered). */
+  requestId: string | null;
+  acting: { itemId: string; action: DevAction } | null;
+  items: DevItem[] | null;
+  open: number | null;
+  /** This device may use `add_rule` (from the last `dev` answer; false until then). */
+  canManage: boolean;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /**
+   * Earlier request ids replaced by a newer one (e.g. "Yenile" after a
+   * timeout). A late error for one of them is dropped instead of becoming a
+   * chat notice.
+   */
+  staleIds: string[];
+};
+
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
 export type VoicePreview = { id: string; failed: boolean };
 
@@ -142,6 +170,7 @@ export type AssistantState = {
   voices: VoiceCatalog;
   voicePreview: VoicePreview | null;
   memory: MemoryView;
+  dev: DevView;
 };
 
 export type Action =
@@ -165,10 +194,13 @@ export type Action =
   | { type: "voices_timeout"; id: string }
   | { type: "voice_preview_requested"; id: string }
   | { type: "memory_requested"; id: string; entryId?: string }
-  | { type: "memory_timeout"; id: string };
+  | { type: "memory_timeout"; id: string }
+  | { type: "dev_requested"; id: string; acting?: { itemId: string; action: DevAction } }
+  | { type: "dev_timeout"; id: string };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
+const MAX_STALE_DEV = 8;
 
 export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
@@ -192,6 +224,17 @@ export const initialState: AssistantState = {
   voices: { status: "idle", requestId: null, defaultVoice: null, voices: [] },
   voicePreview: null,
   memory: { status: "idle", requestId: null, deleting: null, contents: null, errorCode: null, errorMessage: null },
+  dev: {
+    status: "idle",
+    requestId: null,
+    acting: null,
+    items: null,
+    open: null,
+    canManage: false,
+    errorCode: null,
+    errorMessage: null,
+    staleIds: [],
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -281,6 +324,35 @@ export function memoryAvailable(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "memory");
 }
 
+/** The Development panel and badge may be offered: connected to a Core with the `dev` feature. */
+export function devAvailable(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "dev");
+}
+
+/** The Development badge count (0 = no badge): only while the panel is available. */
+export function devBadgeCount(s: AssistantState): number {
+  return devAvailable(s) ? (s.dev.open ?? 0) : 0;
+}
+
+/**
+ * The actions offered for an item, per the docs/08 action table: a rule
+ * candidate can be added (only when this device may: `canManage`) or ignored,
+ * a suspended rule ignored, an open note fixed or ignored. Active rules,
+ * ignored / fixed notes and unknown statuses get none.
+ */
+export function devItemActions(item: DevItem, canManage: boolean): DevAction[] {
+  if (item.type === "rule") {
+    if (item.status === "candidate") return canManage ? ["add_rule", "ignore"] : ["ignore"];
+    return item.status === "suspended" ? ["ignore"] : [];
+  }
+  return item.status === "open" ? ["fixed", "ignore"] : [];
+}
+
+/** A failed or unanswered Development request (keeps the shown items). */
+function devFailed(d: DevView, code: string, message?: string): DevView {
+  return { ...d, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
+}
+
 /** A failed or unanswered memory request (keeps the shown contents). */
 function memoryFailed(m: MemoryView, code: string, message?: string): MemoryView {
   return { ...m, status: "error", deleting: null, errorCode: code, errorMessage: message ?? null };
@@ -353,6 +425,7 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         voices: s.voices.status === "loading" ? initialState.voices : s.voices,
         // Its answer can no longer arrive.
         memory: s.memory.status === "loading" ? memoryFailed(s.memory, "connection") : s.memory,
+        dev: s.dev.status === "loading" ? devFailed(s.dev, "connection") : s.dev,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -457,6 +530,18 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         ? { ...s, memory: memoryFailed(s.memory, "timeout") }
         : s;
 
+    case "dev_requested": {
+      const prev = s.dev.requestId;
+      const staleIds = prev && prev !== a.id ? [...s.dev.staleIds, prev].slice(-MAX_STALE_DEV) : s.dev.staleIds;
+      return {
+        ...s,
+        dev: { ...s.dev, status: "loading", requestId: a.id, acting: a.acting ?? null, errorCode: null, errorMessage: null, staleIds },
+      };
+    }
+
+    case "dev_timeout":
+      return s.dev.status === "loading" && s.dev.requestId === a.id ? { ...s, dev: devFailed(s.dev, "timeout") } : s;
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -482,6 +567,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         voicePreview: null,
         // Another Core may have other (or no) memory; the panel asks again.
         memory: initialState.memory,
+        // Same for the Development items and the badge (the controller asks again).
+        dev: initialState.dev,
       };
 
     case "state": {
@@ -603,6 +690,11 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       if (msg.id !== undefined && msg.id === s.memory.requestId) {
         return s.memory.status === "loading" ? { ...s, memory: memoryFailed(s.memory, msg.code, msg.message) } : s;
       }
+      // So do errors of the Development panel (unknown_item, not_allowed, …).
+      if (msg.id !== undefined && msg.id === s.dev.requestId) {
+        return s.dev.status === "loading" ? { ...s, dev: devFailed(s.dev, msg.code, msg.message) } : s;
+      }
+      if (msg.id !== undefined && s.dev.staleIds.includes(msg.id)) return s;
       if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
         return {
           ...s,
@@ -653,9 +745,27 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
     case "pong":
       return s;
 
-    // Development frames (feature `dev`): parsed since T7.w.4a, handled by the panel in T7.w.4c.
     case "dev":
+      // Only the answer to the latest request (as with memory); it still
+      // counts after the local timeout.
+      if (msg.id !== s.dev.requestId) return s;
+      return {
+        ...s,
+        dev: {
+          status: "ready",
+          requestId: msg.id,
+          acting: null,
+          items: msg.items,
+          open: msg.open,
+          canManage: msg.canManage,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: s.dev.staleIds,
+        },
+      };
+
     case "dev_count":
-      return s;
+      // Badge only; the list is refreshed when the panel opens (or "Yenile").
+      return msg.open === s.dev.open ? s : { ...s, dev: { ...s.dev, open: msg.open } };
   }
 }

@@ -7,13 +7,15 @@
  * unit-tested with a fake adapter and a fake socket.
  */
 import { CoreClient, type CoreClientOptions, type StatusEvent } from "../protocol/client.ts";
-import type { ClientMessage, ServerMessage, SpeechChunkMessage, SpeechPrefsMessage } from "../protocol/types.ts";
+import type { ClientMessage, DevAction, ServerMessage, SpeechChunkMessage, SpeechPrefsMessage } from "../protocol/types.ts";
 import { toPlatformError, type AudioClip, type PlatformAdapter } from "../platform/types.ts";
 import {
   bargeInTarget,
   canPreviewVoice,
   confirmPending,
   currentConfirm,
+  devAvailable,
+  devItemActions,
   hasFeature,
   initialState,
   isCancelled,
@@ -48,6 +50,8 @@ export const VOICES_TIMEOUT_MS = 8_000;
  * shown as failed in the memory panel. A late answer still fills it.
  */
 export const MEMORY_TIMEOUT_MS = 8_000;
+/** Same for `dev_list` / `dev_action` in the Development panel. */
+export const DEV_TIMEOUT_MS = 8_000;
 /**
  * Streamed speech: after `assistant_done`, a turn whose queue waits for more
  * chunks is closed when no chunk (and no `final`) arrived for this long, so a
@@ -155,6 +159,7 @@ export class AssistantController {
   private voice: string | null = null;
   private voicesTimer: ReturnType<typeof setTimeout> | null = null;
   private memoryTimer: ReturnType<typeof setTimeout> | null = null;
+  private devTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The last `speech_prefs` this connection sent, null before the first one
    * (or when the Core lacks `speech_stream`). Its `enabled` decides whether
@@ -243,8 +248,9 @@ export class AssistantController {
   private connectionLost(): void {
     // A queued turn cannot survive a dropped socket; the reducer marks it failed.
     this.resetCancelling();
-    // A memory request in flight is failed by the reducer ("connection").
+    // A memory or Development request in flight is failed by the reducer ("connection").
     this.clearMemoryTimer();
+    this.clearDevTimer();
     // No more chunks can come: play what arrived, then end. The next Core
     // session needs its own speech_prefs; old turn ids are meaningless there.
     this.sentPrefs = null;
@@ -264,6 +270,7 @@ export class AssistantController {
     this.resetCancelling();
     this.clearVoicesTimer();
     this.clearMemoryTimer();
+    this.clearDevTimer();
     this.stopLocalAudio();
   }
 
@@ -474,6 +481,44 @@ export class AssistantController {
     return true;
   }
 
+  /**
+   * Asks the Core for the Development items (`dev_list`). Only with the `dev`
+   * feature, while connected and no Development request is in flight. Also
+   * sent after `welcome`, for the badge count.
+   */
+  requestDev(): boolean {
+    return this.sendDev((id) => ({ type: "dev_list", id }));
+  }
+
+  /**
+   * One action on one listed item; the Core answers with the fresh list. Only
+   * actions `devItemActions` offers for the item as last listed are sent (so
+   * `add_rule` needs `canManage`); the Core checks again and may still answer
+   * `not_allowed` / `unknown_item`. "Kuralı ekle" is confirmed in the panel
+   * before this is called.
+   */
+  devAction(itemId: string, action: DevAction): boolean {
+    const item = this.state.dev.items?.find((i) => i.itemId === itemId);
+    if (!item || !devItemActions(item, this.state.dev.canManage).includes(action)) return false;
+    return this.sendDev((id) => ({ type: "dev_action", id, itemId, action }), { itemId, action });
+  }
+
+  private sendDev(
+    frame: (id: string) => Extract<ClientMessage, { type: "dev_list" | "dev_action" }>,
+    acting?: { itemId: string; action: DevAction },
+  ): boolean {
+    if (!devAvailable(this.state) || this.state.dev.status === "loading") return false;
+    const id = this.newId();
+    if (!this.client?.send(frame(id))) return false;
+    this.dispatch(acting ? { type: "dev_requested", id, acting } : { type: "dev_requested", id });
+    this.clearDevTimer();
+    this.devTimer = setTimeout(() => {
+      this.devTimer = null;
+      this.dispatch({ type: "dev_timeout", id });
+    }, DEV_TIMEOUT_MS);
+    return true;
+  }
+
   dismissNotice(): void {
     this.dispatch({ type: "dismiss_notice" });
   }
@@ -565,6 +610,11 @@ export class AssistantController {
     this.memoryTimer = null;
   }
 
+  private clearDevTimer(): void {
+    if (this.devTimer !== null) clearTimeout(this.devTimer);
+    this.devTimer = null;
+  }
+
   private clearMaxTimer(): void {
     if (this.maxTimer !== null) clearTimeout(this.maxTimer);
     this.maxTimer = null;
@@ -578,15 +628,22 @@ export class AssistantController {
       case "welcome":
         this.clearVoicesTimer(); // the reducer reset the voice list
         this.clearMemoryTimer(); // and the memory view
+        this.clearDevTimer(); // and the Development view
         this.sentPrefs = null; // a new Core session: opt in again
         this.syncSpeechPrefs();
         this.requestHistory();
+        // The badge count: the Core sends `dev_count` only when it changes.
+        this.requestDev();
         break;
       case "voices":
         if (msg.id === this.state.voices.requestId) this.clearVoicesTimer();
         break;
       case "memory":
         if (msg.id === this.state.memory.requestId) this.clearMemoryTimer();
+        break;
+      // Development frames are silent: no notify, vibration or sound (docs/08 §T7.w.4).
+      case "dev":
+        if (msg.id === this.state.dev.requestId) this.clearDevTimer();
         break;
       case "state":
         if (msg.state === "idle" && this.cancelling) this.flushQueuedTurn();
@@ -609,6 +666,12 @@ export class AssistantController {
           this.clearMemoryTimer();
           break;
         }
+        if (msg.id !== undefined && msg.id === this.state.dev.requestId) {
+          this.clearDevTimer();
+          break;
+        }
+        // A late error for an earlier Development request: not about a turn.
+        if (msg.id !== undefined && this.state.dev.staleIds.includes(msg.id)) break;
         if (failedSpeak) {
           this.speakNatively(failedSpeak.id, failedSpeak.text, msg.code);
           break;

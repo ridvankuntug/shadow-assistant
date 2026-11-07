@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { canPreviewVoice, canStop, currentConfirm, derivePhase, hasFeature, memoryAvailable } from "./assistant/state.ts";
+import {
+  canPreviewVoice,
+  canStop,
+  currentConfirm,
+  derivePhase,
+  devAvailable,
+  devBadgeCount,
+  hasFeature,
+  memoryAvailable,
+} from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
 import { PHASE_COLOR } from "./scene/phaseStyle.ts";
@@ -8,17 +17,22 @@ import { ConfirmCard } from "./ui/ConfirmCard.tsx";
 import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
 import { Conversation } from "./ui/Conversation.tsx";
+import { DevPanel } from "./ui/DevPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { sttStatus } from "./ui/serviceHealth.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
-import { CONNECTION_LABEL, noticeMessage, noticeText, resolvedText } from "./ui/strings.ts";
+import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, resolvedText } from "./ui/strings.ts";
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "memory" | "connect";
+type Panel = "none" | "history" | "settings" | "memory" | "dev" | "connect";
+
+/** The tray opens the UI at `#dev` (docs/08 §T7.w.4). */
+const DEV_HASH = "#dev";
+const atDevHash = () => typeof window !== "undefined" && window.location.hash === DEV_HASH;
 
 export default function App({ adapter, controller }: Props) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState);
@@ -42,6 +56,11 @@ export default function App({ adapter, controller }: Props) {
   const [panel, setPanel] = useState<Panel>("none");
   const closePanel = useCallback(() => setPanel("none"), []);
   const backToSettings = useCallback(() => setPanel("settings"), []);
+  // Where closing the Development panel returns to (it opens from Settings or the badge).
+  const [devFrom, setDevFrom] = useState<"none" | "settings">("none");
+  const closeDev = useCallback(() => setPanel(devFrom), [devFrom]);
+  // `#dev` asked for the Development panel; it opens once the Core offers it.
+  const [devWanted, setDevWanted] = useState(atDevHash);
 
   // Connect on start when a configuration is stored; reconnect when it changes.
   useEffect(() => {
@@ -72,6 +91,33 @@ export default function App({ adapter, controller }: Props) {
   useEffect(() => {
     if (panel === "memory" && memoryOn) controller.requestMemory();
   }, [controller, panel, memoryOn]);
+
+  // The Development panel asks for the items each time it opens, and again
+  // after a reconnect (the welcome resets them).
+  const devOn = devAvailable(state);
+  useEffect(() => {
+    if (panel === "dev" && devOn) controller.requestDev();
+  }, [controller, panel, devOn]);
+
+  useEffect(() => {
+    const onHash = () => {
+      if (atDevHash()) setDevWanted(true);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  // Drop a consumed `#dev` so the tray can target it again in this tab (hashchange).
+  useEffect(() => {
+    if (panel === "dev" && atDevHash()) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  }, [panel]);
+  // Open it once the Core offers it (state adjusted during render, no effect needed).
+  if (devWanted && devOn) {
+    setDevWanted(false);
+    setDevFrom("none");
+    setPanel("dev");
+  }
 
   // Back in the foreground: skip the remaining reconnect backoff. Visibility
   // never touches a recording here: in a browser tab it keeps running while
@@ -120,6 +166,12 @@ export default function App({ adapter, controller }: Props) {
     if (!v) controller.stopSpeaking();
   };
 
+  const openDev = (from: "none" | "settings") => {
+    setDevFrom(from);
+    setPanel("dev");
+  };
+  const devCount = devBadgeCount(state);
+
   const status = state.connection.status;
   const unauthorized = status === "unauthorized";
 
@@ -153,6 +205,22 @@ export default function App({ adapter, controller }: Props) {
         <nav className="topbar-actions">
           {/* Only while connected: after a disconnect the last list is stale. */}
           {connected && <ServiceIndicator services={state.services} />}
+          {/* Development badge: a count only, never a notification or a sound. */}
+          {devCount > 0 && (
+            <button
+              type="button"
+              className="btn btn-icon dev-badge"
+              aria-label={`Geliştirme: ${devOpenText(devCount)}`}
+              onClick={() => openDev("none")}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M9.4 16.6 4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4Zm5.2 0 4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4Z" />
+              </svg>
+              <span className="dev-count" aria-hidden="true">
+                {devCount > 99 ? "99+" : devCount}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-icon"
@@ -250,6 +318,8 @@ export default function App({ adapter, controller }: Props) {
             />
           }
           onOpenMemory={memoryOn ? () => setPanel("memory") : undefined}
+          onOpenDev={devOn ? () => openDev("settings") : undefined}
+          devOpen={devCount}
           onQuality={changeQuality}
           onVoiceReplies={changeVoiceReplies}
           onChangeConnection={() => setPanel("connect")}
@@ -264,6 +334,16 @@ export default function App({ adapter, controller }: Props) {
           onRefresh={() => controller.requestMemory()}
           onDelete={(entryId) => controller.deleteMemoryEntry(entryId)}
           onClose={backToSettings}
+        />
+      )}
+      {/* Hidden without the Core feature `dev` (e.g. after reconnecting to an older Core). */}
+      {panel === "dev" && hasFeature(state, "dev") && (
+        <DevPanel
+          dev={state.dev}
+          connected={connected}
+          onRefresh={() => controller.requestDev()}
+          onAction={(itemId, action) => controller.devAction(itemId, action)}
+          onClose={closeDev}
         />
       )}
     </div>

@@ -1,7 +1,7 @@
 /** User-facing Turkish strings. */
 import type { Notice, Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
-import type { MemoryWarning } from "../protocol/types.ts";
+import type { DevAction, DevRuleInfo, MemoryWarning } from "../protocol/types.ts";
 import type { Quality } from "../scene/quality.ts";
 import type { SttStatus } from "./serviceHealth.ts";
 
@@ -184,4 +184,105 @@ export function memoryErrorText(code: string, message?: string | null): string {
 /** "412 / 800 karakter" */
 export function memoryCharsText(chars: number, budget?: number): string {
   return budget ? `${chars} / ${budget} karakter` : `${chars} karakter`;
+}
+
+// ------------------------------------------------------- development panel
+
+export const DEV_ACTION_LABEL: Record<DevAction, string> = {
+  add_rule: "Kuralı ekle",
+  ignore: "Yok say",
+  fixed: "Düzeltildi",
+};
+
+const DEV_STATUS: Record<string, string> = {
+  candidate: "aday",
+  active: "etkin",
+  suspended: "askıya alındı",
+  rejected: "reddedildi",
+  open: "açık",
+  ignored: "yok sayıldı",
+  fixed: "düzeltildi",
+};
+
+/** Item status in Turkish; unknown values as-is (docs/02 *Development*). */
+export function devStatusText(status: string): string {
+  return DEV_STATUS[status] ?? status;
+}
+
+const DEV_KIND: Record<string, string> = {
+  learned_rule: "Öğrenilen kural",
+  new_tool: "Yeni araç",
+  tool_added: "Araç eklendi",
+  tool_removed: "Araç kaldırıldı",
+  rule_unmatched: "Kurala uymayan araç",
+  missing_capability: "Eksik yetenek",
+  wandering: "Uzayan tur",
+  tool_error: "Araç hatası",
+  rule_suspended: "Askıya alınan kural",
+};
+
+/** Note kind heading; unknown kinds as-is. */
+export function devKindText(kind: string): string {
+  return DEV_KIND[kind] ?? kind;
+}
+
+const DEV_TOOL: Record<string, string> = {
+  intent__HassTurnOn: "aç",
+  intent__HassTurnOff: "kapat",
+  light__HassLightSet: "parlaklık ayarla",
+};
+
+/** What a learned rule does, as a Turkish label; unknown tools by name. */
+export function devToolText(tool: string): string {
+  return DEV_TOOL[tool] ?? tool;
+}
+
+const DEV_DOMAIN: Record<string, string> = {
+  light: "ışık",
+  switch: "priz / anahtar",
+  media_player: "medya oynatıcı",
+};
+
+/** "ışık, medya oynatıcı"; unknown domains as-is. */
+export function devDomainsText(domains: readonly string[]): string {
+  return domains.map((d) => DEV_DOMAIN[d] ?? d).join(", ");
+}
+
+const DEV_SLOT: Record<string, string> = { "<ad>": "‹cihaz›", "<sayi>": "‹sayı›" };
+
+/** The rule pattern with its slots: `[<ad>, yüzde, <sayi>, yap]` → "‹cihaz› yüzde ‹sayı› yap". */
+export function devPatternText(tokens: readonly string[]): string {
+  return tokens.map((t) => DEV_SLOT[t] ?? t).join(" ");
+}
+
+/** How far a rule generalizes, shown before "Kuralı ekle". */
+export function devRuleDetails(rule: DevRuleInfo): string[] {
+  const lines = [`Eylem: ${devToolText(rule.tool)}`];
+  if (rule.domains.length > 0) lines.push(`Cihaz türü: ${devDomainsText(rule.domains)}`);
+  if (rule.numberRange) lines.push(`Sayı aralığı: ${rule.numberRange.min}–${rule.numberRange.max}`);
+  lines.push(`${rule.observations} kez görüldü`);
+  return lines;
+}
+
+/** Badge / button label: "3 açık öğe". */
+export function devOpenText(open: number): string {
+  return `${open} açık öğe`;
+}
+
+/** Why the last Development request failed (`timeout` / `connection` are local codes). */
+export function devErrorText(code: string, message?: string | null): string {
+  switch (code) {
+    case "timeout":
+      return "Çekirdek geliştirme isteğine yanıt vermedi.";
+    case "connection":
+      return "Bağlantı koptu; geliştirme listesi alınamadı.";
+    case "unknown_item":
+      return "Bu öğe artık listede yok. Listeyi yenile.";
+    case "not_allowed":
+      return "Bu işlem bu öğe için geçerli değil ya da bu cihazın yetkisi yok.";
+    case "bad_request":
+      return "Çekirdek isteği reddetti. Listeyi yenile.";
+    default:
+      return noticeText(code, message ?? undefined);
+  }
 }

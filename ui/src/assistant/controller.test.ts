@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CoreClientOptions, StatusEvent } from "../protocol/client.ts";
-import type { ClientMessage, ServerMessage } from "../protocol/types.ts";
+import type { ClientMessage, DevItem, ServerMessage } from "../protocol/types.ts";
 import { PlatformError, type PlatformAdapter, type TtsCapability, type Utterance } from "../platform/types.ts";
 import {
   AssistantController,
   CANCEL_SETTLE_MS,
+  DEV_TIMEOUT_MS,
   MAX_UTTERANCE_MS,
   MEMORY_TIMEOUT_MS,
   SPEECH_FINAL_TIMEOUT_MS,
@@ -13,7 +14,7 @@ import {
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
-import { derivePhase } from "./state.ts";
+import { derivePhase, devBadgeCount } from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -1262,6 +1263,181 @@ describe("memory panel (M8)", () => {
       t.receive(frame("t1"));
       vi.advanceTimersByTime(MEMORY_TIMEOUT_MS * 2);
       expect(t.controller.getState().memory.status).toBe("ready");
+    });
+  });
+});
+
+describe("development panel (T7.w.4c)", () => {
+  const rule = (status = "candidate"): DevItem => ({
+    itemId: "r-1",
+    type: "rule",
+    kind: "learned_rule",
+    status,
+    message: "Kural önerisi",
+    count: 3,
+    firstSeen: "2026-11-07T18:00:00.000Z",
+    lastSeen: "2026-11-08T07:30:00.000Z",
+    rule: { tokens: ["<ad>", "yüzde", "<sayi>", "yap"], tool: "light__HassLightSet", domains: ["light"], observations: 3 },
+  });
+  const note = (status = "open"): DevItem => ({
+    itemId: "n-1",
+    type: "note",
+    kind: "wandering",
+    status,
+    message: "Uzun tur",
+    count: 2,
+    firstSeen: "2026-11-07T18:00:00.000Z",
+    lastSeen: "2026-11-08T07:30:00.000Z",
+  });
+  const frame = (id: string, canManage = false, items: DevItem[] = [rule(), note()], open = items.length): ServerMessage => ({
+    type: "dev",
+    id,
+    items,
+    open,
+    canManage,
+  });
+  /** Connected to a Core with `dev`; the dev_list sent on welcome ("t1") answered with `answer`. */
+  const ready = (answer = frame("t1")) => {
+    const t = setup(undefined, ["dev"]);
+    t.receive(answer);
+    return t;
+  };
+
+  it("without the dev feature: no dev_list on welcome, no requests, no badge", () => {
+    const t = setup(undefined, ["memory"]);
+    expect(t.controller.getState().dev.status).toBe("idle");
+    expect(t.controller.requestDev()).toBe(false);
+    expect(t.controller.devAction("r-1", "ignore")).toBe(false);
+    expect(t.sent).toEqual([]);
+    t.receive({ type: "dev_count", open: 4 }); // an odd Core: still no badge
+    expect(devBadgeCount(t.controller.getState())).toBe(0);
+  });
+
+  it("list: dev_list right after welcome (for the badge); the answer fills the panel", () => {
+    const a = fakeAdapter();
+    const c = fakeClient();
+    const controller = new AssistantController({ adapter: a.adapter, clientVersion: "x", createClient: c.create, newId: () => "d1" });
+    controller.connect("ws://localhost:8700/ws", "tok");
+    c.connect(["dev"]);
+    expect(c.sent).toContainEqual({ type: "dev_list", id: "d1" });
+    expect(controller.requestDev()).toBe(false); // one request at a time
+    c.receive(frame("d1", true));
+    const dev = controller.getState().dev;
+    expect(dev).toMatchObject({ status: "ready", open: 2, canManage: true });
+    expect(dev.items?.map((i) => i.itemId)).toEqual(["r-1", "n-1"]);
+    expect(devBadgeCount(controller.getState())).toBe(2);
+    expect(controller.requestDev()).toBe(true); // "Yenile"
+  });
+
+  it("badge: dev_count changes it; it is gone while disconnected", () => {
+    const t = ready();
+    t.receive({ type: "dev_count", open: 5 });
+    expect(devBadgeCount(t.controller.getState())).toBe(5);
+    t.receive({ type: "dev_count", open: 0 });
+    expect(devBadgeCount(t.controller.getState())).toBe(0);
+    t.receive({ type: "dev_count", open: 1 });
+    t.drop();
+    expect(devBadgeCount(t.controller.getState())).toBe(0);
+  });
+
+  it("development frames never notify, vibrate or play a sound (also in the background)", () => {
+    const t = setup(undefined, ["dev"]);
+    t.adapter.isVisible = () => false;
+    t.receive(frame("t1", true));
+    t.receive({ type: "dev_count", open: 7 });
+    t.controller.devAction("n-1", "fixed");
+    t.receive(frame("t2", true, [rule()], 1));
+    expect(t.adapter.notify).not.toHaveBeenCalled();
+    expect(t.adapter.vibrate).not.toHaveBeenCalled();
+    expect(t.adapter.playback.play).not.toHaveBeenCalled();
+    expect(t.calls).toEqual([]);
+    expect(t.controller.getState().notice).toBeNull();
+  });
+
+  it("ignore / fixed: dev_action with the item id; the fresh list replaces the old one", () => {
+    const t = ready();
+    expect(t.controller.devAction("n-1", "fixed")).toBe(true);
+    expect(t.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "n-1", action: "fixed" }]);
+    expect(t.controller.getState().dev).toMatchObject({ status: "loading", acting: { itemId: "n-1", action: "fixed" } });
+    expect(t.controller.devAction("r-1", "ignore")).toBe(false); // one request at a time
+    t.receive(frame("t2", false, [rule()], 1));
+    expect(t.controller.getState().dev).toMatchObject({ status: "ready", acting: null, open: 1 });
+    expect(t.controller.devAction("r-1", "ignore")).toBe(true);
+    expect(t.sent[1]).toEqual({ type: "dev_action", id: "t3", itemId: "r-1", action: "ignore" });
+  });
+
+  it("canManage: add_rule is only sent when the Core says this device may", () => {
+    const t = ready(frame("t1", false));
+    expect(t.controller.devAction("r-1", "add_rule")).toBe(false);
+    expect(t.sent).toEqual([]);
+    const m = ready(frame("t1", true));
+    expect(m.controller.devAction("r-1", "add_rule")).toBe(true);
+    expect(m.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "r-1", action: "add_rule" }]);
+  });
+
+  it("only actions valid for the listed item are sent", () => {
+    const t = ready(frame("t1", true, [rule("active"), note("fixed"), { ...rule("suspended"), itemId: "r-2" }]));
+    expect(t.controller.devAction("r-1", "add_rule")).toBe(false); // already active
+    expect(t.controller.devAction("r-1", "ignore")).toBe(false);
+    expect(t.controller.devAction("n-1", "ignore")).toBe(false); // already fixed
+    expect(t.controller.devAction("r-2", "fixed")).toBe(false); // fixed is for notes
+    expect(t.controller.devAction("r-2", "add_rule")).toBe(false); // suspended: decision 4
+    expect(t.controller.devAction("nope", "ignore")).toBe(false);
+    expect(t.controller.devAction("", "ignore")).toBe(false);
+    expect(t.sent).toEqual([]);
+    expect(t.controller.devAction("r-2", "ignore")).toBe(true);
+  });
+
+  it("not_allowed / unknown_item stay in the panel (no chat notice) and keep the list", () => {
+    const t = ready(frame("t1", true));
+    t.controller.sendText("ışığı aç"); // a turn running meanwhile is not touched
+    t.controller.devAction("r-1", "add_rule");
+    t.receive({ type: "error", id: "t3", code: "not_allowed", message: "device may not add rules" });
+    const s = t.controller.getState();
+    expect(s.notice).toBeNull();
+    expect(s.dev).toMatchObject({ status: "error", acting: null, errorCode: "not_allowed" });
+    expect(s.dev.items).toHaveLength(2);
+    expect(s.activeTurn?.id).toBe("t2");
+    expect(t.controller.devAction("n-1", "ignore")).toBe(true); // can go on
+    t.receive({ type: "error", id: "t4", code: "unknown_item", message: "gone" });
+    expect(t.controller.getState().dev).toMatchObject({ status: "error", errorCode: "unknown_item" });
+    expect(t.controller.getState().notice).toBeNull();
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("no answer -> timeout error; a late answer still fills the panel", () => {
+      const t = setup(undefined, ["dev"]);
+      vi.advanceTimersByTime(DEV_TIMEOUT_MS - 1);
+      expect(t.controller.getState().dev.status).toBe("loading");
+      vi.advanceTimersByTime(1);
+      expect(t.controller.getState().dev).toMatchObject({ status: "error", errorCode: "timeout" });
+      t.receive(frame("t1"));
+      expect(t.controller.getState().dev.status).toBe("ready");
+    });
+
+    it("a late error for a replaced request is dropped (no chat notice, panel unchanged)", () => {
+      const t = setup(undefined, ["dev"]);
+      vi.advanceTimersByTime(DEV_TIMEOUT_MS);
+      expect(t.controller.requestDev()).toBe(true); // "Yenile" after the timeout: t2
+      t.receive({ type: "error", id: "t1", code: "not_allowed", message: "late" });
+      expect(t.controller.getState().notice).toBeNull();
+      expect(t.controller.getState().dev).toMatchObject({ status: "loading", requestId: "t2" });
+      t.receive(frame("t2"));
+      t.receive({ type: "error", id: "t1", code: "unknown_item", message: "later" });
+      expect(t.controller.getState().notice).toBeNull();
+      expect(t.controller.getState().dev.status).toBe("ready");
+    });
+
+    it("an answer in time cancels the timeout; a dropped connection fails the request", () => {
+      const t = ready();
+      vi.advanceTimersByTime(DEV_TIMEOUT_MS * 2);
+      expect(t.controller.getState().dev.status).toBe("ready");
+      t.controller.requestDev();
+      t.drop();
+      expect(t.controller.getState().dev).toMatchObject({ status: "error", errorCode: "connection" });
     });
   });
 });
