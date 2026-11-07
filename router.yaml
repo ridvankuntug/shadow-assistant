@@ -27,6 +27,12 @@
 # The permission gate applies to tier 0 exactly as to the model: levels come
 # from services.yaml (read / write / confirm, confirm_inputs, CORE_READ_ONLY).
 # A rule's `permission` can only raise that level, never lower it.
+#
+# Turn-on rules (tool intent__HassTurnOn) only ever switch on a light or a plug
+# (a `switch` with device_class: outlet), whatever their `domains` say: a switch
+# without a device class (it may drive a door relay) or a fan is resolved but
+# not called, and the request goes to the model. Turn-off rules are not limited
+# this way. This is a Core rule, not a setting.
 
 version: 1
 
@@ -110,7 +116,8 @@ learning:
   domains: [light, switch, media_player]
   # Added to the Core's own list (kapı, kilit, garaj, alarm, kepenk, panjur,
   # vana, siren, door, lock, garage, gate, valve, shutter): a target whose name,
-  # alias or area contains one is never learned or run. Generic words only.
+  # alias or area has a word starting with one ("kilidi", "kapısı"; not inside
+  # a word: "clock" is not "lock") is never learned or run. Generic words only.
   deny_name_words: [kapı, kilit, garaj, alarm, kepenk, panjur, vana, kombi, ocak, fırın]
   # Device words that may follow the spoken name in the entity name, per domain.
   keywords:
@@ -168,7 +175,9 @@ rules:
   # ---------------------------------------------------------------- tier 0: other switches
   # "<ad>'ı aç", "<ad>u kapat": the name may carry an accusative suffix with
   # or without an apostrophe. Only these domains are ever touched at tier 0;
-  # locks, covers, alarms and the like always go through the model.
+  # locks, covers, alarms and the like always go through the model. device-on
+  # still lists switch and fan so a name shared with a light stays ambiguous,
+  # but it only turns on lights and outlet switches (see the top of the file).
   - id: device-on
     tier: 0
     patterns:

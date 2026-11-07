@@ -34,7 +34,8 @@ export function fold(text: string): string {
 /**
  * Lower-cases with Turkish rules and cleans up: an apostrophe suffix of a
  * proper noun or a number is dropped ("Salon'u" → "salon", "Mutfak’taki" →
- * "mutfak", "50'ye" → "50"), a percent sign becomes the spoken word ("%50",
+ * "mutfak", "50'ye" → "50") — except in "yüz'de", which is "yüzde" with a
+ * stray apostrophe (speech to text), a percent sign becomes the spoken word ("%50",
  * "50 %" → "yüzde 50"), a minus sign before a number becomes "eksi" ("-20" →
  * "eksi 20"), other punctuation becomes a space, whitespace collapses.
  */
@@ -45,6 +46,9 @@ export function cleanTurkish(text: string): string {
       .toLocaleLowerCase("tr-TR")
       // "i̇" (i + combining dot) can appear when upper-case input was lower-cased elsewhere.
       .replace(/i̇/g, "i")
+      // "yüz'de" is a speech-to-text spelling of the percent word "yüzde", not a suffix
+      // to drop ("yüz'de elli" = "yüzde elli", T7.w.10): the apostrophe is ignored.
+      .replace(/(?<![\p{L}\p{N}])(y[üu]z)['’‘`´](de)(?![\p{L}\p{N}])/gu, "$1$2")
       .replace(/([\p{L}\p{N}])['’‘`´](\p{L}+)/gu, "$1")
       // A minus sign in front of a number is kept as a word ("-20", "%-20" → "eksi 20"),
       // so a negative level never turns into a positive one. A hyphen inside a word

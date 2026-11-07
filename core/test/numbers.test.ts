@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { NUMBER_FORM_COUNT, normalizeNumbers, prepareNumbers } from "../src/numbers.js";
-import { loadRouterFile, matchRules } from "../src/router-config.js";
+import { TEXT_NORMALIZER_VERSION, loadRouterFile, matchRules } from "../src/router-config.js";
 import { TieredRouter } from "../src/router.js";
 import { prepareText } from "../src/turkish.js";
 
@@ -58,6 +58,16 @@ describe("normalizeNumbers: conversions", () => {
     ["yüzde ona", "yüzde 10"],
     ["yüzde on bire", "yüzde 11"],
     ["yüzde 50ye", "yüzde 50"],
+    // a stray apostrophe from speech to text is ignored (T7.w.10)
+    ["yüz'de elli", "yüzde 50"],
+    ["Yüz’de elli", "yüzde 50"],
+    ["YÜZ'DE ELLİ", "yüzde 50"],
+    ["yuz'de elli", "yuzde 50"],
+    ["yüz'de elli'ye", "yüzde 50"],
+    ["yüz'de 50", "yüzde 50"],
+    ["yüz'de yüz yap", "yüzde 100 yap"],
+    ["yüzde'yi elli yap", "yüzde 50 yap"],
+    ["yüzde elli'yi", "yüzde 50"],
     // "bir" and the pronoun forms: right after "yüzde" only
     ["yüzde bir yap", "yüzde 1 yap"],
     ["yüzde on yap", "yüzde 10 yap"],
@@ -135,6 +145,12 @@ describe("normalizeNumbers: left unchanged (false positives)", () => {
     test(`'${input}' unchanged`, () => assert.equal(normalizeNumbers(input), input));
   }
 
+  test("only \"yüz'de\" keeps its apostrophe suffix; other suffixes are dropped as before, no number", () => {
+    assert.equal(normalizeNumbers("yüz'den"), "yüz");
+    assert.equal(normalizeNumbers("yüz'ünü yıka"), "yüz yıka");
+    assert.equal(normalizeNumbers("Salon'da yüz'de leke var"), "salon yüzde leke var");
+  });
+
   test("ambiguous diacritic-less spelling needs a context ('uc' may be 'uç')", () => {
     assert.equal(normalizeNumbers("uc lamba"), "uc lamba");
     assert.equal(normalizeNumbers("yuzde uc"), "yuzde 3");
@@ -159,13 +175,55 @@ describe("normalizeNumbers: properties", () => {
     assert.equal(NUMBER_FORM_COUNT, 20 * 5 - 1);
   });
 
+  test("the \"yüz'de\" change bumped the text normalizer version (learned counters restart)", () => {
+    assert.equal(TEXT_NORMALIZER_VERSION, 2);
+  });
+
   test("linear on long input", () => {
-    for (const text of ["yüz ".repeat(20_000), "on ".repeat(20_000), "yüz de ".repeat(20_000), "1".repeat(50_000) + "ye"]) {
+    // Relative, not an absolute time limit (which a loaded machine can miss): the
+    // best of a few runs at n and at 4n words. Linear work gives a ratio near 4,
+    // quadratic work near 16; the limit of 10 leaves room for noise either way.
+    const N0 = 4_000;
+    const RATIO = 10;
+    const RUNS = 3;
+    // The small run must take at least this long, or timer/GC noise dominates the ratio;
+    // n is doubled until it does (no floor on the divisor, which would hide small times).
+    const MIN_SMALL_MS = 15;
+    const MAX_N = 256_000;
+    const work = (text: string) => {
       const start = performance.now();
       normalizeNumbers(text);
       route(text);
-      const ms = performance.now() - start;
-      assert.ok(ms < 500, `${text.slice(0, 12)}… (${text.length} chars) took ${ms.toFixed(0)} ms`);
+      return performance.now() - start;
+    };
+    const inputs: Array<[label: string, make: (n: number) => string]> = [
+      ["yüz", (n) => "yüz ".repeat(n)],
+      ["on", (n) => "on ".repeat(n)],
+      ["yüz de", (n) => "yüz de ".repeat(n)],
+      ["digits + suffix", (n) => "1".repeat(3 * n) + "ye"],
+    ];
+    for (const [label, make] of inputs) {
+      let n = N0;
+      let small = make(n);
+      let bestSmall: number;
+      for (;;) {
+        bestSmall = Infinity;
+        for (let k = 0; k < RUNS; k++) bestSmall = Math.min(bestSmall, work(small));
+        if (bestSmall >= MIN_SMALL_MS || n >= MAX_N) break;
+        n *= 2;
+        small = make(n);
+      }
+      assert.ok(bestSmall >= MIN_SMALL_MS, `${label}: even ${small.length} chars take only ${bestSmall.toFixed(2)} ms - nothing meaningful to compare`);
+      const large = make(4 * n);
+      let bestLarge = Infinity;
+      // Interleaved, so both sizes see the same load.
+      for (let k = 0; k < RUNS; k++) {
+        bestLarge = Math.min(bestLarge, work(large));
+        bestSmall = Math.min(bestSmall, work(small));
+      }
+      // Linear work gives a ratio near 4, quadratic near 16; the limit of 10 leaves room for noise.
+      const ratio = bestLarge / bestSmall;
+      assert.ok(ratio < RATIO, `${label}: ${small.length} chars ${bestSmall.toFixed(1)} ms, ${large.length} chars ${bestLarge.toFixed(1)} ms (x${ratio.toFixed(1)})`);
     }
   });
 });
@@ -181,6 +239,8 @@ describe("router integration (tier 0)", () => {
     ["salon ışığını otuz beş yap", "light-level", "salon", 35],
     ["ışığın seviyesini yüzde kırka ayarla oturma odası", "light-level", "oturma odası", 40],
     ["salon ışığını yüzde sıfır yap", "light-level", "salon", 0],
+    ["salon ışığını yüz'de elli yap", "light-level", "salon", 50],
+    ["salon ışığını yüz'de elli'ye ayarla", "light-level", "salon", 50],
   ];
   for (const [text, rule, name, level] of cases) {
     test(text, () => {

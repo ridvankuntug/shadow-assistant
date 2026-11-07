@@ -35,6 +35,21 @@ export const LIVE_CONTEXT_TOOL = "homeassistant__GetLiveContext";
 export const LIGHT_SET_TOOL = "light__HassLightSet";
 export const SWITCH_TOOLS = ["intent__HassTurnOn", "intent__HassTurnOff"] as const;
 export const DIRECT_TOOLS = [...SWITCH_TOOLS, LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL] as const;
+
+/**
+ * Targets a static tier-0 turn-on rule (tool `intent__HassTurnOn`: "aç", "yak",
+ * "çalıştır") may switch on, whatever its router.yaml `domains` list: a light,
+ * or a plug — a `switch` with positive evidence (`device_class: outlet`). A
+ * switch without a device class can drive a door relay or a heater, and a fan
+ * is not low-risk: such a target is resolved (so a name shared with a light
+ * stays ambiguous) but not called, and the turn goes to the model (T7.w.10,
+ * docs/08). Turn-off rules have no such filter.
+ */
+export function staticTurnOnTarget(entity: LiveEntity): boolean {
+  if (entity.domain === "light") return true;
+  const raw = entity.attributes.device_class;
+  return entity.domain === "switch" && typeof raw === "string" && raw.trim().toLowerCase() === "outlet";
+}
 export type DirectTool = (typeof DIRECT_TOOLS)[number];
 export type SensorKind = "temperature" | "humidity";
 
@@ -116,7 +131,8 @@ export const NEVER_LEARNABLE_DOMAINS: ReadonlySet<string> = new Set([
 ]);
 /**
  * Name words that always refuse a target (its name, aliases or areas; matched
- * as a substring of a folded word, so compounds count too). The
+ * as a whole folded word with or without a suffix — "kilidi", "kapısı" — never
+ * as a substring: "Wall Clock" is not "lock", learn/extract.ts isDenyWord). The
  * router.yaml `learning.deny_name_words` list is added to these: an empty or
  * shorter list there can never re-allow a door or an alarm.
  */
@@ -143,7 +159,8 @@ export const BASE_DENY_NAME_WORDS = [
  * their output changes: learned rules record it, and observations counted
  * under another version restart (docs/08 §Data file).
  */
-export const TEXT_NORMALIZER_VERSION = 1;
+// 2: "yüz'de" is read as "yüzde" (T7.w.10).
+export const TEXT_NORMALIZER_VERSION = 2;
 
 export const isLearnableTool = (t: string): t is LearnableTool => (LEARNABLE_TOOLS as readonly string[]).includes(t);
 /** In the code ceiling and not never-learnable (router.yaml narrowing is applied separately). */
@@ -408,8 +425,9 @@ export interface DirectPlan {
   maxItems: number;
   messages: DirectMessages;
   /**
-   * Learned rules only (safety layer 3, docs/08): the resolved entity must
-   * pass this check, else the plan falls back to the model. Static rules have none.
+   * The resolved entity must pass this check, else the plan falls back to the
+   * model. Learned rules: safety layer 3 (docs/08). Static rules: only the
+   * turn-on rules (`staticTurnOnTarget`); every other static rule has none.
    */
   targetFilter?: (entity: LiveEntity) => boolean;
 }
@@ -628,6 +646,7 @@ export function matchRules(cfg: CompiledRouterConfig, text: MatchText): RuleMatc
           replyMany: rule.reply_many,
           maxItems: cfg.direct.maxItems,
           messages: cfg.direct.messages,
+          ...(rule.tool === "intent__HassTurnOn" ? { targetFilter: staticTurnOnTarget } : {}),
         },
       };
     }

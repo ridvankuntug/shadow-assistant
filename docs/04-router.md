@@ -85,7 +85,9 @@ first match wins.
 Before matching, both the text and the patterns are normalized:
 
 - lower-cased with Turkish rules (`İ`→`i`, `I`→`ı`);
-- an apostrophe suffix is dropped (`Salon'u`, `Mutfak’taki`, `50'ye` → `salon`, `mutfak`, `50`);
+- an apostrophe suffix is dropped (`Salon'u`, `Mutfak’taki`, `50'ye` → `salon`, `mutfak`, `50`),
+  except in `yüz'de`, a speech-to-text spelling of `yüzde` (the apostrophe is ignored:
+  `yüz'de elli` → `yüzde elli` → `yüzde 50`);
 - a percent sign becomes the spoken word (`%50`, `50%` → `yüzde 50`);
 - other punctuation becomes a space, and repeated whitespace collapses to one space;
 - filler words are removed;
@@ -171,6 +173,15 @@ These go to a model on purpose:
    name and its domain, `{name, domain: [<domain>]}`; `light-level` adds
    `brightness` (0 to 100). Passing the domain keeps
    `confirm_inputs: domain: [lock, …]` effective even for name-based calls.
+   **Turn-on rules** (`intent__HassTurnOn`: "aç", "yak", "çalıştır") then
+   check the one resolved entity in code (`staticTurnOnTarget`, T7.w.10): only
+   a `light`, or a `switch` with `device_class: outlet` (a plug), is called. A
+   switch without a device class (it may drive a door relay), any other switch
+   class and a `fan` are resolved but refused: nothing is called and the turn
+   goes to the model (`target_refused`, always a fallback, whatever
+   `on_tool_error` says). The rule's `domains` cannot widen this; listing
+   `switch` and `fan` only keeps a name shared with a light ambiguous.
+   Turn-off and light-level rules have no such check.
 4. **Sensor rules.** Numeric `device_class: temperature|humidity` sensors (and
    `climate` current values) are filtered:
    - by the spoken name (area, label or name words);
@@ -269,8 +280,12 @@ The block can only narrow the code ceilings: a tool outside
 `learning.domains.0: 'lock' is never learnable`. `deny_name_words` is added to
 `BASE_DENY_NAME_WORDS` (kapı, kilit, garaj, alarm, kepenk, panjur, vana, siren,
 door, lock, garage, gate, valve, shutter), so an empty list cannot re-allow
-those; a deny word refuses a target when it occurs anywhere inside a word of
-its name, alias or area ("Bahçekapısı" too). A learned pattern never stores a
+those; a deny word refuses a target when a word of its name, alias or area
+is that word, with or without a suffix ("kilit", "kilitli", "kilidi",
+"kapısı"; T7.w.10). A deny word inside another word does not count ("Wall
+Clock" is not "lock"), so a compound such as "Bahçekapısı" is not caught by its
+name; the domain ban and the switch `device_class: outlet` check do not depend
+on wording. A learned pattern never stores a
 word that is a name or area word of the home (live context names, aliases and
 areas, and every `direct.area_aliases` name), in any suffixed form: a stem match,
 or the word starting with a name word of 3+ letters, with k/ğ, t/d, p/b folded
@@ -283,7 +298,8 @@ check); anything else stops the Core at startup. Brightness is learnable on ligh
 
 `TEXT_NORMALIZER_VERSION` (router-config.ts) is the version of the text the
 matcher runs on (`prepareText` and the number words of `numbers.ts`); bump it
-whenever their output changes. Learned rules record it.
+whenever their output changes. Learned rules record it. Version 2 (T7.w.10):
+`yüz'de` is read as `yüzde`.
 
 ## Tiers 1 to 3 and escalation
 

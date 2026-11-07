@@ -11,7 +11,18 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { compilePattern, loadRouterFile, matchRules, parseRouterConfig, RouterConfigError, TIER0_MAX_CHARS } from "../src/router-config.js";
+import { runDirectPlan, type GatedCall } from "../src/direct.js";
+import { parseLiveContext } from "../src/live-context.js";
+import {
+  compilePattern,
+  loadRouterFile,
+  matchRules,
+  parseRouterConfig,
+  RouterConfigError,
+  staticTurnOnTarget,
+  TIER0_MAX_CHARS,
+  type DirectPlan,
+} from "../src/router-config.js";
 import { TieredRouter } from "../src/router.js";
 import { aliasVariants, cleanTurkish, prepareText, stemCandidates } from "../src/turkish.js";
 
@@ -385,5 +396,114 @@ describe("long input", () => {
     assert.equal(prepareText(`${name} ışığını aç`).folded.length, TIER0_MAX_CHARS);
     assert.equal(route(`${name} ışığını aç`).tier, 0);
     assert.notEqual(route(`${name}x ışığını aç`).tier, 0);
+  });
+});
+
+// ------------------------------------------------------------------ static turn-on targets (T7.w.10)
+
+describe("static turn-on rules: lights and outlet switches only", () => {
+  /** Generic fake home: one entity per kind, each with its own name word. */
+  const HOME = JSON.stringify({
+    result: [
+      "Live Context: An overview of the areas and the devices in this smart home:",
+      ...["- names: Tavan Işık", "  domain: light", "  state: 'off'"],
+      ...["- names: Masa Prizi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Röle Işık", "  domain: switch", "  state: 'off'"],
+      ...["- names: Kontaktör", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: switch"],
+      ...["- names: Vantilatör", "  domain: fan", "  state: 'off'"],
+    ].join("\n"),
+  });
+
+  function planOf(text: string, config = cfg): DirectPlan {
+    const hit = matchRules(config, prepareText(text, config.fillers));
+    assert.ok(hit?.tier === 0, `no tier-0 match for '${text}'`);
+    return hit.plan;
+  }
+
+  async function run(text: string, fallbackOnError = true, config = cfg) {
+    const calls: string[] = [];
+    const call: GatedCall = async (tool, args) => {
+      calls.push(`${tool} ${JSON.stringify(args)}`);
+      return { status: "ok", result: { text: tool === "homeassistant__GetLiveContext" ? HOME : "{}", isError: false } };
+    };
+    const outcome = await runDirectPlan(planOf(text, config), call, { fallbackOnError });
+    return { outcome, calls };
+  }
+
+  test("turn-on plans carry the filter, turn-off and light-level plans do not", () => {
+    assert.equal(planOf("tavan ışığını aç").targetFilter, staticTurnOnTarget);
+    assert.equal(planOf("vantilatörü aç").targetFilter, staticTurnOnTarget);
+    assert.equal(planOf("vantilatörü çalıştır").targetFilter, staticTurnOnTarget);
+    assert.equal(planOf("tavan ışığını kapat").targetFilter, undefined);
+    assert.equal(planOf("kontaktörü kapat").targetFilter, undefined);
+    assert.equal(planOf("tavan ışığını yüzde 50 yap").targetFilter, undefined);
+  });
+
+  test("staticTurnOnTarget: light, outlet switch; nothing else", () => {
+    const byName = new Map(parseLiveContext(HOME).map((e) => [e.names[0], e]));
+    const ok = (n: string) => staticTurnOnTarget(byName.get(n) as Parameters<typeof staticTurnOnTarget>[0]);
+    assert.equal(ok("Tavan Işık"), true);
+    assert.equal(ok("Masa Prizi"), true);
+    assert.equal(ok("Röle Işık"), false, "switch without a device class");
+    assert.equal(ok("Kontaktör"), false, "switch with another device class");
+    assert.equal(ok("Vantilatör"), false, "fan");
+    for (const domain of ["lock", "cover", "valve", "alarm_control_panel", "media_player"]) {
+      assert.equal(staticTurnOnTarget({ names: ["X"], domain, state: "off", areas: [], attributes: { device_class: "outlet" } }), false, domain);
+    }
+    assert.equal(staticTurnOnTarget({ names: ["X"], domain: "switch", state: "off", areas: [], attributes: { device_class: " Outlet " } }), true);
+  });
+
+  test("a light and an outlet switch are turned on at tier 0", async () => {
+    const light = await run("tavan ışığını aç");
+    assert.equal(light.outcome.kind, "reply");
+    assert.match(light.calls[1] ?? "", /^intent__HassTurnOn .*"Tavan Işık".*"light"/);
+    const plug = await run("masa prizini aç");
+    assert.equal(plug.outcome.kind, "reply");
+    assert.match(plug.calls[1] ?? "", /^intent__HassTurnOn .*"Masa Prizi".*"switch"/);
+  });
+
+  for (const text of ["röle ışığını aç", "kontaktörü aç", "vantilatörü aç", "vantilatörü çalıştır"]) {
+    test(`'${text}': resolved but not called, falls back to the model`, async () => {
+      const { outcome, calls } = await run(text);
+      assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+      assert.equal(calls.length, 1, "only the live context was read");
+    });
+  }
+
+  test("a refused target falls back even with direct.on_tool_error: reply", async () => {
+    const { outcome, calls } = await run("kontaktörü aç", false);
+    assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+    assert.equal(calls.length, 1);
+    // Other failures still follow on_tool_error.
+    const missing = await run("banyo ışığını aç", false);
+    assert.equal(missing.outcome.kind, "reply");
+  });
+
+  test("turn-off rules are unchanged: a switch without a device class and a fan are still switched off", async () => {
+    for (const [text, name] of [
+      ["röle ışığını kapat", "Röle Işık"],
+      ["vantilatörü kapat", "Vantilatör"],
+    ] as const) {
+      const { outcome, calls } = await run(text);
+      assert.equal(outcome.kind, "reply", text);
+      assert.match(calls[1] ?? "", new RegExp(`^intent__HassTurnOff .*"${name}"`), text);
+    }
+  });
+
+  test("the filter is a code rule: a router.yaml turn-on rule listing other domains cannot widen it", async () => {
+    const custom = parseRouterConfig(`
+version: 1
+rules:
+  - id: anything-on
+    tier: 0
+    patterns: ["<ad> aç"]
+    service: home-assistant
+    tool: intent__HassTurnOn
+    domains: [light, switch, fan, lock, cover]
+    reply: "Tamam."
+`);
+    const { outcome, calls } = await run("vantilatörü aç", true, custom);
+    assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+    assert.equal(calls.length, 1);
   });
 });

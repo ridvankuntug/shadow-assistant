@@ -7,10 +7,20 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runDirectPlan } from "../src/direct.js";
-import { checkTurn, extractPattern, learnPolicy, learnTargetFilter, type LearnPolicy, type ObservedCall, type ObservedTurn } from "../src/learn/extract.js";
+import { checkTurn, extractPattern, isDenyWord, learnPolicy, learnTargetFilter, type LearnPolicy, type ObservedCall, type ObservedTurn } from "../src/learn/extract.js";
 import type { LiveEntity } from "../src/live-context.js";
 import { prepareNumbers } from "../src/numbers.js";
-import { LEARNED_WORD, loadRouterFile, NEVER_LEARNABLE_DOMAINS, parseRouterConfig, type DirectPlan, type MatchText } from "../src/router-config.js";
+import {
+  compileLearnedRule,
+  isLearnableDomain,
+  LEARNED_WORD,
+  loadRouterFile,
+  matchLearnedRules,
+  NEVER_LEARNABLE_DOMAINS,
+  parseRouterConfig,
+  type DirectPlan,
+  type MatchText,
+} from "../src/router-config.js";
 import { parseServices } from "../src/services.js";
 import { prepareText } from "../src/turkish.js";
 
@@ -202,10 +212,83 @@ describe("extractPattern: arguments", () => {
   });
 });
 
+describe("never-learnable domains: locks, alarms, covers, valves (T7.w.10)", () => {
+  const BANNED = ["lock", "alarm_control_panel", "cover", "valve"];
+  // A neutral name and an outlet class: only the domain can refuse these.
+  const neutral = (domain: string) => ent("Masa Prizi", domain, { attributes: { device_class: "outlet" } });
+
+  test("each one is in NEVER_LEARNABLE_DOMAINS and outside the ceiling", () => {
+    for (const d of BANNED) {
+      assert.ok(NEVER_LEARNABLE_DOMAINS.has(d), d);
+      assert.equal(isLearnableDomain(d), false, d);
+    }
+  });
+
+  test("never learned, whatever the name", () => {
+    for (const d of BANNED) {
+      const r = extractPattern(textOf("masa prizi açılsın"), turnOn("Masa Prizi", d), [neutral(d)], noConfirmClasses);
+      assert.deepEqual(r, { ok: false, reason: "domain_not_learnable" }, d);
+    }
+  });
+
+  test("never run: the run-time filter refuses them and a stored rule naming one does not match", () => {
+    const allow = learnTargetFilter(noConfirmClasses);
+    for (const d of BANNED) {
+      assert.equal(allow(neutral(d)), false, d);
+      const rule = compileLearnedRule(
+        { id: "lr-test", tokens: ["<ad>", "açılsın"], service: "home-assistant", tool: "intent__HassTurnOn", domains: [d], keywords: [] },
+        config.direct.maxNameWords,
+      );
+      assert.equal(matchLearnedRules(config, [rule], textOf("masa prizi açılsın"), allow), undefined, d);
+    }
+    // Control: the same rule on a plug domain does match.
+    const plugRule = compileLearnedRule(
+      { id: "lr-test", tokens: ["<ad>", "açılsın"], service: "home-assistant", tool: "intent__HassTurnOn", domains: ["switch"], keywords: [] },
+      config.direct.maxNameWords,
+    );
+    assert.ok(matchLearnedRules(config, [plugRule], textOf("masa prizi açılsın"), allow));
+  });
+});
+
 describe("extractPattern: target check (layer 3)", () => {
-  test("a deny word inside a compound or in English", () => {
-    assert.equal(rejected("bahçekapısı prizi açılsın", turnOn("Bahçekapısı Prizi", "switch")), "target_refused");
+  test("a deny word in English", () => {
     assert.equal(rejected("garage plug açılsın", turnOn("Garage Plug", "switch")), "target_refused");
+  });
+
+  test("deny words match whole words with a suffix, not substrings (T7.w.10)", () => {
+    const allow = learnTargetFilter(policy);
+    const plug = (names: string, areas: string[] = []) => ent(names, "switch", { areas, attributes: { device_class: "outlet" } });
+    // Inside another word: not a deny word.
+    assert.equal(allow(plug("Wall Clock")), true, "clock is not lock");
+    assert.equal(allow(plug("Duvar Saati", ["Clockroom"])), true);
+    // The word itself, any case, with a suffix, softened, in an alias or an area.
+    for (const [names, areas] of [
+      ["Lock"],
+      ["Front Door Lock"],
+      ["Locks"],
+      ["Kilit"],
+      ["Kilitli Priz"],
+      ["Kapı Kilidi"],
+      ["Garaj Kapısı Prizi"],
+      ["Masa Prizi, Kilit Prizi"],
+      ["Masa Prizi", ["Kiler Kapısı"]],
+    ] as [string, string[]?][]) {
+      assert.equal(allow(plug(names, areas ?? [])), false, `${names} / ${(areas ?? []).join(",")}`);
+    }
+    // Compounds are no longer caught by the name (the domain ban is the guard).
+    assert.equal(allow(plug("Bahçekapısı Prizi")), true);
+  });
+
+  test("isDenyWord: start of the word, softened stem, never inside", () => {
+    assert.equal(isDenyWord("lock", "lock"), true);
+    assert.equal(isDenyWord("locked", "lock"), true);
+    assert.equal(isDenyWord("clock", "lock"), false);
+    assert.equal(isDenyWord("kilidi", "kilit"), true);
+    assert.equal(isDenyWord("kepengi", "kepenk"), true);
+    assert.equal(isDenyWord("kilid", "kilit"), false, "a softened stem needs a suffix");
+    assert.equal(isDenyWord("bahcekapisi", "kapi"), false);
+    assert.equal(isDenyWord("kap", "kapi"), false);
+    assert.equal(isDenyWord("kapi", ""), false);
   });
 
   test("a deny word in the name or in the area", () => {

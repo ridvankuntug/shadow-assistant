@@ -116,6 +116,10 @@ function). Numbers in that text are plain digits ("yüzlü", "yüzde yüz", "%10
 The normalizer should expose a version number (a constant bumped when its output
 changes). Learned rules record it (see [Data file](#data-file)).
 
+T7.w.10: a stray apostrophe in "yüz'de" (speech to text) is ignored, so "yüz'de
+elli" → "yüzde elli" → `50`; other apostrophe suffixes are still dropped
+("elli'ye" → "elli"). This changed the output, so `TEXT_NORMALIZER_VERSION` is 2.
+
 ## T7.w.2 Pattern learning
 
 ### Decision
@@ -176,7 +180,11 @@ prepared text
 Because learned rules come after every static rule, an utterance that tier 0
 handles today (light on/off in 0.2 s) can never be taken over by a learned rule,
 a learned rule never hides a tier-2/3 rule, and a static tier-0 rule that falls
-back goes to the model as today (no second, learned attempt). The router gets the
+back goes to the model as today (no second, learned attempt). Static turn-on
+rules (`intent__HassTurnOn`) only call a `light` or a `switch` with
+`device_class: outlet` (T7.w.10, `staticTurnOnTarget`); any other resolved target
+is a `target_refused` fallback to the model, whatever `direct.on_tool_error`
+says. The router gets the
 active rules as an in-memory snapshot (swapped when the store changes), so
 activation needs no restart and routing stays pure and synchronous.
 
@@ -354,9 +362,15 @@ at activation, at every Core start (load) and at every run.
      without a device class is refused ([decision 7](#kullanıcı-kararı-gerekli-decisions-for-the-user)).
    - Any target whose `device_class` is in services.yaml `confirm_inputs.device_class`
      is refused.
-   - Any target whose name, aliases or areas contain a word of
+   - Any target whose name, aliases or areas hold a word of
      `learning.deny_name_words` (generic Turkish vocabulary in router.yaml, e.g.
-     `kapı, kilit, garaj, alarm, kepenk, panjur, vana`) is refused.
+     `kapı, kilit, garaj, alarm, kepenk, panjur, vana`) is refused. A word
+     counts when it starts with the deny word or its softened stem ("kilit",
+     "kilitli", "kilidi", "kapısı"), never as a substring (T7.w.10: "Wall Clock"
+     is not "lock"; a compound such as "Bahçekapısı" is not caught by its name).
+     The wording-independent guard is the domain: `lock`,
+     `alarm_control_panel`, `cover` and `valve` are in `NEVER_LEARNABLE_DOMAINS`
+     and are never learned or run (pinned by tests).
    - At run time the resolved entity is checked again (the executor gets the
      check as a resolution filter); a refused target falls back to the model.
 4. **The gate itself.** At learn time the action must have been at level `write`.
@@ -680,7 +694,10 @@ resolves it. No field beyond the above is needed.
   to the confirmation channel, and a per-item notification id derived from the
   item id (today every call replaces id 1). Dismissing the system notification
   does not delete the item. This is **not** push: a phone whose app is closed sees
-  the items when it next connects.
+  the items when it next connects. On connect, more than three normal items not
+  yet shown here become one summary notification ("N yeni bildirim", replaced by
+  the next summary); urgent items are always shown on their own and are never
+  spoken by the catch-up. Summarized items count as shown (T7.w.10).
 - **Real push** (app closed) needs one of: FCM (new external dependency, Firebase
   project, Google services on the phone), a periodic WorkManager poll of an
   authenticated `GET /notifications` on the pattern of the T11 worker (no external
@@ -806,6 +823,8 @@ block.
   `fan`) targets with no device-class or name check; a `switch` that drives a door
   relay is only caught if HA does not expose it. The learned rules add such a
   check (layer 3); the static ones could use the same filter.
+  **Turn-on part closed by T7.w.10** (lights and outlet switches only); the
+  turn-off rules (`light-off`, `device-off`) are unchanged and still open.
 - Tier-0 fallbacks with `name_not_found` point at missing HA aliases. A
   `tier0_fallback` dev-note kind would surface them; it is not in T7.w.3's list.
 - `Notifier.kt` uses one fixed notification id, so a second confirmation request
@@ -835,6 +854,7 @@ task may touch. Two tasks that share a file are never run in parallel; the
 | T7.w.4d | `deploy/windows/tray/src/ShadowTray/CoreHealth.cs`, `TrayApp.cs`, `TrayIcons.cs`, tray tests | 4b, 5b | – |
 | T7.w.6a | `core/test/agent.test.ts`, `core/test/gateway-sdk.test.ts`, `core/test/permissions.test.ts` | – | – |
 | T7.w.9 | `core/src/learn/extract.ts`, `core/test/learn-extract.test.ts`, `core/test/session-learn.test.ts` | 2b, 2d | – |
+| T7.w.10 | `core/src/router-config.ts`, `core/src/direct.ts`, `core/src/learn/extract.ts`, `core/src/turkish.ts`, `router.yaml`, `docs/04-router.md`, `core/test/router-tier0.test.ts`, `core/test/tiers.test.ts`, `core/test/learn-extract.test.ts`, `core/test/numbers.test.ts` | T7.w.9 | – |
 
 Parallel lanes: {3a, 4a, 5a, 6a} can start at once; 2a starts when T7.w.1 has
 landed (both touch the router). 2b and 2c run in parallel after 2a. 4c runs in
@@ -918,6 +938,12 @@ T7.w.7 has no task (deferred).
   home name ("prizma", "lambada") never becomes a literal word; "tavan lambasını …" for a
   device "Tavan Lambası" stays learnable; a learned rule whose `<ad>` matches nothing or
   several entities falls back silently and counts one failure.
+- **T7.w.10 — Fast-path hardening.** Durum: Başlandı
+  - [x] T7.w.10a — static tier-0 "aç" only on `light` and on `switch` with `device_class: outlet`
+  - [x] T7.w.10b — never-learnable domains pinned by tests; deny name words match whole words, not substrings
+  - [x] T7.w.10c — apostrophe in "yüz'de" ignored in number expressions
+  - [x] T7.w.10d — relative timing in the "linear on long input" test
+  - [x] T7.w.10e — UI: closing the memory panel abandons its request; a tray hash for the open panel is cleared; catch-up summary above three normal items
 
 ## Progress log
 
@@ -1051,3 +1077,25 @@ T7.w.7 has no task (deferred).
   `entity === target` checks, equivalent once the model's target is unique, kept as defense in
   depth). Left open (related findings): `name_ambiguous` also reports nested spans that all fail
   for another reason; the keywords exemption assumes `learning.keywords` holds generic words only.
+- 2026-11-07: T7.w.10 implemented (senior-dev; review and tester pending). Narrowest readings:
+  the turn-on filter is a code rule keyed on `intent__HassTurnOn` (`staticTurnOnTarget`, so
+  "aç", "yak" and "çalıştır" share it; turn-off rules untouched); refused targets are resolved
+  first (a name shared with a light stays ambiguous) and always fall back to the model, also
+  with `on_tool_error: reply`; tiers.test.ts confirm-path tests moved to a turn-off rule on a
+  lock. Deny words: word start plus softened stem, so compounds ("Bahçekapısı") are no longer
+  caught by name. Apostrophe: only "yüz'de" is joined; `TEXT_NORMALIZER_VERSION` 1 → 2
+  (observing / candidate entries restart at the next load, active rules stay). Timing test:
+  best of 3 at n and 4n, ratio < 10.
+- 2026-11-07: T7.w.10e done (senior-dev; code-reviewer 1 round, one medium finding fixed: a late
+  error of a closed memory request no longer reaches the speech path; tester: ui 386/386, lint,
+  build, 5 of 5 mutations killed). Closing the memory panel abandons its request (`memory_closed`,
+  `staleIds`; a delete already sent stays done on the Core; the panel has no separate cancel
+  button, closing is the cancel); a tray hash for the panel already open is cleared at once
+  (`ui/trayHash.ts`); catch-up summary above three normal items, urgent ones separate and not
+  spoken.
+- 2026-11-07: T7.w.10a-d done (senior-code-reviewer 1 round, no critical or high finding; tester:
+  core 1220/1220, lint, build, all 12 mutations killed). Tester strengthened the tiers.test.ts
+  refusals to assert `target_refused` and made the timing test grow n until the small run takes
+  ≥ 15 ms (no 1 ms floor); a test pins `TEXT_NORMALIZER_VERSION` 2. Left open (related findings):
+  turn-off rules still unfiltered; static turn-on has no name check (an outlet named after a door
+  is still switched on); a multi-word `deny_name_words` entry never matches.

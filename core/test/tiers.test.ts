@@ -103,6 +103,13 @@ rules:
     tool: intent__HassTurnOn
     domains: [light, switch, lock]
     reply: "Tamam, {ad} açıldı."
+  - id: lock-off
+    tier: 0
+    patterns: ["<ad> kilitle"]
+    service: home-assistant
+    tool: intent__HassTurnOff
+    domains: [lock]
+    reply: "Tamam, {ad} kilitlendi."
   - id: device-off-confirm
     tier: 0
     patterns: ["<ad> kapat"]
@@ -324,21 +331,57 @@ test("tier 0 in read-only mode: write denied without asking, nothing sent to HA,
   assert.equal(h.agent.calls.length, 0);
 });
 
+/** The session's conversation-log lines (closes the session first so the appends are flushed). */
+async function convLines(h: ReturnType<typeof harness>): Promise<Array<Record<string, unknown>>> {
+  await h.session.close("test");
+  const root = join(h.dataDir, "conversations");
+  const day = readdirSync(root)[0] as string;
+  return readFileSync(join(root, day, readdirSync(join(root, day))[0] as string), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+// A turn-on rule never calls a lock (T7.w.10: lights and outlet switches only), so the
+// confirm_inputs path is exercised through a turn-off rule of the test config.
 test("tier 0 confirm via confirm_inputs (domain lock): approved by button → called", async () => {
   const h = harness();
-  const turn = h.say("ön kapıyı aç");
+  const turn = h.say("ön kapıyı kilitle");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
-  assert.equal(req.tool, "intent__HassTurnOn");
+  assert.equal(req.tool, "intent__HassTurnOff");
   assert.equal(h.ha.writes.length, 0, "nothing runs before the answer");
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: true });
   await turn;
   assert.deepEqual(h.ha.writes[0]?.args, { name: "Ön Kapı", domain: ["lock"] });
-  assert.equal(done(h), "Tamam, ön kapı açıldı.");
+  assert.equal(done(h), "Tamam, ön kapı kilitlendi.");
+});
+
+test("static turn-on rule whose domains list a lock: the lock is not called, the model gets the turn (T7.w.10)", async () => {
+  const h = harness();
+  await h.say("ön kapıyı aç");
+  assert.equal(h.of("confirm_request").length, 0);
+  assert.equal(h.ha.writes.length, 0);
+  assert.equal(h.agent.calls.length, 1);
+  assert.equal(done(h), "Model cevabı.");
+  // on_tool_error is `fallback` here, so name_not_found would also reach the model: pin the reason.
+  const fb = (await convLines(h)).filter((l) => l.kind === "route" && l.tier === 0 && l.fallback !== undefined);
+  assert.deepEqual(fb.map((l) => l.fallback), ["target_refused"]);
+  assert.equal(h.usage[0]?.outcome, "fallback");
+});
+
+test("static turn-on rule on a switch without a device class: not called, the model gets the turn (T7.w.10)", async () => {
+  const h = harness();
+  await h.say("yatak odası ışığını aç");
+  assert.equal(h.ha.writes.length, 0);
+  assert.equal(h.agent.calls.length, 1);
+  const fb = (await convLines(h)).filter((l) => l.kind === "route" && l.tier === 0 && l.fallback !== undefined);
+  assert.deepEqual(fb.map((l) => l.fallback), ["target_refused"]);
+  assert.equal(h.usage[0]?.outcome, "fallback");
 });
 
 test("tier 0 confirm declined → not called, short reply, no model fallback", async () => {
   const h = harness();
-  const turn = h.say("ön kapıyı aç");
+  const turn = h.say("ön kapıyı kilitle");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: false });
   await turn;
@@ -606,7 +649,7 @@ test("escalation after tools but without a fork id restarts tier 2 from the user
 
 test("tier 0 denied by the user is recorded as outcome denied", async () => {
   const h = harness();
-  const turn = h.say("ön kapıyı aç");
+  const turn = h.say("ön kapıyı kilitle");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: false });
   await turn;

@@ -19,7 +19,8 @@
  *            brightness on lights only)
  *   layer 3  target check: a switch only with device_class outlet, never a
  *            device_class from services.yaml confirm_inputs, never a target
- *            whose name / alias / area starts with a deny word
+ *            whose name / alias / area has a word that starts with a deny
+ *            word (a whole word plus suffix, not a substring: isDenyWord)
  *   layer 4  the gate: the action ran at level `write` (checked here at learn
  *            time; at run time the learned plan goes through Session.authorize()).
  *
@@ -189,11 +190,28 @@ export function learnTargetFilter(policy: LearnPolicy): (entity: LiveEntity) => 
     if (domain === "switch" && deviceClass !== "outlet") return false;
     if (raw !== undefined && deviceClass === undefined) return false;
     if (deviceClass !== undefined && policy.confirmDeviceClasses.has(deviceClass)) return false;
-    // Substring match: suffixed and compound forms too ("Garaj Kapısı" → "kapisi",
-    // "Bahçekapısı" → "bahcekapisi"). Refusing too much is the safe side.
     const words = [...entity.names, ...entity.areas].flatMap((n) => key(n).split(" "));
-    return !words.some((w) => w !== "" && deny.some((d) => w.includes(d)));
+    return !words.some((w) => w !== "" && deny.some((d) => isDenyWord(w, d)));
   };
+}
+
+/** A final consonant softened before a vowel suffix ("kilit" → "kilidi", "kepenk" → "kepengi"), folded. */
+const SOFTENED: Readonly<Record<string, string>> = { t: "d", k: "g", p: "b" };
+
+/**
+ * Whether one folded name word is the folded deny word `deny`: the whole word,
+ * with or without a Turkish suffix — the word starts with it, or with its
+ * softened stem before a suffix ("kilit", "kilitli", "kilidi", "kapısı",
+ * "locks"). A deny word *inside* a word does not count (T7.w.10): "Wall Clock"
+ * is not a lock. So a compound ("Bahçekapısı") is not caught by its name; the
+ * domain ban (NEVER_LEARNABLE_DOMAINS) and the switch device-class check are
+ * the guards that do not depend on wording.
+ */
+export function isDenyWord(word: string, deny: string): boolean {
+  if (deny === "" || word.length < deny.length) return false;
+  if (word.startsWith(deny)) return true;
+  const soft = SOFTENED[deny.slice(-1)];
+  return soft !== undefined && word.length > deny.length && word.startsWith(deny.slice(0, -1) + soft);
 }
 
 const ALLOWED_KEYS = new Set(["name", "area", "domain"]);
