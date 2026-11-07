@@ -37,6 +37,28 @@ test("buildOptions locks the model down to MCP tools only", () => {
   assert.equal(opts.forkSession, undefined);
 });
 
+test("buildOptions: the SDK guard denies a name no list knows (T7.w.6a)", async () => {
+  const runner = new SdkAgentRunner({
+    systemPrompt: "sys",
+    mcpServers: () => ({ "home-assistant": { type: "sse", url: "http://localhost:1/a" } }),
+    cwd: join(base, "cwd"),
+  });
+  const opts = runner.buildOptions(
+    { prompt: "x", model: "haiku", signal: new AbortController().signal, canUseTool: async () => ({ behavior: "allow", updatedInput: {} }) },
+    new AbortController(),
+  );
+  const guard = opts.canUseTool;
+  assert.ok(guard);
+  const ask = (name: string) =>
+    guard(name, {}, { signal: new AbortController().signal, toolUseID: "t" } as Parameters<NonNullable<typeof guard>>[2]);
+  for (const name of ["FutureTool", "future_tool", "MCP__home-assistant__x", "mcp__other__x"]) {
+    assert.ok(!DENIED_BUILTIN_TOOLS.includes(name));
+    // Even though the turn's own gate would allow everything, the SDK guard closes non-gateway names.
+    assert.equal((await ask(name))?.behavior, "deny", name);
+  }
+  assert.equal((await ask("mcp__home-assistant__intent__HassTurnOn"))?.behavior, "allow");
+});
+
 test("buildOptions: tier-1 escalation prompt, fork only when resuming, MCP server filter", () => {
   const runner = new SdkAgentRunner({
     systemPrompt: "sys",

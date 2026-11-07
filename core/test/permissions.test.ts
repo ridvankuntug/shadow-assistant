@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { DENIED_BUILTIN_TOOLS } from "../src/agent.js";
 import { matchGlob } from "../src/glob.js";
 import {
   ConfirmBroker,
@@ -81,6 +82,43 @@ test("levels: exact beats glob, glob beats default, default, unknown, builtin", 
   assert.equal(p.levelFor("mcp__off__x").level, "confirm"); // disabled service = unknown
   assert.equal(p.levelFor("Bash").level, "deny");
   assert.equal(p.levelFor("WebFetch").level, "deny");
+});
+
+/**
+ * T7.w.6a: names DENIED_BUILTIN_TOOLS does not list (a built-in a later SDK
+ * adds, a misspelt or case-shifted MCP prefix) are denied by the policy
+ * itself, so Session.authorize() denies them before any list knows them.
+ */
+const UNLISTED_NON_MCP_NAMES = [
+  "FutureTool",
+  "future_tool",
+  "Bash2",
+  "",
+  "MCP__home-assistant__intent__HassTurnOn",
+  "Mcp__home-assistant__intent__HassTurnOn",
+  "mcp_home-assistant__intent__HassTurnOn",
+  " mcp__home-assistant__intent__HassTurnOn",
+  "home-assistant__intent__HassTurnOn",
+];
+
+test("levels: an unknown non-mcp__ name is denied as a built-in, even when no list names it", () => {
+  const services = parseServices(
+    ["services:", "  - name: home-assistant", "    kind: mcp", "    url: http://localhost:1/sse", "    permission: write"].join("\n"),
+    {},
+  ).services;
+  for (const readOnly of [false, true]) {
+    const p = new PermissionPolicy(services, { readOnly });
+    for (const name of UNLISTED_NON_MCP_NAMES) {
+      assert.ok(!DENIED_BUILTIN_TOOLS.includes(name), `${name} must not be in the static list for this test`);
+      const d = p.levelFor(name, { command: "rm -rf /" });
+      assert.equal(d.level, "deny", JSON.stringify(name));
+      assert.equal(d.reason, "builtin_tool", JSON.stringify(name));
+      assert.equal(d.identity.builtin, true);
+      assert.equal(d.identity.service, undefined);
+    }
+  }
+  // The real mcp__ name is not affected.
+  assert.equal(policy().levelFor(`${HA}intent__HassTurnOn`).level, "write");
 });
 
 test("confirm_inputs escalates risky arguments, never lowers", () => {

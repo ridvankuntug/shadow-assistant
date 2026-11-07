@@ -824,7 +824,7 @@ T7.w.7 has no task (deferred).
   Acceptance: the router and session tests in [Tests](#tests); a static tier-0
   command still runs without a model and without added latency; three eligible
   turns of one phrasing produce one candidate and no active rule.
-- [ ] **T7.w.3a — Shared counted-notes helper and `turns.json`.** Move the
+- [x] **T7.w.3a — Shared counted-notes helper and `turns.json`.** Move the
   observe/cap/write logic out of `DevNotes`; `tools.json` behaviour unchanged;
   optional `status` / `statusAt`; coalesced writes. Acceptance: existing
   `dev-notes.test.ts` passes unchanged; tests for each `turns.json` kind and for
@@ -834,7 +834,7 @@ T7.w.7 has no task (deferred).
   `McpGateway.call()`), `wandering`, `tool_error`, `rule_suspended`. Acceptance:
   session/gateway tests for each kind; `lastTurnId` set; a user denial is not a
   `tool_error`.
-- [ ] **T7.w.4a — Protocol: dev frames.** Types, parsing, `dev` feature, docs/02.
+- [x] **T7.w.4a — Protocol: dev frames.** Types, parsing, `dev` feature, docs/02.
   Acceptance: parser tests (valid, invalid, unknown fields ignored); old frames
   unchanged.
 - [ ] **T7.w.4b — Core: Development listing and actions.** `dev_list`, `dev_action`,
@@ -849,7 +849,7 @@ T7.w.7 has no task (deferred).
 - [ ] **T7.w.4d — Tray counts.** As in [Tray](#tray). Acceptance: tray tests parse
   `inbox` (present, absent, malformed); menu items open `#dev` / `#notifications`;
   no balloon for development counts; no token read from `.env`.
-- [ ] **T7.w.5a — Notification store.** `raise` (with `key`, `renotify`),
+- [x] **T7.w.5a — Notification store.** `raise` (with `key`, `renotify`),
   `resolve(source, key)`, `markRead` / `markUnread`, `delete`, `list`, the hard
   limit, quarantine. Acceptance: unit tests including the T11-B sequence (raise,
   renotify, read as acknowledgement, resolve) with a fake clock; items survive a
@@ -867,7 +867,7 @@ T7.w.7 has no task (deferred).
   channel, per-item ids. Acceptance: manual on a phone: a test item appears while
   the app is in the background; two items show as two notifications; a
   confirmation still uses its own channel; dismissing does not delete the item.
-- [ ] **T7.w.6a — Built-in tools test gaps.** The two additions in
+- [~] **T7.w.6a — Built-in tools test gaps.** The two additions in
   [T7.w.6](#t7w6-built-in-tools-closed). Acceptance: the tests fail if `tools`,
   `mcpServers`, `settingSources` or the guard of `buildOneShotOptions()` is
   loosened, or if an unknown non-`mcp__` name is allowed.
@@ -876,3 +876,10 @@ T7.w.7 has no task (deferred).
 
 - 2026-11-07: design written (software-architect, after a Codex review of the
   same code). T7.w.1 in progress separately.
+- 2026-11-07: T7.w.3a, T7.w.4a, T7.w.5a done (senior-code-reviewer 2 rounds, tester
+  with mutation checks). T7.w.4a: malformed `dev_action` answers the existing
+  `bad_request` (not a new `bad_frame`); `ui/src/assistant/state.ts` got no-op
+  cases for `dev` / `dev_count` so the exhaustive reducer builds. T7.w.6a gap 2
+  (unknown non-`mcp__` names) done; gap 1 blocked: `buildOneShotOptions()` lives
+  in `index.ts`, which runs `main()` on import, so it cannot be tested without a
+  source change (move it to its own module) — awaiting a decision.

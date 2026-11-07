@@ -179,6 +179,31 @@ test("guard: gateway tools pass to the Core gate; built-in and foreign tools are
   }
 });
 
+/** T7.w.6a: names no list knows (a built-in a later SDK adds, a bent mcp__ prefix). */
+const UNLISTED_NAMES = [
+  "FutureTool",
+  "future_tool",
+  "",
+  "MCP__home-assistant__intent__HassTurnOn",
+  "mcp_home-assistant__intent__HassTurnOn",
+  " mcp__home-assistant__intent__HassTurnOn",
+  "mcp__home-assistant_intent__HassTurnOn",
+  "mcp__shadow-vaultx__read_note",
+];
+
+test("guard: an unknown non-mcp__ name (or a foreign prefix) is denied without DENIED_BUILTIN_TOOLS listing it", async () => {
+  const guard = gatewayToolGuard([HA, "shadow-vault"]);
+  for (const t of UNLISTED_NAMES) {
+    assert.ok(!DENIED_BUILTIN_TOOLS.includes(t), `${t} must not be in the static list for this test`);
+    const r = await ask(guard, t, { command: "x" });
+    assert.equal(r.behavior, "deny", JSON.stringify(t));
+  }
+  // No servers: nothing passes.
+  for (const t of ["FutureTool", "mcp__home-assistant__intent__HassTurnOn"]) {
+    assert.equal((await ask(gatewayToolGuard([]), t)).behavior, "deny", t);
+  }
+});
+
 test("built-in Claude Code tools are closed in every model query (legacy and persistent)", async () => {
   const received: PermissionCallback[] = [];
   const runner = new SdkAgentRunner({
@@ -206,6 +231,8 @@ test("built-in Claude Code tools are closed in every model query (legacy and per
     assert.deepEqual(Object.keys(o.mcpServers ?? {}), [HA, "shadow-vault"], "only gateway servers");
     const guard = o.canUseTool as CanUseTool;
     for (const t of DENIED_BUILTIN_TOOLS) assert.equal((await ask(guard, t)).behavior, "deny", t);
+    // T7.w.6a: a name the list does not know is closed too.
+    for (const t of UNLISTED_NAMES) assert.equal((await ask(guard, t)).behavior, "deny", JSON.stringify(t));
     assert.equal((await ask(guard, "mcp__home-assistant__intent__HassTurnOn")).behavior, "allow");
   }
 });
