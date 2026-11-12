@@ -81,6 +81,33 @@ export type RaiseResult =
    */
   | { ok: false; reason: "invalid" | "full" | "unavailable" };
 
+/**
+ * Quiet hours for urgent speech (T7.w.11.9, docs/09): a daily window
+ * [start, end) in minutes after local midnight (Core host time). `start > end`
+ * crosses midnight (e.g. 22:00-07:00); `start === end` is never built (the
+ * parser rejects it as ambiguous).
+ */
+export interface QuietHours {
+  startMin: number;
+  endMin: number;
+}
+
+/** Default window 00:00-09:00 (docs/09 *Quiet hours for urgent speech*). */
+export const DEFAULT_QUIET_HOURS: QuietHours = { startMin: 0, endMin: 9 * 60 };
+
+/** Whether `at` (its local hour and minute) falls in the window; no window = never quiet. */
+export function inQuietHours(q: QuietHours | null | undefined, at: Date): boolean {
+  if (!q) return false;
+  const m = at.getHours() * 60 + at.getMinutes();
+  return q.startMin < q.endMin ? m >= q.startMin && m < q.endMin : m >= q.startMin || m < q.endMin;
+}
+
+/** `HH:MM-HH:MM` of a window (logs, docs). */
+export function formatQuietHours(q: QuietHours): string {
+  const hm = (n: number) => `${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`;
+  return `${hm(q.startMin)}-${hm(q.endMin)}`;
+}
+
 export const NOTIFICATIONS_DIR = "notifications";
 export const NOTIFICATIONS_FILE = "notifications.json";
 /** Hard limit: at this many items new keyless raises are refused. */

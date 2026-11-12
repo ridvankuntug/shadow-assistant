@@ -229,7 +229,7 @@ each time. Design only; no code yet.
 Implemented (T7.w.11.4): `NotificationCenter.speechOn()`, called by the session
 when its speech turns on (first `speech_prefs` with `enabled:true`, or on
 again); the speaker check for the raise path and pending speech is one method
-(`canSpeak`), where quiet hours (T7.w.11.9) go. docs/02 updated.
+(`canSpeak`), where quiet hours (T7.w.11.9, implemented) are applied. docs/02 updated.
 
 The confirmed delivery rule says an urgent item is always shown on its own on
 connect **and spoken once**; today the catch-up never speaks, so an urgent item
@@ -268,7 +268,27 @@ is known to be near a person); the **first speech-enabled connection after
 09:00** speaks it **once**, on one socket, if it is still unread and unresolved
 (and not suppressed). Read, delete or resolve before then cancels it; after it
 was spoken once it is never spoken again. Not chosen: never speaking it later.
-Pending speech is implemented (T7.w.11.4); quiet hours are not yet (T7.w.11.9).
+
+Implemented (T7.w.11.9): `NotificationCenter` option `quietHours` (+ injected
+`now` clock), checked in `canSpeak`, the one speaker check of the raise path
+and `speechOn()`; inside the window `speechOn()` stops before using any pending
+id up. Core setting `CORE_QUIET_HOURS` (`HH:MM-HH:MM`, Core host local time,
+start included, end excluded, may cross midnight; `off` = none), wired in
+`index.ts`; `.env.example`, docs/02 and docs/05 updated. "Not suppressed" is
+not checked yet: suppression is T7.w.11.7.
+
+- A socket already connected with speech on when the window ends speaks
+  nothing by itself: the pending items are spoken on the next speech-enabled
+  connection (or speech turned on again). A later urgent raise outside the
+  window is spoken as usual (that item only).
+- **Varsayılan — kullanıcı onayı bekliyor:** an unset or **blank**
+  `CORE_QUIET_HOURS` means the default 00:00-09:00 (like every blank line in
+  `.env.example`); only `off` / `0` / `false` / `no` / `none` disables it.
+- **Varsayılan — kullanıcı onayı bekliyor:** an invalid value (bad format, hour
+  over 23, minute over 59, start equal to end) uses the default and logs one
+  warning at startup; the Core still starts.
+- **Varsayılan — kullanıcı onayı bekliyor:** minute precision; 08:59:59 is still
+  quiet, 09:00:00 is not. A clock that fails counts as not quiet.
 
 ### Dismiss options: "Gördüm" vs "Tekrar gösterme"
 
@@ -302,7 +322,8 @@ The client action and its protocol shape (extra to delete) are specified in
   restarted by a recovery), startup adoption, vault/memory checks.
 - Quiet hours: fake clock at 23:59, 00:00, 08:59 and 09:00; an urgent raise in
   the window is broadcast without `speak`; pending speech is not spoken on a
-  connect inside the window.
+  connect inside the window (kept, spoken once on the first speech-on after
+  09:00; read or resolved before then → not spoken); `CORE_QUIET_HOURS` parsing.
 - HA: a local `ws` server speaking the auth + subscribe + list_issues exchange:
   current set, add/update/remove, disconnect (no resolve), reconnect with a
   smaller set (resolve), `auth_invalid` → `ha:access`.
@@ -323,7 +344,7 @@ The client action and its protocol shape (extra to delete) are specified in
 
 - T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests.
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
-- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock.
+- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock. Implemented: `canSpeak` + `CORE_QUIET_HOURS` (see *Quiet hours for urgent speech*, defaults awaiting approval there); tests in `core/test/quiet-hours.test.ts` and `session-notifications.test.ts`.
 
 - T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests.
 

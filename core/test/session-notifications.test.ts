@@ -12,6 +12,9 @@
  * - pending speech (T7.w.11.4): an urgent item raised with no speaker is
  *   spoken once by the next socket that turns speech on; read / delete /
  *   resolve cancel it;
+ * - quiet hours (T7.w.11.9, fake clock): urgent items in the window are
+ *   broadcast without `speak` and kept pending; a speech-on inside the window
+ *   speaks nothing; the first speech-on after it speaks them once;
  * - the producer's dedupe key never leaves the Core.
  */
 import assert from "node:assert/strict";
@@ -23,7 +26,7 @@ import { after, test } from "node:test";
 import type { AgentRunner, TurnResult } from "../src/agent.js";
 import { ConversationLog } from "../src/conversation-log.js";
 import type { AtomicFs } from "../src/atomic-file.js";
-import { NOTIFICATIONS_FILE, NotificationStore, NotificationsUnavailableError } from "../src/notifications.js";
+import { DEFAULT_QUIET_HOURS, NOTIFICATIONS_FILE, NotificationStore, NotificationsUnavailableError, type QuietHours } from "../src/notifications.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import type { ClientFrame, ServerFrame } from "../src/protocol.js";
 import { parseServices } from "../src/services.js";
@@ -49,12 +52,17 @@ type Frame<T extends ServerFrame["type"]> = Extract<ServerFrame, { type: T }>;
 let counter = 0;
 
 /** One home: a store, a center, and sockets (sessions) attached to it. */
-function home(o: { withCenter?: boolean; fs?: AtomicFs } = {}) {
+function home(o: { withCenter?: boolean; fs?: AtomicFs; quietHours?: QuietHours | null; now?: () => Date } = {}) {
   const dir = join(base, `h${++counter}`);
   const store = new NotificationStore({ dir: join(dir, "notifications"), log: () => {}, ...(o.fs ? { fs: o.fs, retryDelaysMs: [] } : {}) });
   const infos: string[] = [];
   const warns: string[] = [];
-  const center = new NotificationCenter({ store, logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) } });
+  const center = new NotificationCenter({
+    store,
+    logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
+    ...(o.quietHours !== undefined ? { quietHours: o.quietHours } : {}),
+    ...(o.now ? { now: o.now } : {}),
+  });
   let sessions = 0;
   let req = 0;
 
@@ -510,6 +518,146 @@ test("pending speech: a socket that closes or turns speech off while the file is
   const browser = h.connect("browser");
   await browser.speechOn();
   assert.deepEqual(browser.spoken().map((f) => f.item.id), [a.item.id]);
+});
+
+/** A fake local clock for quiet hours: set(h, m) moves it to that local time on a fixed day. */
+function fakeClock() {
+  let at = new Date(2026, 0, 15, 12, 0);
+  return { now: () => at, set: (h: number, m: number, day = 15) => void (at = new Date(2026, 0, day, h, m)) };
+}
+
+test("quiet hours: an urgent raise at 23:59 and 09:00 is spoken; at 00:00 and 08:59 it is broadcast to every socket without speak", async () => {
+  const clock = fakeClock();
+  const h = home({ quietHours: DEFAULT_QUIET_HOURS, now: clock.now });
+  const phone = h.connect("phone");
+  const tablet = h.connect("tablet");
+  await phone.speechOn();
+  await tablet.speechOn();
+  await phone.say(); // the phone had the latest turn: it is the speaker outside the window
+
+  const at = async (hh: number, mm: number, day: number, title: string) => {
+    clock.set(hh, mm, day);
+    const r = await h.center.raise({ source: "test", urgency: "urgent", title });
+    assert.ok(r.ok);
+    return r.item.id;
+  };
+  const before = await at(23, 59, 14, "23:59");
+  const midnight = await at(0, 0, 15, "00:00");
+  const late = await at(8, 59, 15, "08:59");
+  const after9 = await at(9, 0, 15, "09:00");
+
+  // Every raise reached both sockets (shown); only the ones outside the window carry speak, on one socket.
+  for (const s of [phone, tablet]) {
+    assert.deepEqual(s.of("notification").map((f) => f.item.id), [before, midnight, late, after9]);
+  }
+  assert.deepEqual(phone.spoken().map((f) => f.item.id), [before, after9]);
+  assert.equal(tablet.spoken().length, 0);
+  // Normal items are never spoken, in the window or not.
+  clock.set(3, 0);
+  await h.center.raise({ source: "test", title: "Normal" });
+  assert.equal(phone.spoken().length + tablet.spoken().length, 2);
+});
+
+test("quiet hours: an urgent item from the window is not spoken on a speech-on inside it and stays pending; nothing at 09:00 by itself; the first speech-on after 09:00 speaks it once", async () => {
+  const clock = fakeClock();
+  const h = home({ quietHours: DEFAULT_QUIET_HOURS, now: clock.now });
+  const awake = h.connect("tablet");
+  await awake.speechOn(); // a speech-enabled socket connected through the night
+
+  clock.set(3, 30);
+  const r = await h.center.raise({ source: "test", urgency: "urgent", title: "Gece acil" });
+  assert.ok(r.ok);
+  assert.equal(awake.of("notification").length, 1);
+  assert.equal(awake.spoken().length, 0);
+
+  // A connect with speech on inside the window (08:59): nothing spoken, the id is not used up.
+  clock.set(8, 59);
+  const early = h.connect("phone");
+  await early.speechOn();
+  assert.equal(early.spoken().length, 0);
+
+  // 09:00: nothing is spoken by itself, also not by the socket already connected with speech on.
+  clock.set(9, 0);
+  await h.center.list();
+  assert.equal(awake.spoken().length + early.spoken().length, 0);
+
+  // The first speech-enabled connection after 09:00 speaks it once, on that socket only.
+  clock.set(9, 5);
+  const morning = h.connect("browser");
+  await morning.speechOn();
+  assert.deepEqual(morning.spoken().map((f) => f.item.id), [r.item.id]);
+  assert.equal(awake.spoken().length + early.spoken().length, 0);
+
+  // Spoken once: never again (another speech-on, a reconnect).
+  await early.speechOff();
+  await early.speechOn();
+  const again = h.connect("browser");
+  await again.speechOn();
+  assert.equal(early.spoken().length + again.spoken().length, 0);
+  assert.equal(morning.spoken().length, 1);
+});
+
+test("quiet hours: an item pending from before the window is kept through it; read or resolved before 09:00 it is not spoken", async () => {
+  const clock = fakeClock();
+  const h = home({ quietHours: DEFAULT_QUIET_HOURS, now: clock.now });
+  clock.set(23, 30, 14);
+  const evening = await h.center.raise({ source: "test", urgency: "urgent", title: "Akşam" }); // nobody connected
+  clock.set(2, 0);
+  const toRead = await h.center.raise({ source: "test", urgency: "urgent", title: "Okunacak" });
+  const toResolve = await h.center.raise({ source: "test", key: "k", urgency: "urgent", title: "Çözülecek" });
+  assert.ok(evening.ok && toRead.ok && toResolve.ok);
+
+  const night = h.connect("phone");
+  await night.speechOn(); // inside the window: nothing, the ids are kept
+  assert.equal(night.spoken().length, 0);
+  clock.set(7, 0);
+  assert.equal(errorCode(await night.ask({ type: "notification_action", notificationId: toRead.item.id, action: "read" })), "notifications");
+  assert.equal(await h.center.resolve("test", "k"), true);
+
+  clock.set(9, 1);
+  const day = h.connect("browser");
+  await day.speechOn();
+  assert.deepEqual(day.spoken().map((f) => f.item.id), [evening.item.id]);
+  assert.equal(night.spoken().length, 0);
+});
+
+test("quiet hours: a keyed urgent item renotified and another deleted inside the window stay pending once / are dropped; spoken once at 09:00", async () => {
+  const clock = fakeClock();
+  const h = home({ quietHours: DEFAULT_QUIET_HOURS, now: clock.now });
+  const s = h.connect("phone");
+  await s.speechOn();
+  clock.set(1, 0);
+  const a = await h.center.raise({ source: "test", key: "a", urgency: "urgent", title: "A" });
+  const d = await h.center.raise({ source: "test", urgency: "urgent", title: "Silinecek" });
+  assert.ok(a.ok && d.ok);
+  clock.set(2, 0);
+  await h.center.raise({ source: "test", key: "a", urgency: "urgent", title: "A2", renotify: true });
+  await h.store.delete(d.item.id);
+  assert.equal(s.spoken().length, 0);
+  clock.set(9, 30);
+  const m = h.connect("browser");
+  await m.speechOn();
+  assert.deepEqual(m.spoken().map((f) => f.item.id), [a.item.id]);
+  const m2 = h.connect("browser");
+  await m2.speechOn();
+  assert.equal(m2.spoken().length, 0);
+});
+
+test("quiet hours: a window across midnight (22:00-07:00) and no window (off) at 03:00", async () => {
+  const clock = fakeClock();
+  const cross = home({ quietHours: { startMin: 22 * 60, endMin: 7 * 60 }, now: clock.now });
+  const off = home({ quietHours: null, now: clock.now });
+  const a = cross.connect("phone");
+  const b = off.connect("phone");
+  await a.speechOn();
+  await b.speechOn();
+  for (const [hh, mm] of [[21, 59], [22, 0], [3, 0], [6, 59], [7, 0]] as const) {
+    clock.set(hh, mm);
+    await cross.center.raise({ source: "test", urgency: "urgent", title: `${hh}:${mm}` });
+    await off.center.raise({ source: "test", urgency: "urgent", title: `${hh}:${mm}` });
+  }
+  assert.deepEqual(a.spoken().map((f) => f.item.title), ["21:59", "7:0"]);
+  assert.equal(b.spoken().length, 5);
 });
 
 test("an unreadable notifications file: list and actions answer notifications_unavailable, the file is not overwritten, the Core recovers", async () => {

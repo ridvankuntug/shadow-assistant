@@ -238,6 +238,8 @@ All optional, set in `.env` (defaults in `.env.example`; details in
 - Memory: `CORE_MEMORY` (`off` disables it completely), `CORE_MEMORY_MODEL`,
   `CORE_MEMORY_IDLE_MIN`, `CORE_MEMORY_EVERY_TURNS`, `CORE_MEMORY_MAX_RUNS_DAY`,
   `CORE_COMPACT_AT_TOKENS`.
+- Notifications: `CORE_QUIET_HOURS` (default `00:00-09:00`, `off` disables):
+  urgent notifications are shown but not spoken in this window (docs/09).
 - `SHADOW_PRONUNCIATIONS_FILE`: alternative pronunciation lexicon.
 
 Data lives in `<SHADOW_DATA_DIR>`: `sessions/devices.json`, `memory/brief.md`,

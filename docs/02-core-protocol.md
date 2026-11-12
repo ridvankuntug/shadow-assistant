@@ -309,6 +309,14 @@ them or the producer resolves them.
   it is read or changed without a new reminder. Being spoken does not mark an
   item read. Added within protocol 1 (T7.w.11.4): no new frame; a client that
   already speaks `speak:true` and records shown items needs no change.
+- **Quiet hours** (T7.w.11.9; Core setting `CORE_QUIET_HOURS`, default
+  00:00-09:00 Core host local time, `off` disables): inside the window no
+  socket gets `"speak":true`. An urgent item raised then is broadcast and
+  shown like any item and becomes pending speech; a socket turning speech on
+  inside the window speaks nothing and leaves it pending. Nothing is spoken by
+  itself when the window ends, not even by a socket already connected with
+  speech on: the next socket that turns speech on after the window speaks it
+  once (same rules as above: still existing, urgent and unread).
 - There is no push to a phone whose app is not connected; it sees the items in
   `notifications_list` on its next connect.
 - While the Core cannot read its notifications file (locked or otherwise

@@ -6,6 +6,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_HEALTH_TIMEOUT_MS } from "./health.js";
+import { DEFAULT_QUIET_HOURS, type QuietHours } from "./notifications.js";
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from "./permissions.js";
 import { EMPTY_LEXICON, parsePronunciations, type Lexicon } from "./pronunciation.js";
 import { loadRouterFile, type CompiledRouterConfig } from "./router-config.js";
@@ -50,6 +51,10 @@ export interface CoreConfig {
    * that may use "Kuralı ekle" in the Development tab. Empty = nobody.
    */
   devDevices: string[];
+  /** CORE_QUIET_HOURS (default 00:00-09:00; `off` = none): no urgent speech in this window (docs/09). */
+  quietHours: QuietHours | null;
+  /** Set when CORE_QUIET_HOURS was invalid and the default is used; the Core logs it at startup. */
+  quietHoursWarning?: string;
 }
 
 export interface MemoryConfig {
@@ -105,6 +110,30 @@ export function parseDeviceList(v: string | undefined): string[] {
   return [...new Set((v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter((x) => x !== ""))];
 }
 
+const QUIET_HOURS_RE = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/;
+
+/**
+ * CORE_QUIET_HOURS (T7.w.11.9): `HH:MM-HH:MM` in Core host local time, start
+ * inclusive, end exclusive; the window may cross midnight (`22:00-07:00`).
+ * Unset or blank → the default 00:00-09:00 (blank like every other empty
+ * `.env.example` line); `off` / `0` / `false` / `no` / `none` → no quiet hours.
+ * Anything else (bad format, hour > 23, minute > 59, start = end) → the default
+ * plus a warning. Never throws: a typo must not stop the Core.
+ */
+export function parseQuietHours(v: string | undefined): { quietHours: QuietHours | null; warning?: string } {
+  const s = v?.trim() ?? "";
+  if (s === "") return { quietHours: DEFAULT_QUIET_HOURS };
+  if (/^(0|off|false|no|none)$/i.test(s)) return { quietHours: null };
+  const m = QUIET_HOURS_RE.exec(s);
+  if (m) {
+    const [sh = 99, sm = 99, eh = 99, em = 99] = m.slice(1, 5).map(Number);
+    if (sh <= 23 && sm <= 59 && eh <= 23 && em <= 59 && sh * 60 + sm !== eh * 60 + em) {
+      return { quietHours: { startMin: sh * 60 + sm, endMin: eh * 60 + em } };
+    }
+  }
+  return { quietHours: DEFAULT_QUIET_HOURS, warning: "CORE_QUIET_HOURS is not HH:MM-HH:MM (or 'off'); using the default 00:00-09:00" };
+}
+
 function positiveInt(name: string, v: string | undefined, def: number): number {
   if (v === undefined || v.trim() === "") return def;
   const n = Number(v);
@@ -140,6 +169,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     2: model,
     3: env.CORE_MODEL_TIER3?.trim() || "opus",
   };
+  const parsedQuiet = parseQuietHours(env.CORE_QUIET_HOURS);
+  const quiet = { quietHours: parsedQuiet.quietHours, ...(parsedQuiet.warning ? { quietHoursWarning: parsedQuiet.warning } : {}) };
 
   return {
     host: env.CORE_HOST?.trim() || "127.0.0.1",
@@ -177,6 +208,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
         : positiveInt("CORE_COMPACT_AT_TOKENS", env.CORE_COMPACT_AT_TOKENS, 50_000),
     },
     devDevices: parseDeviceList(env.CORE_DEV_DEVICES),
+    ...quiet,
   };
 }
 

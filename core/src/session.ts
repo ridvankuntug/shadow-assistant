@@ -45,7 +45,15 @@ import {
   type ConfirmResolution,
   type PermissionPolicy,
 } from "./permissions.js";
-import { NotificationsUnavailableError, type NotificationItem, type NotificationStore, type RaiseInput, type RaiseResult } from "./notifications.js";
+import {
+  inQuietHours,
+  NotificationsUnavailableError,
+  type NotificationItem,
+  type NotificationStore,
+  type QuietHours,
+  type RaiseInput,
+  type RaiseResult,
+} from "./notifications.js";
 import type {
   ClientFrame,
   DevAction,
@@ -1991,6 +1999,13 @@ export interface NotificationCenterOptions {
   retryMs?: number;
   /** Timer for the retry (tests: a fake fired by hand). Returns a cancel function. Default: setTimeout, unref'd. */
   setTimer?: (fn: () => void, ms: number) => () => void;
+  /**
+   * Quiet hours for urgent speech (T7.w.11.9): inside the window no socket is asked to speak.
+   * Default none (never quiet); the Core passes CORE_QUIET_HOURS (default 00:00-09:00).
+   */
+  quietHours?: QuietHours | null;
+  /** Clock for the quiet-hours check (tests: a fake). Default: the real local time. */
+  now?: () => Date;
 }
 
 /** The retry never keeps the process alive; shutdown calls close(). */
@@ -2036,6 +2051,11 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * is empty, so each is spoken once, on one socket. Read, delete and resolve
  * cancel it. Nothing else speaks: a `notifications` list never carries
  * `speak`, and an item already spoken is not spoken on a reconnect.
+ *
+ * Quiet hours (T7.w.11.9, `quietHours`): inside the window an urgent item is
+ * raised and broadcast but no socket gets `speak: true`; it is pending speech,
+ * and a `speechOn()` inside the window speaks nothing and keeps the ids. After
+ * the window the next `speechOn()` speaks them once (see `canSpeak`).
  *
  * While the store cannot read its file, `list()`, `act()` and `resolve()`
  * reject with NotificationsUnavailableError (the session answers
@@ -2275,11 +2295,25 @@ export class NotificationCenter {
 
   /**
    * Whether `l` may be asked to speak an urgent item now. The one check for both
-   * the raise path (`speaker()`) and pending speech (`speechOn()`): a later rule
-   * such as quiet hours (T7.w.11.9) belongs here.
+   * the raise path (`speaker()`) and pending speech (`speechOn()`).
+   *
+   * Quiet hours (T7.w.11.9): inside the window nobody speaks. A raise then finds
+   * no speaker, so the item goes to the pending-speech set; `speechOn()` stops
+   * before using any id up, so the ids stay pending. Nothing is spoken by itself
+   * when the window ends: a socket that already has speech on at its end speaks
+   * the pending items only when it (or another socket) next turns speech on, or
+   * a later urgent raise is spoken by it (that raise only).
    */
   private canSpeak(l: NotificationListener): boolean {
+    if (this.quietNow()) return false;
     return safe(() => l.speaks(), false);
+  }
+
+  /** Inside the quiet-hours window now. A failing clock counts as not quiet (speech as before T7.w.11.9). */
+  private quietNow(): boolean {
+    const q = this.o.quietHours;
+    if (!q) return false;
+    return safe(() => inQuietHours(q, (this.o.now ?? (() => new Date()))()), false);
   }
 
   private broadcast(frame: ServerFrame, speaker?: NotificationListener): void {

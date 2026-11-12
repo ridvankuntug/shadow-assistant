@@ -26,7 +26,7 @@ import { memoryTools } from "./memory/tools.js";
 import { createGatewaySdkServers } from "./gateway-sdk.js";
 import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from "./mcp-direct.js";
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
-import { NOTIFICATIONS_DIR, NotificationStore } from "./notifications.js";
+import { formatQuietHours, NOTIFICATIONS_DIR, NotificationStore } from "./notifications.js";
 import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
@@ -316,7 +316,10 @@ export async function main(): Promise<void> {
   await devTab.view(); // the first badge count, for /health `inbox`
   // The home's notification inbox (docs/08 T7.w.5); producers call notificationCenter.raise()/resolve() (docs/09).
   const notificationStore = new NotificationStore({ dir: join(cfg.dataDir, NOTIFICATIONS_DIR), log: (m) => logger.warn(m) });
-  const notificationCenter = new NotificationCenter({ store: notificationStore, logger });
+  // Quiet hours (docs/09, T7.w.11.9): no urgent speech in this window (Core host local time).
+  if (cfg.quietHoursWarning) logger.warn(`[shadow-core] ${cfg.quietHoursWarning}`);
+  logger.info(`[shadow-core] quiet hours for urgent speech: ${cfg.quietHours ? formatQuietHours(cfg.quietHours) : "off"}`);
+  const notificationCenter = new NotificationCenter({ store: notificationStore, logger, quietHours: cfg.quietHours });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
   // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
   // Startup adoption reads the store directly (the center's list drops the dedupe key).
