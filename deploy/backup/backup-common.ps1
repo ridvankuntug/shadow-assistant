@@ -190,6 +190,64 @@ function Clear-ShadowCryptRemote {
     $script:ShadowBackupEnvSaved = @{}
 }
 
+# --- Status file (<data dir>\backup\status.json), read by the Core ----------
+# Shape: {version: 1, runId, startedAt, finishedAt?, result: running|ok|failed,
+# stage?: setup|archive|upload|prune, lastSuccessAt}; timestamps ISO 8601 UTC,
+# lastSuccessAt null until the first success. Error messages are never written
+# (they can hold remote names), only the stage. The archive excludes this file
+# (backup-data.ps1), so a restore never brings an old status back.
+
+function Get-ShadowUtcStamp([datetime] $Time = [datetime]::UtcNow) {
+    return $Time.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+}
+
+# lastSuccessAt of an existing status file, normalised to ISO UTC; $null when
+# the file is missing, unreadable, invalid JSON or holds no valid timestamp.
+function Read-ShadowBackupLastSuccess([string] $StatusFile) {
+    try {
+        if (-not (Test-Path -LiteralPath $StatusFile -PathType Leaf)) { return $null }
+        $json = [IO.File]::ReadAllText($StatusFile) | ConvertFrom-Json
+        if ($null -eq $json -or -not ($json.PSObject.Properties.Name -contains 'lastSuccessAt')) { return $null }
+        $v = $json.lastSuccessAt
+        # PowerShell 7's ConvertFrom-Json already turns ISO strings into [datetime].
+        if ($v -is [datetime]) { return Get-ShadowUtcStamp $v }
+        if ($v -isnot [string] -or -not $v) { return $null }
+        $parsed = [datetime]::MinValue
+        $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+        if (-not [datetime]::TryParse($v, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) { return $null }
+        return Get-ShadowUtcStamp $parsed
+    }
+    catch {
+        return $null
+    }
+}
+
+# Writes the status atomically: a temp file next to it, then a replace/move, so
+# the Core never reads a half-written file. Creates <data dir>\backup if needed,
+# but never the data folder itself. Ignores -WhatIf on purpose: the caller
+# decides (backup-data.ps1 writes nothing under -WhatIf).
+function Write-ShadowBackupStatus([string] $StatusFile, [System.Collections.IDictionary] $Status) {
+    $dir = Split-Path -Parent $StatusFile
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { New-Item -ItemType Directory -Path $dir -Force -WhatIf:$false | Out-Null }
+    $tmp = $StatusFile + '.tmp'
+    $text = ConvertTo-Json -InputObject $Status -Depth 2
+    [IO.File]::WriteAllText($tmp, $text + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    # A few short retries: OneDrive or an antivirus scanner may hold the file
+    # for a moment, and a lost final write would leave a false "running".
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            # [NullString]::Value: a plain $null would reach .NET as "" (invalid backup path).
+            if (Test-Path -LiteralPath $StatusFile -PathType Leaf) { [IO.File]::Replace($tmp, $StatusFile, [NullString]::Value) }
+            else { [IO.File]::Move($tmp, $StatusFile) }
+            return
+        }
+        catch [IO.IOException], [UnauthorizedAccessException] {
+            if ($attempt -ge 3) { throw }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+
 # Appends to <LogDir>\<name>; keeps one previous file (<name>.1) above MaxBytes.
 function Write-ShadowBackupLog([string] $LogFile, [string] $Message, [long] $MaxBytes = 2MB) {
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz'), $Message

@@ -267,6 +267,15 @@ File contents **and** file names are encrypted on Drive. The Drive remote uses
 the `drive.file` scope, so rclone can only see files it created itself, not the
 rest of your Drive. Log: `%LOCALAPPDATA%\ShadowAssistant\logs\backup.log`.
 
+Status: each run also writes `<data folder>\backup\status.json` (atomically,
+at start and at the end): `result` (`running` / `ok` / `failed`), the failed
+`stage` (`setup` / `archive` / `upload` / `prune`), `lastSuccessAt` and the
+run's timestamps (UTC). The Core reads this file to raise "backup failed" and
+"no backup" notifications; no file means backups are not set up, so no
+notification. It holds no error text (that is in `backup.log`), is not written
+under `-WhatIf` or when the data folder is missing, and is left out of the
+archive, so a restore never brings back an old status.
+
 All settings (parameter, else environment variable, else `.env`, else
 default) are listed in `.env.example` under "Backups" and in
 `Get-Help .\backup-data.ps1 -Full`. rclone is found on PATH, else in the winget

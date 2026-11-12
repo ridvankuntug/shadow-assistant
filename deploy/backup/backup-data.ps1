@@ -23,6 +23,13 @@
     is written to backup.log (stderr when the log cannot be written) and ends
     the script with exit code 1, so the scheduled task's last result shows it.
 
+    Status for the Core: <data folder>\backup\status.json is written atomically
+    when the run starts (result "running") and when it ends ("ok", or "failed"
+    with the stage: setup, archive, upload or prune), together with
+    lastSuccessAt. No error text goes into it (see backup.log for that). The
+    archive leaves this file out. Not written under -WhatIf, nor when the data
+    folder is missing or unknown (that failure is only logged).
+
 .PARAMETER DataDir           Folder to back up. Env: SHADOW_DATA_DIR (fallback SHADOW_VAULT_DIR\.shadow-assistant).
 .PARAMETER LocalDir          Where archives are written. Env: SHADOW_BACKUP_LOCAL_DIR. Default %LOCALAPPDATA%\ShadowAssistant\backups.
 .PARAMETER LocalKeep         Archives kept locally. Env: SHADOW_BACKUP_LOCAL_KEEP. Default 3.
@@ -60,6 +67,13 @@ $ErrorActionPreference = 'Stop'
 # log and ends the script with a non-zero exit code.
 $logFile = $null
 $exitCode = 0
+# Status file state: set once the data folder is known to exist (never under
+# -WhatIf). $stage is the step in progress, reported if the run fails.
+$statusFile = $null
+$runId = [guid]::NewGuid().ToString()
+$startedAt = $null
+$lastSuccessAt = $null
+$stage = 'setup'
 try {
     . (Join-Path $PSScriptRoot 'backup-common.ps1')
 
@@ -73,6 +87,17 @@ try {
     $logFile = Join-Path ([IO.Path]::GetFullPath($LogDir)) 'backup.log'
 
     $DataDir = Resolve-ShadowDataDir $DataDir $dot $RepoRoot
+    # Checked before anything else: the status file lives inside the data folder.
+    if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) { throw "Data folder does not exist: $DataDir (backup status not written)" }
+    if (-not $WhatIfPreference) {
+        $statusFile = Join-Path $DataDir 'backup\status.json'
+        $startedAt = Get-ShadowUtcStamp
+        $lastSuccessAt = Read-ShadowBackupLastSuccess $statusFile
+        Write-ShadowBackupStatus $statusFile ([ordered]@{
+                version = 1; runId = $runId; startedAt = $startedAt; result = 'running'; lastSuccessAt = $lastSuccessAt
+            })
+    }
+
     $LocalDir = [IO.Path]::GetFullPath((Get-ShadowSetting $LocalDir 'SHADOW_BACKUP_LOCAL_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\backups')))
     $keepText = Get-ShadowSetting $LocalKeep 'SHADOW_BACKUP_LOCAL_KEEP' $dot '3'
     $daysText = Get-ShadowSetting $RemoteDays 'SHADOW_BACKUP_REMOTE_DAYS' $dot '60'
@@ -89,7 +114,6 @@ try {
     if ($RcloneConfig) { $cfgArgs = @('--config', $RcloneConfig) }
     $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
     if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) { throw "tar.exe not found at $tar (it ships with Windows 10 1803 and later)." }
-    if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) { throw "Data folder does not exist: $DataDir" }
 
     $name = '{0}{1}{2}' -f $ShadowBackupPrefix, (Get-Date -Format 'yyyyMMdd-HHmmss'), $ShadowBackupSuffix
     $archive = Join-Path $LocalDir $name
@@ -102,12 +126,17 @@ try {
 
     Write-ShadowBackupLog $logFile "backup start: $DataDir -> $archive -> $target (crypt remote from $mode; remote keeps $days days, local keeps $keep)"
 
+    $stage = 'archive'
     if ($PSCmdlet.ShouldProcess($archive, "Create archive of $DataDir")) {
         if (-not (Test-Path -LiteralPath $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
         $partial = $archive + '.partial'
         $parent = Split-Path -Parent $DataDir
         $leaf = Split-Path -Leaf $DataDir
-        $tarOut = & $tar -czf $partial -C $parent $leaf 2>&1
+        # The status file (and its temp file) stays out of the archive, so a
+        # restore never brings an old status back. tar.exe (bsdtar) matches these
+        # from the start of the stored path, so only <leaf>/backup/ is affected.
+        # They are glob patterns: a data folder name with [ ] * ? would not match.
+        $tarOut = & $tar -czf $partial --exclude "$leaf/backup/status.json" --exclude "$leaf/backup/status.json.tmp" -C $parent $leaf 2>&1
         if ($LASTEXITCODE -ne 0) {
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             throw "tar failed (exit $LASTEXITCODE): $(@($tarOut) -join ' | ')"
@@ -116,6 +145,7 @@ try {
         Write-ShadowBackupLog $logFile ("archive written: {0} ({1:N0} bytes)" -f $name, (Get-Item -LiteralPath $archive).Length)
     }
 
+    $stage = 'upload'
     if ($PSCmdlet.ShouldProcess($target, "Upload $name")) {
         Invoke-ShadowRclone $rclone $cfgArgs @('copy', $archive, $target) | Out-Null
         $present = @(Invoke-ShadowRclone $rclone $cfgArgs @('lsf', $target, '--files-only', '--include', $name))
@@ -123,6 +153,7 @@ try {
         Write-ShadowBackupLog $logFile "uploaded: $name"
     }
 
+    $stage = 'prune'
     if ($days -gt 0 -and $PSCmdlet.ShouldProcess($target, "Delete $ShadowBackupPrefix* archives older than $days days")) {
         # --min-age is relative to now, so the archive just uploaded is never matched.
         Invoke-ShadowRclone $rclone $cfgArgs @('delete', $target, '--min-age', "${days}d",
@@ -174,5 +205,30 @@ catch {
 }
 finally {
     if (Get-Command Clear-ShadowCryptRemote -ErrorAction SilentlyContinue) { Clear-ShadowCryptRemote }
+}
+
+# Final status, outside the try: a run stopped from outside (Ctrl+C, the task's
+# time limit) never gets here and stays "running", which the Core reports as stuck.
+if ($statusFile) {
+    try {
+        $finishedAt = Get-ShadowUtcStamp
+        $final = [ordered]@{ version = 1; runId = $runId; startedAt = $startedAt; finishedAt = $finishedAt }
+        if ($exitCode) {
+            $final.result = 'failed'
+            $final.stage = $stage
+            $final.lastSuccessAt = $lastSuccessAt
+        }
+        else {
+            $final.result = 'ok'
+            $final.lastSuccessAt = $finishedAt
+        }
+        Write-ShadowBackupStatus $statusFile $final
+    }
+    catch {
+        $statusMessage = "backup status not written: $($_.Exception.Message)"
+        try { Write-ShadowBackupLog $logFile $statusMessage }
+        catch { [Console]::Error.WriteLine($statusMessage) }
+        $exitCode = 1
+    }
 }
 if ($exitCode) { exit $exitCode }
