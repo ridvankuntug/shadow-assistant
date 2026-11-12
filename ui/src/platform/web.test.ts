@@ -93,8 +93,10 @@ afterEach(() => {
 });
 
 describe("web adapter microphone", () => {
-  it("offers no Gemini hand-off (no button in the browser)", () => {
-    expect(createWebAdapter().openGemini).toBeUndefined();
+  it("offers no Gemini hand-off and no installed-app info (browser)", () => {
+    const adapter = createWebAdapter();
+    expect(adapter.gemini).toBeUndefined();
+    expect(adapter.app).toBeUndefined();
   });
 
   it("a normal stop returns the recorded utterance and releases the mic", async () => {

@@ -182,6 +182,10 @@ input:focus-visible {
 .topbar-actions {
   margin-left: auto;
   display: flex;
+  flex: none;
+}
+.brand {
+  flex: none;
 }
 /* Phone widths: room for one more icon (the Gemini button) next to the badges. */
 @media (max-width: 420px) {
@@ -195,6 +199,65 @@ input:focus-visible {
   .topbar-actions .btn-icon {
     min-width: 40px;
   }
+}
+/* Overflow guard (T16.3, ui/topbar.ts): with six or more icons the brand gives way;
+   the connection status shrinks to its dot by itself. Up to 480 px: above 420 px the
+   icons are 44 px and the brand wider, so seven icons need ~460 px with the brand. */
+@media (max-width: 480px) {
+  .topbar-crowded .brand {
+    display: none;
+  }
+}
+
+/* "⋮" menu (T16.2): a short list under the button, anchored to the bar like .svc-list. */
+.app-menu-list {
+  position: absolute;
+  right: 8px;
+  top: calc(100% + 4px);
+  z-index: 10;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  min-width: 200px;
+  max-width: calc(100vw - 24px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-solid);
+}
+.app-menu-item {
+  display: block;
+  width: 100%;
+  min-height: var(--touch);
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+}
+.app-menu-item:hover,
+.app-menu-item:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: none;
+}
+
+/* "Güncelleme ve sürüm" page (T16.2). */
+.version-info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+.version-info dt {
+  color: var(--muted);
+}
+.version-info dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 /* Service health: hidden while all ok; a dot + count, tap for the reasons. */

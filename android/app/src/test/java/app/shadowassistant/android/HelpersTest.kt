@@ -35,12 +35,22 @@ class HelpersTest {
     }
 
     @Test
+    fun geminiFailedEventHasNoDetails() {
+        assertEquals(
+            "window.__shadowAndroidEvent&&window.__shadowAndroidEvent(\"geminiFailed\",\"{}\")",
+            BridgeJs.eventScript(BridgeJs.GEMINI_FAILED, JSONObject()),
+        )
+    }
+
+    @Test
     fun infoHasBridgeVersionOne() {
-        val o = JSONObject(BridgeJs.info("0.1.0", "phone", null))
+        val o = JSONObject(BridgeJs.info("0.1.57", 57, "phone", null))
         assertEquals(1, o.getInt("bridgeVersion"))
+        assertEquals("0.1.57", o.getString("appVersion"))
+        assertEquals(57, o.getInt("appVersionCode"))
         assertEquals("phone", o.getString("deviceClass"))
         assertFalse(o.has("reducedMotion"))
-        assertTrue(JSONObject(BridgeJs.info("0.1.0", "tablet", true)).getBoolean("reducedMotion"))
+        assertTrue(JSONObject(BridgeJs.info("0.1.0", 1, "tablet", true)).getBoolean("reducedMotion"))
         assertEquals("phone", BridgeJs.deviceClass(411))
         assertEquals("tablet", BridgeJs.deviceClass(600))
     }

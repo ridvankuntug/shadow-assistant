@@ -30,6 +30,7 @@ class ShadowBridge(
     private val onStorageChanged: (String) -> Unit,
     private val geminiAvailable: () -> Boolean,
     private val launchGemini: () -> Unit,
+    private val launchUpdates: () -> Unit,
 ) {
     @JavascriptInterface
     fun getInfo(): String = if (trusted()) info else "{}"
@@ -107,6 +108,16 @@ class ShadowBridge(
     @JavascriptInterface
     fun openGemini() {
         if (trusted()) main.post { launchGemini() }
+    }
+
+    /**
+     * "Güncellemeleri denetle" from the UI's version page (T16.2; optional for the page).
+     * Opens only [UpdateActivity], the same screen as the launcher shortcut; the page
+     * passes nothing, so it cannot pick another target.
+     */
+    @JavascriptInterface
+    fun openUpdates() {
+        if (trusted()) main.post { launchUpdates() }
     }
 
     @JavascriptInterface

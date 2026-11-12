@@ -16,6 +16,7 @@ import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
 import { PHASE_COLOR } from "./scene/phaseStyle.ts";
 import { resolveQuality, type Quality } from "./scene/quality.ts";
+import { AppMenu } from "./ui/AppMenu.tsx";
 import { ConfirmCard } from "./ui/ConfirmCard.tsx";
 import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
@@ -25,7 +26,10 @@ import { MemoryPanel } from "./ui/MemoryPanel.tsx";
 import { NotificationsPanel } from "./ui/NotificationsPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
-import { sttStatus } from "./ui/serviceHealth.ts";
+import { serviceIssues, sttStatus } from "./ui/serviceHealth.ts";
+import { watchGemini } from "./ui/gemini.ts";
+import { topbarCrowded } from "./ui/topbar.ts";
+import { VersionPanel } from "./ui/VersionPanel.tsx";
 import { clearTrayHash, trayTarget, watchTrayHash } from "./ui/trayHash.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
@@ -33,7 +37,7 @@ import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, notifications
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect";
+type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect" | "version";
 
 /** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5; ui/trayHash.ts). */
 const atHash = (panel: "dev" | "notifications") => typeof window !== "undefined" && trayTarget(window.location.hash) === panel;
@@ -158,6 +162,10 @@ export default function App({ adapter, controller }: Props) {
     controller.resume();
   }, [controller, visible]);
 
+  // Asked at start and again on each return to the foreground; a failed open shows a hint (T16.3).
+  const [geminiOn, setGeminiOn] = useState(() => adapter.gemini?.available() ?? false);
+  useEffect(() => watchGemini(adapter, setGeminiOn, () => controller.geminiFailed()), [adapter, controller]);
+
   useEffect(() => () => controller.dispose(), [controller]);
 
   const level = useCallback(() => Math.max(adapter.mic.level(), adapter.playback.level()), [adapter]);
@@ -201,9 +209,9 @@ export default function App({ adapter, controller }: Props) {
     setPanel("dev");
   };
   // Gemini hand-off (T15): only where the host can open it (the Android shell); never in a browser.
-  const openGemini = adapter.openGemini;
-  const handOffToGemini = (open: () => void) => {
-    // Leave nothing listening or speaking behind; the running turn's text still arrives.
+  const gemini = adapter.gemini;
+  // Leaving for Gemini or the update screen: nothing listening or speaking behind; the running turn's text still arrives.
+  const handOff = (open: () => void) => {
     controller.leaveForOtherApp();
     open();
   };
@@ -230,10 +238,17 @@ export default function App({ adapter, controller }: Props) {
   const connected = status === "connected";
   const notice = state.notice;
   const accent = PHASE_COLOR[phase];
+  // Too many icons for a phone-wide bar: the brand text gives way (T16.3, ui/topbar.ts).
+  const crowded = topbarCrowded({
+    services: connected && serviceIssues(state.services) !== null,
+    dev: devCount > 0,
+    notifications: notificationsOn,
+    gemini: gemini !== undefined && geminiOn,
+  });
 
   return (
     <div className={`app phase-${phase}`} style={{ "--accent": accent } as CSSProperties}>
-      <header className="topbar">
+      <header className={crowded ? "topbar topbar-crowded" : "topbar"}>
         <span className="brand">SHADOW</span>
         <span className={`conn conn-${status}`} role="status">
           <span className="conn-dot" aria-hidden="true" />
@@ -310,20 +325,22 @@ export default function App({ adapter, controller }: Props) {
               <path d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3h-4l-.4 2.9a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1L11 21h4l.4-2.9a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5L19.4 13ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
             </svg>
           </button>
-          {/* Rightmost, in the corner. A plain sparkle, not Google's logo. */}
-          {openGemini && (
+          {/* A plain sparkle, not Google's logo. */}
+          {gemini && geminiOn && (
             <button
               type="button"
               className="btn btn-icon gemini-btn"
               aria-label="Gemini'yi aç"
               title="Gemini'yi aç"
-              onClick={() => handOffToGemini(openGemini)}
+              onClick={() => handOff(() => gemini.open())}
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2Z" />
               </svg>
             </button>
           )}
+          {/* Rightmost, in the corner (T16.2); more entries will join later. */}
+          <AppMenu items={[{ id: "version", label: "Güncelleme ve sürüm", onSelect: () => setPanel("version") }]} />
         </nav>
       </header>
 
@@ -431,6 +448,7 @@ export default function App({ adapter, controller }: Props) {
           onClose={closeDev}
         />
       )}
+      {panel === "version" && <VersionPanel app={adapter.app} onCheckUpdates={handOff} onClose={closePanel} />}
       {/* Hidden without the Core feature `notifications`. */}
       {panel === "notifications" && hasFeature(state, "notifications") && (
         <NotificationsPanel

@@ -49,7 +49,16 @@ interface PlatformAdapter {
   prefersReducedMotion(): boolean;
   isVisible(): boolean;
   onVisibilityChange(listener: (visible: boolean) => void): () => void; // returns unsubscribe
-  readonly openGemini?: () => void;          // Android only (T15): hand over to Gemini; absent = no button
+  readonly gemini?: {                         // Android only (T15): hand over to Gemini; absent = no button
+    available(): boolean;                    // asked at start and on each return to the foreground (T16.3)
+    open(): void;                            // fixed target picked by the host
+    onFailed(listener: () => void): () => void; // nothing could be started (T16.3): the UI shows a hint
+  };
+  readonly app?: {                           // Android only (T16.2): the installed app, for "Güncelleme ve sürüm"
+    versionName?: string;                    // e.g. "0.1.57"
+    versionCode?: number;                    // e.g. 57
+    openUpdates?: () => void;                // the shell's update screen; absent = not offered
+  };
 }
 
 type Utterance = { mime: string; data: string; durationMs: number };
@@ -189,7 +198,7 @@ never block the bridge thread for long.
 
 | Method (Kotlin) | Returns | Kind | Notes |
 |---|---|---|---|
-| `getInfo(): String` | JSON | sync | `{"bridgeVersion":1,"appVersion":"1.0.0","deviceClass":"phone","reducedMotion":false}`. `bridgeVersion` is required and must be `1`; `deviceClass` (`phone`/`tablet`/`desktop`) and `reducedMotion` are optional (defaults: `phone`, the WebView's `prefers-reduced-motion`). |
+| `getInfo(): String` | JSON | sync | `{"bridgeVersion":1,"appVersion":"0.1.57","appVersionCode":57,"deviceClass":"phone","reducedMotion":false}`. `bridgeVersion` is required and must be `1`; `appVersion` (versionName), `appVersionCode` (versionCode, T16.2), `deviceClass` (`phone`/`tablet`/`desktop`) and `reducedMotion` are optional (defaults: unknown, unknown, `phone`, the WebView's `prefers-reduced-motion`). |
 | `startCapture(requestId: String)` | void | async | Start recording one utterance. Callback `{"ok":true}` once the mic is actually recording, or an error (`permission_denied`, `busy`, `not_supported`; `capture_aborted` if the activity went to the background before recording began, see §4.5). |
 | `stopCapture(requestId: String)` | void | async | Stop and encode. Callback `{"ok":true,"mime":"audio/mp4","data":"<base64>","durationMs":1840}`. `data` = whole file (e.g. AAC in MP4 from `MediaRecorder`, or WAV), base64 `NO_WRAP`. Error `capture_aborted` if the shell cut the recording on `onPause` since the last `startCapture` (§4.5); `not_recording` if nothing was recording. |
 | `cancelCapture()` | void | sync | Stop and discard; no callback. Must be safe when idle. |
@@ -202,8 +211,9 @@ never block the bridge thread for long.
 | `vibrate(patternJson: String)` | void | sync | e.g. `"[30,60,30]"` — on/off milliseconds starting with "on". Optional. |
 | `notify(title: String, body: String)` | void | sync | System notification, used for a confirmation request while the app is in the background. Optional. |
 | `notifyItem(id: String, title: String, body: String, urgent: Boolean)` | void | sync | System notification for one inbox item (docs/08 T7.w.5d): own channel (silent, or the urgent channel), one notification per item id; dismissing it does not delete the item. Optional; the UI falls back to `notify`. |
-| `canOpenGemini(): Boolean` | bool | sync | Whether the shell can open Gemini on this device (T15): the Gemini app (`com.google.android.apps.bard`) or else `https://gemini.google.com/app` in a browser. Asked once when the adapter is created; `false` or missing = no Gemini button. Optional (with `openGemini`). |
-| `openGemini()` | void | sync | Opens that fixed target (never `ACTION_ASSIST`, which would reopen Shadow as the default assistant). Takes no argument, so the page cannot start an arbitrary intent. Before calling it the UI cancels a recording and stops speech; leaving the app then pauses it (§4.5). Optional. |
+| `canOpenGemini(): Boolean` | bool | sync | Whether the shell can open Gemini on this device (T15): the Gemini app (`com.google.android.apps.bard`) or else `https://gemini.google.com/app` in a browser. Asked when the UI starts and again each time the app returns to the foreground (T16.3); `false` or missing = no Gemini button. Optional (with `openGemini`). |
+| `openGemini()` | void | sync | Opens that fixed target (never `ACTION_ASSIST`, which would reopen Shadow as the default assistant). Takes no argument, so the page cannot start an arbitrary intent. Before calling it the UI cancels a recording and stops speech; leaving the app then pauses it (§4.5). When no target starts, the shell sends the event `geminiFailed` (§4.3). Optional. |
+| `openUpdates()` | void | sync | Opens the shell's own update screen (T16.2; the same one as the launcher shortcut "Güncellemeleri denetle"), from the UI's "Güncelleme ve sürüm" page. Takes no argument and has one fixed target, so the page cannot start anything else. Before calling it the UI cancels a recording and stops speech. Optional; missing = the page shows no button. |
 | `getItem(key: String): String?` | string or null | sync | Persistent storage (see storage keys). Store `shadow.deviceToken` encrypted (e.g. Android Keystore-backed). |
 | `setItem(key: String, value: String)` | void | sync | |
 | `removeItem(key: String)` | void | sync | |
@@ -262,6 +272,7 @@ window.__shadowAndroidEvent(name, payload)   // payload: JSON string or object
 | Event | Payload | When |
 |---|---|---|
 | `visibility` | `{"visible":false}` / `{"visible":true}` | `onPause` / `onResume` of the activity hosting the WebView |
+| `geminiFailed` | `{}` | after `openGemini()` when no Gemini target could be started (T16.3); the UI shows a short hint and asks `canOpenGemini()` again |
 
 The adapter combines this with `document.visibilityState`; either one hidden
 means "in background". Calling `webView.onPause()/onResume()` as well is

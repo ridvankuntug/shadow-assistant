@@ -123,12 +123,37 @@ export interface PlatformAdapter {
   /** Subscribes to foreground/background changes. Returns an unsubscribe function. */
   onVisibilityChange(listener: (visible: boolean) => void): () => void;
   /**
-   * Hands over to Google's Gemini (the app, else its web page), a target the
-   * host picks. Present only where that works (Android shells from T15 on);
-   * absent in the browser, where the top bar shows no Gemini button.
+   * Hand-off to Google's Gemini (the app, else its web page), a target the
+   * host picks. Present only on hosts that can do it (Android shells from T15
+   * on); absent in the browser, where the top bar shows no Gemini button.
    */
-  readonly openGemini?: () => void;
+  readonly gemini?: GeminiHandoff;
+  /** The installed app (Android shell); absent in the browser (T16.2). */
+  readonly app?: AppInfo;
 }
+
+export interface GeminiHandoff {
+  /**
+   * Whether a target exists right now. Asked at start and again each time the
+   * app comes back to the foreground (Gemini may have been installed or
+   * removed meanwhile, T16.3). Never throws.
+   */
+  available(): boolean;
+  /** Opens the fixed target the host picks. Never throws. */
+  open(): void;
+  /** The host could not start any target (T16.3). Returns an unsubscribe function. */
+  onFailed(listener: () => void): () => void;
+}
+
+/** The installed Android app as the shell reports it (T16.2). */
+export type AppInfo = {
+  /** versionName, e.g. "0.1.57"; absent when the shell does not say. */
+  versionName?: string;
+  /** versionCode, e.g. 57; absent on shells before T16.2. */
+  versionCode?: number;
+  /** Opens the shell's update check (Android shells from T16.2 on); absent = not offered here. */
+  openUpdates?: () => void;
+};
 
 /** Storage keys used by the app (documented for the Android side). */
 export const STORAGE_KEYS = {

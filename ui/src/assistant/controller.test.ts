@@ -732,6 +732,16 @@ describe("streamed speech (speech_stream)", () => {
     expect(t.controller.getState().capture).toBe("off");
   });
 
+  it("a failed Gemini open shows its hint as a notice that can be dismissed", () => {
+    const t = setup(undefined, STREAM);
+    t.controller.geminiFailed();
+    const notice = t.controller.getState().notice;
+    expect(notice).toEqual({ code: "gemini_failed" });
+    expect(noticeMessage(notice!)).toMatch(/^Gemini açılamadı/);
+    t.controller.dismissNotice();
+    expect(t.controller.getState().notice).toBeNull();
+  });
+
   it("does not speak twice: no speak after assistant_done while streaming", () => {
     const t = setup(undefined, STREAM);
     t.controller.sendText("selam");

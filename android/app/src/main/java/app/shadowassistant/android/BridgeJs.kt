@@ -47,11 +47,18 @@ object BridgeJs {
 
     fun visibility(visible: Boolean): JSONObject = JSONObject().put("visible", visible)
 
-    /** `getInfo()` result; `reducedMotion` is omitted when unknown (the UI then asks the WebView). */
-    fun info(appVersion: String, deviceClass: String, reducedMotion: Boolean?): String {
+    /** Event `geminiFailed` (T16.3): the shell could not start any Gemini target. No details. */
+    const val GEMINI_FAILED = "geminiFailed"
+
+    /**
+     * `getInfo()` result; `reducedMotion` is omitted when unknown (the UI then asks the WebView).
+     * `appVersionCode` (T16.2) is the installed versionCode, shown on the UI's version page.
+     */
+    fun info(appVersion: String, appVersionCode: Int, deviceClass: String, reducedMotion: Boolean?): String {
         val o = JSONObject()
             .put("bridgeVersion", BRIDGE_VERSION)
             .put("appVersion", appVersion)
+            .put("appVersionCode", appVersionCode)
             .put("deviceClass", deviceClass)
         if (reducedMotion != null) o.put("reducedMotion", reducedMotion)
         return o.toString()

@@ -487,6 +487,11 @@ export class AssistantController {
     this.stopSpeaking(); // also trims droppedSpeech
   }
 
+  /** The host could not open Gemini (T16.3): a short hint in the notice card. */
+  geminiFailed(): void {
+    this.dispatch({ type: "notice", notice: { code: "gemini_failed" } });
+  }
+
   respondConfirm(approved: boolean): void {
     const c = currentConfirm(this.state);
     if (!c || c.responding) return;

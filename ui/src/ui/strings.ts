@@ -51,6 +51,7 @@ const NOTICE_TEXT: Record<string, string> = {
   mic_unknown: "Mikrofon kaydı başarısız oldu.",
   playback_failed: "Ses çalınamadı.",
   tts_failed: "Cevap seslendirilemedi.",
+  gemini_failed: "Gemini açılamadı: cihazda Gemini uygulaması ya da bir tarayıcı bulunamadı.",
 };
 
 /**

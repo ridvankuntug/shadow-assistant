@@ -169,28 +169,69 @@ describe("Android adapter", () => {
     expect(old.notify).toHaveBeenCalledWith("Başlık", "Metin");
   });
 
-  it("openGemini: only with a shell that offers it and says it can", () => {
-    // Older shell without the methods: no Gemini button.
-    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge() }).openGemini).toBeUndefined();
-    // No target on the device, or a throwing check: none either.
-    const none = fakeBridge({ canOpenGemini: () => false, openGemini: vi.fn() });
-    expect(createAndroidAdapter({ ShadowAndroid: none }).openGemini).toBeUndefined();
+  it("gemini: only with a shell that has both methods; availability is asked each time", () => {
+    // Older shell without the methods (or half a pair): no Gemini hand-off at all.
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge() }).gemini).toBeUndefined();
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini: () => true }) }).gemini).toBeUndefined();
+
+    let can = false;
+    const canOpenGemini = vi.fn(() => can);
+    const g = createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini, openGemini: vi.fn() }) }).gemini;
+    expect(g?.available()).toBe(false);
+    can = true; // e.g. Gemini installed while the app was in the background
+    expect(g?.available()).toBe(true);
+    expect(canOpenGemini).toHaveBeenCalledTimes(2);
+
     const broken = fakeBridge({
       canOpenGemini: () => {
         throw new Error("boom");
       },
       openGemini: vi.fn(),
     });
-    expect(createAndroidAdapter({ ShadowAndroid: broken }).openGemini).toBeUndefined();
-    // Half a pair is not enough.
-    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini: () => true }) }).openGemini).toBeUndefined();
+    expect(createAndroidAdapter({ ShadowAndroid: broken }).gemini?.available()).toBe(false);
+  });
 
+  it("gemini.open calls the bridge without arguments and never throws", () => {
     const open = vi.fn(() => {
       throw new Error("ignored");
     });
     const adapter = createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini: () => true, openGemini: open }) });
-    expect(() => adapter.openGemini?.()).not.toThrow();
+    expect(() => adapter.gemini?.open()).not.toThrow();
     expect(open).toHaveBeenCalledWith();
+  });
+
+  it("gemini.onFailed follows the shell's geminiFailed event until unsubscribed", () => {
+    const win: AndroidWindow = { ShadowAndroid: fakeBridge({ canOpenGemini: () => true, openGemini: vi.fn() }) };
+    const adapter = createAndroidAdapter(win);
+    const failed = vi.fn();
+    const off = adapter.gemini!.onFailed(failed);
+    win.__shadowAndroidEvent?.("geminiFailed", "{}");
+    win.__shadowAndroidEvent?.("visibility", { visible: true }); // other events: not a failure
+    expect(failed).toHaveBeenCalledTimes(1);
+    off();
+    win.__shadowAndroidEvent?.("geminiFailed", "{}");
+    expect(failed).toHaveBeenCalledTimes(1);
+  });
+
+  it("app: version from getInfo; the update screen only with a shell that offers openUpdates", () => {
+    const info = () => JSON.stringify({ bridgeVersion: 1, appVersion: "0.1.57", appVersionCode: 57 });
+    const openUpdates = vi.fn(() => {
+      throw new Error("ignored");
+    });
+    const app = createAndroidAdapter({ ShadowAndroid: fakeBridge({ getInfo: info, openUpdates }) }).app;
+    expect(app?.versionName).toBe("0.1.57");
+    expect(app?.versionCode).toBe(57);
+    expect(() => app?.openUpdates?.()).not.toThrow();
+    expect(openUpdates).toHaveBeenCalledWith();
+
+    // A shell before T16.2: version name only, no versionCode, no update button.
+    const old = createAndroidAdapter({ ShadowAndroid: fakeBridge() }).app;
+    expect(old).toEqual({ versionName: "1.0" });
+    // Bad values are dropped.
+    const bad = () => JSON.stringify({ bridgeVersion: 1, appVersion: "", appVersionCode: 1.5 });
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge({ getInfo: bad }) }).app).toEqual({});
+    const negative = () => JSON.stringify({ bridgeVersion: 1, appVersionCode: -3 });
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge({ getInfo: negative }) }).app?.versionCode).toBeUndefined();
   });
 
   it("follows visibility events pushed by the shell", () => {

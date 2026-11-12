@@ -229,6 +229,7 @@ class MainActivity : Activity() {
         }
         val info = BridgeJs.info(
             appVersion = BuildConfig.VERSION_NAME,
+            appVersionCode = BuildConfig.VERSION_CODE,
             deviceClass = BridgeJs.deviceClass(resources.configuration.smallestScreenWidthDp),
             reducedMotion = if (animationsOff()) true else null,
         )
@@ -251,7 +252,9 @@ class MainActivity : Activity() {
             },
             geminiAvailable = gemini::available,
             // Leaving pauses this activity: onPause stops playback/speech and cuts a running recording.
-            launchGemini = { if (!destroyed) gemini.open() },
+            // Nothing started (T16.3): tell the page, which shows a short hint.
+            launchGemini = { if (!destroyed && !gemini.open()) sendEvent(BridgeJs.GEMINI_FAILED, JSONObject()) },
+            launchUpdates = { if (!destroyed) openUpdateScreen() },
         )
         // Injected before the first load so selectAdapter() finds it (docs/03 §2).
         webView.addJavascriptInterface(bridge, "ShadowAndroid")
@@ -358,6 +361,22 @@ class MainActivity : Activity() {
         if (destroyed) return
         val js = BridgeJs.callbackScript(requestId, payload)
         main.post { if (!destroyed) webView.evaluateJavascript(js, null) }
+    }
+
+    /**
+     * The update screen (T16.2), started like the launcher shortcut starts it: in its own task
+     * (UpdateActivity's affinity, where the install-status PendingIntent also lands) and fresh,
+     * so it always begins with a new check.
+     */
+    private fun openUpdateScreen() {
+        try {
+            startActivity(
+                Intent(this, UpdateActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
+            )
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "Update screen did not start", e)
+        }
     }
 
     private fun sendEvent(name: String, payload: JSONObject) {
