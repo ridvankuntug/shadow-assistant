@@ -15,6 +15,7 @@ import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { BackupProducer, backupStatusPath } from "./backup-producer.js";
+import { ServiceProducer } from "./service-producer.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
 import { LEARNED_RULES_DIR, LearnedRuleStore } from "./learn/store.js";
@@ -344,6 +345,16 @@ export async function main(): Promise<void> {
     timeoutMs: cfg.healthTimeoutMs,
     logger,
   });
+  // Service producer (docs/09 (b)): notifications from the monitor's shown status; adoption reads the store directly.
+  const serviceProducer = new ServiceProducer({
+    monitor,
+    notifications: {
+      raise: (input) => notificationCenter.raise(input),
+      resolve: (source, key) => notificationCenter.resolve(source, key),
+      list: () => notificationStore.list(),
+    },
+    logger,
+  });
 
   const server = createCoreServer({
     tokens,
@@ -409,6 +420,7 @@ export async function main(): Promise<void> {
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
   backupProducer.start();
+  serviceProducer.start();
   // List the remote services once now, so the first session gets their tools and instructions.
   void gateway.warm();
   logger.info(`[shadow-core] mcp gateway: ${gateway.services.join(", ") || "no services"}`);
@@ -427,6 +439,7 @@ export async function main(): Promise<void> {
           { name: "background", run: () => background.abort() },
           { name: "health monitor", run: () => monitor.close() },
           { name: "backup producer", run: () => backupProducer.close() },
+          { name: "service producer", run: () => serviceProducer.close() },
           // Closes every socket; each session flushes its conversation log lines.
           { name: "server", run: () => server.close() },
           // Closes the model sessions and flushes the continuity pointers.

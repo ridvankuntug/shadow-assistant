@@ -134,6 +134,28 @@ service the Core depends on going down, and Home Assistant's own alerts.
   the same open item is re-raised as **urgent** with `renotify` (spoken once,
   subject to [quiet hours](#quiet-hours-for-urgent-speech)). The 30 min count
   starts with the shown `down` and restarts after a recovery.
+- Implemented (T7.w.11.3, [`service-producer.ts`](../core/src/service-producer.ts)):
+  covered by services.yaml name (`home-assistant`, `whisper-svc`, `tts-svc`,
+  `shadow-vault` → `service:vault`, `shadow-memory` → `service:memory`); one timer
+  for the earliest deadline, `snapshot()` re-read when it fires; a failed store
+  call is retried for that key after 60 s. Startup adoption: open `service` items count as
+  raised (an urgent HA item as already escalated).
+- **Varsayılan — kullanıcı onayı bekliyor:**
+  - Texts: vault "Not kasasına (vault) ulaşılamıyor", memory "Hafıza deposu
+    kullanılamıyor"; "yüklenemedi" title `<servis> yüklenemedi`; detail codes as
+    short Turkish sentences (`timeout` "Sağlık kontrolü zaman aşımına uğradı.",
+    `http_<n>` "Servis HTTP <n> yanıtı verdi.", unknown "Servis yanıt vermiyor.").
+  - While an item is open (any back window, not only the flap one) a new outage
+    updates it at once (text only, no renotify), without a new 90 s wait.
+  - Flap guard counts new items only (not the HA urgent re-raise), over the hour
+    before the `ok` period started; the window length is fixed then.
+  - HA: any shown non-`down` status (one good check) is a break that restarts
+    the 30 min; the urgent re-raise also happens during a flap back window.
+  - A covered service missing from the snapshot (removed from services.yaml)
+    resolves like `disabled`; `loading` counts as "more than 180 s" (strict).
+  - An open item the user deleted is not recreated by a text update (detail
+    change, new outage in the back window) until the condition resolves; the HA
+    30 min urgent re-raise still recreates it (spoken once).
 
 ### (c) Home Assistant's own alerts
 
@@ -294,7 +316,7 @@ The client action and its protocol shape (extra to delete) are specified in
 
 - T7.w.11.1 — Backup status file: `backup-data.ps1` writes `backup/status.json` (start/end, stage, lastSuccessAt; setup inside `try`; `-WhatIf` none; excluded from the archive); docs/05 note.
 - T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests. Implemented: [`backup-producer.ts`](../core/src/backup-producer.ts), wired in `index.ts` (started with the health monitor, closed in the shutdown chain); tests in `core/test/backup-producer.test.ts`.
-- T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests.
+- T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests. Implemented: [`service-producer.ts`](../core/src/service-producer.ts), wired in `index.ts` (started after the health monitor, closed in the shutdown chain); tests in `core/test/service-producer.test.ts`.
 - T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
 - T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server.
 - T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope.
