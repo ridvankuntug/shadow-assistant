@@ -298,9 +298,17 @@ them or the producer resolves them.
   sent `speech_prefs` with `enabled:true`, the one whose device had the most
   recent turn (ties: that socket's own latest turn, then the newest socket).
   That client speaks title + body through its usual speech path. With no such
-  socket nothing is spoken. `speak` is never sent again for the item: not in
-  `notifications`, not after a reconnect, not when it is read or changed
-  without a new reminder. Being spoken does not mark an item read.
+  socket the item is **pending speech** (kept in the Core's memory only, lost
+  on a Core restart): the next socket that turns speech on (its first
+  `speech_prefs` with `enabled:true` after `welcome`, or on again after off)
+  gets `notification` with `"speak":true` for it, to that socket only, if the
+  item still exists and is still urgent and unread; then it is no longer
+  pending. Read, delete or resolve on any device cancels it. So a reconnect
+  speaks only items still pending speech, once, on one socket. Otherwise
+  `speak` is never sent again for the item: not in `notifications`, not when
+  it is read or changed without a new reminder. Being spoken does not mark an
+  item read. Added within protocol 1 (T7.w.11.4): no new frame; a client that
+  already speaks `speak:true` and records shown items needs no change.
 - There is no push to a phone whose app is not connected; it sees the items in
   `notifications_list` on its next connect.
 - While the Core cannot read its notifications file (locked or otherwise

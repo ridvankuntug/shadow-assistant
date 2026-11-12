@@ -754,9 +754,9 @@ resolves it. No field beyond the above is needed.
   That client speaks title + body through the existing speech path. User rule:
   an urgent item is also spoken once when a client connects if it was not
   spoken at raise time (no speech-enabled socket then); an item already spoken
-  is not spoken again. Designed in docs/09 (pending speech, T7.w.11.4) and not
-  implemented yet: today the connect catch-up shows urgent items but does not
-  speak them. Quiet hours 00:00-09:00 (decided, docs/09): no urgent speech in
+  is not spoken again. Implemented as pending speech in docs/09 (T7.w.11.4):
+  the Core sends `speak: true` to the first socket that turns speech on; the
+  client's connect catch-up itself still never speaks. Quiet hours 00:00-09:00 (decided, docs/09): no urgent speech in
   that window.
 - **Phone, narrowest form without a new dependency.** While the Android app is
   connected, the UI gets the `notification` frame and calls `adapter.notify()`

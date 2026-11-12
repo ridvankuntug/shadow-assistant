@@ -9,6 +9,9 @@
  * - an urgent item is spoken by exactly one socket (speech on, device with
  *   the latest turn) and never again: not on a reconnect, not by a list, not
  *   by a raise without renotify;
+ * - pending speech (T7.w.11.4): an urgent item raised with no speaker is
+ *   spoken once by the next socket that turns speech on; read / delete /
+ *   resolve cancel it;
  * - the producer's dedupe key never leaves the Core.
  */
 import assert from "node:assert/strict";
@@ -335,6 +338,178 @@ test("urgent: a closed socket is detached and no longer the speaker (the next so
   await h.center.raise({ source: "test", urgency: "urgent", title: "Acil" });
   assert.equal(phone.spoken().length, 0);
   assert.equal(browser.spoken().length, 1, "the urgent item must not be lost on a dead socket");
+});
+
+// --- Pending speech (T7.w.11.4, docs/09 §Urgent items while no client is connected)
+
+test("pending speech: an urgent item raised with no speaker is spoken once by the next socket that turns speech on, never again", async () => {
+  const h = home();
+  const silent = h.connect("tablet"); // connected, speech off: gets the item, cannot speak it
+  const r = await h.center.raise({ source: "test", urgency: "urgent", title: "Acil", body: "Ayrıntı" });
+  assert.ok(r.ok);
+  assert.equal(silent.of("notification").length, 1);
+  assert.equal(silent.spoken().length, 0);
+
+  const phone = h.connect("phone");
+  await phone.speechOn();
+  assert.equal(phone.spoken().length, 1);
+  assert.equal(phone.spoken()[0]?.item.id, r.item.id);
+  assert.equal(phone.spoken()[0]?.item.title, "Acil");
+  // Only the speaker gets the frame: no second (duplicate) copy, nothing for the other socket.
+  assert.equal(phone.of("notification").length, 1);
+  assert.equal(silent.of("notification").length, 1);
+  // Being spoken does not mark it read; the list carries no speak.
+  const v = await phone.list();
+  assert.equal(v.items[0]?.readAt, null);
+  assert.equal(phone.of("notification").length, 1);
+
+  // A second socket with speech on, a reconnect, and speech off/on again: nothing more.
+  const browser = h.connect("browser");
+  await browser.speechOn();
+  await phone.speechOff();
+  await phone.speechOn();
+  await phone.session.close("socket_closed");
+  const again = h.connect("phone");
+  await again.speechOn();
+  assert.equal(browser.spoken().length + again.spoken().length, 0);
+  assert.equal(phone.spoken().length, 1);
+});
+
+test("pending speech: read, delete or resolve before a speaker comes cancels it; marking unread again does not bring it back", async () => {
+  const h = home();
+  const other = h.connect("browser"); // the device that reads / deletes, speech off
+  const toRead = await h.center.raise({ source: "test", urgency: "urgent", title: "Okunacak" });
+  const toDelete = await h.center.raise({ source: "test", urgency: "urgent", title: "Silinecek" });
+  const toResolve = await h.center.raise({ source: "test", key: "k", urgency: "urgent", title: "Çözülecek" });
+  assert.ok(toRead.ok && toDelete.ok && toResolve.ok);
+  assert.equal(errorCode(await other.ask({ type: "notification_action", notificationId: toRead.item.id, action: "read" })), "notifications");
+  assert.equal(errorCode(await other.ask({ type: "notification_action", notificationId: toRead.item.id, action: "unread" })), "notifications");
+  assert.equal(errorCode(await other.ask({ type: "notification_action", notificationId: toDelete.item.id, action: "delete" })), "notifications");
+  assert.equal(await h.center.resolve("test", "k"), true);
+
+  const phone = h.connect("phone");
+  await phone.speechOn();
+  assert.equal(phone.spoken().length, 0);
+  assert.equal(other.spoken().length, 0);
+});
+
+test("pending speech: a socket without speech does not use it up; an item made normal is dropped", async () => {
+  const h = home();
+  const urgent = await h.center.raise({ source: "test", urgency: "urgent", title: "Acil" });
+  await h.center.raise({ source: "test", key: "k", urgency: "urgent", title: "Önce acil" });
+  // The keyed one is raised again as normal (no renotify): no longer urgent, not spoken later.
+  await h.center.raise({ source: "test", key: "k", urgency: "normal", title: "Artık normal" });
+  assert.ok(urgent.ok);
+
+  const quiet = h.connect("phone");
+  await quiet.speechOff(); // prefs sent, speech off
+  await quiet.list();
+  assert.equal(quiet.spoken().length, 0);
+
+  // The same socket turns speech on later: it speaks the urgent one now.
+  await quiet.speechOn();
+  assert.deepEqual(quiet.spoken().map((f) => f.item.id), [urgent.item.id]);
+});
+
+test("pending speech: a renotify that finds a speaker first is spoken once, not again by the pending set", async () => {
+  const h = home();
+  const first = await h.center.raise({ source: "test", key: "k", urgency: "urgent", title: "Hatırlatma" });
+  assert.ok(first.ok);
+  const phone = h.connect("phone");
+  // The renotify is queued before the socket's pending-speech call: it already finds the speaker.
+  const again = h.center.raise({ source: "test", key: "k", urgency: "urgent", title: "Hatırlatma", renotify: true });
+  await phone.speechOn();
+  await again;
+  assert.equal(phone.spoken().length, 1);
+  assert.equal(phone.spoken()[0]?.item.id, first.item.id);
+});
+
+test("pending speech: while the file cannot be read the ids stay pending; the next speaker gets them", async () => {
+  const h = home();
+  const r = await h.center.raise({ source: "test", urgency: "urgent", title: "Acil" });
+  assert.ok(r.ok);
+  const realGet = h.store.get.bind(h.store);
+  let fail = true;
+  h.store.get = (id) => (fail ? Promise.reject(new NotificationsUnavailableError()) : realGet(id));
+  const a = h.connect("phone");
+  await a.speechOn();
+  assert.equal(a.spoken().length, 0);
+  assert.equal(h.center.unavailable, true);
+  h.center.close(); // no retry timer left behind
+  fail = false;
+  const b = h.connect("browser");
+  await b.speechOn();
+  assert.equal(b.spoken().length, 1);
+  assert.equal(a.spoken().length, 0);
+});
+
+test("pending speech: a socket that closes or turns speech off while the file is read consumes nothing; an item changed behind the Core's back is dropped, not spoken", async () => {
+  const h = home();
+  const a = await h.center.raise({ source: "test", urgency: "urgent", title: "Acil" });
+  assert.ok(a.ok);
+  const realGet = h.store.get.bind(h.store);
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  let gate: Promise<void> | null = null;
+  let reached: Promise<void> = Promise.resolve();
+  const block = () => {
+    gate = new Promise<void>((r) => (release = r));
+    reached = new Promise<void>((r) => (entered = r));
+  };
+  h.store.get = async (id) => {
+    const g = gate;
+    if (g) {
+      entered();
+      await g;
+    }
+    return realGet(id);
+  };
+
+  // Speech turned off while the item is being read: not delivered, still pending.
+  block();
+  const phone = h.connect("phone");
+  const p1 = phone.speechOn();
+  await reached;
+  await phone.speechOff();
+  release();
+  await p1;
+  assert.equal(phone.spoken().length, 0);
+
+  // The socket closes while the item is being read: not delivered, still pending.
+  const tab = h.connect("tablet");
+  block();
+  const p2 = tab.speechOn();
+  await reached;
+  await tab.session.close("socket_closed");
+  release();
+  await p2;
+  assert.equal(tab.spoken().length, 0);
+
+  // Speech turned off while the call waits for the chain, before the first read.
+  gate = null;
+  const early = h.connect("early");
+  block();
+  const busy = h.center.act("early", a.item.id, "unread"); // holds the chain on a store read
+  await reached;
+  const p3 = early.speechOn();
+  await early.speechOff();
+  release();
+  await busy;
+  await p3;
+  assert.equal(early.spoken().length, 0);
+  gate = null;
+
+  // Changed directly in the store (not through the center): read or deleted items are dropped.
+  const r = await h.center.raise({ source: "test", urgency: "urgent", title: "Okundu" });
+  const d = await h.center.raise({ source: "test", urgency: "urgent", title: "Silindi" });
+  assert.ok(r.ok && d.ok);
+  await h.store.markRead(r.item.id);
+  await h.store.delete(d.item.id);
+
+  // Nobody consumed anything: the next speaker gets only the item that is still urgent and unread.
+  const browser = h.connect("browser");
+  await browser.speechOn();
+  assert.deepEqual(browser.spoken().map((f) => f.item.id), [a.item.id]);
 });
 
 test("an unreadable notifications file: list and actions answer notifications_unavailable, the file is not overwritten, the Core recovers", async () => {

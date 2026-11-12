@@ -173,10 +173,11 @@ export interface SessionDeps {
   /**
    * The notification inbox (T7.w.5, feature `notifications`): the session
    * attaches itself for the `notification` broadcasts, reports its turns (for
-   * the urgent speaker) and answers `notifications_list` /
+   * the urgent speaker), tells when it turns speech on (pending urgent
+   * speech, T7.w.11.4) and answers `notifications_list` /
    * `notification_action`; absent = `bad_request`.
    */
-  notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "list" | "act">;
+  notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "speechOn" | "list" | "act">;
 }
 
 /** What a session needs for pattern learning. */
@@ -266,6 +267,8 @@ export class Session {
   private readonly sentHere = new SentEntries();
   /** The "result not paired" learning note is logged once per session. */
   private unpairedLogged = false;
+  /** This socket as the notification center sees it (undefined without the center). */
+  private readonly notificationListener: NotificationListener | undefined;
   /** Stops the notification broadcasts to this socket (close()). */
   private readonly detachNotifications: (() => void) | undefined;
 
@@ -285,12 +288,15 @@ export class Session {
     // Start the device's model session now, so the first turn finds it warm (07 §Prewarm).
     deps.registry?.prewarm(info.device);
     // Synchronous with the server's welcome: a broadcast (always after an await) never precedes it.
-    this.detachNotifications = deps.notifications?.attach({
-      sessionId: info.sessionId,
-      device: info.device,
-      speaks: () => this.speechPrefs !== undefined,
-      deliver: (frame) => this.emit(frame),
-    });
+    if (deps.notifications) {
+      this.notificationListener = {
+        sessionId: info.sessionId,
+        device: info.device,
+        speaks: () => this.speechPrefs !== undefined,
+        deliver: (frame) => this.emit(frame),
+      };
+      this.detachNotifications = deps.notifications.attach(this.notificationListener);
+    }
   }
 
   get busy(): boolean {
@@ -337,9 +343,13 @@ export class Session {
       case "voices":
         await this.handleVoices(frame.id);
         return;
-      case "speech_prefs":
+      case "speech_prefs": {
+        const wasOn = this.speechPrefs !== undefined;
         this.speechPrefs = frame.enabled ? { mode: frame.mode, ...(frame.voice ? { voice: frame.voice } : {}) } : undefined;
+        // Speech just turned on (first prefs after welcome, or on again): urgent items still pending speech are spoken here.
+        if (!wasOn && this.speechPrefs && this.notificationListener) await this.deps.notifications?.speechOn(this.notificationListener);
         return;
+      }
       case "cancel":
         // An utterance still being transcribed must never become a turn.
         this.transcribing.get(frame.id)?.abort();
@@ -2017,9 +2027,15 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * Urgent speech: when an urgent item is raised (new, or raised again with
  * `renotify`), exactly one socket gets `speak: true`: among the sockets with
  * speech on, the one whose device had the most recent turn (ties: the
- * socket's own latest turn, then the newest socket). Nothing is spoken when
- * no socket has speech on, and nothing is spoken again later: a reconnect or
- * a `notifications` list never carries `speak`.
+ * socket's own latest turn, then the newest socket).
+ *
+ * Pending speech (T7.w.11.4, docs/09): when no socket has speech on at that
+ * raise, the item id is kept (in memory only). The next socket that turns
+ * speech on (`speechOn()`) gets `notification {item, speak: true}` for each
+ * pending item that still exists and is still urgent and unread, then the set
+ * is empty, so each is spoken once, on one socket. Read, delete and resolve
+ * cancel it. Nothing else speaks: a `notifications` list never carries
+ * `speak`, and an item already spoken is not spoken on a reconnect.
  *
  * While the store cannot read its file, `list()`, `act()` and `resolve()`
  * reject with NotificationsUnavailableError (the session answers
@@ -2038,6 +2054,8 @@ export class NotificationCenter {
   private readonly sessionTurns = new Map<string, number>();
   /** One counter for attach and turn order (no clock ties). */
   private seq = 0;
+  /** Ids of urgent items raised while no socket could speak them, in raise order (T7.w.11.4). In memory only. */
+  private readonly pendingSpeech = new Set<string>();
   private lastUnread = 0;
   /** The last store call could not read the file (cleared by the next one that could). */
   private lastUnavailable = false;
@@ -2105,7 +2123,10 @@ export class NotificationCenter {
         return r;
       }
       const speak = r.item.urgency === "urgent" && (r.created || input.renotify === true);
-      this.broadcast({ type: "notification", item: notificationInfo(r.item) }, speak ? this.speaker() : undefined);
+      const speaker = speak ? this.speaker() : undefined;
+      if (speak && !speaker) this.pendingSpeech.add(r.item.id);
+      else if (speaker) this.pendingSpeech.delete(r.item.id); // spoken now; an older pending entry is used up
+      this.broadcast({ type: "notification", item: notificationInfo(r.item) }, speaker);
       await this.recount();
       return r;
     });
@@ -2122,10 +2143,36 @@ export class NotificationCenter {
         await this.settle();
         return false;
       }
+      this.pendingSpeech.delete(item.id);
       this.broadcast({ type: "notification_removed", notificationId: item.id });
       await this.recount();
       return true;
     });
+  }
+
+  /**
+   * `listener` turned speech on (its first `speech_prefs` with `enabled:true`
+   * after `welcome`, or on again after off): it alone gets
+   * `notification {item, speak: true}` for each item pending speech that
+   * still exists and is still urgent and unread (oldest raise first); every
+   * pending id is then used up (spoken or dropped), so a second socket speaks
+   * nothing. A listener that is detached or no longer speaks consumes nothing.
+   * While the file cannot be read the ids stay pending. Never rejects.
+   */
+  speechOn(listener: NotificationListener): Promise<void> {
+    if (this.pendingSpeech.size === 0) return Promise.resolve();
+    return this.serial(async () => {
+      for (const id of [...this.pendingSpeech]) {
+        // Checked again after each read: the socket may close or turn speech off meanwhile.
+        if (!this.listeners.has(listener) || !this.canSpeak(listener)) return;
+        const item = await this.o.store.get(id);
+        if (!this.listeners.has(listener) || !this.canSpeak(listener)) return;
+        if (!this.pendingSpeech.delete(id)) continue;
+        if (!item || item.urgency !== "urgent" || item.readAt !== null) continue;
+        safe(() => listener.deliver({ type: "notification", item: notificationInfo(item), speak: true }), undefined);
+      }
+      await this.settle();
+    }).catch(() => {});
   }
 
   /** All items (most recently updated first) and the unread count. */
@@ -2158,6 +2205,7 @@ export class NotificationCenter {
   private async actOnStore(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
     if (action === "delete") {
       if (!(await this.o.store.delete(notificationId))) return unknownNotification();
+      this.pendingSpeech.delete(notificationId);
       this.o.logger.info(`[shadow-core] notification ${notificationId} deleted by device ${device}`);
       this.broadcast({ type: "notification_removed", notificationId });
       await this.recount();
@@ -2167,6 +2215,8 @@ export class NotificationCenter {
     if (!before) return unknownNotification();
     const after = action === "read" ? await this.o.store.markRead(notificationId) : await this.o.store.markUnread(notificationId);
     if (!after) return unknownNotification();
+    // Read on any device cancels pending speech; marking it unread again does not bring it back.
+    if (action === "read") this.pendingSpeech.delete(notificationId);
     if (after.readAt !== before.readAt) {
       this.broadcast({ type: "notification", item: notificationInfo(after) });
       await this.recount();
@@ -2216,11 +2266,20 @@ export class NotificationCenter {
   private speaker(): NotificationListener | undefined {
     let best: { l: NotificationListener; rank: number[] } | undefined;
     for (const [l, attached] of this.listeners) {
-      if (!safe(() => l.speaks(), false)) continue;
+      if (!this.canSpeak(l)) continue;
       const rank = [this.deviceTurns.get(l.device) ?? 0, this.sessionTurns.get(l.sessionId) ?? 0, attached];
       if (!best || compareRank(rank, best.rank) > 0) best = { l, rank };
     }
     return best?.l;
+  }
+
+  /**
+   * Whether `l` may be asked to speak an urgent item now. The one check for both
+   * the raise path (`speaker()`) and pending speech (`speechOn()`): a later rule
+   * such as quiet hours (T7.w.11.9) belongs here.
+   */
+  private canSpeak(l: NotificationListener): boolean {
+    return safe(() => l.speaks(), false);
   }
 
   private broadcast(frame: ServerFrame, speaker?: NotificationListener): void {

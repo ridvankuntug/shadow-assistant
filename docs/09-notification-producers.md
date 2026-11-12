@@ -19,7 +19,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
   item in place; `renotify: true` makes it unread again; `resolve(source, key)`
   removes it. `NotificationCenter.raise` speaks an urgent item once, on the most
   recent speech-enabled socket, only when it is new or re-raised with `renotify`;
-  with no such socket it is never spoken (`speaker()` returns nothing).
+  with no such socket it is pending speech (T7.w.11.4, implemented; see
+  [Urgent items while no client is connected](#urgent-items-while-no-client-is-connected-protocol-change-proposed)).
 - **Services.** `HealthMonitor` ([`health.ts`](../core/src/health.ts)) polls every
   `services.yaml` entry every 30 s (timeout 3 s, `CORE_HEALTH_*`); `subscribe()`
   fires only when a status or detail **changes**, `snapshot()` gives the latest
@@ -192,6 +193,11 @@ each time. Design only; no code yet.
 
 ### Urgent items while no client is connected (protocol change, proposed)
 
+Implemented (T7.w.11.4): `NotificationCenter.speechOn()`, called by the session
+when its speech turns on (first `speech_prefs` with `enabled:true`, or on
+again); the speaker check for the raise path and pending speech is one method
+(`canSpeak`), where quiet hours (T7.w.11.9) go. docs/02 updated.
+
 The confirmed delivery rule says an urgent item is always shown on its own on
 connect **and spoken once**; today the catch-up never speaks, so an urgent item
 raised with no speech-enabled socket (03:30, phone app closed) is never heard.
@@ -229,7 +235,7 @@ is known to be near a person); the **first speech-enabled connection after
 09:00** speaks it **once**, on one socket, if it is still unread and unresolved
 (and not suppressed). Read, delete or resolve before then cancels it; after it
 was spoken once it is never spoken again. Not chosen: never speaking it later.
-Not implemented yet: quiet hours and pending speech are T7.w.11.4 / T7.w.11.9.
+Pending speech is implemented (T7.w.11.4); quiet hours are not yet (T7.w.11.9).
 
 ### Dismiss options: "Gördüm" vs "Tekrar gösterme"
 
@@ -278,7 +284,7 @@ The client action and its protocol shape (extra to delete) are specified in
 - T7.w.11.1 — Backup status file: `backup-data.ps1` writes `backup/status.json` (start/end, stage, lastSuccessAt; setup inside `try`; `-WhatIf` none; excluded from the archive); docs/05 note.
 - T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests.
 - T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests.
-- T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests.
+- T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
 - T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server.
 - T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope.
 
