@@ -420,6 +420,8 @@ export async function main(): Promise<void> {
           { name: "mcp gateway", run: () => gateway.close() },
           { name: "mcp client", run: () => mcpClient.close() },
           { name: "development tab", run: () => devTab?.close() },
+          // The retry read of an unreadable notifications file (T7.w.13); the flush below still runs.
+          { name: "notification center", run: () => notificationCenter.close() },
         ],
         flush: [
           { name: "usage log", run: () => usageLog.flush() },

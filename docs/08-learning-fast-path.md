@@ -373,6 +373,10 @@ at activation, at every Core start (load) and at every run.
      counts when it starts with the deny word or its softened stem ("kilit",
      "kilitli", "kilidi", "kapısı"), never as a substring (T7.w.10: "Wall Clock"
      is not "lock"; a compound such as "Bahçekapısı" is not caught by its name).
+     A multi-word entry matches as consecutive words of one name (T7.w.12). The
+     same check runs on the fixed rules: turn-on / turn-off (T7.w.12) and the
+     brightness rule `light-level` (T7.w.13); a match there falls back to the
+     model.
      The wording-independent guard is the domain: `lock`,
      `alarm_control_panel`, `cover` and `valve` are in `NEVER_LEARNABLE_DOMAINS`
      and are never learned or run (pinned by tests).
@@ -470,7 +474,7 @@ is unaffected). Read-modify-write serialized on one promise chain.
 | `core/src/learn/store.ts` (new) | I/O | `rules.json`, lifecycle, counters, caps, load-time re-validation, active snapshot |
 | `router-config.ts` | pure | `learning` schema and ceilings; compile learned rules with `compilePattern()`; matcher shared with static rules |
 | `router.ts` | pure | `TieredRouter` tries the active snapshot after static rules; `RouteDecision.source` |
-| `direct.ts` | pure | optional target filter (safety layer 3) in `resolveWithAliases()`; used only by learned plans |
+| `direct.ts` | pure | optional target filter (safety layer 3) in `resolveWithAliases()`; used by learned plans, static turn-on / turn-off rules (T7.w.12) and the static brightness rule (deny names only, T7.w.13) |
 | `session.ts` | wiring | per-turn gated-call capture; observation at settle; learned-rule outcome reporting |
 
 ### Tests
@@ -715,7 +719,12 @@ notifications (no push, no sound) and stay in their own stores.
   (`NotificationsUnavailableError`) and clients get `error`
   `notifications_unavailable` ([docs/02](02-core-protocol.md#notifications)); the
   UI shows "Bildirimler okunamadı" and a "!" bell badge instead of an empty inbox.
-  An invalid file that could be moved aside keeps the T7.w.5a behaviour
+  `/health` `inbox.notificationsUnavailable` is true meanwhile (T7.w.12) and the
+  Windows tray shows "Bildirimler (!)" and "bildirimler okunamadı" in its tooltip
+  (T7.w.13). While the flag is set the Core re-reads the file once a minute
+  (`NotificationCenter`, T7.w.13) and the UI asks for the inbox once a minute,
+  so the flag, the tray and the "!" badge clear by themselves once the file can
+  be read. An invalid file that could be moved aside keeps the T7.w.5a behaviour
   (`.corrupt-<ts>` copy, empty inbox, one warning).
 - **Store internals (T7.w.10g).** Items are held in a Map by id (file order) with a
   source + key index, so an action finds and copies one item; only the list reply
@@ -742,8 +751,13 @@ resolves it. No field beyond the above is needed.
 - **Urgent = spoken, once, on one device.** At raise time the Core sends a
   `speak: true` flag on the `notification` frame to one session only: the
   connected session with speech enabled whose device had the most recent turn.
-  That client speaks title + body through the existing speech path. A reconnect
-  never speaks an old urgent item again.
+  That client speaks title + body through the existing speech path. User rule:
+  an urgent item is also spoken once when a client connects if it was not
+  spoken at raise time (no speech-enabled socket then); an item already spoken
+  is not spoken again. Designed in docs/09 (pending speech, T7.w.11.4) and not
+  implemented yet: today the connect catch-up shows urgent items but does not
+  speak them. Quiet hours 00:00-09:00 (decided, docs/09): no urgent speech in
+  that window.
 - **Phone, narrowest form without a new dependency.** While the Android app is
   connected, the UI gets the `notification` frame and calls `adapter.notify()`
   when not visible; on connect, unread items not yet shown on this phone (ids kept
@@ -754,8 +768,9 @@ resolves it. No field beyond the above is needed.
   does not delete the item. This is **not** push: a phone whose app is closed sees
   the items when it next connects. On connect, more than three normal items not
   yet shown here become one summary notification ("N yeni bildirim", replaced by
-  the next summary); urgent items are always shown on their own and are never
-  spoken by the catch-up. Summarized items count as shown (T7.w.10).
+  the next summary); urgent items are always shown on their own, never
+  summarized, and are spoken once on connect per the rule above (pending speech,
+  docs/09). Summarized items count as shown (T7.w.10).
 - **Real push** (app closed) needs one of: FCM (new external dependency, Firebase
   project, Google services on the phone), a periodic WorkManager poll of an
   authenticated `GET /notifications` on the pattern of the T11 worker (no external
@@ -881,12 +896,15 @@ block.
 
 ## Related findings (not part of the plan; need approval)
 
-- The static tier-0 rules `light-on/off` and `device-on/off` accept `switch` (and
+- The static tier-0 rules `light-on/off` and `device-on/off` accepted `switch` (and
   `fan`) targets with no device-class or name check; a `switch` that drives a door
-  relay is only caught if HA does not expose it. The learned rules add such a
-  check (layer 3); the static ones could use the same filter.
-  **Turn-on part closed by T7.w.10** (lights and outlet switches only); the
-  turn-off rules (`light-off`, `device-off`) are unchanged and still open.
+  relay was only caught if HA did not expose it. The learned rules add such a
+  check (layer 3).
+  **Turn-on part closed by T7.w.10, turn-off part and name check closed by
+  T7.w.12**: static turn-on and turn-off rules act on lights and outlet switches
+  only, and apply the deny-name check (name, alias, area) of the learned rules;
+  other targets fall back to the model. The static brightness rule
+  (`light-level`, lights only) applies the same deny-name check since T7.w.13.
 - Tier-0 fallbacks with `name_not_found` point at missing HA aliases. A
   `tier0_fallback` dev-note kind would surface them; it is not in T7.w.3's list.
   **Closed by T7.w.10i** (`unknown_name` turn note).

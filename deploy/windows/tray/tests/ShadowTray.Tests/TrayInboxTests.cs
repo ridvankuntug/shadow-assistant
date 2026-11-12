@@ -24,6 +24,58 @@ public class TrayInboxTests
     }
 
     [Fact]
+    public void Parses_notificationsUnavailable_and_defaults_to_false()
+    {
+        var bad = CoreHealth.Parse("""{"status":"ok","inbox":{"dev":1,"notifications":0,"notificationsUnavailable":true}}""");
+        Assert.True(bad.Inbox!.NotificationsUnavailable);
+        Assert.Equal("Bildirimler (!)", TrayInbox.NotificationsMenuText(bad.Inbox));
+        Assert.Equal("Bildirimler okunamadı", TrayInbox.NotificationsProblemText(bad.Inbox));
+        Assert.True(TrayStatusEvaluator.Evaluate(Running(), bad, Now).NotificationDot);
+        Assert.Contains("bildirimler okunamadı", TrayStatusEvaluator.Evaluate(Running(), bad, Now).Tooltip);
+
+        foreach (var json in new[]
+                 {
+                     """{"status":"ok","inbox":{"notifications":0}}""",
+                     """{"status":"ok","inbox":{"notifications":0,"notificationsUnavailable":false}}""",
+                     """{"status":"ok","inbox":{"notifications":0,"notificationsUnavailable":"yes"}}""",
+                 })
+        {
+            var h = CoreHealth.Parse(json);
+            Assert.True(h.Reachable);
+            Assert.False(h.Inbox!.NotificationsUnavailable);
+            Assert.Equal("Bildirimler (0)", TrayInbox.NotificationsMenuText(h.Inbox));
+            Assert.Null(TrayInbox.NotificationsProblemText(h.Inbox));
+        }
+    }
+
+    [Fact]
+    public void Unavailable_notifications_give_no_balloon_and_keep_the_baseline()
+    {
+        var b = new NotificationBalloon();
+        Assert.Null(b.Observe(new InboxCounts(0, 2)));
+        Assert.Null(b.Observe(new InboxCounts(0, 0, true)));
+        Assert.Null(b.Observe(new InboxCounts(0, 2)));
+        // The baseline survived the unreadable spell: a real rise after it still gives a balloon.
+        Assert.Null(b.Observe(new InboxCounts(0, 9, true)));
+        Assert.NotNull(b.Observe(new InboxCounts(0, 3)));
+
+        // Unreadable from the first poll: the first real count is only the baseline.
+        var fresh = new NotificationBalloon();
+        Assert.Null(fresh.Observe(new InboxCounts(0, 0, true)));
+        Assert.Null(fresh.Observe(new InboxCounts(0, 4)));
+    }
+
+    [Fact]
+    public void An_unreachable_Core_shows_no_unreadable_mark()
+    {
+        var status = TrayStatusEvaluator.Evaluate(Running(), CoreHealth.Unreachable, Now);
+        Assert.Null(status.Inbox);
+        Assert.False(status.NotificationDot);
+        Assert.DoesNotContain("okunamadı", status.Tooltip);
+        Assert.Equal("Bildirimler", TrayInbox.NotificationsMenuText(status.Inbox));
+    }
+
+    [Fact]
     public void Each_count_is_optional()
     {
         // Today's Core sends only dev; the notification store adds its count separately.

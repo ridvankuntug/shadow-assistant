@@ -25,6 +25,13 @@
  * `welcome`. Rounds never overlap: the next one is scheduled only after the
  * previous one finished, and `checkNow()` during a round joins that round.
  *
+ * Hysteresis (T7.w.13): a service shown as `ok` or `loading` is shown as `down`
+ * only after `downAfter` (default DEFAULT_HEALTH_DOWN_AFTER) failed checks in a
+ * row; a single failed check keeps the shown status (and is logged). One
+ * check that is not `down` shows that status at once. The first round shows
+ * what it found (there is nothing to hold yet). Clients, `GET /health` and the
+ * tray all see the shown status (`snapshot()` / `subscribe()`).
+ *
  * `detail` is a short code from a fixed vocabulary; error messages (which can
  * contain URLs) are never copied into it.
  */
@@ -34,6 +41,14 @@ import type { ServiceDef } from "./services.js";
 
 export const DEFAULT_HEALTH_INTERVAL_MS = 30_000;
 export const DEFAULT_HEALTH_TIMEOUT_MS = 3_000;
+/**
+ * Failed checks in a row before a service is shown as `down`. Two: one lost
+ * check (a timeout while the PC is busy, a service restart) no longer flips
+ * the UI and tray, and a real outage still shows within two intervals (60 s at
+ * the default 30 s). Three would take up to 90 s, and the notification
+ * producer (docs/09) waits another 90 s on top of the shown `down`.
+ */
+export const DEFAULT_HEALTH_DOWN_AFTER = 2;
 
 export type CheckResult = { status: Exclude<ServiceHealthStatus, "disabled">; detail?: string };
 /** One check; must honour `signal` (aborted on timeout or close). */
@@ -221,6 +236,8 @@ export function buildHealthTargets(
 export interface HealthMonitorOptions {
   intervalMs?: number;
   timeoutMs?: number;
+  /** Failed checks in a row before `down` is shown (default DEFAULT_HEALTH_DOWN_AFTER; 1 = no hysteresis). */
+  downAfter?: number;
   logger?: MonitorLogger;
   now?: () => number;
 }
@@ -231,6 +248,9 @@ export class HealthMonitor {
   private readonly intervalMs: number;
   private readonly timeoutMs: number;
   private readonly now: () => number;
+  private readonly downAfter: number;
+  /** Failed checks in a row per target (targets order); reset by any other result. */
+  private readonly failures: number[];
   private readonly listeners = new Set<HealthListener>();
   /** Aborts in-flight checks on close(). */
   private readonly stopper = new AbortController();
@@ -247,6 +267,9 @@ export class HealthMonitor {
     this.intervalMs = opts.intervalMs ?? DEFAULT_HEALTH_INTERVAL_MS;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
     this.now = opts.now ?? Date.now;
+    const n = opts.downAfter ?? DEFAULT_HEALTH_DOWN_AFTER;
+    this.downAfter = Number.isInteger(n) && n >= 1 ? n : DEFAULT_HEALTH_DOWN_AFTER;
+    this.failures = targets.map(() => 0);
   }
 
   /** Latest statuses (services.yaml order), or undefined before the first round finished. */
@@ -335,10 +358,30 @@ export class HealthMonitor {
     return { name: t.name, status: result.status, checkedAt: this.now(), ...(detail ? { detail } : {}) };
   }
 
+  /**
+   * The status to show for one check result: a `down` result is held back
+   * (the previous status, with the new `checkedAt`) until `downAfter` in a
+   * row, unless `down` is already shown or nothing was shown yet.
+   */
+  private shown(idx: number, raw: ServiceHealth, prev: ServiceHealth | undefined): ServiceHealth {
+    if (raw.status !== "down") {
+      this.failures[idx] = 0;
+      return raw;
+    }
+    const n = (this.failures[idx] ?? 0) + 1;
+    this.failures[idx] = n;
+    if (!prev || prev.status === "down" || n >= this.downAfter) return raw;
+    this.opts.logger?.info(
+      `[shadow-core] health: ${raw.name} check failed${raw.detail ? ` (${raw.detail})` : ""}; shown as down after ${this.downAfter} in a row (${n}/${this.downAfter})`,
+    );
+    return { ...prev, checkedAt: raw.checkedAt };
+  }
+
   private async round(): Promise<void> {
-    const items = await Promise.all(this.targets.map((t) => this.runOne(t)));
+    const raw = await Promise.all(this.targets.map((t) => this.runOne(t)));
     if (this.closed) return;
     const prev = this.current;
+    const items = raw.map((r, idx) => this.shown(idx, r, prev?.[idx]));
     this.current = items;
     const changed =
       !prev ||

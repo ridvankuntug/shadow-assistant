@@ -19,6 +19,10 @@
     -WhatIf checks rclone and the remotes and prints the plan; it writes,
     uploads and deletes nothing.
 
+    Every failure, setup included (settings, rclone, tar, missing data folder),
+    is written to backup.log (stderr when the log cannot be written) and ends
+    the script with exit code 1, so the scheduled task's last result shows it.
+
 .PARAMETER DataDir           Folder to back up. Env: SHADOW_DATA_DIR (fallback SHADOW_VAULT_DIR\.shadow-assistant).
 .PARAMETER LocalDir          Where archives are written. Env: SHADOW_BACKUP_LOCAL_DIR. Default %LOCALAPPDATA%\ShadowAssistant\backups.
 .PARAMETER LocalKeep         Archives kept locally. Env: SHADOW_BACKUP_LOCAL_KEEP. Default 3.
@@ -51,39 +55,46 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'backup-common.ps1')
 
-if (-not $RepoRoot) { $RepoRoot = $env:SHADOW_REPO_ROOT }
-if (-not $RepoRoot) { $RepoRoot = Join-Path $PSScriptRoot '..\..' }
-$RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
-$dot = Read-ShadowDotEnv $RepoRoot
-
-$DataDir = Resolve-ShadowDataDir $DataDir $dot $RepoRoot
-$LocalDir = [IO.Path]::GetFullPath((Get-ShadowSetting $LocalDir 'SHADOW_BACKUP_LOCAL_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\backups')))
-$keepText = Get-ShadowSetting $LocalKeep 'SHADOW_BACKUP_LOCAL_KEEP' $dot '3'
-$daysText = Get-ShadowSetting $RemoteDays 'SHADOW_BACKUP_REMOTE_DAYS' $dot '60'
-$keep = 0; $days = 0
-if (-not [int]::TryParse($keepText, [ref]$keep) -or $keep -lt 1) { throw "LocalKeep must be a whole number >= 1 (got '$keepText')." }
-if (-not [int]::TryParse($daysText, [ref]$days) -or $days -lt 0) { throw "RemoteDays must be a whole number >= 0 (got '$daysText')." }
-$DriveRemote = Get-ShadowSetting $DriveRemote 'SHADOW_BACKUP_DRIVE_REMOTE' $dot 'gdrive'
-$DrivePath = Get-ShadowSetting $DrivePath 'SHADOW_BACKUP_DRIVE_PATH' $dot 'shadow-assistant-backup'
-$CryptRemote = Get-ShadowSetting $CryptRemote 'SHADOW_BACKUP_CRYPT_REMOTE' $dot 'shadowcrypt'
-$RcloneConfig = Get-ShadowSetting $RcloneConfig 'SHADOW_BACKUP_RCLONE_CONFIG' $dot $null
-$LogDir = Get-ShadowSetting $LogDir 'SHADOW_BACKUP_LOG_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\logs')
-$logFile = Join-Path ([IO.Path]::GetFullPath($LogDir)) 'backup.log'
-
-$rclone = Find-ShadowRclone (Get-ShadowSetting $RclonePath 'SHADOW_BACKUP_RCLONE_PATH' $dot $null)
-$cfgArgs = @()
-if ($RcloneConfig) { $cfgArgs = @('--config', $RcloneConfig) }
-$tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) { throw "tar.exe not found at $tar (it ships with Windows 10 1803 and later)." }
-if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) { throw "Data folder does not exist: $DataDir" }
-
-$name = '{0}{1}{2}' -f $ShadowBackupPrefix, (Get-Date -Format 'yyyyMMdd-HHmmss'), $ShadowBackupSuffix
-$archive = Join-Path $LocalDir $name
-$target = "${CryptRemote}:"
-
+# Everything, setup included, runs inside the try so that any failure reaches the
+# log and ends the script with a non-zero exit code.
+$logFile = $null
+$exitCode = 0
 try {
+    . (Join-Path $PSScriptRoot 'backup-common.ps1')
+
+    if (-not $RepoRoot) { $RepoRoot = $env:SHADOW_REPO_ROOT }
+    if (-not $RepoRoot) { $RepoRoot = Join-Path $PSScriptRoot '..\..' }
+    $RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
+    $dot = Read-ShadowDotEnv $RepoRoot
+
+    # Resolve the log file first, so later setup errors can be logged.
+    $LogDir = Get-ShadowSetting $LogDir 'SHADOW_BACKUP_LOG_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\logs')
+    $logFile = Join-Path ([IO.Path]::GetFullPath($LogDir)) 'backup.log'
+
+    $DataDir = Resolve-ShadowDataDir $DataDir $dot $RepoRoot
+    $LocalDir = [IO.Path]::GetFullPath((Get-ShadowSetting $LocalDir 'SHADOW_BACKUP_LOCAL_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\backups')))
+    $keepText = Get-ShadowSetting $LocalKeep 'SHADOW_BACKUP_LOCAL_KEEP' $dot '3'
+    $daysText = Get-ShadowSetting $RemoteDays 'SHADOW_BACKUP_REMOTE_DAYS' $dot '60'
+    $keep = 0; $days = 0
+    if (-not [int]::TryParse($keepText, [ref]$keep) -or $keep -lt 1) { throw "LocalKeep must be a whole number >= 1 (got '$keepText')." }
+    if (-not [int]::TryParse($daysText, [ref]$days) -or $days -lt 0) { throw "RemoteDays must be a whole number >= 0 (got '$daysText')." }
+    $DriveRemote = Get-ShadowSetting $DriveRemote 'SHADOW_BACKUP_DRIVE_REMOTE' $dot 'gdrive'
+    $DrivePath = Get-ShadowSetting $DrivePath 'SHADOW_BACKUP_DRIVE_PATH' $dot 'shadow-assistant-backup'
+    $CryptRemote = Get-ShadowSetting $CryptRemote 'SHADOW_BACKUP_CRYPT_REMOTE' $dot 'shadowcrypt'
+    $RcloneConfig = Get-ShadowSetting $RcloneConfig 'SHADOW_BACKUP_RCLONE_CONFIG' $dot $null
+
+    $rclone = Find-ShadowRclone (Get-ShadowSetting $RclonePath 'SHADOW_BACKUP_RCLONE_PATH' $dot $null)
+    $cfgArgs = @()
+    if ($RcloneConfig) { $cfgArgs = @('--config', $RcloneConfig) }
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) { throw "tar.exe not found at $tar (it ships with Windows 10 1803 and later)." }
+    if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) { throw "Data folder does not exist: $DataDir" }
+
+    $name = '{0}{1}{2}' -f $ShadowBackupPrefix, (Get-Date -Format 'yyyyMMdd-HHmmss'), $ShadowBackupSuffix
+    $archive = Join-Path $LocalDir $name
+    $target = "${CryptRemote}:"
+
     $mode = Initialize-ShadowCryptRemote -Rclone $rclone -ConfigArgs $cfgArgs -DriveRemote $DriveRemote -DrivePath $DrivePath `
         -CryptRemote $CryptRemote `
         -Password (Get-ShadowSetting $null 'SHADOW_BACKUP_CRYPT_PASSWORD' $dot $null) `
@@ -130,9 +141,38 @@ try {
     Write-ShadowBackupLog $logFile 'backup done'
 }
 catch {
-    Write-ShadowBackupLog $logFile "backup FAILED: $($_.Exception.Message)"
-    throw
+    $failMessage = "backup FAILED: $($_.Exception.Message)"
+    try {
+        # Setup may have failed before the log path was known: derive it from the
+        # parameter / environment / default only (no .env).
+        if (-not $logFile) {
+            $fallbackDir = $LogDir
+            if (-not $fallbackDir) { $fallbackDir = $env:SHADOW_BACKUP_LOG_DIR }
+            if (-not $fallbackDir) { $fallbackDir = Join-Path $env:LOCALAPPDATA 'ShadowAssistant\logs' }
+            $logFile = Join-Path ([IO.Path]::GetFullPath($fallbackDir)) 'backup.log'
+        }
+        if (Get-Command Write-ShadowBackupLog -ErrorAction SilentlyContinue) {
+            Write-ShadowBackupLog $logFile $failMessage
+        }
+        else {
+            # backup-common.ps1 itself failed to load: plain append.
+            $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz'), $failMessage
+            Write-Output $line
+            if (-not $WhatIfPreference) {
+                $dir = Split-Path -Parent $logFile
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -WhatIf:$false | Out-Null }
+                [IO.File]::AppendAllText($logFile, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+            }
+        }
+    }
+    catch {
+        # Log path unknown or not writable: fall back to stderr.
+        [Console]::Error.WriteLine($failMessage)
+        [Console]::Error.WriteLine("(could not write to log file: $($_.Exception.Message))")
+    }
+    $exitCode = 1
 }
 finally {
-    Clear-ShadowCryptRemote
+    if (Get-Command Clear-ShadowCryptRemote -ErrorAction SilentlyContinue) { Clear-ShadowCryptRemote }
 }
+if ($exitCode) { exit $exitCode }

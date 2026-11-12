@@ -170,6 +170,7 @@ public sealed class TrayApp : ApplicationContext
             _notify.Icon = _icons[status.Colour, status.GameMode, status.NotificationDot];
         _devItem.Text = TrayInbox.DevMenuText(status.Inbox);
         _notificationsItem.Text = TrayInbox.NotificationsMenuText(status.Inbox);
+        _notificationsItem.ToolTipText = TrayInbox.NotificationsProblemText(status.Inbox) ?? "";
         if (_shown is null || _shown.Tooltip != status.Tooltip) _notify.Text = status.Tooltip;
         if (_shown is null || force || _menu.Visible) RebuildStatusLines(status.Lines);
         _shown = status;

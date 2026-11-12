@@ -9,6 +9,7 @@ import {
   DEV_TIMEOUT_MS,
   MAX_UTTERANCE_MS,
   MEMORY_TIMEOUT_MS,
+  NOTIFICATIONS_RETRY_MS,
   NOTIFICATIONS_TIMEOUT_MS,
   SPEECH_FINAL_TIMEOUT_MS,
   VOICES_TIMEOUT_MS,
@@ -1899,6 +1900,34 @@ describe("notification inbox (T7.w.5c)", () => {
       // A reconnect starts from scratch (the list after welcome decides again).
       t.drop();
       expect(notificationsUnavailable(t.controller.getState())).toBe(false);
+    });
+
+    it("while unavailable the inbox is asked for again every minute until it answers; a drop stops it (T7.w.13)", () => {
+      const t = inbox(null);
+      const lists = () => t.sent.filter((m) => m.type === "notifications_list").length;
+      t.receive({ type: "error", id: t.listId(), code: "notifications_unavailable" });
+      expect(lists()).toBe(1);
+      vi.advanceTimersByTime(NOTIFICATIONS_RETRY_MS - 1);
+      expect(lists()).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(lists()).toBe(2);
+      // Still unreadable: the next minute asks again.
+      t.receive({ type: "error", id: t.listId(), code: "notifications_unavailable" });
+      vi.advanceTimersByTime(NOTIFICATIONS_RETRY_MS);
+      expect(lists()).toBe(3);
+      // Readable again: "!" clears, the badge shows the count, no more retries.
+      t.receive(list(t.listId(), [item("n-1")]));
+      expect(notificationsUnavailable(t.controller.getState())).toBe(false);
+      expect(t.badge()).toBe(1);
+      vi.advanceTimersByTime(NOTIFICATIONS_RETRY_MS * 3);
+      expect(lists()).toBe(3);
+      // Unavailable again, then the socket drops: no request after the drop.
+      t.controller.requestNotifications();
+      t.receive({ type: "error", id: t.listId(), code: "notifications_unavailable" });
+      expect(lists()).toBe(4);
+      t.drop();
+      vi.advanceTimersByTime(NOTIFICATIONS_RETRY_MS * 3);
+      expect(lists()).toBe(4);
     });
 
     it("a timeout or another error never marks the inbox unavailable", () => {

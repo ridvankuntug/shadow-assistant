@@ -65,6 +65,17 @@ export function staticSwitchTargetFilter(deny: Iterable<string>): (entity: LiveE
   return (entity) => staticSwitchTarget(entity) && !hasDenyPhrase(entity, phrases);
 }
 
+/**
+ * The `targetFilter` of every static light-set (brightness) plan: no deny name
+ * word (`hasDenyName`, T7.w.13), so "garaj lambasını yüzde 50 yap" goes to the
+ * model like "garaj lambasını aç". The domain boundary is the rule's
+ * `domains` (lights). `deny` is folded (CompiledLearning.denyNameWords).
+ */
+export function staticDenyNameFilter(deny: Iterable<string>): (entity: LiveEntity) => boolean {
+  const phrases = denyPhrases(deny);
+  return (entity) => !hasDenyPhrase(entity, phrases);
+}
+
 /** A final consonant softened before a vowel suffix ("kilit" → "kilidi", "kepenk" → "kepengi"), folded. */
 const SOFTENED: Readonly<Record<string, string>> = { t: "d", k: "g", p: "b" };
 
@@ -491,8 +502,9 @@ export interface DirectPlan {
   messages: DirectMessages;
   /**
    * The resolved entity must pass this check, else the plan falls back to the
-   * model. Learned rules: safety layer 3 (docs/08). Static rules: only the
-   * switch rules (turn on / off: `staticSwitchTargetFilter`); every other static rule has none.
+   * model. Learned rules: safety layer 3 (docs/08). Static rules: the switch
+   * rules (turn on / off: `staticSwitchTargetFilter`) and the light-set rules
+   * (`staticDenyNameFilter`, T7.w.13); every other static rule has none.
    */
   targetFilter?: (entity: LiveEntity) => boolean;
 }
@@ -520,6 +532,8 @@ export interface CompiledRouterConfig {
     messages: DirectMessages;
     /** `targetFilter` of the static switch plans (`staticSwitchTargetFilter` over `learning.denyNameWords`). */
     switchTargetFilter: (entity: LiveEntity) => boolean;
+    /** `targetFilter` of the static light-set plans (`staticDenyNameFilter` over `learning.denyNameWords`, T7.w.13). */
+    lightSetTargetFilter: (entity: LiveEntity) => boolean;
   };
   rules: CompiledRule[];
   learning: CompiledLearning;
@@ -578,6 +592,7 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
       messages: cfg.direct.messages,
       // Also with learning off: the deny words guard the static switch rules too (T7.w.12).
       switchTargetFilter: staticSwitchTargetFilter(denyNameWords),
+      lightSetTargetFilter: staticDenyNameFilter(denyNameWords),
     },
     rules,
     learning: {
@@ -716,12 +731,20 @@ export function matchRules(cfg: CompiledRouterConfig, text: MatchText): RuleMatc
           replyMany: rule.reply_many,
           maxItems: cfg.direct.maxItems,
           messages: cfg.direct.messages,
-          ...(rule.tool !== undefined && isSwitchTool(rule.tool) ? { targetFilter: cfg.direct.switchTargetFilter } : {}),
+          ...staticTargetFilter(cfg, rule.tool),
         },
       };
     }
   }
   return undefined;
+}
+
+/** The `targetFilter` field of a static tier-0 plan by its tool: switch and light-set rules have one, others none. */
+function staticTargetFilter(cfg: CompiledRouterConfig, tool: string | undefined): Pick<DirectPlan, "targetFilter"> {
+  if (tool === undefined) return {};
+  if (isSwitchTool(tool)) return { targetFilter: cfg.direct.switchTargetFilter };
+  if (tool === LIGHT_SET_TOOL) return { targetFilter: cfg.direct.lightSetTargetFilter };
+  return {};
 }
 
 // ---------------------------------------------------------------- learned rules (T7.w.2)

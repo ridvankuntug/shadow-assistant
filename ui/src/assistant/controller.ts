@@ -30,6 +30,7 @@ import {
   isCancelled,
   memoryAvailable,
   notificationsAvailable,
+  notificationsUnavailable,
   notificationToggleAction,
   reducer,
   shouldPlaySpeech,
@@ -65,6 +66,12 @@ export const MEMORY_TIMEOUT_MS = 8_000;
 export const DEV_TIMEOUT_MS = 8_000;
 /** Same for `notifications_list` / `notification_action` in the inbox. */
 export const NOTIFICATIONS_TIMEOUT_MS = 8_000;
+/**
+ * While the Core cannot read its notifications file ("!" badge), the inbox is
+ * asked for again this often, so the badge recovers without a reconnect once
+ * the Core can read it (the Core retries on the same period, T7.w.13).
+ */
+export const NOTIFICATIONS_RETRY_MS = 60_000;
 /**
  * Catch-up on connect: up to this many normal items are shown one by one;
  * more become one summary notification (urgent items are always separate).
@@ -190,6 +197,8 @@ export class AssistantController {
   private memoryTimer: ReturnType<typeof setTimeout> | null = null;
   private devTimer: ReturnType<typeof setTimeout> | null = null;
   private notificationsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Next inbox request while the inbox is unavailable (NOTIFICATIONS_RETRY_MS). */
+  private notificationsRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Set by `welcome`: the next inbox list is the catch-up of this connection
    * (unread items not yet shown on this device go to the system once).
@@ -248,6 +257,26 @@ export class AssistantController {
     this.state = next;
     for (const l of this.listeners) l();
     if (this.announcements.length > 0) this.scheduleAnnouncement();
+    this.syncNotificationsRetry();
+  }
+
+  /**
+   * Keeps one retry of the inbox request scheduled while connected and the
+   * inbox is unavailable; cancels it otherwise (a list that answered, a
+   * dropped socket). A request still in flight when it fires answers for
+   * itself (`requestNotifications` sends nothing then).
+   */
+  private syncNotificationsRetry(): void {
+    if (!this.connected || !notificationsUnavailable(this.state)) {
+      this.clearNotificationsRetryTimer();
+      return;
+    }
+    if (this.notificationsRetryTimer !== null) return;
+    this.notificationsRetryTimer = setTimeout(() => {
+      this.notificationsRetryTimer = null;
+      this.requestNotifications();
+      this.syncNotificationsRetry();
+    }, NOTIFICATIONS_RETRY_MS);
   }
 
   private get connected(): boolean {
@@ -319,6 +348,7 @@ export class AssistantController {
     this.clearMemoryTimer();
     this.clearDevTimer();
     this.clearNotificationsTimer();
+    this.clearNotificationsRetryTimer();
     this.stopLocalAudio();
   }
 
@@ -717,6 +747,11 @@ export class AssistantController {
   private clearNotificationsTimer(): void {
     if (this.notificationsTimer !== null) clearTimeout(this.notificationsTimer);
     this.notificationsTimer = null;
+  }
+
+  private clearNotificationsRetryTimer(): void {
+    if (this.notificationsRetryTimer !== null) clearTimeout(this.notificationsRetryTimer);
+    this.notificationsRetryTimer = null;
   }
 
   private clearMaxTimer(): void {

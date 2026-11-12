@@ -18,7 +18,11 @@ public sealed record ServiceHealth(string Name, bool Enabled, string Status, str
 /// </summary>
 /// <param name="Dev">Open development items.</param>
 /// <param name="Notifications">Unread notifications.</param>
-public sealed record InboxCounts(int? Dev, int? Notifications);
+/// <param name="NotificationsUnavailable">
+/// The Core could not read its notifications file (<c>notificationsUnavailable</c>): <paramref name="Notifications"/>
+/// is then a stale count, not "nothing unread". False when absent (older Core).
+/// </param>
+public sealed record InboxCounts(int? Dev, int? Notifications, bool NotificationsUnavailable = false);
 
 /// <summary>Result of one poll of the Core's <c>GET /health</c>.</summary>
 /// <param name="Inbox">Null when the body has no <c>inbox</c> object (remote caller, older Core, malformed).</param>
@@ -74,7 +78,8 @@ public sealed record CoreHealth(bool Reachable, IReadOnlyList<ServiceHealth> Ser
     private static InboxCounts? ParseInbox(JsonElement root)
     {
         if (!root.TryGetProperty("inbox", out var inbox) || inbox.ValueKind != JsonValueKind.Object) return null;
-        return new InboxCounts(Count(inbox, "dev"), Count(inbox, "notifications"));
+        return new InboxCounts(Count(inbox, "dev"), Count(inbox, "notifications"),
+            inbox.TryGetProperty("notificationsUnavailable", out var un) && un.ValueKind == JsonValueKind.True);
     }
 
     /// <summary>A non-negative integer that fits an int; anything else (string, 1.5, -1, 1e20) is no count.</summary>

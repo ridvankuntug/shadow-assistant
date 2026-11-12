@@ -304,7 +304,8 @@ test("monitor: broadcasts the first round and only changes afterwards", async ()
   await m.checkNow();
   await m.checkNow();
   result = { status: "down", detail: "error" };
-  await m.checkNow();
+  await m.checkNow(); // first failure: held (hysteresis), silent
+  await m.checkNow(); // second in a row: down
   result = { status: "down", detail: "timeout" }; // detail change counts
   await m.checkNow();
   assert.deepEqual(
@@ -312,6 +313,88 @@ test("monitor: broadcasts the first round and only changes afterwards", async ()
     ["loading,disabled:off", "ok,disabled:off", "down:error,disabled:off", "down:timeout,disabled:off"],
   );
   await m.close();
+});
+
+test("monitor hysteresis: down only after 2 failed checks in a row, back on one good check (T7.w.13)", async () => {
+  let result: CheckResult = { status: "ok" };
+  let clock = 1_000;
+  const lines: string[] = [];
+  const m = new HealthMonitor([{ name: "a", check: async () => result }], {
+    now: () => clock,
+    logger: { info: (l) => lines.push(l), warn: (l) => lines.push(l) },
+  });
+  const seen: string[] = [];
+  m.subscribe((items) => seen.push(items.map((i) => `${i.status}${i.detail ? `:${i.detail}` : ""}`).join(",")));
+  const shown = () => {
+    const s = m.snapshot()?.[0];
+    return `${s?.status}${s?.detail ? `:${s.detail}` : ""}`;
+  };
+  await m.checkNow();
+  assert.equal(shown(), "ok");
+
+  // One failed check: still ok (checkedAt moves on), logged, no broadcast.
+  result = { status: "down", detail: "timeout" };
+  clock = 2_000;
+  await m.checkNow();
+  assert.equal(shown(), "ok");
+  assert.equal(m.snapshot()?.[0]?.checkedAt, 2_000);
+  assert.match(lines.at(-1) ?? "", /a check failed \(timeout\); shown as down after 2 in a row \(1\/2\)/);
+  // A good check in between resets the count.
+  result = { status: "ok" };
+  await m.checkNow();
+  result = { status: "down", detail: "timeout" };
+  await m.checkNow();
+  assert.equal(shown(), "ok", "the count restarted");
+  // Second failure in a row: down.
+  await m.checkNow();
+  assert.equal(shown(), "down:timeout");
+  // Already down: a detail change shows at once.
+  result = { status: "down", detail: "unreachable" };
+  await m.checkNow();
+  assert.equal(shown(), "down:unreachable");
+  // One good check: back to ok at once.
+  result = { status: "ok" };
+  await m.checkNow();
+  assert.equal(shown(), "ok");
+  // loading is not a failure: shown at once, and a single failure while loading holds loading.
+  result = { status: "loading" };
+  await m.checkNow();
+  assert.equal(shown(), "loading");
+  result = { status: "down", detail: "error" };
+  await m.checkNow();
+  assert.equal(shown(), "loading");
+  await m.checkNow();
+  assert.equal(shown(), "down:error");
+  assert.deepEqual(seen, ["ok", "down:timeout", "down:unreachable", "ok", "loading", "down:error"]);
+  await m.close();
+});
+
+test("monitor hysteresis: the first round shows a failure at once; downAfter 1 turns it off; a bad value falls back to 2", async () => {
+  const down: CheckResult = { status: "down", detail: "timeout" };
+  const first = new HealthMonitor([{ name: "a", check: async () => down }]);
+  await first.checkNow();
+  assert.equal(first.snapshot()?.[0]?.status, "down", "nothing to hold on the first round");
+  await first.close();
+
+  let result: CheckResult = { status: "ok" };
+  const one = new HealthMonitor([{ name: "a", check: async () => result }], { downAfter: 1 });
+  await one.checkNow();
+  result = down;
+  await one.checkNow();
+  assert.equal(one.snapshot()?.[0]?.status, "down");
+  await one.close();
+
+  for (const downAfter of [0, -1, 1.5, Number.NaN]) {
+    result = { status: "ok" };
+    const bad = new HealthMonitor([{ name: "a", check: async () => result }], { downAfter });
+    await bad.checkNow();
+    result = down;
+    await bad.checkNow();
+    assert.equal(bad.snapshot()?.[0]?.status, "ok", String(downAfter));
+    await bad.checkNow();
+    assert.equal(bad.snapshot()?.[0]?.status, "down", String(downAfter));
+    await bad.close();
+  }
 });
 
 test("monitor: rounds never overlap", async () => {
@@ -440,6 +523,7 @@ test("server: new client gets services after welcome + state; changes are broadc
 
     whisper = { status: "down", detail: "timeout" };
     await monitor.checkNow();
+    await monitor.checkNow(); // second failed check in a row (hysteresis)
     const all = await c.wait(2, "services");
     const second = all[1];
     assert.deepEqual(second?.type === "services" && second.items[0], {

@@ -431,14 +431,15 @@ describe("static turn-on / off rules: lights and outlet switches only", () => {
     return { outcome, calls };
   }
 
-  test("turn-on and turn-off plans share one filter, light-level plans have none", () => {
+  test("turn-on and turn-off plans share one filter, light-level plans have the deny-name filter (T7.w.13)", () => {
     const shared = cfg.direct.switchTargetFilter;
     assert.equal(planOf("tavan ışığını aç").targetFilter, shared);
     assert.equal(planOf("vantilatörü aç").targetFilter, shared);
     assert.equal(planOf("vantilatörü çalıştır").targetFilter, shared);
     assert.equal(planOf("tavan ışığını kapat").targetFilter, shared);
     assert.equal(planOf("kontaktörü kapat").targetFilter, shared);
-    assert.equal(planOf("tavan ışığını yüzde 50 yap").targetFilter, undefined);
+    assert.equal(planOf("tavan ışığını yüzde 50 yap").targetFilter, cfg.direct.lightSetTargetFilter);
+    assert.notEqual(cfg.direct.lightSetTargetFilter, shared);
   });
 
   test("staticSwitchTarget: light, outlet switch; nothing else", () => {
@@ -534,6 +535,9 @@ describe("static turn-on / off rules: deny name words", () => {
       ...["- names: Masa Prizi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
       ...["- names: Bahçe Prizi, Avlu Kapısı", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
       ...["- names: Çalışma Prizi", "  domain: switch", "  state: 'off'", "  areas: Garaj", "  attributes:", "    device_class: outlet"],
+      ...["- names: Okuma Lambası, Kapı Lambası", "  domain: light", "  state: 'off'"],
+      ...["- names: Tavan Lambası", "  domain: light", "  state: 'off'", "  areas: Kiler"],
+      ...["- names: Hol Lambası", "  domain: light", "  state: 'off'", "  areas: Kapı Önü"],
     ].join("\n"),
   });
 
@@ -560,6 +564,21 @@ describe("static turn-on / off rules: deny name words", () => {
       });
     }
   }
+
+  // T7.w.13: the static brightness rule applies the same check (name, alias, area).
+  for (const text of ["garaj lambasını yüzde 50 yap", "okuma lambasını yüzde 40 yap", "hol lambasını yüzde 30 yap"]) {
+    test(`'${text}' (T7.w.13): a deny word in the name, an alias or the area, brightness falls back to the model`, async () => {
+      const { outcome, calls } = await run(text);
+      assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+      assert.equal(calls.length, 1, "only the live context was read");
+    });
+  }
+
+  test("a light without a deny word gets its brightness set at tier 0 (T7.w.13)", async () => {
+    const { outcome, calls } = await run("tavan lambasını yüzde 50 yap");
+    assert.equal(outcome.kind, "reply");
+    assert.match(calls[1] ?? "", /^light__HassLightSet .*"Tavan Lambası".*"brightness":50/);
+  });
 
   test("a deny word inside another word does not refuse ('clock' is not 'lock'); a plain plug is switched", async () => {
     for (const [text, name] of [

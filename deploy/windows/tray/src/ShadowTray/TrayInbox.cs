@@ -17,7 +17,15 @@ public static class TrayInbox
     public static string DevMenuText(InboxCounts? inbox) => WithCount("Geliştirme", inbox?.Dev);
 
     /// <summary>"Bildirimler (2)"; without a count while the Core sends none.</summary>
-    public static string NotificationsMenuText(InboxCounts? inbox) => WithCount("Bildirimler", inbox?.Notifications);
+    public static string NotificationsMenuText(InboxCounts? inbox) =>
+        inbox is { NotificationsUnavailable: true } ? "Bildirimler (!)" : WithCount("Bildirimler", inbox?.Notifications);
+
+    /// <summary>Tooltip text for the notifications item / icon while the Core cannot read them; null otherwise.</summary>
+    public static string? NotificationsProblemText(InboxCounts? inbox) =>
+        inbox is { NotificationsUnavailable: true } ? UnavailableText : null;
+
+    /// <summary>Same wording as the UI's notification panel.</summary>
+    public const string UnavailableText = "Bildirimler okunamadı";
 
     /// <summary>The UI address with <paramref name="hash"/> as its fragment: <c>http://localhost:8703/#dev</c>.</summary>
     public static string UiUrl(Uri uiBase, string? hash) =>
@@ -43,6 +51,8 @@ public sealed class NotificationBalloon
     /// <returns>The balloon text, or null for no balloon.</returns>
     public string? Observe(InboxCounts? inbox)
     {
+        // Unreadable file: the count is stale, neither a baseline nor a rise.
+        if (inbox is { NotificationsUnavailable: true }) return null;
         if (inbox?.Notifications is not { } unread) return null;
         var previous = _baseline;
         _baseline = unread;

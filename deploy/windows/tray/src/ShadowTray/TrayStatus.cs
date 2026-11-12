@@ -55,7 +55,7 @@ public sealed record TrayStatus(TrayColour Colour, string Tooltip, IReadOnlyList
     InboxCounts? Inbox = null)
 {
     /// <summary>The icon gets a dot while there are unread notifications (never for development counts).</summary>
-    public bool NotificationDot => Inbox?.Notifications > 0;
+    public bool NotificationDot => Inbox is { NotificationsUnavailable: true } || Inbox?.Notifications > 0;
 }
 
 /// <summary>
@@ -146,8 +146,10 @@ public static class TrayStatusEvaluator
                 break;
         }
 
+        var inbox = reachable ? health!.Inbox : null;
+        if (TrayInbox.NotificationsProblemText(inbox) is { } unreadable) summary += "; " + unreadable.ToLowerInvariant();
         return new TrayStatus(colour, Truncate((gameMode ? GameModePrefix : Prefix) + summary, MaxTooltipLength), lines, gameMode,
-            reachable ? health!.Inbox : null);
+            inbox);
     }
 
     /// <summary>"sorun: whisper-svc kapalı (timeout), …" or null when no enabled service has a problem.</summary>

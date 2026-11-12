@@ -1971,10 +1971,24 @@ export interface NotificationListener {
   deliver(frame: ServerFrame): void;
 }
 
+/** While the notifications file cannot be read, the center tries to read it again this often (T7.w.13). */
+export const NOTIFICATIONS_RETRY_MS = 60_000;
+
 export interface NotificationCenterOptions {
   store: Pick<NotificationStore, "raise" | "resolve" | "get" | "markRead" | "markUnread" | "delete" | "list" | "unreadCount" | "flush">;
   logger: Logger;
+  /** Default NOTIFICATIONS_RETRY_MS. */
+  retryMs?: number;
+  /** Timer for the retry (tests: a fake fired by hand). Returns a cancel function. Default: setTimeout, unref'd. */
+  setTimer?: (fn: () => void, ms: number) => () => void;
 }
+
+/** The retry never keeps the process alive; shutdown calls close(). */
+const unrefRetryTimer = (fn: () => void, ms: number): (() => void) => {
+  const t = setTimeout(fn, ms);
+  t.unref?.();
+  return () => clearTimeout(t);
+};
 
 export type NotificationActResult = { ok: true } | { ok: false; code: Extract<ErrorCode, "unknown_item">; message: string };
 
@@ -2012,6 +2026,9 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * `notifications_unavailable`), `raise()` answers `unavailable`, `unread`
  * keeps its last value and `unavailable` is true (/health `inbox`, T7.w.12)
  * until a later call reads the file again (`refresh()`, `list()`, an action, a producer call).
+ * While `unavailable` is true the center itself calls `refresh()` once per
+ * `retryMs` (T7.w.13), so the flag clears without a client or producer;
+ * `close()` (shutdown) stops it.
  */
 export class NotificationCenter {
   /** Attached sockets → attach order. */
@@ -2026,6 +2043,9 @@ export class NotificationCenter {
   private lastUnavailable = false;
   /** Serializes store calls, their broadcasts and the unread count. */
   private chain: Promise<unknown> = Promise.resolve();
+  /** Cancels the scheduled retry read; undefined when none is scheduled. */
+  private cancelRetry: (() => void) | undefined;
+  private closed = false;
 
   constructor(private readonly o: NotificationCenterOptions) {}
 
@@ -2159,6 +2179,39 @@ export class NotificationCenter {
     return this.serial(() => this.o.store.flush()).catch(() => {});
   }
 
+  /** Stops the retry read (shutdown); no new one is scheduled afterwards. Calls still work. */
+  close(): void {
+    this.closed = true;
+    this.stopRetry();
+  }
+
+  /**
+   * After every call on the chain: while the file is unreadable, keep one
+   * retry read scheduled (`refresh()`, which comes back here); once it could
+   * be read, cancel it.
+   */
+  private syncRetry(): void {
+    if (!this.lastUnavailable || this.closed) {
+      this.stopRetry();
+      return;
+    }
+    if (this.cancelRetry) return;
+    try {
+      this.cancelRetry = (this.o.setTimer ?? unrefRetryTimer)(() => {
+        this.cancelRetry = undefined;
+        void this.refresh();
+      }, this.o.retryMs ?? NOTIFICATIONS_RETRY_MS);
+    } catch (err) {
+      this.o.logger.warn(`[shadow-core] notifications retry not scheduled: ${(err as Error)?.name ?? "error"}`);
+    }
+  }
+
+  private stopRetry(): void {
+    const cancel = this.cancelRetry;
+    this.cancelRetry = undefined;
+    cancel?.();
+  }
+
   /** The socket that speaks an urgent item now, or undefined (no socket has speech on). */
   private speaker(): NotificationListener | undefined {
     let best: { l: NotificationListener; rank: number[] } | undefined;
@@ -2203,7 +2256,7 @@ export class NotificationCenter {
       // An unreadable file is logged by the store, once per call.
       if (err instanceof NotificationsUnavailableError) this.lastUnavailable = true;
       else this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`);
-    });
+    }).then(() => this.syncRetry());
     return run;
   }
 }

@@ -451,3 +451,120 @@ test("/health inbox (T7.w.12): a call that reads the file but changes nothing cl
     assert.deepEqual(center.healthInbox(), { notifications: 0, notificationsUnavailable: false }, what);
   }
 });
+
+// ------------------------------------------------------------------ retry read while unavailable (T7.w.13)
+
+/** A fake timer: `fire()` runs the pending callbacks by hand; `pending` lists them with their delay. */
+function fakeTimer() {
+  const pending: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+  return {
+    pending: () => pending.filter((t) => !t.cancelled),
+    setTimer: (fn: () => void, ms: number) => {
+      const t = { fn, ms, cancelled: false };
+      pending.push(t);
+      return () => {
+        t.cancelled = true;
+      };
+    },
+    fire() {
+      const due = pending.splice(0).filter((t) => !t.cancelled);
+      for (const t of due) t.fn();
+      return due.length;
+    },
+  };
+}
+
+/** Lets the retry bookkeeping that runs after each call on the center's chain settle. */
+const settle = () => new Promise<void>((r) => setImmediate(r));
+
+function failingFs(state: { failRead: boolean }): AtomicFs {
+  return {
+    mkdir: (p, o) => nodeFs.mkdir(p, o),
+    open: (p, f, m) => nodeFs.open(p, f, m),
+    rename: (a, b) => nodeFs.rename(a, b),
+    unlink: (p) => nodeFs.unlink(p),
+    readFile: (p, e) => (state.failRead ? Promise.reject(Object.assign(new Error("simulated"), { code: "EBUSY" })) : nodeFs.readFile(p, e)),
+    readdir: (p) => nodeFs.readdir(p),
+  };
+}
+
+test("unreadable file (T7.w.13): the center re-reads it once a minute until it can, then the flag clears", async () => {
+  const state = { failRead: false };
+  const fs = failingFs(state);
+  const dir = join(base, `retry${++counter}`, "notifications");
+  const seeded = new NotificationStore({ dir, coalesceMs: 0 });
+  assert.ok((await seeded.raise({ source: "test", key: "k", title: "Korunan" })).ok);
+
+  const timer = fakeTimer();
+  let reads = 0;
+  const store = new NotificationStore({ dir, log: () => {}, fs: { ...fs, readFile: (p, e) => (reads++, fs.readFile(p, e)) }, retryDelaysMs: [] });
+  const center = new NotificationCenter({ store, logger: { info: () => {}, warn: () => {} }, setTimer: timer.setTimer });
+
+  // Readable: no retry is scheduled.
+  assert.equal(await center.refresh(), 1);
+  await settle();
+  assert.equal(timer.pending().length, 0);
+
+  // A fresh store that cannot read: one retry, a minute away.
+  const store2 = new NotificationStore({ dir, log: () => {}, fs: { ...fs, readFile: (p, e) => (reads++, fs.readFile(p, e)) }, retryDelaysMs: [] });
+  const c2 = new NotificationCenter({ store: store2, logger: { info: () => {}, warn: () => {} }, setTimer: timer.setTimer });
+  state.failRead = true;
+  await c2.refresh();
+  await settle();
+  assert.equal(c2.unavailable, true);
+  assert.deepEqual(timer.pending().map((t) => t.ms), [60_000]);
+  // More failed calls do not stack timers.
+  assert.deepEqual(await c2.raise({ source: "test", title: "Yeni" }), { ok: false, reason: "unavailable" });
+  await settle();
+  assert.equal(timer.pending().length, 1);
+
+  // The minute passes, still unreadable: it tries again and schedules the next one.
+  const before = reads;
+  assert.equal(timer.fire(), 1);
+  await c2.flush(); // queued behind the retry read: waits for it
+  await settle();
+  assert.ok(reads > before, "the file was read again");
+  assert.equal(c2.unavailable, true);
+  assert.deepEqual(timer.pending().map((t) => t.ms), [60_000]);
+
+  // Readable again: the next retry clears the flag (real count) and stops.
+  state.failRead = false;
+  timer.fire();
+  await c2.flush();
+  await settle();
+  assert.deepEqual(c2.healthInbox(), { notifications: 1, notificationsUnavailable: false });
+  assert.equal(timer.pending().length, 0);
+});
+
+test("unreadable file (T7.w.13): a successful call cancels the pending retry; close() stops it for good", async () => {
+  const state = { failRead: true };
+  const timer = fakeTimer();
+  const dir = join(base, `retry${++counter}`, "notifications");
+  const store = new NotificationStore({ dir, log: () => {}, fs: failingFs(state), retryDelaysMs: [] });
+  const center = new NotificationCenter({ store, logger: { info: () => {}, warn: () => {} }, setTimer: timer.setTimer, retryMs: 5 });
+  await center.refresh();
+  await settle();
+  assert.deepEqual(timer.pending().map((t) => t.ms), [5], "retryMs is honoured");
+
+  // A list that could read the file cancels the retry.
+  state.failRead = false;
+  await center.list();
+  await settle();
+  assert.equal(center.unavailable, false);
+  assert.equal(timer.pending().length, 0);
+
+  // Unreadable again, then shutdown: the retry is cancelled and never re-armed.
+  const store2 = new NotificationStore({ dir, log: () => {}, fs: failingFs(state), retryDelaysMs: [] });
+  const c2 = new NotificationCenter({ store: store2, logger: { info: () => {}, warn: () => {} }, setTimer: timer.setTimer });
+  state.failRead = true;
+  await c2.refresh();
+  await settle();
+  assert.equal(timer.pending().length, 1);
+  c2.close();
+  assert.equal(timer.pending().length, 0);
+  await c2.refresh(); // still unreadable, but closed
+  await c2.flush();
+  await settle();
+  assert.equal(timer.pending().length, 0);
+  assert.equal(c2.unavailable, true);
+});
