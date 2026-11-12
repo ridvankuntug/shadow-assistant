@@ -49,6 +49,7 @@ interface PlatformAdapter {
   prefersReducedMotion(): boolean;
   isVisible(): boolean;
   onVisibilityChange(listener: (visible: boolean) => void): () => void; // returns unsubscribe
+  readonly openGemini?: () => void;          // Android only (T15): hand over to Gemini; absent = no button
 }
 
 type Utterance = { mime: string; data: string; durationMs: number };
@@ -201,6 +202,8 @@ never block the bridge thread for long.
 | `vibrate(patternJson: String)` | void | sync | e.g. `"[30,60,30]"` — on/off milliseconds starting with "on". Optional. |
 | `notify(title: String, body: String)` | void | sync | System notification, used for a confirmation request while the app is in the background. Optional. |
 | `notifyItem(id: String, title: String, body: String, urgent: Boolean)` | void | sync | System notification for one inbox item (docs/08 T7.w.5d): own channel (silent, or the urgent channel), one notification per item id; dismissing it does not delete the item. Optional; the UI falls back to `notify`. |
+| `canOpenGemini(): Boolean` | bool | sync | Whether the shell can open Gemini on this device (T15): the Gemini app (`com.google.android.apps.bard`) or else `https://gemini.google.com/app` in a browser. Asked once when the adapter is created; `false` or missing = no Gemini button. Optional (with `openGemini`). |
+| `openGemini()` | void | sync | Opens that fixed target (never `ACTION_ASSIST`, which would reopen Shadow as the default assistant). Takes no argument, so the page cannot start an arbitrary intent. Before calling it the UI cancels a recording and stops speech; leaving the app then pauses it (§4.5). Optional. |
 | `getItem(key: String): String?` | string or null | sync | Persistent storage (see storage keys). Store `shadow.deviceToken` encrypted (e.g. Android Keystore-backed). |
 | `setItem(key: String, value: String)` | void | sync | |
 | `removeItem(key: String)` | void | sync | |

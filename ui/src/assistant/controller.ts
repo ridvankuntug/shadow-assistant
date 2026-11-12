@@ -476,6 +476,17 @@ export class AssistantController {
     this.dispatch({ type: "speech_stopped" });
   }
 
+  /**
+   * The user hands over to another app (the Gemini button, T15): nothing keeps
+   * listening or speaking, also later in the turn in flight (a first
+   * `speech_chunk` or the after-answer `speak` still to come). Its text still arrives.
+   */
+  leaveForOtherApp(): void {
+    this.cancelTalk();
+    for (const turn of [this.state.activeTurn?.id, this.state.queuedTurn]) if (turn) this.droppedSpeech.add(turn);
+    this.stopSpeaking(); // also trims droppedSpeech
+  }
+
   respondConfirm(approved: boolean): void {
     const c = currentConfirm(this.state);
     if (!c || c.responding) return;
@@ -808,7 +819,7 @@ export class AssistantController {
           this.speechTurnEnded(msg.id, msg.text);
           break;
         }
-        if (this.voiceReplies && !isCancelled(this.state, msg.id) && msg.text.trim()) {
+        if (this.voiceReplies && !isCancelled(this.state, msg.id) && !this.droppedSpeech.has(msg.id) && msg.text.trim()) {
           this.speakReply(msg.id, msg.text);
         }
         break;

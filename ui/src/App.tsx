@@ -200,6 +200,14 @@ export default function App({ adapter, controller }: Props) {
     setDevFrom(from);
     setPanel("dev");
   };
+  // Gemini hand-off (T15): only where the host can open it (the Android shell); never in a browser.
+  const openGemini = adapter.openGemini;
+  const handOffToGemini = (open: () => void) => {
+    // Leave nothing listening or speaking behind; the running turn's text still arrives.
+    controller.leaveForOtherApp();
+    open();
+  };
+
   const devCount = devBadgeCount(state);
   const unreadCount = notificationsBadgeCount(state);
   const inboxUnreadable = notificationsUnavailable(state);
@@ -302,6 +310,20 @@ export default function App({ adapter, controller }: Props) {
               <path d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3h-4l-.4 2.9a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1L11 21h4l.4-2.9a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5L19.4 13ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
             </svg>
           </button>
+          {/* Rightmost, in the corner. A plain sparkle, not Google's logo. */}
+          {openGemini && (
+            <button
+              type="button"
+              className="btn btn-icon gemini-btn"
+              aria-label="Gemini'yi aç"
+              title="Gemini'yi aç"
+              onClick={() => handOffToGemini(openGemini)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3l2.2 6.8L21 12l-6.8 2.2L12 21l-2.2-6.8L3 12l6.8-2.2Z" />
+              </svg>
+            </button>
+          )}
         </nav>
       </header>
 

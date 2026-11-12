@@ -656,6 +656,14 @@ describe("streamed speech (speech_stream)", () => {
     ]);
   });
 
+  it("an older Core: leaving for another app before assistant_done sends no speak for that turn", () => {
+    const t = setup(undefined, ["memory"]);
+    t.controller.sendText("selam");
+    t.controller.leaveForOtherApp();
+    t.receive({ type: "assistant_done", id: "t1", text: "Merhaba" });
+    expect(t.sentTypes()).toEqual(["user_text"]);
+  });
+
   it("an older Core (no speech_stream) gets no speech_prefs and speak still follows assistant_done", () => {
     const t = setup(undefined, ["memory"]);
     t.controller.setVoiceReplies(false);
@@ -688,6 +696,40 @@ describe("streamed speech (speech_stream)", () => {
     t.finishPlayback();
     await flush();
     expect(t.phase()).toBe("idle");
+  });
+
+  it("leaving for another app (Gemini) silences the turn in flight, before its first chunk too; its text still arrives", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive({ type: "state", state: "thinking" });
+    t.controller.leaveForOtherApp();
+    t.receive(chunk("t1", 0, "A"));
+    t.receive({ type: "assistant_done", id: "t1", text: "Bir." });
+    t.receive(chunk("t1", 1, "B", true));
+    await flush();
+    expect(playedData(t)).toEqual([]);
+    expect(t.sentTypes()).toEqual(["user_text"]); // no cancel: the answer is not thrown away
+    expect(t.controller.getState().messages.at(-1)?.text).toBe("Bir.");
+    // The next turn speaks normally.
+    t.controller.sendText("devam");
+    t.receive(chunk("t2", 0, "C", true));
+    expect(playedData(t)).toEqual(["C"]);
+  });
+
+  it("leaving for another app stops a playing chunk and cuts a recording", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("anlat");
+    t.receive(chunk("t1", 0, "A"));
+    expect(playedData(t)).toEqual(["A"]);
+    t.controller.leaveForOtherApp();
+    expect(t.adapter.playback.stop).toHaveBeenCalled();
+    t.receive(chunk("t1", 1, "B", true));
+    await flush();
+    expect(playedData(t)).toEqual(["A"]);
+    await t.controller.startTalk();
+    t.controller.leaveForOtherApp();
+    expect(t.adapter.mic.cancel).toHaveBeenCalled();
+    expect(t.controller.getState().capture).toBe("off");
   });
 
   it("does not speak twice: no speak after assistant_done while streaming", () => {

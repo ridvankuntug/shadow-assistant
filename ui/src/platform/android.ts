@@ -36,6 +36,10 @@ export interface ShadowAndroidBridge {
    * notification, keyed by `id`, on the quiet or (`urgent`) the urgent channel.
    */
   notifyItem?(id: string, title: string, body: string, urgent: boolean): void;
+  /** Optional (shells from T15 on): whether a Gemini target exists on this device. */
+  canOpenGemini?(): boolean;
+  /** Optional (shells from T15 on): opens Gemini (a fixed target picked by the shell). */
+  openGemini?(): void;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
@@ -196,6 +200,24 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
     }
   };
 
+  // Asked once: the shell falls back to the web page, so the answer hardly changes while the app runs.
+  let geminiAvailable = false;
+  try {
+    geminiAvailable =
+      typeof bridge.canOpenGemini === "function" && typeof bridge.openGemini === "function" && bridge.canOpenGemini() === true;
+  } catch {
+    // an older or broken shell: no Gemini button
+  }
+  const openGemini = geminiAvailable
+    ? () => {
+        try {
+          bridge.openGemini?.();
+        } catch {
+          // ignore
+        }
+      }
+    : undefined;
+
   const safeNumber = (fn: () => number): number => {
     try {
       const n = Number(fn());
@@ -317,5 +339,6 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
         win.document?.removeEventListener?.("visibilitychange", onDoc);
       };
     },
+    ...(openGemini ? { openGemini } : {}),
   };
 }

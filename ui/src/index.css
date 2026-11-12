@@ -183,6 +183,19 @@ input:focus-visible {
   margin-left: auto;
   display: flex;
 }
+/* Phone widths: room for one more icon (the Gemini button) next to the badges. */
+@media (max-width: 420px) {
+  .topbar {
+    gap: 4px;
+    padding-left: 12px;
+  }
+  .brand {
+    letter-spacing: 0.2em;
+  }
+  .topbar-actions .btn-icon {
+    min-width: 40px;
+  }
+}
 
 /* Service health: hidden while all ok; a dot + count, tap for the reasons. */
 .svc-btn {

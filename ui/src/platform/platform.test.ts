@@ -169,6 +169,30 @@ describe("Android adapter", () => {
     expect(old.notify).toHaveBeenCalledWith("Başlık", "Metin");
   });
 
+  it("openGemini: only with a shell that offers it and says it can", () => {
+    // Older shell without the methods: no Gemini button.
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge() }).openGemini).toBeUndefined();
+    // No target on the device, or a throwing check: none either.
+    const none = fakeBridge({ canOpenGemini: () => false, openGemini: vi.fn() });
+    expect(createAndroidAdapter({ ShadowAndroid: none }).openGemini).toBeUndefined();
+    const broken = fakeBridge({
+      canOpenGemini: () => {
+        throw new Error("boom");
+      },
+      openGemini: vi.fn(),
+    });
+    expect(createAndroidAdapter({ ShadowAndroid: broken }).openGemini).toBeUndefined();
+    // Half a pair is not enough.
+    expect(createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini: () => true }) }).openGemini).toBeUndefined();
+
+    const open = vi.fn(() => {
+      throw new Error("ignored");
+    });
+    const adapter = createAndroidAdapter({ ShadowAndroid: fakeBridge({ canOpenGemini: () => true, openGemini: open }) });
+    expect(() => adapter.openGemini?.()).not.toThrow();
+    expect(open).toHaveBeenCalledWith();
+  });
+
   it("follows visibility events pushed by the shell", () => {
     const win: AndroidWindow = { ShadowAndroid: fakeBridge() };
     const adapter = createAndroidAdapter(win);

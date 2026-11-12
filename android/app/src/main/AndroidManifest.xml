@@ -31,6 +31,13 @@
         </intent>
         <!-- Buds Case Widget: its permission and provider must be visible to check their owner. -->
         <package android:name="io.github.budscasewidget" />
+        <!-- Gemini button (T15): the Gemini app's launcher, else gemini.google.com in a browser. -->
+        <package android:name="com.google.android.apps.bard" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
     </queries>
 
     <!-- The token blob is useless elsewhere (its Keystore key never leaves the device): no backups. -->

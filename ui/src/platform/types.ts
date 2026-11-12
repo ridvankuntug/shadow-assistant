@@ -122,6 +122,12 @@ export interface PlatformAdapter {
   isVisible(): boolean;
   /** Subscribes to foreground/background changes. Returns an unsubscribe function. */
   onVisibilityChange(listener: (visible: boolean) => void): () => void;
+  /**
+   * Hands over to Google's Gemini (the app, else its web page), a target the
+   * host picks. Present only where that works (Android shells from T15 on);
+   * absent in the browser, where the top bar shows no Gemini button.
+   */
+  readonly openGemini?: () => void;
 }
 
 /** Storage keys used by the app (documented for the Android side). */

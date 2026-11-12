@@ -28,6 +28,8 @@ class ShadowBridge(
     private val notify: (String, String) -> Unit,
     private val notifyItem: (String, String, String, Boolean) -> Unit,
     private val onStorageChanged: (String) -> Unit,
+    private val geminiAvailable: () -> Boolean,
+    private val launchGemini: () -> Unit,
 ) {
     @JavascriptInterface
     fun getInfo(): String = if (trusted()) info else "{}"
@@ -92,6 +94,19 @@ class ShadowBridge(
         val t = title.orEmpty().take(MAX_TITLE)
         val b = body.orEmpty().take(MAX_BODY)
         if (t.isNotBlank() || b.isNotBlank()) main.post { notifyItem(itemId, t, b, urgent) }
+    }
+
+    /**
+     * Gemini hand-off (T15; optional for the page). Only a fixed target the shell
+     * picks ([GeminiLauncher]); the page passes nothing, so it cannot start an
+     * arbitrary intent.
+     */
+    @JavascriptInterface
+    fun canOpenGemini(): Boolean = trusted() && geminiAvailable()
+
+    @JavascriptInterface
+    fun openGemini() {
+        if (trusted()) main.post { launchGemini() }
     }
 
     @JavascriptInterface

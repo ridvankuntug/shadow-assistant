@@ -76,6 +76,7 @@ class MainActivity : Activity() {
     private lateinit var speaker: Speaker
     private lateinit var notifier: Notifier
     private lateinit var probe: CoreProbe
+    private lateinit var gemini: GeminiLauncher
 
     @Volatile
     private var trustedPage = false
@@ -119,6 +120,7 @@ class MainActivity : Activity() {
         speaker = Speaker(this, main, focus, ::reply)
         notifier = Notifier(this)
         probe = CoreProbe(main)
+        gemini = GeminiLauncher(this)
 
         configureWebView()
 
@@ -247,6 +249,9 @@ class MainActivity : Activity() {
                 // token only (the job then finds a matching address/token pair).
                 if (key == BridgeStorage.TOKEN_KEY) CaseBatterySync.syncIfAllowed(this)
             },
+            geminiAvailable = gemini::available,
+            // Leaving pauses this activity: onPause stops playback/speech and cuts a running recording.
+            launchGemini = { if (!destroyed) gemini.open() },
         )
         // Injected before the first load so selectAdapter() finds it (docs/03 §2).
         webView.addJavascriptInterface(bridge, "ShadowAndroid")
