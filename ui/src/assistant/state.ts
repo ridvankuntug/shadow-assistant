@@ -404,6 +404,11 @@ export function notificationsAvailable(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "notifications");
 }
 
+/** "Tekrar gösterme" (`suppress`) may be offered: the inbox is available and the Core has `notifications_suppress`. */
+export function notificationsSuppressAvailable(s: AssistantState): boolean {
+  return notificationsAvailable(s) && hasFeature(s, "notifications_suppress");
+}
+
 /** The inbox badge count (0 = no count): only while the inbox is available. */
 export function notificationsBadgeCount(s: AssistantState): number {
   return notificationsAvailable(s) ? (s.notifications.unread ?? 0) : 0;

@@ -52,8 +52,13 @@ export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule";
 export type DevListMessage = { type: "dev_list"; id: string };
 /** One action on one Development item; answered by a fresh `dev` frame or `error`. */
 export type DevActionMessage = { type: "dev_action"; id: string; itemId: string; action: DevAction };
-/** Inbox actions (Core feature `notifications`); `read` / `unread` are shared by every device. */
-export type NotificationAction = "read" | "unread" | "delete";
+/**
+ * Inbox actions (Core feature `notifications`); `read` / `unread` are shared by
+ * every device. `delete` is "Gördüm"; `suppress` ("Tekrar gösterme") deletes
+ * the item too and keeps its condition hidden while it lasts (Core feature
+ * `notifications_suppress`; an older Core answers it with `bad_request`).
+ */
+export type NotificationAction = "read" | "unread" | "delete" | "suppress";
 /** Asks for the inbox (Core feature `notifications`). */
 export type NotificationsListMessage = { type: "notifications_list"; id: string };
 /** One action on one inbox item; answered by a fresh `notifications` frame or `error`. */
@@ -86,7 +91,7 @@ export type ClientMessage =
 // Core -> Client
 
 /** Optional Core capabilities this client uses (`welcome.features`). */
-export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications";
+export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications" | "notifications_suppress";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;

@@ -325,7 +325,18 @@ export function devErrorText(code: string, message?: string | null): string {
 export const NOTIFICATION_ACTION_LABEL: Record<NotificationAction, string> = {
   read: "Okundu",
   unread: "Okunmadı",
-  delete: "Sil",
+  delete: "Gördüm",
+  suppress: "Tekrar gösterme",
+};
+
+/**
+ * Short hints of the two ways to clear an inbox item (button tooltip and the
+ * confirm question): "Gördüm" records nothing, so a lasting condition may come
+ * back once after a Core restart; "Tekrar gösterme" keeps it hidden while it lasts.
+ */
+export const NOTIFICATION_DISMISS_HINT: Record<"delete" | "suppress", string> = {
+  delete: "Tüm cihazlardan kalkar. Durum sürüyorsa Core yeniden başlayınca bir kez daha gelebilir.",
+  suppress: "Tüm cihazlardan kalkar ve durum sürdükçe gösterilmez. Durum düzelip yeniden olursa tekrar gelir.",
 };
 
 const NOTIFICATION_SOURCE: Record<string, string> = {

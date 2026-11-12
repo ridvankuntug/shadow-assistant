@@ -17,7 +17,7 @@ import {
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
-import { derivePhase, devBadgeCount, notificationsBadgeCount, notificationsUnavailable } from "./state.ts";
+import { derivePhase, devBadgeCount, notificationsBadgeCount, notificationsSuppressAvailable, notificationsUnavailable } from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -1701,6 +1701,46 @@ describe("notification inbox (T7.w.5c)", () => {
     expect(s.notice).toBeNull();
     expect(s.notifications).toMatchObject({ status: "ready", acting: null, errorCode: null });
     expect(s.notifications.items?.map((i) => i.id)).toEqual(["n-2"]);
+  });
+
+  it("suppress (T7.w.11.8): not sent and not offered without notifications_suppress", () => {
+    const t = inbox([item("n-1")]);
+    expect(notificationsSuppressAvailable(t.controller.getState())).toBe(false);
+    t.sent.length = 0;
+    expect(t.controller.notificationAction("n-1", "suppress")).toBe(false);
+    expect(t.sent).toEqual([]);
+    // "Gördüm" (delete) stays available on an older Core.
+    expect(t.controller.notificationAction("n-1", "delete")).toBe(true);
+    expect(t.sent).toEqual([{ type: "notification_action", id: "t2", notificationId: "n-1", action: "delete" }]);
+  });
+
+  it("suppress with notifications_suppress: one frame; the item goes on notification_removed", () => {
+    const t = inbox([item("n-1"), item("n-2", { readAt: READ })], ["notifications_suppress"]);
+    expect(notificationsSuppressAvailable(t.controller.getState())).toBe(true);
+    t.sent.length = 0;
+    expect(t.controller.notificationAction("nope", "suppress")).toBe(false);
+    expect(t.controller.notificationAction("n-2", "suppress")).toBe(true); // read or unread alike
+    expect(t.sent).toEqual([{ type: "notification_action", id: "t2", notificationId: "n-2", action: "suppress" }]);
+    expect(t.controller.getState().notifications).toMatchObject({ status: "loading", acting: { notificationId: "n-2", action: "suppress" } });
+    t.receive({ type: "notification_removed", notificationId: "n-2" });
+    t.receive(list("t2", [item("n-1")]));
+    expect(t.controller.getState().notifications).toMatchObject({ status: "ready", acting: null, unread: 1 });
+    expect(t.controller.getState().notifications.items?.map((i) => i.id)).toEqual(["n-1"]);
+    // "Gördüm" next to it removes the same way.
+    expect(t.controller.notificationAction("n-1", "delete")).toBe(true);
+    expect(t.sent[1]).toMatchObject({ type: "notification_action", notificationId: "n-1", action: "delete" });
+    t.receive({ type: "notification_removed", notificationId: "n-1" });
+    expect(t.controller.getState().notifications.items).toEqual([]);
+    expect(t.badge()).toBe(0);
+  });
+
+  it("suppress raced by another device: unknown_item after notification_removed is swallowed", () => {
+    const t = inbox([item("n-1"), item("n-2")], ["notifications_suppress"]);
+    t.controller.notificationAction("n-1", "suppress");
+    t.receive({ type: "notification_removed", notificationId: "n-1" });
+    t.receive({ type: "error", id: "t2", code: "unknown_item", message: "gone" });
+    expect(t.controller.getState().notifications).toMatchObject({ status: "ready", acting: null, errorCode: null });
+    expect(t.controller.getState().notifications.items?.map((i) => i.id)).toEqual(["n-2"]);
   });
 
   it("other inbox errors stay in the panel (no chat notice) and keep the list", () => {
