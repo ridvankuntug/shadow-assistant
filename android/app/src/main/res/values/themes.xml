@@ -11,4 +11,10 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
+
+    <!-- UpdateActivity (docs/10): a small dialog over whatever is on screen. -->
+    <style name="Theme.Shadow.Update" parent="android:Theme.Material.Dialog">
+        <item name="android:colorAccent">@color/shadow_accent</item>
+        <item name="android:windowCloseOnTouchOutside">false</item>
+    </style>
 </resources>

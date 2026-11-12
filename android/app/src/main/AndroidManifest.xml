@@ -16,6 +16,9 @@
     <!-- Galaxy Buds case battery shared by Buds Case Widget (T11): its read-only provider and change
          broadcast. "dangerous", defined by that app: asked once at startup only if it is installed. -->
     <uses-permission android:name="io.github.budscasewidget.permission.READ_CASE_BATTERY" />
+    <!-- In-app update (docs/10): hand a verified release APK to PackageInstaller. Special access
+         ("install unknown apps") granted by the user once; the system always asks to confirm. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-feature
         android:name="android.hardware.microphone"
@@ -56,7 +59,23 @@
                 <action android:name="android.intent.action.ASSIST" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <!-- Launcher shortcut "Güncellemeleri denetle" → UpdateActivity (docs/10 D5). -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- In-app update (docs/10). Not exported: started by the static shortcut and by the
+             install-status PendingIntent only. Own task affinity, because the launcher starts
+             shortcuts with CLEAR_TASK, which must not clear MainActivity's task. -->
+        <activity
+            android:name=".UpdateActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:taskAffinity="app.shadowassistant.android.update"
+            android:theme="@style/Theme.Shadow.Update" />
 
         <!-- Default digital assistant role (T6.3). -->
         <service

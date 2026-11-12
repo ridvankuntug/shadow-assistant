@@ -23,4 +23,38 @@
 
     <string name="error_local_network_title">Yerel ağ izni gerekli</string>
     <string name="error_local_network_message">Çekirdek yerel ağ adresinde (evde Wi-Fi, dışarıda Tailscale üzerinden) çalışıyor; Android bu adrese bağlanmak için \"Yerel ağ\" izni istiyor. İzin verilmeden çekirdeğe bağlanılamaz. Tekrar dene ile izni yeniden iste ya da Ayarları aç → İzinler bölümünden \"Yerel ağ\" iznini aç.</string>
+
+    <!-- In-app update (docs/10): launcher shortcut and UpdateActivity. -->
+    <string name="update_shortcut_short">Güncelle</string>
+    <string name="update_shortcut_long">Güncellemeleri denetle</string>
+    <string name="update_title">Shadow güncellemesi</string>
+    <string name="update_checking">Güncelleme denetleniyor…</string>
+    <string name="update_up_to_date">Shadow güncel (%1$s).</string>
+    <string name="update_available">%1$s sürümü mevcut (yüklü: %2$s). Güncellensin mi? Ayarlar ve izinler korunur.</string>
+    <string name="update_need_install_access">Güncellemeyi kurmak için Shadow\'a bir kez \"Bilinmeyen uygulamaları yükle\" izni vermen gerekiyor. Ayarları aç, izni ver ve geri dön.</string>
+    <string name="update_need_install_access_manual">Ayarlar ekranı açılamadı. Ayarlar → Uygulamalar → Shadow → \"Bilinmeyen uygulamaları yükle\" iznini verip tekrar dene.</string>
+    <string name="update_downloading">İndiriliyor… %%%1$d</string>
+    <string name="update_installing">Doğrulandı, kurulum hazırlanıyor…</string>
+    <string name="update_waiting_confirm">Android\'in kurulum onayını bekliyor…</string>
+    <string name="update_done">Güncelleme kuruldu.</string>
+    <string name="update_aborted">Kurulum iptal edildi.</string>
+    <string name="update_busy">Bir güncelleme işlemi zaten sürüyor.</string>
+    <string name="update_button_install">Güncelle</string>
+    <string name="update_button_cancel">Vazgeç</string>
+    <string name="update_button_close">Kapat</string>
+    <string name="update_button_retry">Tekrar dene</string>
+    <string name="update_button_settings">Ayarları aç</string>
+    <string name="update_failed_network">GitHub\'a ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.</string>
+    <string name="update_failed_no_release">Henüz yayımlanmış bir sürüm yok.</string>
+    <string name="update_failed_bad_release">Son sürüm beklenen biçimde değil (update.json ya da APK eksik veya hatalı); kurulmadı.</string>
+    <string name="update_failed_blocked">İzin verilmeyen bir adrese yönlendirildi; güncelleme durduruldu.</string>
+    <string name="update_failed_too_large">Güncelleme dosyası izin verilen boyutu aşıyor; kurulmadı.</string>
+    <string name="update_failed_hash">İndirilen dosyanın SHA-256 özeti update.json ile uyuşmuyor; kurulmadı.</string>
+    <string name="update_failed_package">İndirilen APK bu uygulamaya ya da duyurulan sürüme ait değil; kurulmadı.</string>
+    <string name="update_failed_not_newer">İndirilen sürüm yüklü sürümden yeni değil; kurulmadı.</string>
+    <string name="update_failed_signer">İmza uyuşmuyor: güncelleme yüklü uygulamayla aynı anahtarla imzalanmamış (telefonda debug derlemesi olabilir). Hiçbir şey değişmedi; çözüm için android/README.md.</string>
+    <string name="update_failed_conflict">Android güncellemeyi reddetti (imza ya da sürüm uyuşmuyor). Uygulama ve verileri olduğu gibi duruyor.</string>
+    <string name="update_failed_storage">Kurulum için yeterli depolama alanı yok.</string>
+    <string name="update_failed_install">Kurulum tamamlanamadı (durum %1$d).</string>
+    <string name="update_failed_generic">Güncelleme kurulamadı. Tekrar dene.</string>
 </resources>

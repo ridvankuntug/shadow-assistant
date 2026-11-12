@@ -41,6 +41,7 @@ role (opens from the assist gesture / power key).
 | `LocalNetworkPermission.kt` | When the Android 17 local network permission is needed / asked at startup |
 | `CaseBattery.kt`, `CaseBatterySync.kt` | Buds case battery: validation, Core request, receiver + WorkManager job |
 | `AppStorage.kt` | Opens the stores (shared by the activity and the background job) |
+| `Updater.kt`, `UpdateActivity.kt` | In-app update from GitHub Releases: checks (`UpdateRules`), download, `PackageInstaller`; shortcut dialog |
 | `assist/AssistServices.kt` | `VoiceInteractionService` + session + recognition stub |
 | `res/xml/network_security_config.xml` | Cleartext only to `192.168.1.2` |
 
@@ -79,6 +80,9 @@ There is no Play Store release; the APK is installed by hand.
 - Or download the `shadow-release-apk` (or `shadow-debug-apk`) artifact of the
   **Android** workflow run on GitHub, copy it to the phone and open it (allow
   "Install unknown apps" for the file manager/browser once).
+
+- Or, once a release build is installed, from inside the app: see
+  [Releases and in-app update](#releases-and-in-app-update).
 
 A debug APK and a release APK are signed with different keys: switching
 between them requires uninstalling first (which deletes the stored token and
@@ -222,7 +226,9 @@ lint, and builds the **debug APK** (artifact `shadow-debug-apk`). If all four
 signing secrets exist (and the run is not a pull request) it also builds a
 **signed release APK** (artifact `shadow-release-apk`) and verifies the
 signature with `apksigner`. `versionCode` is the workflow run number, so each
-CI release installs over the previous one.
+CI release installs over the previous one. `versionName` is `0.1.0-ci.<run>`
+(`X.Y.Z` for a release tag, see below); local builds keep `0.1.0` / `1`
+unless `-PshadowVersionName` / `-PshadowVersionCode` are given.
 
 The keystore never enters the repository: CI decodes it from a secret into
 the runner's temp directory and deletes it at the end of the job.
@@ -267,3 +273,63 @@ GitHub users. The APK contains no token or address beyond the documented
 
 Signing keys (`*.jks`, `*.keystore`) and `local.properties` are git-ignored and
 must never be committed.
+
+## Releases and in-app update
+
+Design: [`docs/10-android-updates.md`](../docs/10-android-updates.md).
+
+**Publishing (you):** push a tag `vX.Y.Z` (strictly three numbers, e.g.
+`git tag v0.2.0 && git push origin v0.2.0`). The same **Android** workflow then
+builds and tests as usual, refuses the tag if it is not `vX.Y.Z` or if any
+signing secret is missing, builds the signed APK with `versionName X.Y.Z` and
+`versionCode` = run number, and a separate `release` job (the only one with
+`contents: write`; it never sees the signing secrets) publishes a GitHub
+Release with two assets:
+
+- `shadow-vX.Y.Z.apk`: the signed APK,
+- `update.json`: `{"versionCode": N, "versionName": "X.Y.Z", "apk": "shadow-vX.Y.Z.apk", "sha256": "<hex>"}`,
+  read back from the built APK by CI.
+
+A release is never overwritten: if the tag's release already exists (e.g. a
+re-run) the job fails; push a new tag instead.
+
+**Versioning:** "newer" means a higher `versionCode` only (the run number is
+shared by main pushes and tags). A main-push artifact installed after a release
+is therefore not offered the older release; the next release supersedes it.
+
+**Updating (phone):** long-press the Shadow icon → **Güncellemeleri denetle**.
+It reads the latest release of this repository, shows "X.Y.Z mevcut" if its
+`versionCode` is higher than the installed one, and on **Güncelle**:
+
+1. asks once for "Bilinmeyen uygulamaları yükle" for Shadow (system settings),
+2. downloads the APK (HTTPS only, hosts `api.github.com`, `github.com`,
+   `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
+   redirects re-checked, at most 60 MB) into the app's private cache,
+3. checks SHA-256 against `update.json`, package name, `versionCode`
+   (= `update.json`, > installed) and that the signer equals the installed
+   app's (or is a key-rotation successor of it),
+4. hands it to `PackageInstaller`; Android always shows its own install
+   confirmation. The file is deleted afterwards.
+
+Nothing is checked automatically or in the background. An in-place update keeps
+the device token, settings, permissions and the assist role (same package, same
+key, higher `versionCode`). Android itself also refuses a different key or a
+lower version, without touching data.
+
+### Debug build on the phone? (one-time)
+
+The update only works if the installed app is signed with the release key.
+To find out without `adb`: open the newest CI `shadow-release-apk` (or a
+release APK) on the phone. If it installs as an update, nothing to do. If the
+installer refuses ("uygulama yüklenmedi" / package conflict), the phone has a
+debug build; the installer changes nothing. Then choose once:
+
+- **A. Reinstall (recommended):** uninstall, install the release APK, enter the
+  device token again, re-grant permissions, pick Shadow as assist app again.
+  All later updates keep data.
+- **B. Key rotation** (APK Signature Scheme v3, Android 9+): rotate from the
+  debug key to the release key with `apksigner rotate` and sign releases with
+  the lineage. Keeps data but needs an extra CI signing step and a lineage
+  file; the in-app check already accepts a rotation successor.
+- **C. Debug key as release key:** not recommended (ties releases to a
+  dev-tool key that can be regenerated).

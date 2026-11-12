@@ -54,7 +54,9 @@ android {
         minSdk = 29
         targetSdk = 37
         versionCode = (findProperty("shadowVersionCode") as String?)?.toInt() ?: 1
-        versionName = "0.1.0"
+        // CI sets both (docs/10 D1): versionCode = run number (the only "newer" signal the
+        // in-app updater uses), versionName = tag "X.Y.Z" or "0.1.0-ci.<run>" (display only).
+        versionName = (findProperty("shadowVersionName") as String?)?.takeIf { it.isNotBlank() } ?: "0.1.0"
     }
 
     signingConfigs {

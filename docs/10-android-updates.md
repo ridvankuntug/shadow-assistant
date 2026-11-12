@@ -181,23 +181,23 @@ refuses **without touching data**. Then choose (user decision, nothing automatic
 
 ## Implementation tasks
 
-- [ ] T14.1 — Gradle: `-PshadowVersionName` (default `0.1.0`), versionCode
+- [x] T14.1 — Gradle: `-PshadowVersionName` (default `0.1.0`), versionCode
   unchanged. Files: `android/app/build.gradle.kts`.
-- [ ] T14.2 — CI: tag trigger `v*`, strict tag check, versionName per D1,
+- [x] T14.2 — CI: tag trigger `v*`, strict tag check, versionName per D1,
   signing secrets required on tags, `update.json` + renamed APK, `release` job
   (`contents: write`, `softprops/action-gh-release`, own concurrency group),
   keystore removed in `always()`. Files: `.github/workflows/android.yml`.
-- [ ] T14.3 — `Updater.kt` (pure logic + network): latest release, `update.json`,
+- [x] T14.3 — `Updater.kt` (pure logic + network): latest release, `update.json`,
   allowlist/redirects, download with caps, SHA-256, archive checks (package,
   versionCode, signer), `PackageInstaller` session. Files:
   `android/app/src/main/java/app/shadowassistant/android/Updater.kt`,
   `android/app/src/test/java/app/shadowassistant/android/UpdaterTest.kt`.
-- [ ] T14.4 — `UpdateActivity` + shortcut: dialog flow, unknown-sources access,
+- [x] T14.4 — `UpdateActivity` + shortcut: dialog flow, unknown-sources access,
   install status handling, Turkish strings. Files: `UpdateActivity.kt` (new),
   `AndroidManifest.xml` (`REQUEST_INSTALL_PACKAGES`, activity, receiver if
   used, shortcut meta-data on `MainActivity`), `res/xml/shortcuts.xml` (new),
   `res/values/strings.xml`, `res/values/themes.xml` (dialog theme if needed).
-- [ ] T14.5 — Docs: `android/README.md` (Releases, update shortcut, debug vs
+- [x] T14.5 — Docs: `android/README.md` (Releases, update shortcut, debug vs
   release migration A/B/C, versioning), `docs/README.md` index line for this file.
 
 Order: 14.1 → 14.2; 14.3 → 14.4; 14.5 last. No `ui/`, `ShadowBridge.kt`,

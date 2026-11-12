@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Static launcher shortcut (long-press the app icon), docs/10 D5. The target activity is not
+     exported: static shortcuts are started on behalf of this package. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="check_updates"
+        android:shortcutLongLabel="@string/update_shortcut_long"
+        android:shortcutShortLabel="@string/update_shortcut_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="app.shadowassistant.android.UpdateActivity"
+            android:targetPackage="app.shadowassistant.android" />
+    </shortcut>
+</shortcuts>

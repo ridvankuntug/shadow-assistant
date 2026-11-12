@@ -2,11 +2,15 @@ name: Android
 
 # Builds the Android shell (android/) around the same ui/ bundle the browser
 # uses. Debug APK always; a signed release APK only when the signing secrets
-# exist (never for pull requests). See android/README.md → "CI and signing".
+# exist (never for pull requests). A `vX.Y.Z` tag additionally publishes a
+# GitHub Release (signed APK + update.json) for the in-app updater (docs/10).
+# See android/README.md → "CI and signing" and "Releases and in-app update".
 
 on:
   push:
     branches: [main]
+    # Release tags (docs/10 D2). Path filters are not evaluated for tag pushes.
+    tags: ["v*"]
     paths:
       - "android/**"
       - "ui/**"
@@ -23,7 +27,8 @@ permissions:
 
 concurrency:
   group: android-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a release build half-way; branch/PR runs supersede each other.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   apk:
@@ -33,7 +38,32 @@ jobs:
     env:
       # Secrets cannot be used in `if:` directly; this is only "set or not".
       HAS_SIGNING: ${{ secrets.SHADOW_KEYSTORE_BASE64 != '' && secrets.SHADOW_KEYSTORE_PASSWORD != '' && secrets.SHADOW_KEY_ALIAS != '' && secrets.SHADOW_KEY_PASSWORD != '' }}
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+      # Keep equal to the versionName default in android/app/build.gradle.kts.
+      BASE_VERSION_NAME: "0.1.0"
     steps:
+      # docs/10 D1/D2: versionCode is always the run number; versionName is "X.Y.Z" for a
+      # release tag, "<base>-ci.<run>" otherwise. A tag that is not strictly vX.Y.Z, or a tag
+      # build without all signing secrets, fails here (no unsigned/debug-signed release).
+      - name: Version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$IS_TAG" = "true" ]; then
+            if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release tags must look like vX.Y.Z"
+              exit 1
+            fi
+            if [ "$HAS_SIGNING" != "true" ]; then
+              echo "::error::Release tags need all four SHADOW_* signing secrets"
+              exit 1
+            fi
+            echo "SHADOW_VERSION_NAME=${REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "SHADOW_VERSION_NAME=${BASE_VERSION_NAME}-ci.${RUN_NUMBER}" >> "$GITHUB_ENV"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -64,7 +94,7 @@ jobs:
       - name: Unit tests, lint, debug APK
         working-directory: android
         # `bash ./gradlew`: works even if the executable bit was lost on a Windows checkout.
-        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug -PshadowVersionCode=${{ github.run_number }}
+        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug -PshadowVersionCode=${{ github.run_number }} -PshadowVersionName="$SHADOW_VERSION_NAME"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -89,7 +119,7 @@ jobs:
           SHADOW_KEY_ALIAS: ${{ secrets.SHADOW_KEY_ALIAS }}
           SHADOW_KEY_PASSWORD: ${{ secrets.SHADOW_KEY_PASSWORD }}
         run: |
-          bash ./gradlew --no-daemon assembleRelease -PshadowVersionCode=${{ github.run_number }}
+          bash ./gradlew --no-daemon assembleRelease -PshadowVersionCode=${{ github.run_number }} -PshadowVersionName="$SHADOW_VERSION_NAME"
           # Fails the job if the APK is not properly signed. (No --print-certs: keep the certificate out of public logs.)
           "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify app/build/outputs/apk/release/app-release.apk
 
@@ -103,3 +133,113 @@ jobs:
           name: shadow-release-apk
           path: android/app/build/outputs/apk/release/app-release.apk
           retention-days: 30
+
+      # Release assets, read back from the built APK (not from the tag alone): the in-app
+      # updater trusts update.json for versionCode and SHA-256 (docs/10 D3).
+      - name: Release files (APK + update.json)
+        if: env.IS_TAG == 'true'
+        working-directory: android
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          apk=app/build/outputs/apk/release/app-release.apk
+          badging="$("$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$apk")"
+          # First line: "package: name='…' versionCode='…' versionName='…' …"
+          pkg="$(printf '%s\n' "$badging" | sed -n "1s/^package: name='\([^']*\)'.*/\1/p")"
+          code="$(printf '%s\n' "$badging" | sed -n "1s/.* versionCode='\([0-9]*\)'.*/\1/p")"
+          name="$(printf '%s\n' "$badging" | sed -n "1s/.* versionName='\([^']*\)'.*/\1/p")"
+          if [ "$pkg" != "app.shadowassistant.android" ] || [ "$code" != "$RUN_NUMBER" ] || [ "$name" != "$SHADOW_VERSION_NAME" ]; then
+            echo "::error::Unexpected APK identity: package=$pkg versionCode=$code versionName=$name"
+            exit 1
+          fi
+          out="$RUNNER_TEMP/release-files"
+          mkdir -p "$out"
+          file="shadow-v${SHADOW_VERSION_NAME}.apk"
+          cp "$apk" "$out/$file"
+          sha="$(sha256sum "$out/$file" | cut -d' ' -f1)"
+          jq -n --argjson versionCode "$code" --arg versionName "$name" --arg apk "$file" --arg sha256 "$sha" \
+            '{versionCode: $versionCode, versionName: $versionName, apk: $apk, sha256: $sha256}' > "$out/update.json"
+          cat "$out/update.json"
+
+      - uses: actions/upload-artifact@v4
+        if: env.IS_TAG == 'true'
+        with:
+          name: shadow-release-files
+          path: ${{ runner.temp }}/release-files/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publishes the GitHub Release for a vX.Y.Z tag. Separate job: the only one with write
+  # access, and it never sees the signing secrets.
+  release:
+    name: GitHub Release
+    needs: apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: android-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: shadow-release-files
+          path: release-files
+
+      # A re-run reuses the run number (= versionCode): never replace a published APK. Only a
+      # confirmed 404 counts as "no release yet"; any other answer stops the job. Then decide
+      # "latest": the app reads releases/latest only, so a slower, older tag build (lower
+      # versionCode) must not become latest over a newer one.
+      - name: Check existing releases
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          api() {
+            curl -sS -o "$2" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GH_REPO/$1"
+          }
+          code="$(api "releases/tags/$TAG" tag.json)"
+          if [ "$code" = "200" ]; then
+            echo "::error::Release $TAG already exists; push a new tag instead"
+            exit 1
+          elif [ "$code" != "404" ]; then
+            echo "::error::Could not check for an existing release (HTTP $code)"
+            exit 1
+          fi
+          ours="$(jq -er '.versionCode' release-files/update.json)"
+          latest=0
+          code="$(api "releases/latest" latest.json)"
+          if [ "$code" = "200" ]; then
+            url="$(jq -r '.assets[] | select(.name == "update.json") | .browser_download_url' latest.json)"
+            if [ -n "$url" ]; then
+              curl -sSfL --max-filesize 65536 -o latest-update.json "$url"
+              latest="$(jq -er '.versionCode' latest-update.json)"
+            fi
+          elif [ "$code" != "404" ]; then
+            echo "::error::Could not read the latest release (HTTP $code)"
+            exit 1
+          fi
+          if [ "$ours" -gt "$latest" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::versionCode $ours is not above the latest release ($latest); published without becoming latest"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-files/shadow-${{ github.ref_name }}.apk
+            release-files/update.json
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          make_latest: ${{ steps.existing.outputs.make_latest }}
