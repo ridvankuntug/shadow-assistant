@@ -6,7 +6,7 @@ import { join, posix } from "node:path";
 import { after, test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { PermissionCallback } from "../src/model-provider.js";
-import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, TurnStream } from "../src/agent.js";
+import { DENIED_BUILTIN_TOOLS, SdkAgentRunner, subprocessEnv, toolResultText, TurnStream } from "../src/agent.js";
 import { buildOneShotOptions } from "../src/one-shot.js";
 import { buildTurnEnvelope, DIRECT_NOTES_END, DIRECT_NOTES_START, TIER1_MARKER, wrapDirectNotes } from "../src/turn-envelope.js";
 
@@ -271,4 +271,22 @@ test("session.ts never loads the provider SDK: its value-import graph does not r
   assert.ok(!seen.has("agent.ts"), `agent.ts is value-imported (${[...seen].join(", ")})`);
   assert.ok(!reached.some((r) => r.includes("@anthropic-ai/")), reached.join("\n"));
   assert.ok(seen.has("turn-envelope.ts"));
+});
+
+test("TurnStream: an error tool_result hands its text to onToolResult (T7.w.10j); a success hands none", () => {
+  const got: Array<[string, boolean, string | undefined]> = [];
+  const s = new TurnStream({ onDelta: () => {}, onToolResult: (id, _n, isError, errorText) => got.push([id, isError, errorText]) });
+  const result = (id: string, content: unknown, isError?: boolean) =>
+    msg({ type: "user", parent_tool_use_id: null, session_id: "s1", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, ...(isError !== undefined ? { is_error: isError } : {}) }] } });
+  s.consume(result("a", "ok"));
+  s.consume(result("b", [{ type: "text", text: "Error calling tool:" }, { type: "image", data: "x" }, { type: "text", text: "not found" }], true));
+  s.consume(result("c", "timed out", true));
+  s.consume(result("d", undefined, true));
+  assert.deepEqual(got, [
+    ["a", false, undefined],
+    ["b", true, "Error calling tool:\nnot found"],
+    ["c", true, "timed out"],
+    ["d", true, ""],
+  ]);
+  assert.equal(toolResultText(42), "");
 });

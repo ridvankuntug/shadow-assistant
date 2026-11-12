@@ -827,3 +827,37 @@ test("ClaudeSdkProvider: openSession builds a DeviceAgent; oneShot returns text,
   ac.abort();
   assert.equal((await provider.oneShot({ model: "haiku", prompt: "özetle", maxTokens: 100, signal: ac.signal })).status, "cancelled");
 });
+
+test("gate dispatcher bindTurn carries the attempt's turn id; tool result error text is forwarded (T7.w.10j)", async () => {
+  const f = new FakeSdk();
+  f.reply = () => {};
+  const agent = makeAgent(f);
+  const dispatch = f.buildArgs?.gate as GatewayGate;
+  const h = agent.runAttempt(attempt("a", { turnId: "turn-7" }));
+  await tick();
+  assert.equal(dispatch.bindTurn?.()?.turnId, "turn-7");
+  await agent.interrupt();
+  await h.settled;
+  const h2 = agent.runAttempt(attempt("b"));
+  await tick();
+  const bound = dispatch.bindTurn?.();
+  assert.ok(bound);
+  assert.equal("turnId" in bound, false, "no turn id given → none bound");
+  await agent.interrupt();
+  await h2.settled;
+  agent.close();
+
+  const g = new FakeSdk();
+  g.reply = (_m, ff) => {
+    ff.assistant([{ type: "tool_use", id: "tu1", name: "mcp__ha__Get", input: {} }]);
+    ff.push({ type: "user", parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "Error calling tool: not found", is_error: true }] } });
+    ff.delta("Bulamadım.");
+    ff.stop("end_turn");
+    ff.result({ result: "Bulamadım." });
+  };
+  const results: Array<[string, boolean, string | undefined]> = [];
+  const a2 = makeAgent(g);
+  await a2.runAttempt(attempt("ışık?", { callbacks: { onDelta: () => {}, onToolResult: (id, _n, isError, text) => results.push([id, isError, text]) } })).done;
+  assert.deepEqual(results, [["tu1", true, "Error calling tool: not found"]]);
+  a2.close();
+});

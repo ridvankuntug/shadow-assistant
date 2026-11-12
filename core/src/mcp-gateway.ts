@@ -19,7 +19,8 @@
  *   to dev-notes ("new tool: classify", added/removed tools, stale rules).
  * - A call naming a tool the gateway does not offer is a turn dev-note
  *   (`missing_capability`, reason `unknown_tool`; T7.w.3), recorded before the
- *   gate. The gateway serves no particular turn, so the note has no turn id.
+ *   gate, with the turn id of the gate the call came through (`BoundGate.turnId`
+ *   / `GatewayGate.turnId`, T7.w.10j) when it has one.
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -71,6 +72,8 @@ export interface ToolClassifier {
 export interface BoundGate {
   gate: PermissionCallback;
   isCurrent(): boolean;
+  /** The Core turn id of that turn, if known (only for turn dev-notes). */
+  turnId?: string;
 }
 
 /**
@@ -78,9 +81,10 @@ export interface BoundGate {
  * turns (a persistent session's dispatcher) also has `bindTurn`: the gateway
  * calls it at the very start of a tool call, before any wait, so the call
  * belongs to the turn that was running when it arrived (undefined = no turn:
- * refused). Without `bindTurn` the gate is a per-turn gate and always current.
+ * refused). Without `bindTurn` the gate is a per-turn gate and always current;
+ * its `turnId` (if set) is the id of that one turn.
  */
-export type GatewayGate = PermissionCallback & { bindTurn?: () => BoundGate | undefined };
+export type GatewayGate = PermissionCallback & { bindTurn?: () => BoundGate | undefined; turnId?: string };
 
 export interface McpGatewayOptions {
   sources: readonly GatewaySource[];
@@ -432,7 +436,9 @@ export class McpGateway {
     // 0) Bind the call to the turn running now, before any wait: a list refresh
     //    below must not let a late call of an ended turn run under the next
     //    turn's gate, nor a call made between turns attach to the next one.
-    const bound: BoundGate | undefined = turnGate.bindTurn ? turnGate.bindTurn() : { gate: turnGate, isCurrent: () => true };
+    const bound: BoundGate | undefined = turnGate.bindTurn
+      ? turnGate.bindTurn()
+      : { gate: turnGate, isCurrent: () => true, ...(turnGate.turnId !== undefined ? { turnId: turnGate.turnId } : {}) };
     if (!bound) return text(GATEWAY_MESSAGES.noTurn, true);
     const { gate } = bound;
     const src = this.sources.get(service);
@@ -444,7 +450,7 @@ export class McpGateway {
     let input = args ?? {};
     if (src.kind === "local") {
       local = src.tools.find((t) => t.name === tool);
-      if (!local) return this.unknownTool(service, tool);
+      if (!local) return this.unknownTool(service, tool, bound.turnId);
       const parsed = z.object(local.shape).safeParse(input);
       if (!parsed.success) return text(GATEWAY_MESSAGES.invalidArgs(tool, zodSummary(parsed.error)), true);
     } else {
@@ -458,7 +464,7 @@ export class McpGateway {
           return text(GATEWAY_MESSAGES.unavailable(service), true);
         }
       }
-      if (!known) return this.unknownTool(service, tool);
+      if (!known) return this.unknownTool(service, tool, bound.turnId);
       if (!bound.isCurrent()) return text(GATEWAY_MESSAGES.noTurn, true);
     }
 
@@ -522,11 +528,13 @@ export class McpGateway {
   /**
    * A tool the service does not offer: refused before the gate and noted. The
    * name is the model's own; TurnNotes stores it only if it looks like an
-   * identifier. Never throws.
+   * identifier. `turnId`: the turn the call was bound to, if known. Never throws.
    */
-  private unknownTool(service: string, tool: string): GatewayToolResult {
+  private unknownTool(service: string, tool: string, turnId: string | undefined): GatewayToolResult {
     try {
-      void this.o.turnNotes?.record({ kind: "missing_capability", reason: "unknown_tool", service, tool }).catch(() => {});
+      void this.o.turnNotes
+        ?.record({ kind: "missing_capability", reason: "unknown_tool", service, tool, ...(turnId !== undefined ? { turnId } : {}) })
+        .catch(() => {});
     } catch {
       // a broken recorder must never affect the call
     }

@@ -48,7 +48,12 @@ export interface TurnRequest {
 export interface TurnCallbacks {
   onDelta(text: string): void;
   onToolUse?(toolUseId: string, name: string): void;
-  onToolResult?(toolUseId: string, name: string | undefined, isError: boolean): void;
+  /**
+   * `errorText`: only for an error result, the text of its content (joined text
+   * blocks; may be empty). Callers classify it (dev-notes `classifyToolError`)
+   * and must not store or log it.
+   */
+  onToolResult?(toolUseId: string, name: string | undefined, isError: boolean, errorText?: string): void;
 }
 
 export interface TurnResult {
@@ -258,6 +263,19 @@ export class SdkAgentRunner implements AgentRunner {
   }
 }
 
+/** The text of a tool_result block's content: a string, or its text blocks joined (anything else is skipped). */
+export function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (c): c is { type: "text"; text: string } =>
+        typeof c === "object" && c !== null && (c as { type?: unknown }).type === "text" && typeof (c as { text?: unknown }).text === "string",
+    )
+    .map((c) => c.text)
+    .join("\n");
+}
+
 /**
  * Folds the SDK message stream of one turn into client callbacks + a result.
  * Exported for unit tests (fed with synthetic SDK messages).
@@ -319,7 +337,9 @@ export class TurnStream {
         if (!Array.isArray(content)) return;
         for (const block of content) {
           if (typeof block === "object" && block !== null && block.type === "tool_result") {
-            this.cb.onToolResult?.(block.tool_use_id, this.toolNames.get(block.tool_use_id), block.is_error === true);
+            const isError = block.is_error === true;
+            const errorText = isError ? toolResultText(block.content) : undefined;
+            this.cb.onToolResult?.(block.tool_use_id, this.toolNames.get(block.tool_use_id), isError, errorText);
           }
         }
         return;

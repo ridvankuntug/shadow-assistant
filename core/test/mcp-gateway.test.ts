@@ -11,7 +11,7 @@ import { after, test } from "node:test";
 import { z } from "zod";
 import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
 import { ConversationLog } from "../src/conversation-log.js";
-import { DevNotes } from "../src/dev-notes.js";
+import { classifyToolError, DevNotes, TurnNotes } from "../src/dev-notes.js";
 import { DirectUnavailableError, type RemoteMcpClient, type RemoteToolDef, type RemoteToolList } from "../src/mcp-direct.js";
 import {
   GATEWAY_MESSAGES,
@@ -660,3 +660,39 @@ test("session: read-only mode denies non-read gateway calls without asking", asy
   assert.match(textOf(r), /Read-only/);
 });
 
+
+test("unknown_tool notes carry the turn id of the gate the call came through (bound or per-turn; T7.w.10j)", async () => {
+  const notes = new TurnNotes({ dir: join(base, "gw-turn-id"), coalesceMs: 0 });
+  const gw = new McpGateway({ sources: [{ kind: "remote", service: HA, client: new FakeHa() }], turnNotes: notes, refreshIntervalMs: 0 });
+  const allowGate: PermissionCallback = async (_n, input) => ({ behavior: "allow", updatedInput: input });
+  const signal = new AbortController().signal;
+  // A persistent session's dispatcher: the binding names the turn.
+  const dispatcher: GatewayGate = Object.assign(allowGate, {
+    bindTurn: () => ({ gate: allowGate, isCurrent: () => true, turnId: "turn-a" }),
+  });
+  await gw.call(HA, "intent__HassMadeUpA", {}, dispatcher, { signal });
+  // A per-turn gate (legacy runner) carries its own turn id.
+  const perTurn: GatewayGate = Object.assign(async (_n: string, input: Record<string, unknown>) => ({ behavior: "allow" as const, updatedInput: input }), { turnId: "turn-b" });
+  await gw.call(HA, "intent__HassMadeUpB", {}, perTurn, { signal });
+  // Without one, the note has none (as before).
+  await gw.call(HA, "intent__HassMadeUpC", {}, async (_n, input) => ({ behavior: "allow", updatedInput: input }), { signal });
+  assert.deepEqual(
+    (await notes.read()).notes.map((n) => [n.tool, n.lastTurnId]),
+    [
+      ["intent__HassMadeUpA", "turn-a"],
+      ["intent__HassMadeUpB", "turn-b"],
+      ["intent__HassMadeUpC", undefined],
+    ],
+  );
+  gw.close();
+});
+
+test("the gateway's own failure texts map to the tool_error classes (pins GATEWAY_MESSAGES to classifyToolError)", () => {
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.cancelled), "cancelled");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.noTurn), "cancelled");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.tooLate), "timeout");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.unavailable(HA)), "unreachable");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.invalidArgs("echo", "say: Too big")), "invalid_value");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.rejected("intent__HassTurnOn")), "invalid_value");
+  assert.equal(classifyToolError(GATEWAY_MESSAGES.failed("echo")), "error");
+});

@@ -6,11 +6,14 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import {
   capNotes,
+  classifyToolError,
   DEV_NOTES_FILE,
   DevNotes,
   INVALID_NAME,
   MAX_NOTES,
+  MAX_SPOKEN_NAME,
   MAX_WANDER_TOOLS,
+  normalizeSpokenName,
   observeNote,
   toolNoteKey,
   TURN_NOTES_FILE,
@@ -169,7 +172,7 @@ test("turns.json: each kind becomes one note per key, every occurrence counts, l
     turnId: "t-4",
   });
   await turns.record({ kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "error", turnId: "t-5" });
-  await turns.record({ kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "unavailable", turnId: "t-6" });
+  await turns.record({ kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "unreachable", turnId: "t-6" });
   await turns.record({ kind: "rule_suspended", ruleId: "lr-1a2b", reason: "name_not_found", turnId: "t-7" });
 
   let f = await turns.read();
@@ -186,7 +189,7 @@ test("turns.json: each kind becomes one note per key, every occurrence counts, l
   assert.equal(wander?.routeRule, "light-on");
   assert.equal(wander?.trigger, "calls");
   assert.equal(f.notes.find((x) => x.reason === "builtin")?.message, "model kapalı bir yerleşik araç istedi");
-  assert.equal(f.notes.find((x) => x.errorClass === "unavailable")?.message, "servise ulaşılamadı");
+  assert.equal(f.notes.find((x) => x.errorClass === "unreachable")?.message, "servise ulaşılamadı");
   for (const x of f.notes) {
     assert.equal(x.count, 1);
     assert.equal(x.firstSeen, new Date(T0).toISOString());
@@ -404,4 +407,138 @@ test("privacy: arguments, user text, entity names and error messages never reach
   assert.equal(f.notes[0]?.service, INVALID_NAME);
   assert.equal(f.notes[0]?.lastTurnId, undefined);
   assert.deepEqual(f.notes.find((x) => x.kind === "wandering")?.tools, [INVALID_NAME, "mcp__ha__HassTurnOn"]);
+});
+
+// ---------------------------------------------------------------------------
+// T7.w.10i / T7.w.10j
+
+test("classifyToolError: one class per observable error text, first match wins, fallback otherwise", () => {
+  const cases: Array<[string | undefined, string]> = [
+    // timeout (before unreachable: a timed-out call is also a failed call)
+    ["call failed: Request timed out", "timeout"],
+    ["MCP error -32001: Request timed out", "timeout"],
+    ["The approval came too late to run the action within this tool call's time limit; it was not run.", "timeout"],
+    ["connect ETIMEDOUT", "timeout"],
+    // unreachable (ENOTFOUND is DNS, not a missing target)
+    ["The service 'ha' is not reachable right now. Tell the user; do not retry immediately.", "unreachable"],
+    ["connect failed: connect ECONNREFUSED", "unreachable"],
+    ["getaddrinfo ENOTFOUND ha-host", "unreachable"],
+    ["fetch failed", "unreachable"],
+    ["HTTP 503 Service Unavailable", "unreachable"],
+    // forbidden
+    ["Error calling tool: 401 Unauthorized", "forbidden"],
+    ["Error calling tool: Forbidden", "forbidden"],
+    ["permission denied for this entity", "forbidden"],
+    // not_found
+    ["Error calling tool: MatchFailedError: no entity matched", "not_found"],
+    ["Error calling tool: Entity light.x not found", "not_found"],
+    ["Error calling tool: unknown entity", "not_found"],
+    ["no_valid_targets", "not_found"],
+    // invalid_value
+    ["Error calling tool: expected int for dictionary value @ data['brightness']", "invalid_value"],
+    ["Error calling tool: value must be at most 100", "invalid_value"],
+    ["Invalid arguments for 'save': v: Required", "invalid_value"],
+    ["The service did not accept the call to 'x' (unknown tool or invalid arguments).", "invalid_value"],
+    ["MCP error -32602: Invalid params", "invalid_value"],
+    // cancelled: never a tool error
+    ["Turn was cancelled.", "cancelled"],
+    ["The turn this call belonged to is over; the action was not run.", "cancelled"],
+    // fallback
+    ["The tool 'x' failed.", "error"],
+    ["Error calling tool: something odd happened", "error"],
+    ["", "error"],
+    [undefined, "error"],
+    // "unexpected" is not "expected"; "cancelled" only as the whole text
+    ["unexpected end of data", "error"],
+    ["the user cancelled the scene earlier", "error"],
+  ];
+  for (const [text, want] of cases) assert.equal(classifyToolError(text), want, JSON.stringify(text));
+  // A thrown tier-0 call falls back to `unreachable`, but a timeout in its message still wins.
+  assert.equal(classifyToolError("call failed: socket closed by peer", "unreachable"), "unreachable");
+  assert.equal(classifyToolError("call failed: Request timed out", "unreachable"), "timeout");
+  assert.equal(classifyToolError(undefined, "unreachable"), "unreachable");
+  // Only the start of a long text is looked at.
+  assert.equal(classifyToolError(`${"x".repeat(5_000)} not found`), "error");
+});
+
+test("classifyToolError: McpDirectClient's `connect failed:` prefix does not hide an inner 401/403", () => {
+  assert.equal(classifyToolError("connect failed: Streamable HTTP error: 401 Unauthorized"), "forbidden");
+  assert.equal(classifyToolError("connect failed: HTTP 403"), "forbidden");
+  assert.equal(classifyToolError("connect failed: ECONNREFUSED"), "unreachable");
+});
+
+test("classifyToolError: a bare number in free text is not an HTTP status; one in context is", () => {
+  assert.equal(classifyToolError("value 502 must be at most 255"), "invalid_value");
+  assert.equal(classifyToolError("brightness 404 is off"), "error");
+  assert.equal(classifyToolError("room 403 something odd"), "error");
+  assert.equal(classifyToolError("HTTP 503"), "unreachable");
+  assert.equal(classifyToolError("503 Service Unavailable"), "unreachable");
+  assert.equal(classifyToolError("status 502"), "unreachable");
+  assert.equal(classifyToolError("HTTP/1.1 502"), "unreachable");
+  assert.equal(classifyToolError("error 403"), "forbidden");
+  assert.equal(classifyToolError("status code: 404"), "not_found");
+  assert.equal(classifyToolError("HTTP 422"), "invalid_value");
+});
+
+test("unknown_name: one note per normalized spoken name, counted; odd or long names are not recorded", async () => {
+  const dir = join(base, `d${++n}`);
+  let now = T0;
+  const turns = new TurnNotes({ dir, now: () => now, coalesceMs: 0 });
+  await turns.record({ kind: "unknown_name", name: "Bahçe", turnId: "t-1" });
+  now += 1_000;
+  await turns.record({ kind: "unknown_name", name: "  BAHÇE ", turnId: "t-2" });
+  await turns.record({ kind: "unknown_name", name: "çalışma  odası", turnId: "t-3" });
+  // Turkish lower case: "IŞIK" → "ışık", "İ" → "i".
+  await turns.record({ kind: "unknown_name", name: "İKİNCİ IŞIK" });
+  for (const bad of ["", "   ", "x".repeat(MAX_SPOKEN_NAME + 1), "bahçe; rm -rf", "<script>", "a\u0000b", "?", 42]) {
+    await turns.record({ kind: "unknown_name", name: bad as string });
+  }
+  const f = await turns.read();
+  assert.deepEqual(
+    f.notes.map((x) => [x.kind, x.name, x.count, x.lastTurnId ?? null]),
+    [
+      ["unknown_name", "bahçe", 2, "t-2"],
+      ["unknown_name", "çalışma odası", 1, "t-3"],
+      ["unknown_name", "ikinci ışık", 1, null],
+    ],
+  );
+  assert.equal(f.notes[0]?.message, "bilinmeyen ad: hızlı yol bu adı bulamadı; HA'da bu ada takma ad eklenebilir");
+  assert.equal(turnNoteKey(f.notes[0] as TurnNotesFile["notes"][number]), JSON.stringify(["unknown_name", "bahçe"]));
+  assert.equal(normalizeSpokenName("x".repeat(MAX_SPOKEN_NAME)), "x".repeat(MAX_SPOKEN_NAME));
+  assert.equal(normalizeSpokenName("salon-2 'lamba'"), "salon-2 'lamba'");
+  // A typographic apostrophe is the same name as the ASCII one.
+  assert.equal(normalizeSpokenName("Ayşe’nin odası"), "ayşe'nin odası");
+  assert.equal(normalizeSpokenName("salon‘lamba’"), "salon'lamba'");
+  const t2 = new TurnNotes({ dir: join(base, `d${++n}`), now: () => T0, coalesceMs: 0 });
+  await t2.record({ kind: "unknown_name", name: "Ayşe’nin odası" });
+  await t2.record({ kind: "unknown_name", name: "ayşe'nin odası" });
+  assert.deepEqual((await t2.read()).notes.map((x) => [x.name, x.count]), [["ayşe'nin odası", 2]]);
+  // Status works like any other note.
+  assert.ok(await turns.setStatus(JSON.stringify(["unknown_name", "bahçe"]), "fixed"));
+});
+
+test("turns.json: a pre-T7.w.10j `unavailable` note is kept as stored; new records use `unreachable`", async () => {
+  const dir = join(base, `d${++n}`);
+  mkdirSync(dir, { recursive: true });
+  const old = { kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "unavailable", message: "servise ulaşılamadı", count: 4, firstSeen: "2026-11-01T00:00:00.000Z", lastSeen: "2026-11-02T00:00:00.000Z" };
+  writeFileSync(join(dir, TURN_NOTES_FILE), JSON.stringify({ version: 1, notes: [old] }));
+  const turns = new TurnNotes({ dir, now: () => T0, coalesceMs: 0 });
+  await turns.record({ kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "unreachable" });
+  // The old class is no longer accepted as input.
+  await turns.record({ kind: "tool_error", service: "ha", tool: "mcp__ha__HassTurnOn", errorClass: "unavailable" as never });
+  const f = await turns.read();
+  assert.deepEqual(f.notes.map((x) => [x.errorClass, x.count]), [["unavailable", 4], ["unreachable", 1]]);
+});
+
+test("privacy: an unknown_name note keeps the normalized name and nothing else of its input", async () => {
+  const dir = join(base, `d${++n}`);
+  const SECRET = "not-a-real-secret-456";
+  const TEXT = "bahçe ışığını aç lütfen";
+  const turns = new TurnNotes({ dir, now: () => T0, coalesceMs: 0 });
+  await turns.record({ kind: "unknown_name", name: "Bahçe", turnId: "t-1", text: TEXT, error: SECRET, args: { token: SECRET } } as never);
+  await turns.flush();
+  const raw = readFileSync(join(dir, TURN_NOTES_FILE), "utf8");
+  for (const leaked of [SECRET, TEXT, "ışığını", "lütfen"]) assert.ok(!raw.includes(leaked), `turns.json must not contain ${leaked}`);
+  const note = (JSON.parse(raw) as TurnNotesFile).notes[0];
+  assert.deepEqual(Object.keys(note ?? {}).sort(), ["count", "firstSeen", "kind", "lastSeen", "lastTurnId", "message", "name"]);
 });

@@ -9,7 +9,15 @@ import { createHash } from "node:crypto";
 // Type-only: agent.ts loads the provider SDK, which session.ts must never do.
 import type { AgentRunner, TurnResult } from "./agent.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
-import { toolNoteKey, turnNoteKey, type DevNotes, type NoteStatus, type TurnNoteInput, type TurnNotes } from "./dev-notes.js";
+import {
+  classifyToolError,
+  toolNoteKey,
+  turnNoteKey,
+  type DevNotes,
+  type NoteStatus,
+  type TurnNoteInput,
+  type TurnNotes,
+} from "./dev-notes.js";
 import type { DeviceRegistry } from "./device-registry.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
 import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
@@ -777,13 +785,15 @@ export class Session {
         try {
           const result = await client.callTool(plan.service, tool, args, turn.abort.signal);
           this.toolFinished(id, full, result.isError);
-          if (result.isError) this.note({ kind: "tool_error", service: plan.service, tool, errorClass: "error", turnId: id });
+          // A result that arrives after the user cancelled the turn is not a tool error (T7.w.10k).
+          if (result.isError && !turn.abort.signal.aborted) this.noteToolError(plan.service, tool, result.text, "error", id);
           return { status: "ok", result };
         } catch (err) {
           if (turn.abort.signal.aborted) return { status: "denied", reason: "cancelled" };
           this.toolFinished(id, full, true);
-          this.note({ kind: "tool_error", service: plan.service, tool, errorClass: "unavailable", turnId: id });
           const message = (err as Error).message;
+          // A thrown call is a transport failure: `unreachable` unless its message says more (e.g. a timeout).
+          this.noteToolError(plan.service, tool, message, "unreachable", id);
           this.deps.logger.warn(`[shadow-core] direct ${plan.service}/${tool} failed: ${message}`);
           return { status: "unavailable", message };
         }
@@ -809,6 +819,8 @@ export class Session {
     });
 
     if (outcome.kind === "fallback") {
+      // The spoken name matched no entity (static or learned rule): a missing HA alias, most likely (T7.w.10i).
+      if (outcome.reason === "name_not_found" && plan.name !== undefined) this.note({ kind: "unknown_name", name: plan.name, turnId: id });
       void this.slog.append({ kind: "route", id, tier: 0, rule: plan.rule, fallback: outcome.reason });
       this.recordUsage(usage("fallback"));
       return false;
@@ -863,17 +875,25 @@ export class Session {
   }
 
   /**
-   * A model tool result: `isError` of a call the gate allowed is a `tool_error`
-   * (class `error`: the model path cannot tell an unreachable service from a
-   * failing tool). Denied calls (user, gate) and calls the gateway refused
-   * before the gate (unknown tool: `missing_capability`) are not errors; nor
-   * is the error result of a cancelled turn.
+   * A model tool result: `isError` of a call the gate allowed is a `tool_error`,
+   * classified from its error text (`classifyToolError`; no text = `error`).
+   * Denied calls (user, gate) and calls the gateway refused before the gate
+   * (unknown tool: `missing_capability`) are not errors; nor is a result of a
+   * turn the user cancelled (Durdur, barge-in, socket close), or one that only
+   * says the turn was cancelled or is over (T7.w.10k).
    */
-  private noteModelResult(turn: ActiveTurn, toolUseId: string, name: string | undefined, isError: boolean): void {
+  private noteModelResult(turn: ActiveTurn, toolUseId: string, name: string | undefined, isError: boolean, errorText?: string): void {
     if (!isError || !turn.allowedUseIds.has(toolUseId) || turn.abort.signal.aborted || !name) return;
     const { identity } = this.deps.policy.levelFor(name);
     if (identity.service === undefined) return;
-    this.note({ kind: "tool_error", service: identity.service, tool: identity.tool, errorClass: "error", turnId: turn.id });
+    this.noteToolError(identity.service, identity.tool, errorText, "error", turn.id);
+  }
+
+  /** One failed tool call as a `tool_error` note; the text is only classified, never stored or logged. */
+  private noteToolError(service: string, tool: string, text: string | undefined, fallback: "error" | "unreachable", turnId: string): void {
+    const verdict = classifyToolError(text, fallback);
+    if (verdict === "cancelled") return;
+    this.note({ kind: "tool_error", service, tool, errorClass: verdict, turnId });
   }
 
   /** One model tool call reached the gate: counted for `wandering`. */
@@ -1183,10 +1203,10 @@ export class Session {
           if (o.escalatable) buffer += chunk;
           else this.live(turn, chunk);
         },
-        onToolResult: (toolUseId, name, isError) => {
+        onToolResult: (toolUseId, name, isError, errorText) => {
           this.toolFinished(id, name, isError);
           this.observeResult(turn, toolUseId, isError);
-          this.noteModelResult(turn, toolUseId, name, isError);
+          this.noteModelResult(turn, toolUseId, name, isError, errorText);
         },
       },
     );
@@ -1361,15 +1381,16 @@ export class Session {
         model: o.model,
         canUseTool: this.gate(turn, this.deps.tierServices?.[o.tier]),
         signal: turn.abort.signal,
+        turnId: turn.id,
         callbacks: {
           onDelta: (chunk) => {
             if (o.escalatable) buffer += chunk;
             else this.live(turn, chunk);
           },
-          onToolResult: (toolUseId, name, isError) => {
+          onToolResult: (toolUseId, name, isError, errorText) => {
             this.toolFinished(turn.id, name, isError);
             this.observeResult(turn, toolUseId, isError);
-            this.noteModelResult(turn, toolUseId, name, isError);
+            this.noteModelResult(turn, toolUseId, name, isError, errorText);
           },
         },
       });
@@ -1469,8 +1490,10 @@ export class Session {
    * (persistent mode, router.yaml `tierN.services`): tools of any other
    * service are denied ("not available in this mode") without asking.
    */
-  gate(turn: ActiveTurn, services?: readonly string[]): PermissionCallback {
-    return async (toolName, input, opts): Promise<PermissionDecision> => {
+  gate(turn: ActiveTurn, services?: readonly string[]): PermissionCallback & { readonly turnId: string } {
+    // `turnId`: a per-turn gate tells the gateway which turn its calls belong to
+    // (legacy runner; `GatewayGate.turnId`), for turn dev-notes such as `unknown_tool`.
+    const gate: PermissionCallback = async (toolName, input, opts): Promise<PermissionDecision> => {
       this.countToolCall(turn, toolName);
       const r = services && !this.inTierServices(toolName, services)
         ? this.denyOutsideTier(turn, toolName, input)
@@ -1481,6 +1504,7 @@ export class Session {
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
         : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
     };
+    return Object.assign(gate, { turnId: turn.id });
   }
 
   private inTierServices(toolName: string, services: readonly string[]): boolean {

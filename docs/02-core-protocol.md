@@ -60,7 +60,7 @@ refuses to start.
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","memory","usage_limit"]}` | Authenticated. `features`: see *Features*. |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -210,7 +210,7 @@ actions, never a push or a sound.
 |---|---|
 | `itemId` | Opaque id; send it back as `dev_action.itemId`. |
 | `type` | `rule` (learned rule) or `note` (dev-note). |
-| `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`) or `learned_rule`. |
+| `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`, `unknown_name`) or `learned_rule`. Clients show unknown kinds as-is. |
 | `status` | Rules: `candidate`, `active`, `suspended`. Notes: `open`, `ignored`, `fixed`. Clients show unknown values as-is. |
 | `count`, `firstSeen`, `lastSeen` | Occurrences / observations and ISO 8601 times, as stored. |
 | `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange` (not sent today: the rule file keeps no range), `observations`. |
@@ -218,7 +218,10 @@ actions, never a push or a sound.
 | `canManage` | Whether this device may use `add_rule` and `remove_rule`. |
 
 Items are display only: they carry the fields of the files, never user text,
-arguments, entity or room names, error messages, URLs or tokens.
+arguments, entity or room names, error messages, URLs or tokens. An
+`unknown_name` note (added in protocol 1, T7.w.10i: a tier-0 rule found no
+entity for a spoken name) keeps that name only in the Core's local
+`dev-notes/turns.json`; its item carries the fixed `message` like any other.
 
 - `dev_list` is answered with `dev` (same `id`).
 - `dev_action` `action` is one of `add_rule` ("Kuralı ekle": candidate → active;

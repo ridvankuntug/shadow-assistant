@@ -7,8 +7,11 @@
  *   services (gate), a tool name the gateway does not list (`McpGateway.call`);
  * - `wandering`: ≥ wander_calls tool calls, or the tool-call cap;
  * - `tool_error`: an `isError` result of an allowed call (model or tier 0), an
- *   unreachable service at tier 0; a user denial is not an error;
+ *   unreachable service at tier 0, classified from the error text (T7.w.10j);
+ *   a user denial and a result of a cancelled turn are not errors (T7.w.10k);
  * - `rule_suspended`: a learned rule suspended after fallbacks in a row;
+ * - `unknown_name`: a tier-0 rule (static or learned) found no entity for the
+ *   spoken name and fell back to the model (T7.w.10i);
  * - `lastTurnId` is the turn's id; no text, argument, result or error message
  *   reaches the file.
  */
@@ -24,7 +27,7 @@ import { TurnNotes, type TurnNote } from "../src/dev-notes.js";
 import { learnPolicy, learnTargetFilter, type Extracted } from "../src/learn/extract.js";
 import { LearnedRuleStore } from "../src/learn/store.js";
 import type { DirectToolClient, DirectToolResult, RemoteMcpClient, RemoteToolList } from "../src/mcp-direct.js";
-import { McpGateway, type GatewayGate } from "../src/mcp-gateway.js";
+import { GATEWAY_MESSAGES, McpGateway, type GatewayGate } from "../src/mcp-gateway.js";
 import type {
   AttemptHandle,
   AttemptOutcome,
@@ -99,9 +102,14 @@ class MockHa implements DirectToolClient {
   calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
   writeResult: DirectToolResult = { text: "ok", isError: false };
   failWrites: Error | undefined;
+  /** Live context returned to the fast path (default: `LIVE`). */
+  liveText: string = LIVE;
+  /** Runs before a write returns (e.g. the user cancels while it runs). */
+  beforeWrite: (() => Promise<void>) | undefined;
   async callTool(_service: string, tool: string, args: Record<string, unknown>): Promise<DirectToolResult> {
     this.calls.push({ tool, args });
-    if (tool === "homeassistant__GetLiveContext") return { text: LIVE, isError: false };
+    if (tool === "homeassistant__GetLiveContext") return { text: this.liveText, isError: false };
+    await this.beforeWrite?.();
     if (this.failWrites) throw this.failWrites;
     return this.writeResult;
   }
@@ -113,13 +121,17 @@ interface ToolUse {
   full?: string;
   args?: Record<string, unknown>;
   isError?: boolean;
+  /** Error text of the result (as the SDK reports it); only with `isError`. */
+  errorText?: string;
+  /** Runs after the gate, before the result is reported (e.g. the user cancels meanwhile). */
+  beforeResult?: () => Promise<void>;
 }
 
 let useSeq = 0;
 /** Like the gateway: every call is gated; a denial comes back as an `isError` result. */
 async function useTools(
   gate: TurnRequest["canUseTool"],
-  onResult: ((id: string, name: string | undefined, isError: boolean) => void) | undefined,
+  onResult: ((id: string, name: string | undefined, isError: boolean, errorText?: string) => void) | undefined,
   signal: AbortSignal | undefined,
   uses: ToolUse[],
 ): Promise<void> {
@@ -127,7 +139,9 @@ async function useTools(
     const id = `tu-${++useSeq}`;
     const name = u.full ?? `${HA}${u.tool ?? "homeassistant__GetLiveContext"}`;
     const d = await gate(name, u.args ?? {}, { signal: signal ?? new AbortController().signal, toolUseID: id });
-    onResult?.(id, name, d.behavior !== "allow" || u.isError === true);
+    await u.beforeResult?.();
+    const isError = d.behavior !== "allow" || u.isError === true;
+    onResult?.(id, name, isError, d.behavior !== "allow" ? d.message : u.errorText);
   }
 }
 
@@ -152,10 +166,12 @@ class FakeLive implements ProviderSession {
   busy = false;
   isClosed = false;
   queue: Plan[] = [];
+  requests: AttemptRequest[] = [];
   ready(): Promise<void> {
     return Promise.resolve();
   }
   runAttempt(req: AttemptRequest): AttemptHandle {
+    this.requests.push(req);
     const plan = this.queue.shift() ?? {};
     const done = (async (): Promise<AttemptOutcome> => {
       await useTools(req.canUseTool, req.callbacks.onToolResult?.bind(req.callbacks), req.signal, plan.uses ?? []);
@@ -347,6 +363,20 @@ test("missing_capability: McpGateway.call() notes a tool name it does not list, 
   gateway.close();
 });
 
+test("unknown_tool through the legacy per-turn gate (Session.gate) carries the turn id (T7.w.10j)", async () => {
+  const h = harness();
+  h.agent.queue.push({ text: "Tamam." });
+  await h.say("salonu kontrol et");
+  const gate = h.agent.calls[0]?.canUseTool as GatewayGate;
+  assert.equal((gate as { turnId?: string }).turnId, "t1");
+  const notes = new TurnNotes({ dir: join(base, "gw-session-gate"), coalesceMs: 0 });
+  const gateway = new McpGateway({ sources: [{ kind: "remote", service: "home-assistant", client: new ListOnlyHa() }], turnNotes: notes });
+  const r = await gateway.call("home-assistant", "intent__HassMadeUp", {}, gate, { signal: new AbortController().signal });
+  assert.equal(r.isError, true);
+  assert.deepEqual((await notes.read()).notes.map((n) => [n.reason, n.tool, n.lastTurnId]), [["unknown_tool", "intent__HassMadeUp", "t1"]]);
+  gateway.close();
+});
+
 // ------------------------------------------------------------------ wandering
 
 test("wandering: five tool calls in one turn (legacy); four are not", async () => {
@@ -411,7 +441,7 @@ test("a user denial and a read-only denial are not tool errors", async () => {
   assert.deepEqual(await ro.settledNotes(), []);
 });
 
-test("tool_error at tier 0: an isError result (class error) and an unreachable service (class unavailable)", async () => {
+test("tool_error at tier 0: an isError result is classified from its text (not_found); a thrown call is unreachable", async () => {
   const h = harness();
   h.ha.writeResult = { text: "Error calling tool: entity light.gizli_oda not found at http://10.0.0.9", isError: true };
   await h.say("salon ışığını aç");
@@ -421,10 +451,125 @@ test("tool_error at tier 0: an isError result (class error) and an unreachable s
   assert.deepEqual(
     notes.filter((n) => n.kind === "tool_error").map((n) => [n.service, n.tool, n.errorClass, n.lastTurnId]),
     [
-      ["home-assistant", "intent__HassTurnOn", "error", "t1"],
-      ["home-assistant", "intent__HassTurnOn", "unavailable", "t2"],
+      ["home-assistant", "intent__HassTurnOn", "not_found", "t1"],
+      ["home-assistant", "intent__HassTurnOn", "unreachable", "t2"],
     ],
   );
+});
+
+test("tool_error classes (T7.w.10j): the model path classifies the error text; cancel texts are not errors", async () => {
+  const h = harness();
+  const on = (errorText: string | undefined): ToolUse => ({ tool: "intent__HassTurnOn", args: { name: "Salon Lamba" }, isError: true, ...(errorText !== undefined ? { errorText } : {}) });
+  h.agent.queue.push({
+    uses: [
+      on("Error calling tool: MatchFailedError: no entity matched the name"),
+      on(GATEWAY_MESSAGES.tooLate),
+      on(GATEWAY_MESSAGES.unavailable("home-assistant")),
+      on("Error calling tool: 403 Forbidden"),
+      on("Error calling tool: expected int for dictionary value @ data['brightness']"),
+      on("Error calling tool: something odd happened"),
+      on(undefined),
+      // Only says the turn is cancelled / over: never a tool error (T7.w.10k).
+      on(GATEWAY_MESSAGES.cancelled),
+      on(GATEWAY_MESSAGES.noTurn),
+    ],
+  });
+  await h.say("salonu aç lütfen");
+  const notes = (await h.settledNotes()).filter((n) => n.kind === "tool_error");
+  assert.deepEqual(
+    notes.map((n) => [n.errorClass, n.count, n.lastTurnId]),
+    [
+      ["not_found", 1, "t1"],
+      ["timeout", 1, "t1"],
+      ["unreachable", 1, "t1"],
+      ["forbidden", 1, "t1"],
+      ["invalid_value", 1, "t1"],
+      ["error", 2, "t1"],
+    ],
+  );
+  assert.equal(notes.find((n) => n.errorClass === "not_found")?.message, "araç hedefi bulamadı");
+});
+
+test("tool_error classes on the persistent path; the attempt carries the turn id (T7.w.10j)", async () => {
+  const live = new FakeLive();
+  const h = harness({ live });
+  live.queue.push({ uses: [{ tool: "light__HassLightSet", args: { name: "Salon Lamba", brightness: 500 }, isError: true, errorText: "Error calling tool: value must be at most 100" }] });
+  await h.say("salonu kıs lütfen");
+  const notes = await h.settledNotes();
+  assert.deepEqual(notes.map((n) => [n.kind, n.tool, n.errorClass, n.lastTurnId]), [["tool_error", "light__HassLightSet", "invalid_value", "t1"]]);
+  assert.equal(live.requests[0]?.turnId, "t1");
+});
+
+test("a result that arrives after the user cancelled the turn is not a tool error (model path and tier 0; T7.w.10k)", async () => {
+  const h = harness();
+  h.agent.queue.push({
+    uses: [
+      {
+        tool: "intent__HassTurnOn",
+        args: { name: "Salon Lamba" },
+        isError: true,
+        errorText: "Error calling tool: something odd happened",
+        beforeResult: () => h.session.handle({ type: "cancel", id: "t1" }),
+      },
+    ],
+  });
+  await h.say("salonu aç lütfen");
+
+  h.ha.writeResult = { text: "Error calling tool: something odd happened", isError: true };
+  h.ha.beforeWrite = () => h.session.handle({ type: "cancel", id: "t2" });
+  await h.say("salon ışığını aç");
+  const notes = await h.settledNotes();
+  assert.equal(h.ha.calls.filter((c) => c.tool === "intent__HassTurnOn").length, 1, "the tier-0 write ran");
+  assert.deepEqual(notes.filter((n) => n.kind === "tool_error"), []);
+});
+
+test("a tier-0 call that throws after the user cancelled the turn is not a tool error (T7.w.10k)", async () => {
+  const h = harness();
+  h.ha.failWrites = new Error("connect ECONNREFUSED 10.0.0.9:8123");
+  h.ha.beforeWrite = () => h.session.handle({ type: "cancel", id: "t1" });
+  await h.say("salon ışığını aç");
+  const notes = await h.settledNotes();
+  assert.equal(h.ha.calls.filter((c) => c.tool === "intent__HassTurnOn").length, 1, "the tier-0 write ran");
+  assert.deepEqual(notes.filter((n) => n.kind === "tool_error"), []);
+});
+
+// ------------------------------------------------------------------ unknown_name
+
+test("unknown_name (T7.w.10i): a static tier-0 rule that finds no entity for the name falls back and notes the name once, counted", async () => {
+  const h = harness();
+  h.agent.queue.push({ text: "Model cevabı." }, { text: "Model cevabı." });
+  await h.say("bahçe ışığını aç");
+  await h.say("Bahçe  ışığını aç");
+  // A name that resolves runs at tier 0 and notes nothing.
+  await h.say("salon ışığını aç");
+  const notes = await h.settledNotes();
+  assert.equal(h.agent.calls.length, 2, "the two unknown names went to the model");
+  const un = notes.filter((n) => n.kind === "unknown_name");
+  assert.deepEqual(un.map((n) => [n.name, n.count, n.lastTurnId]), [["bahçe", 2, "t2"]]);
+  assert.match(un[0]?.message ?? "", /takma ad/);
+  assert.equal(notes.length, 1);
+});
+
+test("unknown_name (T7.w.10i): an ambiguous name falls back to the model without an unknown_name note", async () => {
+  const h = harness();
+  h.ha.liveText = JSON.stringify({
+    result: [
+      "Live Context: An overview of the areas and the devices in this smart home:",
+      "- names: Salon Işık 1",
+      "  domain: light",
+      "  state: 'off'",
+      "  areas: Salon",
+      "- names: Salon Işık 2",
+      "  domain: light",
+      "  state: 'off'",
+      "  areas: Salon",
+    ].join("\n"),
+  });
+  h.agent.queue.push({ text: "Model cevabı." });
+  await h.say("salon ışığını aç");
+  assert.equal(h.agent.calls.length, 1, "the ambiguous name went to the model");
+  assert.equal(h.ha.calls.some((c) => c.tool === "intent__HassTurnOn"), false, "nothing was switched");
+  assert.deepEqual((await h.settledNotes()).filter((n) => n.kind === "unknown_name"), []);
 });
 
 // ------------------------------------------------------------------ rule_suspended
@@ -448,10 +593,16 @@ test("rule_suspended: a learned rule suspended after fallbacks in a row is noted
     await h.say("bilinmeyen lambası parlaklığı yüzde 30 olsun");
   }
   await until(async () => (await h.store.list())[0]?.status === "suspended");
-  const notes = (await h.settledNotes()).filter((n) => n.kind === "rule_suspended");
+  const all = await h.settledNotes();
+  const notes = all.filter((n) => n.kind === "rule_suspended");
   assert.deepEqual(
     notes.map((n) => [n.ruleId, n.reason, n.count, n.lastTurnId]),
     [[id, "name_not_found", 1, "t3"]],
+  );
+  // Each name_not_found fallback of the learned rule is also an unknown name (T7.w.10i).
+  assert.deepEqual(
+    all.filter((n) => n.kind === "unknown_name").map((n) => [n.name, n.count, n.lastTurnId]),
+    [["bilinmeyen", 3, "t3"]],
   );
 });
 

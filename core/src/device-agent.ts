@@ -562,8 +562,8 @@ export class DeviceAgent implements ProviderSession {
       ...(cb.onToolUse ? { onToolUse: (id: string, name: string) => run("onToolUse", () => cb.onToolUse?.(id, name)) } : {}),
       ...(cb.onToolResult
         ? {
-            onToolResult: (id: string, name: string | undefined, isError: boolean) =>
-              run("onToolResult", () => cb.onToolResult?.(id, name, isError)),
+            onToolResult: (id: string, name: string | undefined, isError: boolean, errorText?: string) =>
+              run("onToolResult", () => cb.onToolResult?.(id, name, isError, errorText)),
           }
         : {}),
     };
@@ -637,6 +637,8 @@ export class DeviceAgent implements ProviderSession {
         return {
           gate: (toolName, input, options) => this.gateFor(a, toolName, input, options),
           isCurrent: () => this.inflight === a && !a.settled && !a.stopReason,
+          // The Core turn of the attempt, for the gateway's turn dev-notes (`unknown_tool`, T7.w.10j).
+          ...(a.req.turnId !== undefined ? { turnId: a.req.turnId } : {}),
         };
       },
     },

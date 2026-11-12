@@ -16,6 +16,7 @@ import { DENIED_BUILTIN_TOOLS, SdkAgentRunner } from "../src/agent.js";
 import { BUILTIN_DENY_MESSAGE, createGatewaySdkServers, gatewayToolGuard } from "../src/gateway-sdk.js";
 import { DirectUnavailableError, type RemoteMcpClient, type RemoteToolDef } from "../src/mcp-direct.js";
 import { McpGateway } from "../src/mcp-gateway.js";
+import { TurnNotes } from "../src/dev-notes.js";
 import type { PermissionCallback } from "../src/model-provider.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-gwsdk-test-"));
@@ -235,4 +236,17 @@ test("built-in Claude Code tools are closed in every model query (legacy and per
     for (const t of UNLISTED_NAMES) assert.equal((await ask(guard, t)).behavior, "deny", JSON.stringify(t));
     assert.equal((await ask(guard, "mcp__home-assistant__intent__HassTurnOn")).behavior, "allow");
   }
+});
+
+test("through the SDK server, an unknown tool name is noted with the turn id of the query's gate (T7.w.10j)", async () => {
+  const notes = new TurnNotes({ dir: join(base, "turn-id"), coalesceMs: 0 });
+  const gw = new McpGateway({ sources: [{ kind: "remote", service: HA, client: fakeHa() }], turnNotes: notes });
+  await gw.warm();
+  const gate = Object.assign<PermissionCallback, { turnId: string }>(async (_n, i) => ({ behavior: "allow", updatedInput: i }), { turnId: "turn-9" });
+  const client = await connect(createGatewaySdkServers(gw, gate)[HA] as ReturnType<typeof createGatewaySdkServers>[string]);
+  const r = await client.callTool({ name: "intent__HassMadeUp", arguments: {} });
+  assert.equal(r.isError, true);
+  assert.deepEqual((await notes.read()).notes.map((n) => [n.reason, n.tool, n.lastTurnId]), [["unknown_tool", "intent__HassMadeUp", "turn-9"]]);
+  await client.close();
+  gw.close();
 });

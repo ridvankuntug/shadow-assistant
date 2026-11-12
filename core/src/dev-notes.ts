@@ -26,8 +26,10 @@
  *
  *   - `missing_capability` key: reason + service + tool
  *   - `wandering`          key: tier + route source/rule + sorted unique tool names (max 5)
- *   - `tool_error`         key: service + tool + errorClass
+ *   - `tool_error`         key: service + tool + errorClass (`classifyToolError`)
  *   - `rule_suspended`     key: rule id + reason
+ *   - `unknown_name`       key: the spoken name (normalized): a tier-0 rule found no
+ *                          entity for it and the turn fell back to the model (T7.w.10i)
  *   Every occurrence counts; writes are coalesced (at most one per `coalesceMs`,
  *   `flush()` on shutdown).
  *
@@ -43,6 +45,11 @@
  * entity or room names, error messages, URLs or tokens. TurnNotes copies the
  * whitelisted fields of its input one by one (never spreads it), and names it
  * cannot trust (a tool name the model made up) must look like an identifier.
+ * One exception, approved for T7.w.10i: an `unknown_name` note keeps the name
+ * the user said (normalized, bounded, letters / digits / spaces only), because
+ * that name is exactly what the developer has to add as an HA alias. It stays
+ * in this local file: the Development tab item carries only the fixed message,
+ * and nothing here logs it. Error texts are only classified, never stored.
  */
 import { join } from "node:path";
 import { readJsonOrQuarantine, writeFileAtomic } from "./atomic-file.js";
@@ -428,13 +435,21 @@ function isCountedNote(n: unknown): n is CountedNote {
 // ---------------------------------------------------------------------------
 // turns.json (T7.w.3)
 
-export type TurnNoteKind = "missing_capability" | "wandering" | "tool_error" | "rule_suspended";
+export type TurnNoteKind = "missing_capability" | "wandering" | "tool_error" | "rule_suspended" | "unknown_name";
 /** Why a capability is missing: a built-in tool (gate), a tool outside the tier's services, a name the gateway does not list. */
 export type MissingReason = "builtin" | "tier_service" | "unknown_tool";
 /** What made a turn wander: ≥ `wander_calls` tool calls, or the tool-call cap stopped it. */
 export type WanderTrigger = "calls" | "tool_cap";
-/** A tool result with `isError`, or the service could not be reached. */
-export type ToolErrorClass = "error" | "unavailable";
+/**
+ * Class of a failed tool call (`classifyToolError`, T7.w.10j): the call timed
+ * out, the service found no such target, refused it (permission), could not
+ * be reached, or rejected a value; anything else is `error`. Files written
+ * before T7.w.10j may still hold `unavailable` (the old "unreachable"); such
+ * notes are kept as stored and never written again (LegacyToolErrorClass).
+ */
+export type ToolErrorClass = "timeout" | "not_found" | "forbidden" | "unreachable" | "invalid_value" | "error";
+/** The pre-T7.w.10j class of an unreachable service; read from old files only. */
+export type LegacyToolErrorClass = "unavailable";
 /** Model tiers (router.ts `Tier`). */
 export type NoteTier = 0 | 1 | 2 | 3;
 
@@ -454,7 +469,9 @@ export type TurnNoteInput =
       turnId?: string;
     }
   | { kind: "tool_error"; service: string; tool: string; errorClass: ToolErrorClass; turnId?: string }
-  | { kind: "rule_suspended"; ruleId: string; reason: string; turnId?: string };
+  | { kind: "rule_suspended"; ruleId: string; reason: string; turnId?: string }
+  /** `name`: the spoken name the tier-0 rule could not resolve (user data; see the privacy note above). */
+  | { kind: "unknown_name"; name: string; turnId?: string };
 
 export interface TurnNote extends CountedNote {
   kind: TurnNoteKind;
@@ -467,8 +484,10 @@ export interface TurnNote extends CountedNote {
   tools?: string[];
   /** Latest trigger of a `wandering` note (not part of its key). */
   trigger?: WanderTrigger;
-  errorClass?: ToolErrorClass;
+  errorClass?: ToolErrorClass | LegacyToolErrorClass;
   ruleId?: string;
+  /** `unknown_name` only: the normalized spoken name (`normalizeSpokenName`). */
+  name?: string;
   /** Short Turkish text for the Development tab. */
   message: string;
   /** Opaque id of the last turn that produced this note (points into the local conversation log). */
@@ -488,10 +507,10 @@ export const MAX_WANDER_TOOLS = 5;
 /** Stand-in for a name that does not look like an identifier (it could be anything the model wrote). */
 export const INVALID_NAME = "?";
 
-const TURN_KINDS: ReadonlySet<string> = new Set<TurnNoteKind>(["missing_capability", "wandering", "tool_error", "rule_suspended"]);
+const TURN_KINDS: ReadonlySet<string> = new Set<TurnNoteKind>(["missing_capability", "wandering", "tool_error", "rule_suspended", "unknown_name"]);
 const MISSING_REASONS: ReadonlySet<string> = new Set<MissingReason>(["builtin", "tier_service", "unknown_tool"]);
 const WANDER_TRIGGERS: ReadonlySet<string> = new Set<WanderTrigger>(["calls", "tool_cap"]);
-const ERROR_CLASSES: ReadonlySet<string> = new Set<ToolErrorClass>(["error", "unavailable"]);
+const ERROR_CLASSES: ReadonlySet<string> = new Set<ToolErrorClass>(["timeout", "not_found", "forbidden", "unreachable", "invalid_value", "error"]);
 
 /** Tool, service and rule names: identifier characters only, bounded. Anything else is not stored. */
 const NAME_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -506,11 +525,88 @@ const MISSING_MESSAGES: Record<MissingReason, string> = {
   unknown_tool: "model listede olmayan bir araç istedi",
 };
 const ERROR_MESSAGES: Record<ToolErrorClass, string> = {
+  timeout: "araç çağrısı zaman aşımına uğradı",
+  not_found: "araç hedefi bulamadı",
+  forbidden: "servis izin vermedi (yetki reddi)",
+  unreachable: "servise ulaşılamadı",
+  invalid_value: "araç geçersiz bir değer bildirdi",
   error: "araç hata döndürdü",
-  unavailable: "servise ulaşılamadı",
 };
 const WANDER_MESSAGE = "tur dağıldı: çok fazla araç çağrısı";
 const SUSPENDED_MESSAGE = "öğrenilen kural askıya alındı";
+const UNKNOWN_NAME_MESSAGE = "bilinmeyen ad: hızlı yol bu adı bulamadı; HA'da bu ada takma ad eklenebilir";
+
+/** Longest spoken name an `unknown_name` note keeps (a longer one is not recorded). */
+export const MAX_SPOKEN_NAME = 64;
+/** A normalized spoken name: starts with a letter or digit; then letters, digits, spaces, `'`, `.`, `-`. */
+const SPOKEN_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}' .-]*$/u;
+
+/**
+ * The form an `unknown_name` note stores (and keys on): NFC, Turkish lower
+ * case, trimmed, inner whitespace collapsed. Undefined (nothing recorded) for
+ * a non-string, an empty or too long name, or one with any other character
+ * (punctuation, symbols, control characters), so the note holds a plain name
+ * and nothing else the user said.
+ */
+export function normalizeSpokenName(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const n = v.normalize("NFC").toLocaleLowerCase("tr-TR").replace(/[‘’]/gu, "'").trim().replace(/\s+/gu, " ");
+  if (n.length === 0 || n.length > MAX_SPOKEN_NAME || !SPOKEN_NAME_RE.test(n)) return undefined;
+  return n;
+}
+
+/**
+ * What `classifyToolError` says about a failed result: one of the classes, or
+ * `cancelled` for a result that only says the turn was cancelled or is over
+ * (the gateway's GATEWAY_MESSAGES.cancelled / noTurn): never a `tool_error`.
+ */
+export type ToolErrorVerdict = ToolErrorClass | "cancelled";
+
+/** Only the start of an error text is looked at (texts are short; this bounds the regex work). */
+const CLASSIFY_MAX_CHARS = 2_000;
+
+/**
+ * Tried in this order; the first match wins. The patterns cover the Core's own
+ * texts (mcp-gateway.ts GATEWAY_MESSAGES, mcp-direct.ts DirectUnavailableError),
+ * Node / fetch transport errors, HTTP status and JSON-RPC error codes, and
+ * Home Assistant's tool errors ("Error calling tool: …"). Order matters: a
+ * timed-out call is also a failed connection, and `ENOTFOUND` (DNS) means
+ * unreachable, not "no such target"; `forbidden` is tried before `unreachable`
+ * because McpDirectClient wraps connection errors as `connect failed: <inner>`
+ * (an inner 401 must stay `forbidden`). Bare HTTP codes only count in context
+ * (`status 502`, `HTTP 403`), so a stray number is never a class.
+ */
+const ERROR_PATTERNS: ReadonlyArray<readonly [ToolErrorVerdict, RegExp]> = [
+  ["cancelled", /^turn was cancelled\.?$|^the turn this call belonged to is over\b/],
+  ["timeout", /\btime[d ]?out\b|\btimed out\b|\btime limit\b|\betimedout\b|\bdeadline\b|-32001\b|zaman aşımı/],
+  ["forbidden", /\bforbidden\b|\bunauthori[sz]ed\b|\bpermission denied\b|\baccess denied\b|\bnot permitted\b|\bnot authori[sz]ed\b|(?:\bstatus(?: code)?|\bhttp(?:\/[\d.]+)?|\berror|\bcode)\s*[:=]?\s*40[13]\b|yetki/],
+  [
+    "unreachable",
+    /\bnot reachable\b|\bunreachable\b|\beconnrefused\b|\beconnreset\b|\behostunreach\b|\benetunreach\b|\benotfound\b|\beai_again\b|\bconnect(?:ion)? (?:failed|refused|closed|reset)\b|\bsocket hang up\b|\bfetch failed\b|\bservice unavailable\b|\bbad gateway\b|(?:\bstatus(?: code)?|\bhttp(?:\/[\d.]+)?|\berror|\bcode)\s*[:=]?\s*50[234]\b|-32000\b|ulaşılamıyor/,
+  ],
+  [
+    "not_found",
+    /\bnot found\b|\bno such\b|\bdoes not exist\b|\bunknown (?:entity|device|area|name|target)\b|\bno (?:matching )?(?:entity|entities|device|devices|area|target)\b|\bmatch ?failed|\bno_valid_targets\b|(?:\bstatus(?: code)?|\bhttp(?:\/[\d.]+)?|\berror|\bcode)\s*[:=]?\s*404\b|bulunamadı/,
+  ],
+  [
+    "invalid_value",
+    /\binvalid\b|\bout of range\b|\bnot a valid\b|\bmust be\b|\bvalidation\b|\bexpected\b|\bnot supported\b|\bunsupported\b|\bbad request\b|(?:\bstatus(?: code)?|\bhttp(?:\/[\d.]+)?|\berror|\bcode)\s*[:=]?\s*(?:400|422)\b|-32602\b|geçersiz/,
+  ],
+];
+
+/**
+ * Classifies a failed tool call from what is observable: the error text of an
+ * `isError` result, or the message of a thrown call. Only the verdict leaves
+ * this function; the text is never stored or logged. Without a match (or
+ * without a text) the verdict is `fallback`: `error` for an `isError` result;
+ * tier 0 passes `unreachable` for a thrown call (a transport failure).
+ */
+export function classifyToolError(text: string | undefined, fallback: ToolErrorClass = "error"): ToolErrorVerdict {
+  if (typeof text !== "string" || text === "") return fallback;
+  const t = text.slice(0, CLASSIFY_MAX_CHARS).trim().toLowerCase();
+  for (const [verdict, re] of ERROR_PATTERNS) if (re.test(t)) return verdict;
+  return fallback;
+}
 
 function safeName(v: unknown): string {
   return typeof v === "string" && NAME_RE.test(v) ? v : INVALID_NAME;
@@ -521,7 +617,9 @@ function safeOptionalName(v: unknown): string | undefined {
 }
 
 /** Identity of a turns.json note (one note per key). */
-export function turnNoteKey(n: Pick<TurnNote, "kind" | "reason" | "service" | "tool" | "tier" | "routeSource" | "routeRule" | "tools" | "errorClass" | "ruleId">): string {
+export function turnNoteKey(
+  n: Pick<TurnNote, "kind" | "reason" | "service" | "tool" | "tier" | "routeSource" | "routeRule" | "tools" | "errorClass" | "ruleId" | "name">,
+): string {
   switch (n.kind) {
     case "missing_capability":
       return JSON.stringify([n.kind, n.reason, n.service ?? "", n.tool]);
@@ -531,6 +629,8 @@ export function turnNoteKey(n: Pick<TurnNote, "kind" | "reason" | "service" | "t
       return JSON.stringify([n.kind, n.service, n.tool, n.errorClass]);
     case "rule_suspended":
       return JSON.stringify([n.kind, n.ruleId, n.reason]);
+    case "unknown_name":
+      return JSON.stringify([n.kind, n.name]);
   }
 }
 
@@ -579,6 +679,11 @@ function normalizeTurnInput(input: TurnNoteInput): Omit<TurnNote, keyof CountedN
     case "rule_suspended": {
       if (typeof input.reason !== "string" || !REASON_RE.test(input.reason)) return undefined;
       return { kind: input.kind, ruleId: safeName(input.ruleId), reason: input.reason, message: SUSPENDED_MESSAGE };
+    }
+    case "unknown_name": {
+      const name = normalizeSpokenName(input.name);
+      if (name === undefined) return undefined;
+      return { kind: input.kind, name, message: UNKNOWN_NAME_MESSAGE };
     }
     default:
       return undefined;

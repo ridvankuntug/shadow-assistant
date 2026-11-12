@@ -293,7 +293,7 @@ export interface DevItem {
   /** Opaque id; send it back as `dev_action.itemId`. */
   itemId: string;
   type: DevItemType;
-  /** Note kind (e.g. `new_tool`, `wandering`) or, for rules, `learned_rule`. */
+  /** Note kind (e.g. `new_tool`, `wandering`, `unknown_name`) or, for rules, `learned_rule`. */
   kind: string;
   /** Rules: `candidate` | `active` | `suspended`; notes: `open` | `ignored` | `fixed`. Clients show unknown values as-is. */
   status: string;
@@ -318,7 +318,11 @@ export interface DevFrame {
   canManage: boolean;
 }
 
-/** Sent to every authenticated socket of a client with the `dev` feature when the badge count changes. */
+/**
+ * The Development badge count changed. Sent only by a Core that lists `dev` in
+ * `welcome.features`, to every authenticated socket (whatever the client);
+ * clients that do not know the frame ignore it.
+ */
 export interface DevCountFrame {
   type: "dev_count";
   open: number;

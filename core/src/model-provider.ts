@@ -50,6 +50,12 @@ export interface AttemptRequest {
   callbacks: TurnCallbacks;
   /** Aborting it interrupts the attempt (barge-in / socket close). */
   signal?: AbortSignal;
+  /**
+   * The Core turn this attempt serves (opaque id). The session hands it to the
+   * gateway with each call it binds (`BoundGate.turnId`), so the gateway's turn
+   * dev-notes point at the turn (T7.w.10j). Absent = no turn id.
+   */
+  turnId?: string;
 }
 
 /** Result of one attempt: neutral usage fields come from `TurnResult`. */

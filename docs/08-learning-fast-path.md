@@ -517,8 +517,9 @@ writers on one file, a schema migration, and nothing gained.
 |---|---|---|
 | `missing_capability` | the model asked for something the Core cannot give: a built-in tool (gate `builtin`), a tool outside the tier's services (`tier_service`), a tool name the gateway does not list (`unknown_tool`, recorded in `McpGateway.call()`, before the gate) | kind + reason + service + tool |
 | `wandering` | a model turn with ≥ `wander_calls` tool calls (default 5; `DEFAULT_WANDER_CALLS` in session.ts, not a router.yaml key in v1) or stopped by the tool-call cap (`tool_cap`, persistent sessions) | kind + tier + route source/rule + sorted unique tool names (max 5) |
-| `tool_error` | a tool result with `isError`, or the service unreachable (model or tier 0); user denials are not errors | kind + service + tool + class (`error` / `unavailable`) |
+| `tool_error` | a tool result with `isError`, or the service unreachable (model or tier 0); user denials and results of a cancelled turn are not errors | kind + service + tool + class (`timeout` / `not_found` / `forbidden` / `unreachable` / `invalid_value` / `error`; T7.w.10j) |
 | `rule_suspended` | a learned rule was suspended | kind + rule id + reason |
+| `unknown_name` | a tier-0 rule (static or learned) found no entity for the spoken name (`name_not_found`) and the turn fell back to the model (T7.w.10i); message: "bilinmeyen ad: … HA'da bu ada takma ad eklenebilir" | kind + spoken name (normalized) |
 
 Each note: key fields, a short Turkish `message`, `count`, `firstSeen`,
 `lastSeen`, `lastTurnId`, and the Development-tab state `status?` (`ignored` /
@@ -529,20 +530,51 @@ Each note: key fields, a short Turkish `message`, `count`, `firstSeen`,
   denies every non-gateway name before the Core gate sees it, so a `builtin` note
   only appears for a built-in name that reaches the gate; recording the guard's
   denials needs gateway-sdk.ts / agent.ts and a turn id there (not in T7.w.3b).
-  `unknown_tool` in `McpGateway.call()`, which serves no particular turn, so these
-  notes have **no `lastTurnId`**. `wandering` counts the model calls that reached
+  `unknown_tool` in `McpGateway.call()`, with the turn id of the gate the call came
+  through (T7.w.10j): a persistent session's dispatcher binds the call to the
+  current attempt, whose request carries the Core turn id (`AttemptRequest.turnId`
+  → `BoundGate.turnId`); the legacy runner's per-turn gate carries it as
+  `GatewayGate.turnId`. A gate without one (tests, other adapters) still gives a
+  note without `lastTurnId`. `wandering` counts the model calls that reached
   the Core gate (calls refused before it, by the SDK guard or as `unknown_tool`,
-  are not counted). `tool_error` in the session: at tier 0 with both classes, on
-  the model path for an `isError` result of a call the gate allowed, always class
-  `error` (the session sees only `isError`, so an unreachable service, an approval
-  that came too late for the call's time limit or a call of an ended turn are not
-  told apart); a denied call (user, timeout, read-only, tier) and the error result
-  of a cancelled turn are not errors. `rule_suspended` when a run suspends a learned
-  rule (a load-time suspension by router.yaml is only logged).
+  are not counted). `tool_error` in the session: at tier 0 (an `isError` result,
+  or a thrown call), on the model path for an `isError` result of a call the gate
+  allowed; a denied call (user, timeout, read-only, tier) and a result of a turn
+  the user cancelled (Durdur, barge-in, socket close; also at tier 0, T7.w.10k)
+  are not errors. `unknown_name` in the session when a tier-0 run falls back with
+  `name_not_found` (a `direct.on_tool_error: reply` answer is not a fallback and
+  not noted; `name_ambiguous` is not noted). `rule_suspended` when a run suspends
+  a learned rule (a load-time suspension by router.yaml is only logged).
+- **Error classes (T7.w.10j).** `classifyToolError` (dev-notes.ts) reads the error
+  text and keeps only the class; the text is never stored or logged. Model path:
+  the text of the SDK `tool_result` block (`TurnCallbacks.onToolResult` gets it for
+  error results only). Tier 0: the `isError` result's text, or the message of a
+  thrown call (no match: `unreachable`, since a thrown call is a transport
+  failure). First match wins, in this order:
+
+  | Class | Matches (case-insensitive) |
+  |---|---|
+  | (not a tool error) | exactly the gateway's "Turn was cancelled." or "The turn this call belonged to is over…" |
+  | `timeout` | "timeout", "timed out", "time limit" (the gateway's late approval), `ETIMEDOUT`, "deadline", JSON-RPC `-32001`, "zaman aşımı" |
+  | `unreachable` | "not reachable" (the gateway's unavailable text), "unreachable", `ECONNREFUSED` / `ECONNRESET` / `EHOSTUNREACH` / `ENETUNREACH` / `ENOTFOUND` / `EAI_AGAIN`, "connect(ion) failed/refused/closed/reset", "socket hang up", "fetch failed", "service unavailable", "bad gateway", HTTP 502/503/504, JSON-RPC `-32000`, "ulaşılamıyor" |
+  | `forbidden` | "forbidden", "unauthorized", "permission denied", "access denied", "not permitted", "not authorized", HTTP 401/403, "yetki" |
+  | `not_found` | "not found", "no such", "does not exist", "unknown entity/device/area/name/target", "no (matching) entity/device/area/target", HA `MatchFailedError`, `no_valid_targets`, HTTP 404, "bulunamadı" |
+  | `invalid_value` | "invalid" (also the gateway's invalid-arguments and rejected-call texts), "out of range", "not a valid", "must be", "validation", "expected", "(not) supported", "bad request", HTTP 400/422, JSON-RPC `-32602`, "geçersiz" |
+  | `error` | anything else, or no text |
+
+  Notes written before T7.w.10j may hold class `unavailable`; they are kept as
+  stored (their own key) and new records use `unreachable`. The SDK's own
+  time-out of a gateway call reaches the session as an error result too, so it is
+  classified from its text like any other.
 - **Privacy rule (same as `tools.json`, enforced by a test):** only enum values,
   tool and service names from the catalog, tier, route source / static rule id,
   learned rule id, counts, times and the opaque `lastTurnId`. Never user text,
   arguments, results, entity or room names, error messages, URLs or tokens.
+  One approved exception (T7.w.10i): an `unknown_name` note keeps the spoken name
+  (NFC, Turkish lower case, whitespace collapsed, at most 64 characters, letters,
+  digits, spaces, `'`, `.`, `-` only; anything else is not recorded), since that
+  name is what the developer adds as an HA alias. It stays in the local
+  `turns.json`; the `dev` item carries only the fixed message and nothing logs it.
   `lastTurnId` points into the local conversation log, which already holds the
   text, so the developer can look the turn up without the note copying it.
 - Every occurrence counts (the one-hour `touchMs` stays for `tools.json`, where the
@@ -857,6 +889,7 @@ block.
   turn-off rules (`light-off`, `device-off`) are unchanged and still open.
 - Tier-0 fallbacks with `name_not_found` point at missing HA aliases. A
   `tier0_fallback` dev-note kind would surface them; it is not in T7.w.3's list.
+  **Closed by T7.w.10i** (`unknown_name` turn note).
 - `Notifier.kt` uses one fixed notification id, so a second confirmation request
   replaces the first; T7.w.5d changes the id scheme for notifications only.
 
@@ -885,6 +918,7 @@ task may touch. Two tasks that share a file are never run in parallel; the
 | T7.w.6a | `core/test/agent.test.ts`, `core/test/gateway-sdk.test.ts`, `core/test/permissions.test.ts` | – | – |
 | T7.w.9 | `core/src/learn/extract.ts`, `core/test/learn-extract.test.ts`, `core/test/session-learn.test.ts` | 2b, 2d | – |
 | T7.w.10 | `core/src/router-config.ts`, `core/src/direct.ts`, `core/src/learn/extract.ts`, `core/src/turkish.ts`, `router.yaml`, `docs/04-router.md`, `core/test/router-tier0.test.ts`, `core/test/tiers.test.ts`, `core/test/learn-extract.test.ts`, `core/test/numbers.test.ts` | T7.w.9 | – |
+| T7.w.10i-k | `core/src/dev-notes.ts`, `core/src/session.ts`, `core/src/mcp-gateway.ts`, `core/src/device-agent.ts`, `core/src/agent.ts`, `core/src/model-provider.ts`, `core/src/protocol.ts` (comment), `docs/02-core-protocol.md`, `core/test/dev-notes.test.ts`, `core/test/session-devnotes.test.ts`, `core/test/session-dev.test.ts`, `core/test/mcp-gateway.test.ts`, `core/test/gateway-sdk.test.ts`, `core/test/device-agent.test.ts`, `core/test/agent.test.ts` | T7.w.10f-h | `dev-notes/turns.json` |
 | T7.w.8 | `core/src/learn/store.ts`, `core/src/session.ts`, `core/src/protocol.ts`, `docs/02-core-protocol.md`, `core/test/learn-store.test.ts`, `core/test/session-dev.test.ts`, `core/test/protocol.test.ts`, `ui/src/protocol/types.ts`, `ui/src/ui/DevPanel.tsx`, `ui/src/ui/strings.ts`, `ui/src/assistant/state.ts`, `ui/src/assistant/controller.ts`, `ui/src/**/*.test.ts` | 4b, 4c, T7.w.10 | `fast-path/rules.json` |
 
 Parallel lanes: {3a, 4a, 5a, 6a} can start at once; 2a starts when T7.w.1 has
@@ -969,7 +1003,7 @@ T7.w.7 has no task (deferred).
   home name ("prizma", "lambada") never becomes a literal word; "tavan lambasını …" for a
   device "Tavan Lambası" stays learnable; a learned rule whose `<ad>` matches nothing or
   several entities falls back silently and counts one failure.
-- **T7.w.10 — Fast-path hardening.** Durum: Başlandı
+- **T7.w.10 — Fast-path hardening.** Durum: Bitti
   - [x] T7.w.10a — static tier-0 "aç" only on `light` and on `switch` with `device_class: outlet`
   - [x] T7.w.10b — never-learnable domains pinned by tests; deny name words match whole words, not substrings
   - [x] T7.w.10c — apostrophe in "yüz'de" ignored in number expressions
@@ -978,6 +1012,9 @@ T7.w.7 has no task (deferred).
   - [x] T7.w.10f — unreadable notifications file reported (`notifications_unavailable`), "Bildirimler okunamadı" and a "!" bell badge; the file is never overwritten
   - [x] T7.w.10g — NotificationStore: items by id, no list copy per action, coalesced writes flushed on shutdown
   - [x] T7.w.10h — shutdown chain: every flush runs (`Promise.allSettled`), each failure logged, close budget 3 s (the flushes start even after a hanging close), forced exit after 5 s
+  - [x] T7.w.10i — tier-0 `name_not_found` fallback (static or learned rule) → `unknown_name` turn note (one per spoken name, counted; HA alias hint)
+  - [x] T7.w.10j — `tool_error` classes (`timeout`, `not_found`, `forbidden`, `unreachable`, `invalid_value`, else `error`); `unknown_tool` notes get `lastTurnId`
+  - [x] T7.w.10k — a tool result of a cancelled turn is never a `tool_error`; `DevCountFrame` comment and docs/02 `welcome.features` example
 - [x] **T7.w.8 — Remove and re-open learned rules (decision 4).** `remove_rule` (active →
   rejected) and `add_rule` on a suspended rule (re-validated → active), both limited to
   `CORE_DEV_DEVICES`; "Kaldır" / "Yeniden aç" in the panel. Acceptance: a removed rule leaves the
@@ -1180,3 +1217,25 @@ T7.w.7 has no task (deferred).
   that fails is not rescheduled; `/health` `inbox.notifications` reads 0 while the file is
   unreadable; the UI "!" stays until the next `notifications` reply; a corrupt file that can be
   moved aside still starts as an empty inbox without telling the UI.
+- 2026-11-08: T7.w.10i-k implemented (senior-dev; review and tester pending). Narrowest readings:
+  i: new turn-note kind `unknown_name` (key: kind + normalized spoken name), recorded only when a
+  tier-0 run (static or learned) falls back with `name_not_found`; the name stays in `turns.json`
+  (the `dev` item has the fixed message, no protocol field); `name_ambiguous` and a
+  `direct.on_tool_error: reply` answer are not noted. j: classes from the error text only
+  (`classifyToolError`, table in §T7.w.3); `forbidden` is the permission class (not `denied`, which
+  is the Core gate's user denial); the old `unavailable` becomes `unreachable` for new notes (old
+  notes kept as stored); the model-path text comes from the SDK `tool_result` block via a 4th
+  `onToolResult` argument (agent.ts, device-agent.ts); `unknown_tool` gets `lastTurnId` through
+  `AttemptRequest.turnId` → `BoundGate.turnId` (persistent) and `GatewayGate.turnId` (legacy
+  per-turn gate); gateway-sdk.ts needed no code change (it hands the gate object through). k: a
+  tier-0 `isError` result after a cancel is not noted (the model path already checked the turn's
+  abort); the gateway's cancelled / turn-over texts are never a tool error; `DevCountFrame` comment
+  and the docs/02 `welcome.features` example match the Core.
+- 2026-11-12: T7.w.10i-k done (senior-code-reviewer 1 round, no critical or high finding; tester:
+  core 1269/1269, lint, build, 10 of 11 mutations killed, 1 equivalent). Round 1 fixed: `forbidden`
+  is tried before `unreachable` (a `connect failed: … 401` is a permission error); bare HTTP codes
+  count only with context (`status 502`, `HTTP 503`, `error 403`); typographic apostrophes in a
+  spoken name become `'`. Left open (related findings): a late approval (`tooLate`) is labelled
+  `timeout` though HA was never called; every JSON-RPC error from the gateway reads as
+  `invalid_value`; `unknown_name` notes share the 500-note cap with rarer kinds; the `itemId` hash
+  of an `unknown_name` note is unsalted; the UI has no Turkish label for `unknown_name`.

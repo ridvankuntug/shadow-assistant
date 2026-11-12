@@ -245,6 +245,18 @@ test("dev_list: rule candidates and both note files, the badge count, canManage;
   }
 });
 
+test("dev_list: an unknown_name note shows the fixed message only; the spoken name stays out of the frame (T7.w.10i)", async () => {
+  const h = await harness();
+  await h.turnNotes.record({ kind: "unknown_name", name: "Bahçe Lambası", turnId: "t5" });
+  const v = await h.list();
+  const note = v.items.find((i) => i.type === "note") as DevItem;
+  assert.equal(note.kind, "unknown_name");
+  assert.equal(note.message, "bilinmeyen ad: hızlı yol bu adı bulamadı; HA'da bu ada takma ad eklenebilir");
+  const text = JSON.stringify(v);
+  for (const leaked of ["bahçe", "Bahçe", "lambası", "t5", "\"name\""]) assert.equal(text.includes(leaked), false, `a dev frame must not carry ${leaked}`);
+  assert.equal(note.itemId.startsWith("n-"), true);
+});
+
 test("dev_list with the tab disabled is bad_request; canManage follows CORE_DEV_DEVICES and the token's device", async () => {
   const off = await harness({ withTab: false });
   assert.equal(errorCode(await off.ask({ type: "dev_list" })), "bad_request");
@@ -386,7 +398,7 @@ test("notes: ignore and fixed from any device (idempotent), status stored; add_r
 test("ignore and fixed work for a device outside CORE_DEV_DEVICES", async () => {
   const h = await harness({ managers: [], device: "android" });
   const id = await candidate(h);
-  await h.turnNotes.record({ kind: "tool_error", service: "home-assistant", tool: "intent__HassTurnOn", errorClass: "unavailable" });
+  await h.turnNotes.record({ kind: "tool_error", service: "home-assistant", tool: "intent__HassTurnOn", errorClass: "unreachable" });
   const note = (await h.list()).items.find((i) => i.type === "note") as DevItem;
   assert.equal((await h.ask({ type: "dev_action", itemId: note.itemId, action: "fixed" })).type, "dev");
   assert.equal((await h.ask({ type: "dev_action", itemId: `r-${id}`, action: "ignore" })).type, "dev");
