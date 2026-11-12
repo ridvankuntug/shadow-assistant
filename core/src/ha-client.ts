@@ -1,5 +1,5 @@
 /**
- * Read-only Home Assistant WebSocket client (docs/09 (c), T7.w.11.5).
+ * Read-only Home Assistant WebSocket client (docs/09 (c), T7.w.11.5 / T7.w.11.6).
  *
  * Connects to `${HA_URL}/api/websocket` (ws/wss from http/https), authenticates
  * with the Core's long-lived token and hands the caller a connection that can
@@ -27,8 +27,8 @@
 import WebSocket from "ws";
 import type { Logger } from "./session.js";
 
-/** The only commands this client sends (read-only). T7.w.11.6 adds `repairs/list_issues`. */
-export const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set(["persistent_notification/subscribe"]);
+/** The only commands this client sends (read-only): the notification subscription (T7.w.11.5) and the repairs list (T7.w.11.6). */
+export const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set(["persistent_notification/subscribe", "repairs/list_issues"]);
 
 export const HA_BACKOFF_START_MS = 1_000;
 export const HA_BACKOFF_MAX_MS = 60_000;

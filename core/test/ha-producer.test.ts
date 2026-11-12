@@ -1,6 +1,6 @@
 /**
- * T7.w.11.5: HA alerts (docs/09 (c)): the read-only HA WebSocket client and the
- * persistent-notification producer, against a local fake HA WebSocket server on
+ * T7.w.11.5 / T7.w.11.6: HA alerts (docs/09 (c)): the read-only HA WebSocket client
+ * and the persistent-notification + repairs producer, against a local fake HA WebSocket server on
  * 127.0.0.1 (never a real HA). Backoff timers and the producer's retry timer are
  * fake; the sockets are real.
  */
@@ -19,6 +19,7 @@ import {
 } from "../src/ha-client.js";
 import {
   HA_ACCESS_KEY,
+  HA_REPAIRS_POLL_MS,
   HA_RESOLVE_GRACE_MS,
   HA_SOURCE,
   HaAlertsProducer,
@@ -27,6 +28,8 @@ import {
   haAlertUrgency,
   haAlertsSettings,
   pnKey,
+  repairKey,
+  repairOf,
   type HaNotificationPort,
 } from "../src/ha-producer.js";
 import { MAX_BODY_CHARS, MAX_KEY_CHARS, MAX_TITLE_CHARS, type NotificationItem, type RaiseInput, type RaiseResult } from "../src/notifications.js";
@@ -41,7 +44,25 @@ const notif = (id: string, title: string | null, message = `${id} body`): Notif 
   created_at: "2026-11-13T10:00:00+00:00",
 });
 
-/** A fake HA WebSocket API: auth + persistent_notification/subscribe, events pushed by the test. */
+type Issue = Record<string, unknown>;
+/** A `repairs/list_issues` entry as HA sends it. */
+const issue = (domain: string, issueId: string, o: Issue = {}): Issue => ({
+  breaks_in_ha_version: null,
+  created: "2026-11-13T10:00:00+00:00",
+  dismissed_version: null,
+  domain,
+  ignored: false,
+  is_fixable: false,
+  issue_domain: null,
+  issue_id: issueId,
+  learn_more_url: null,
+  severity: "warning",
+  translation_key: issueId,
+  translation_placeholders: null,
+  ...o,
+});
+
+/** A fake HA WebSocket API: auth + persistent_notification/subscribe + repairs/list_issues, events pushed by the test. */
 class FakeHa {
   readonly wss: WebSocketServer;
   readonly notifications = new Map<string, Notif>();
@@ -50,6 +71,12 @@ class FakeHa {
   acceptToken = true;
   /** Answer the subscription with success: false. */
   refuseSubscribe = false;
+  /** repairs/list_issues answers `{issues}`, or this error code, or `repairsResult` as the raw result. */
+  issues: Issue[] = [];
+  repairsError: string | undefined;
+  repairsResult: unknown;
+  /** Never answer repairs/list_issues (the request stays pending until the socket dies). */
+  holdRepairs = false;
   connections = 0;
   private readonly subs = new Map<WebSocket, number>();
 
@@ -76,6 +103,15 @@ class FakeHa {
           this.subs.set(ws, id);
           ws.send(JSON.stringify({ id, type: "result", success: true, result: null }));
           this.event(ws, "current", [...this.notifications.values()]);
+        } else if (msg.type === "repairs/list_issues") {
+          const id = msg.id as number;
+          if (this.holdRepairs) return;
+          if (this.repairsError) {
+            ws.send(JSON.stringify({ id, type: "result", success: false, error: { code: this.repairsError, message: "Unauthorized" } }));
+            return;
+          }
+          const result = this.repairsResult !== undefined ? this.repairsResult : { issues: this.issues };
+          ws.send(JSON.stringify({ id, type: "result", success: true, result }));
         }
       });
       ws.on("close", () => this.subs.delete(ws));
@@ -119,6 +155,10 @@ class FakeHa {
 
   commandTypes(): string[] {
     return this.received.map((m) => String(m.type));
+  }
+
+  get repairsLists(): number {
+    return this.received.filter((m) => m.type === "repairs/list_issues").length;
   }
 }
 
@@ -251,7 +291,27 @@ async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string } = {
     producerTimers.fire(HA_RESOLVE_GRACE_MS);
     await settle(producer);
   };
-  return { ha, center, logs, producer, client, producerTimers, clientTimers, clock, close, reconnect, sync, passGrace };
+  const pollArmed = () => [...producerTimers.pending.values()].some((p) => p.ms === HA_REPAIRS_POLL_MS);
+  /** Waits until a repairs list was answered and reconciled (the next poll is armed after each answer). */
+  const repairsDone = async () => {
+    await waitFor(pollArmed, "repairs list answered");
+    await producer.idle();
+    await settle(producer);
+  };
+  /** 10 minutes pass: the repairs poll fires; waits for its answer. */
+  const poll = async () => {
+    await repairsDone();
+    const before = ha.repairsLists;
+    clock.now += HA_REPAIRS_POLL_MS;
+    for (const [id, p] of [...producerTimers.pending]) {
+      if (p.ms !== HA_REPAIRS_POLL_MS) continue;
+      producerTimers.pending.delete(id);
+      p.fn();
+    }
+    await waitFor(() => ha.repairsLists === before + 1, "repairs polled");
+    await repairsDone();
+  };
+  return { ha, center, logs, producer, client, producerTimers, clientTimers, clock, close, reconnect, sync, passGrace, pollArmed, repairsDone, poll };
 }
 
 test("haWebSocketUrl: ws/wss from HA_URL, path prefix kept, query dropped; bad URLs refused", () => {
@@ -291,7 +351,7 @@ test("pnKey: pn:<id> up to the store's key limit, sha256 beyond; clipText cuts l
   assert.equal(clipText("  x  ", 10), "x");
   assert.equal(clipText(`${"a".repeat(4)}\u{1F600}`, 5), "aaaa", "no half surrogate pair");
   assert.equal(haAlertUrgency({ kind: "pn", id: "http-login" }), "normal");
-  assert.deepEqual([...READ_ONLY_COMMANDS], ["persistent_notification/subscribe"]);
+  assert.deepEqual([...READ_ONLY_COMMANDS], ["persistent_notification/subscribe", "repairs/list_issues"]);
 });
 
 test("haBackoffMs: 1 → 2 → 4 … → 60 s, ± 20 % jitter", () => {
@@ -315,7 +375,8 @@ test("auth ok + current set: items raised (normal, pn: keys); only auth and the 
     const byKey = new Map(t.center.raises.map((r) => [r.key, r]));
     assert.deepEqual(byKey.get("pn:a"), { source: HA_SOURCE, key: "pn:a", urgency: "normal", title: "Yeni cihaz bulundu", body: "a body", renotify: true });
     assert.deepEqual(byKey.get("pn:b"), { source: HA_SOURCE, key: "pn:b", urgency: "normal", title: "Home Assistant bildirimi", body: "gövde", renotify: true });
-    assert.deepEqual(t.ha.commandTypes(), ["auth", "persistent_notification/subscribe"]);
+    await t.repairsDone();
+    assert.deepEqual(t.ha.commandTypes(), ["auth", "persistent_notification/subscribe", "repairs/list_issues"]);
     assert.equal(t.ha.received[0]!.access_token, TOKEN);
     for (const line of t.logs) {
       assert.ok(!line.includes(TOKEN), "token never logged");
@@ -409,7 +470,7 @@ test("auth_invalid → one normal ha:access item; resolved on the next good conn
     t.reconnect();
     await waitFor(() => t.center.resolves.includes(HA_ACCESS_KEY) && t.center.items.has("pn:a"), "resolved + listed");
     assert.deepEqual(t.center.resolves, [HA_ACCESS_KEY]);
-    assert.ok(!t.ha.commandTypes().some((c) => c !== "auth" && c !== "persistent_notification/subscribe"));
+    assert.ok(t.ha.commandTypes().every((c) => READ_ONLY_COMMANDS.has(c) || c === "auth"));
   } finally {
     await t.close();
   }
@@ -554,7 +615,8 @@ test("unreadable inbox: nothing raised until the startup adoption succeeds (retr
     await settle(t.producer);
     assert.equal(t.center.raises.length, 0);
     assert.ok(t.logs.some((l) => l.includes("startup reconcile retried later")));
-    assert.deepEqual([...t.producerTimers.pending.values()].map((p) => p.ms), [60_000]);
+    await t.repairsDone();
+    assert.deepEqual([...t.producerTimers.pending.values()].map((p) => p.ms).filter((ms) => ms !== HA_REPAIRS_POLL_MS), [60_000]);
     center.unavailable = false;
     t.clock.now += 59_999;
     t.producerTimers.fire();
@@ -694,6 +756,261 @@ test("HA restart: a listing missing ids resolves nothing during the grace; ids b
     assert.deepEqual(t.center.resolves, ["pn:c"]);
     assert.deepEqual(t.center.raises.map((r) => r.key), ["pn:a", "pn:c"], "a and the suppressed b not raised again");
     assert.deepEqual(t.center.suppressedKeys, [{ source: HA_SOURCE, key: "pn:b" }], "suppression kept");
+  } finally {
+    await t.close();
+  }
+});
+
+// --- T7.w.11.6: repairs ---
+
+test("repairKey / repairOf: key limit and hashing, ignored entries, Turkish text without placeholder values", () => {
+  assert.equal(repairKey("hacs", "restart_required"), "repair:hacs:restart_required");
+  const fits = "a".repeat(MAX_KEY_CHARS - "repair:demo:".length);
+  assert.equal(repairKey("demo", fits), `repair:demo:${fits}`);
+  const k = repairKey("demo", `${fits}b`);
+  assert.match(k, /^repair:sha256:[0-9a-f]{64}$/);
+  assert.equal(repairKey("demo", `${fits}b`), k, "stable");
+  assert.notEqual(repairKey("demo2", `${fits}b`), k);
+
+  const r = repairOf(
+    issue("homeassistant", "deprecated_yaml_x", {
+      issue_domain: "sensor",
+      severity: "critical",
+      is_fixable: true,
+      breaks_in_ha_version: "2027.1.0",
+      translation_key: "deprecated_yaml",
+      translation_placeholders: { name: "Gizli Mutfak", url: "http://10.0.0.9" },
+      learn_more_url: "https://docs.example/x",
+    }),
+  );
+  assert.ok(r && r !== "ignored");
+  assert.equal(r.key, "repair:homeassistant:deprecated_yaml_x");
+  assert.deepEqual(r.want, {
+    urgency: "normal",
+    title: "Home Assistant onarımı: sensor",
+    body:
+      "Sorun: deprecated_yaml\nÖnem: kritik\nHome Assistant 2027.1.0 sürümünde çalışmayı bırakacak.\nHome Assistant'ta onarma adımı var.\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar.",
+  });
+  const plain = repairOf(issue("demo", "x1", { translation_key: null, severity: "bogus" }));
+  assert.ok(plain && plain !== "ignored");
+  assert.deepEqual(plain.want, { urgency: "normal", title: "Home Assistant onarımı: demo", body: "Sorun: x1\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar." });
+  assert.equal(repairOf(issue("demo", "x", { ignored: true })), "ignored");
+  assert.equal(repairOf(issue("demo", "x", { ignored: undefined, dismissed_version: "2026.10.0" })), "ignored", "no `ignored`: dismissed_version decides");
+  assert.notEqual(repairOf(issue("demo", "x", { ignored: false, dismissed_version: "2026.10.0" })), "ignored", "`ignored` wins when present");
+  assert.equal(repairOf({ issue_id: "x" }), undefined);
+  assert.equal(repairOf(issue("", "x")), undefined);
+  assert.equal(repairOf(42), undefined);
+  assert.equal(haAlertUrgency({ kind: "repair", domain: "demo", issueId: "x", severity: "critical" }), "normal");
+});
+
+test("repairs: listed after the subscription and every 10 min; ignored ones skipped; only read-only commands", async () => {
+  const ha = new FakeHa();
+  ha.issues = [
+    issue("demo", "a", { translation_placeholders: { name: "Gizli Mutfak" } }),
+    issue("demo", "ign", { ignored: true, dismissed_version: "2026.10.0" }),
+    issue("demo", "old_ign", { ignored: undefined, dismissed_version: "2026.9.0" }),
+  ];
+  const t = await setup({ ha });
+  try {
+    await t.repairsDone();
+    assert.equal(t.ha.repairsLists, 1);
+    assert.deepEqual(t.ha.commandTypes(), ["auth", "persistent_notification/subscribe", "repairs/list_issues"]);
+    assert.deepEqual(t.center.raises, [
+      {
+        source: HA_SOURCE,
+        key: "repair:demo:a",
+        urgency: "normal",
+        title: "Home Assistant onarımı: demo",
+        body: "Sorun: a\nÖnem: uyarı\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar.",
+        renotify: true,
+      },
+    ]);
+    // 10 minutes later: listed again; a new issue is raised, the unchanged one writes nothing.
+    t.ha.issues.push(issue("demo", "b", { severity: "error" }));
+    await t.poll();
+    assert.equal(t.ha.repairsLists, 2);
+    assert.deepEqual(t.center.raises.map((r) => r.key), ["repair:demo:a", "repair:demo:b"]);
+    // A changed issue (severity) replaces the item without renotify.
+    t.ha.issues[3] = issue("demo", "b", { severity: "critical" });
+    await t.poll();
+    assert.equal(t.center.raises.length, 3);
+    assert.equal(t.center.raises[2]!.key, "repair:demo:b");
+    assert.equal(t.center.raises[2]!.renotify, false);
+    assert.match(t.center.raises[2]!.body ?? "", /Önem: kritik/);
+    // An issue the user ignores in HA leaves the list: resolved.
+    t.ha.issues[0] = issue("demo", "a", { ignored: true, dismissed_version: "2026.11.0" });
+    await t.poll();
+    assert.deepEqual(t.center.resolves, ["repair:demo:a"]);
+    assert.equal(t.ha.repairsLists, 4);
+    assert.ok(t.ha.commandTypes().every((c) => c === "auth" || READ_ONLY_COMMANDS.has(c)), "nothing but read-only commands");
+    for (const r of t.center.raises) assert.ok(!r.title.includes("Gizli") && !(r.body ?? "").includes("Gizli"), "placeholder values not copied");
+    for (const line of t.logs) assert.ok(!line.includes("demo") && !line.includes("Gizli"), `no ids/text in logs: ${line}`);
+  } finally {
+    await t.close();
+  }
+});
+
+test("repairs resolve: a smaller successful list after the grace resolves; a failed list, a malformed one, a disconnect and the list at connect do not", async () => {
+  const ha = new FakeHa();
+  ha.issues = [issue("demo", "x"), issue("demo", "y")];
+  const t = await setup({ ha });
+  try {
+    await t.repairsDone();
+    assert.equal(t.center.raises.length, 2);
+    // A failed list resolves nothing.
+    t.ha.issues = [issue("demo", "x")];
+    t.ha.repairsError = "home_assistant_error";
+    await t.poll();
+    assert.deepEqual(t.center.resolves, []);
+    assert.equal(t.logs.filter((l) => l.includes("repairs list failed (home_assistant_error)")).length, 1);
+    assert.ok(!t.center.items.has(HA_ACCESS_KEY), "another error is not a permission problem");
+    // A malformed answer or entry is not a complete listing.
+    t.ha.repairsError = undefined;
+    t.ha.repairsResult = { issues: "nope" };
+    await t.poll();
+    t.ha.repairsResult = { issues: [issue("demo", "x"), { issue_id: "no-domain" }] };
+    await t.poll();
+    assert.deepEqual(t.center.resolves, []);
+    assert.equal(t.logs.filter((l) => l.includes("unexpected repairs list shape")).length, 1, "logged once");
+    t.ha.repairsResult = undefined;
+    // A lost connection resolves nothing and stops the poll.
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    await settle(t.producer);
+    assert.deepEqual(t.center.resolves, []);
+    assert.ok(!t.pollArmed(), "no poll while disconnected");
+    // The list right after a (re)connect is within the grace: it raises but does not resolve.
+    t.reconnect();
+    await t.repairsDone();
+    assert.equal(t.ha.repairsLists, 5);
+    assert.deepEqual(t.center.resolves, []);
+    // The next list (10 min later) resolves the missing one only.
+    await t.poll();
+    assert.deepEqual(t.center.resolves, ["repair:demo:y"]);
+    assert.deepEqual([...t.center.items.keys()], ["repair:demo:x"]);
+    assert.equal(t.center.raises.length, 2, "x not raised again");
+  } finally {
+    await t.close();
+  }
+});
+
+test("repairs unauthorized → ha:access; a token rejection and the repairs refusal do not clear each other; a good list resolves it", async () => {
+  const ha = new FakeHa();
+  ha.repairsError = "unauthorized";
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha });
+  try {
+    await t.repairsDone();
+    const access = () => t.center.raises.filter((r) => r.key === HA_ACCESS_KEY);
+    assert.equal(access().length, 1);
+    assert.equal(access()[0]!.title, "HA uyarıları okunamıyor");
+    assert.match(access()[0]!.body ?? "", /onarım/);
+    assert.equal(access()[0]!.renotify, true);
+    assert.ok(t.center.items.has("pn:a"), "notifications still work");
+    assert.equal(t.logs.filter((l) => l.includes("repairs list refused (unauthorized")).length, 1);
+    // Still refused 10 min later: nothing new.
+    await t.poll();
+    assert.equal(access().length, 1);
+    assert.equal(t.logs.filter((l) => l.includes("repairs list refused")).length, 1, "logged once per streak");
+    // The token is rejected now: the item stays, its text says so (no renotify).
+    t.ha.acceptToken = false;
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    t.reconnect();
+    await waitFor(() => access().length === 2, "token text");
+    assert.match(access()[1]!.body ?? "", /reddetti/);
+    assert.equal(access()[1]!.renotify, false);
+    // The token is accepted again but repairs are still refused: the good connect does not resolve it.
+    t.ha.acceptToken = true;
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    t.reconnect();
+    await t.repairsDone();
+    assert.deepEqual(t.center.resolves, []);
+    assert.equal(access().length, 3);
+    assert.match(access()[2]!.body ?? "", /onarım/);
+    // Repairs allowed now: resolved by the next good list.
+    t.ha.repairsError = undefined;
+    await t.poll();
+    assert.deepEqual(t.center.resolves, [HA_ACCESS_KEY]);
+    assert.equal(access().length, 3);
+  } finally {
+    await t.close();
+  }
+});
+
+test("adopted ha:access is not resolved by a good connect while repairs are refused (no flap at startup)", async () => {
+  const center = new FakeCenter();
+  center.items.set(HA_ACCESS_KEY, { source: HA_SOURCE, key: HA_ACCESS_KEY, urgency: "normal", title: "HA uyarıları okunamıyor", body: "old text" });
+  const ha = new FakeHa();
+  ha.repairsError = "unauthorized";
+  const t = await setup({ ha, center });
+  try {
+    await t.repairsDone();
+    await t.sync();
+    assert.deepEqual(t.center.resolves, []);
+    assert.deepEqual(
+      t.center.raises.map((r) => [r.key, r.renotify]),
+      [[HA_ACCESS_KEY, false]],
+      "text updated without renotify",
+    );
+  } finally {
+    await t.close();
+  }
+});
+
+test("repairs adoption: open repair items and suppressed repair keys count as open; long ids hashed; ended ones resolved after the grace", async () => {
+  const center = new FakeCenter();
+  const a = repairOf(issue("demo", "a"));
+  assert.ok(a && a !== "ignored");
+  center.items.set(a.key, { source: HA_SOURCE, key: a.key, ...a.want });
+  center.items.set("repair:demo:old", { source: HA_SOURCE, key: "repair:demo:old", urgency: "normal", title: "Old", body: "" });
+  center.suppressedKeys = [
+    { source: HA_SOURCE, key: "repair:demo:gone" },
+    { source: HA_SOURCE, key: "repair:demo:sup" },
+  ];
+  const longId = `l${"o".repeat(200)}`;
+  const ha = new FakeHa();
+  ha.issues = [issue("demo", "a"), issue("demo", "sup"), issue("demo", longId)];
+  const t = await setup({ ha, center });
+  try {
+    await t.repairsDone();
+    assert.deepEqual(t.center.raises.map((r) => r.key), [repairKey("demo", longId)], "unchanged adopted and suppressed ones not raised");
+    assert.match(t.center.raises[0]!.key!, /^repair:sha256:[0-9a-f]{64}$/);
+    assert.deepEqual(t.center.resolves, [], "not by the list at connect");
+    await t.poll();
+    assert.deepEqual([...t.center.resolves].sort(), ["repair:demo:gone", "repair:demo:old"]);
+    assert.deepEqual(t.center.suppressedKeys, [{ source: HA_SOURCE, key: "repair:demo:sup" }], "ongoing suppression kept");
+    // The long one leaves the list: resolved under its hashed key.
+    t.ha.issues = [issue("demo", "a"), issue("demo", "sup")];
+    await t.poll();
+    assert.ok(t.center.resolves.includes(repairKey("demo", longId)));
+  } finally {
+    await t.close();
+  }
+});
+
+test("repairs: a list still pending on a dropped connection is ignored (generation guard); the new connection's list counts", async () => {
+  const ha = new FakeHa();
+  ha.issues = [issue("demo", "x")];
+  ha.repairsError = "unauthorized";
+  ha.holdRepairs = true;
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.ha.repairsLists === 1, "first list sent");
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    await settle(t.producer);
+    // The old request never produced an answer or an error: no ha:access, nothing raised or resolved.
+    assert.ok(!t.center.items.has(HA_ACCESS_KEY));
+    assert.equal(t.center.raises.length, 0);
+    assert.deepEqual(t.center.resolves, []);
+    t.ha.holdRepairs = false;
+    t.ha.repairsError = undefined;
+    t.reconnect();
+    await t.repairsDone();
+    assert.equal(t.ha.repairsLists, 2);
+    assert.ok(!t.center.items.has(HA_ACCESS_KEY));
+    assert.deepEqual([...t.center.items.keys()], ["repair:demo:x"]);
   } finally {
     await t.close();
   }

@@ -167,8 +167,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
     Persistent notifications are no longer entities (HA 2023.6), so REST
     `/api/states` and MCP do not see them.
   - Repairs: `repairs/list_issues` at connect and every **10 min**; key
-    `repair:<domain>:<issue_id>`; ignored issues skipped. Admin-only;
-    allowed, see below.
+    `repair:<domain>:<issue_id>` (hashed when longer than 128); ignored issues
+    skipped. Admin-only; allowed, see below.
   - Access: `HA_CORE_TOKEN` belongs to an **admin** user (decided) and is used
     for both the WebSocket API and repairs access (the token value is never
     written anywhere).
@@ -181,7 +181,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
 - **Reconnect:** 1 → 2 → 4 … → 60 s with jitter. Not a new health entry: the HA
   MCP check already reports HA reachability. Only `auth_invalid` (or a
   missing-permission answer for repairs) raises one normal item `ha:access`
-  ("HA uyarıları okunamıyor"), resolved on the next good connect.
+  ("HA uyarıları okunamıyor"), resolved once both causes are known good (an
+  authenticated connection plus a `list_issues` answer that is not `unauthorized`).
 - **Urgency:** learned per alert type, see
   [Learned urgency of HA alerts](#learned-urgency-of-ha-alerts-t7w1110); normal
   unless a type is on the learned urgent list.
@@ -196,6 +197,16 @@ service the Core depends on going down, and Home Assistant's own alerts.
   `index.ts` (off with one info line when `HA_URL` or `HA_CORE_TOKEN` is empty;
   closed in the shutdown chain). No new setting. Tests with a local fake HA
   WebSocket server in `core/test/ha-producer.test.ts`.
+- Implemented (T7.w.11.6, repairs): `repairs/list_issues` added to
+  `READ_ONLY_COMMANDS` (still nothing that writes, ignores or fixes). The producer
+  lists on every authenticated connection once the notification subscription is
+  accepted, then 10 min after each answer while connected (stopped on
+  disconnect). Ignored issues (`ignored: true`; when that field is missing, a set
+  `dismissed_version`) are skipped, so ignoring an issue in HA resolves its item.
+  `ha:access` now has two causes (token rejected, `unauthorized` list answer) and
+  is resolved only when both are known good; adoption covers `repair:` items and
+  suppressed `repair:` keys. Urgency through `haAlertUrgency` (normal). Tests in
+  `core/test/ha-producer.test.ts` (fake server on 127.0.0.1).
 - **Varsayılan — kullanıcı onayı bekliyor:**
   - **Resolve grace 60 s:** an id missing from a `current` listing is resolved
     only if still missing 60 s after it (a `removed` event resolves at once). HA
@@ -226,6 +237,41 @@ service the Core depends on going down, and Home Assistant's own alerts.
     over 8 MiB are refused.
   - Logs hold counts and fixed texts only (no notification ids, titles, bodies,
     URL, token or HA error messages).
+  - **Repairs (T7.w.11.6):**
+    - **Text:** `list_issues` carries no human text, so the item is built in
+      Turkish from codes only: title `Home Assistant onarımı: <issue_domain or
+      domain>`; body lines `Sorun: <translation_key, else issue_id>`, `Önem:
+      kritik / hata / uyarı` (unknown severity left out), `Home Assistant <v>
+      sürümünde çalışmayı bırakacak.` (when `breaks_in_ha_version` is set), `Home
+      Assistant'ta onarma adımı var.` (when `is_fixable`), and `Ayrıntılar: Home
+      Assistant > Ayarlar > Onarımlar.` `translation_placeholders` values and
+      `learn_more_url` are never copied (they can hold names or addresses), so the
+      text is generic; HA's own translated text would need an extra read-only
+      command (`frontend/get_translations`), not chosen.
+    - **Resolve grace:** HA restores non-persistent issues as inactive at start
+      until their integration recreates them, so the list right after a
+      (re)connect raises but never resolves; only a list started 60 s or more after
+      the connection's auth resolves missing keys (in practice the 10-min list).
+      An issue that ended while the Core was down is therefore resolved about 10
+      min after start.
+    - A failed call, an answer whose `issues` is not a list, or a list with a
+      malformed entry (no `domain` / `issue_id`) resolves nothing (logged once,
+      codes only); a lost connection is never taken as an empty list (only keys
+      missing from the last successful complete list are resolved).
+    - `ha:access`: an `unauthorized` list answer opens it (body says repairs need an
+      admin user); any other error counts as permission present (HA checks admin
+      first). Open while either cause holds, resolved only after an authenticated
+      connection **and** a non-`unauthorized` list answer on it, so a good connect
+      does not clear a repairs refusal (no flap at startup). When the cause changes
+      the text is updated without renotify. The list is sent only after the
+      notification subscription is accepted (otherwise its answer would reset the
+      client's backoff while the refused subscription keeps dropping the
+      connection); so while HA keeps refusing that subscription, an open
+      `ha:access` stays open with its last text (HA alerts are unreadable then
+      anyway).
+    - The poll interval counts from each answer (not a fixed clock); a refused
+      list keeps polling every 10 min, so granting admin is picked up without a
+      restart.
 
 #### Learned urgency of HA alerts (T7.w.11.10)
 
@@ -410,7 +456,7 @@ resolves (and clears) them. Tests in `core/test/notification-suppressions.test.t
 - T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests. Implemented: [`service-producer.ts`](../core/src/service-producer.ts), wired in `index.ts` (started after the health monitor, closed in the shutdown chain); tests in `core/test/service-producer.test.ts`.
 - T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
 - T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server. Implemented: [`ha-client.ts`](../core/src/ha-client.ts) + [`ha-producer.ts`](../core/src/ha-producer.ts), wired in `index.ts` (started after the service producer, closed in the shutdown chain); tests in `core/test/ha-producer.test.ts` (see *(c)*, defaults awaiting approval there).
-- T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope.
+- T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope. Implemented: [`ha-producer.ts`](../core/src/ha-producer.ts) (+ allow-list in [`ha-client.ts`](../core/src/ha-client.ts)); tests in `core/test/ha-producer.test.ts` (see *(c)*, repairs defaults awaiting approval there).
 
 - T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests. Implemented: `notification_action` `suppress` + feature `notifications_suppress`, [`notification-suppressions.ts`](../core/src/notification-suppressions.ts), adoption in both producers (see *Dismiss options*, defaults awaiting approval there); tests in `core/test/notification-suppressions.test.ts`.
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
