@@ -20,7 +20,6 @@ import java.net.URL
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * In-app update from this repository's GitHub Releases (docs/10). Pure decisions
@@ -305,14 +304,17 @@ class Updater(context: Context) {
      * system dialog: if that answer never reaches us (app in the background, process death),
      * a lock held until then would block every later attempt. So a new flow started from the
      * shortcut replaces a still-pending one (its session is abandoned here), and
-     * [activeSessionId] lets [UpdateActivity] ignore late results of replaced sessions.
+     * [sessions] lets [UpdateActivity] ignore late results of replaced sessions.
+     * Returns the committed session id.
      */
-    fun install(apk: File) {
+    fun install(apk: File): Int {
         val installer = pm.packageInstaller
         try {
             // Sessions of an earlier flow (e.g. the confirmation was never answered): replaced.
-            activeSessionId.set(NO_SESSION)
-            for (old in installer.mySessions) runCatching { installer.abandonSession(old.sessionId) }
+            // Marked before abandoning, so their ABORTED results are already stale on arrival.
+            val previous = installer.mySessions.map { it.sessionId }
+            sessions.replace(previous)
+            for (old in previous) runCatching { installer.abandonSession(old) }
             val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
                 setAppPackageName(app.packageName)
                 setSize(apk.length())
@@ -321,7 +323,7 @@ class Updater(context: Context) {
                 }
             }
             val sessionId = installer.createSession(params)
-            activeSessionId.set(sessionId)
+            sessions.begin(sessionId)
             try {
                 installer.openSession(sessionId).use { session ->
                     apk.inputStream().use { input ->
@@ -333,10 +335,11 @@ class Updater(context: Context) {
                     session.commit(statusIntent(sessionId).intentSender)
                 }
             } catch (e: Exception) {
-                activeSessionId.compareAndSet(sessionId, NO_SESSION)
+                sessions.retire(sessionId)
                 runCatching { installer.abandonSession(sessionId) }
                 throw e
             }
+            return sessionId
         } catch (e: UpdateRules.UpdateException) {
             throw e
         } catch (e: Exception) {
@@ -475,9 +478,9 @@ class Updater(context: Context) {
         /** One check/download/install at a time per process (also across activity instances). */
         val inFlight = AtomicBoolean(false)
 
-        const val NO_SESSION = -1
+        const val NO_SESSION = InstallSessions.NONE
 
-        /** The session whose result is still expected; [NO_SESSION] if none is known (e.g. after process death). */
-        val activeSessionId = AtomicInteger(NO_SESSION)
+        /** Install sessions of this process: which results are current, unknown or stale. */
+        val sessions = InstallSessions()
     }
 }

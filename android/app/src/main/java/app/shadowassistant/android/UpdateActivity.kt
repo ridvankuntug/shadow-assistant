@@ -41,7 +41,14 @@ class UpdateActivity : Activity() {
         setTitle(R.string.update_title)
         setFinishOnTouchOutside(false)
         buildViews()
-        if (intent?.action == ACTION_INSTALL_STATUS) handleStatus(intent) else startCheck()
+        when {
+            intent?.action != ACTION_INSTALL_STATUS -> startCheck()
+            // Recreated (e.g. locale change, "don't keep activities"): this result was already
+            // classified by the first instance; show its screen again instead of treating the
+            // repeat as a stale delivery.
+            savedInstanceState != null -> handleStatus(intent, redraw = true)
+            else -> handleStatus(intent)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -176,7 +183,11 @@ class UpdateActivity : Activity() {
             Updater.inFlight.set(false)
             onUi {
                 result.fold(
-                    onSuccess = { show(getString(R.string.update_waiting_confirm), progressPercent = -1) },
+                    // The result may already be here (Android can fail a session at once): then
+                    // its screen (with buttons) stays; "waiting" must not replace it.
+                    onSuccess = { sessionId ->
+                        if (!Updater.sessions.hasEnded(sessionId)) show(getString(R.string.update_waiting_confirm), progressPercent = -1)
+                    },
                     onFailure = { showError(it, retry = { startDownload(check) }) },
                 )
             }
@@ -192,18 +203,25 @@ class UpdateActivity : Activity() {
         }
     }
 
-    /** Result of the install session (see [Updater.install]). */
-    private fun handleStatus(intent: Intent) {
+    /**
+     * Result of the install session (see [Updater.install]). [redraw]: the same intent shown
+     * again after recreation — not re-classified, and the confirmation is not started twice.
+     */
+    private fun handleStatus(intent: Intent, redraw: Boolean = false) {
         val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
         val sessionId = intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, Updater.NO_SESSION)
-        val active = Updater.activeSessionId.get()
-        if (active != Updater.NO_SESSION && sessionId != active) {
-            // A late result of a session that a newer flow replaced: not this screen's business.
-            Log.i(TAG, "update: ignoring status of a replaced session")
+        val terminal = status != PackageInstaller.STATUS_PENDING_USER_ACTION
+        if (redraw && !terminal) {
+            show(getString(R.string.update_waiting_confirm), progressPercent = -1)
+            return
+        }
+        if (!redraw && Updater.sessions.onResult(sessionId, terminal) == InstallSessions.Verdict.STALE) {
+            // A late result of a replaced, abandoned or finished session (e.g. the ABORTED of a
+            // session a newer flow abandoned): not this screen's business.
+            Log.i(TAG, "update: ignoring status of a stale session")
             if (intent === this.intent && available == null) finish()
             return
         }
-        if (status != PackageInstaller.STATUS_PENDING_USER_ACTION) Updater.activeSessionId.compareAndSet(sessionId, Updater.NO_SESSION)
         when (status) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 val confirm = confirmIntent(intent)
