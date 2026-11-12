@@ -226,9 +226,10 @@ lint, and builds the **debug APK** (artifact `shadow-debug-apk`). If all four
 signing secrets exist (and the run is not a pull request) it also builds a
 **signed release APK** (artifact `shadow-release-apk`) and verifies the
 signature with `apksigner`. `versionCode` is the workflow run number, so each
-CI release installs over the previous one. `versionName` is `0.1.0-ci.<run>`
-(`X.Y.Z` for a release tag, see below); local builds keep `0.1.0` / `1`
-unless `-PshadowVersionName` / `-PshadowVersionCode` are given.
+CI release installs over the previous one. `versionName` is derived by Gradle
+as `X.Y.<versionCode>`, where `X.Y` is `shadowVersionBase` in
+`gradle.properties` (its only source); local builds without
+`-PshadowVersionCode` are `X.Y.0` / `1`.
 
 The keystore never enters the repository: CI decodes it from a secret into
 the runner's temp directory and deletes it at the end of the job.
@@ -278,24 +279,28 @@ must never be committed.
 
 Design: [`docs/10-android-updates.md`](../docs/10-android-updates.md).
 
-**Publishing (you):** push a tag `vX.Y.Z` (strictly three numbers, e.g.
-`git tag v0.2.0 && git push origin v0.2.0`). The same **Android** workflow then
-builds and tests as usual, refuses the tag if it is not `vX.Y.Z` or if any
-signing secret is missing, builds the signed APK with `versionName X.Y.Z` and
-`versionCode` = run number, and a separate `release` job (the only one with
-`contents: write`; it never sees the signing secrets) publishes a GitHub
-Release with two assets:
+**Publishing (automatic, docs/10 D7):** every push to `main` whose app
+sources (`android/`, `ui/`; not `*.md` or test sources) changed since the
+latest release publishes a release. The **Android** workflow builds and tests
+as usual, fails if any signing secret is missing, builds the signed APK
+(`versionCode` = run number, `versionName` = `X.Y.<run>`), and a separate
+`release` job (the only one with `contents: write`; it never sees the signing
+secrets) publishes the GitHub Release `vX.Y.<run>` (tag created at the built
+commit) with two assets:
 
-- `shadow-vX.Y.Z.apk`: the signed APK,
-- `update.json`: `{"versionCode": N, "versionName": "X.Y.Z", "apk": "shadow-vX.Y.Z.apk", "sha256": "<hex>"}`,
+- `shadow-vX.Y.<run>.apk`: the signed APK,
+- `update.json`: `{"versionCode": N, "versionName": "X.Y.N", "apk": "shadow-vX.Y.N.apk", "sha256": "<hex>"}`,
   read back from the built APK by CI.
 
-A release is never overwritten: if the tag's release already exists (e.g. a
-re-run) the job fails; push a new tag instead.
+No release when nothing in the app changed (e.g. only the workflow or docs).
+Pull requests, forks and manual runs never release. There is no manual tag
+path: pushing a `v*` tag does nothing. A release is never overwritten: if the
+release, its tag or a draft of it already exists (e.g. a re-run) the job fails.
+To start a new `X.Y` line, edit `shadowVersionBase` in `gradle.properties`.
 
-**Versioning:** "newer" means a higher `versionCode` only (the run number is
-shared by main pushes and tags). A main-push artifact installed after a release
-is therefore not offered the older release; the next release supersedes it.
+**Versioning:** "newer" means a higher `versionCode` only (one run-number
+counter for every build of this workflow). Never rename `android.yml`: a new
+workflow restarts the run number at 1.
 
 **Updating (phone):** long-press the Shadow icon → **Güncellemeleri denetle**.
 It reads the latest release of this repository, shows "X.Y.Z mevcut" if its

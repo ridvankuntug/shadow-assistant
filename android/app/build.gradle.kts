@@ -53,10 +53,19 @@ android {
         applicationId = "app.shadowassistant.android"
         minSdk = 29
         targetSdk = 37
-        versionCode = (findProperty("shadowVersionCode") as String?)?.toInt() ?: 1
-        // CI sets both (docs/10 D1): versionCode = run number (the only "newer" signal the
-        // in-app updater uses), versionName = tag "X.Y.Z" or "0.1.0-ci.<run>" (display only).
-        versionName = (findProperty("shadowVersionName") as String?)?.takeIf { it.isNotBlank() } ?: "0.1.0"
+        // docs/10 D1/D7: CI passes versionCode = workflow run number (the only "newer" signal
+        // of the in-app updater). versionName is derived, never set separately: the one
+        // source is `shadowVersionBase` ("X.Y", gradle.properties) plus the versionCode as
+        // patch, e.g. 0.1.57; the release tag is "v" + versionName. Local builds: 1 / X.Y.0.
+        val ciVersionCode = (findProperty("shadowVersionCode") as String?)?.let {
+            it.toIntOrNull()?.takeIf { code -> code > 0 } ?: throw GradleException("shadowVersionCode must be a positive integer")
+        }
+        val versionBase = (findProperty("shadowVersionBase") as String?).orEmpty()
+        if (!Regex("""^\d{1,6}\.\d{1,6}$""").matches(versionBase)) {
+            throw GradleException("shadowVersionBase (gradle.properties) must look like X.Y")
+        }
+        versionCode = ciVersionCode ?: 1
+        versionName = "$versionBase.${ciVersionCode ?: 0}"
     }
 
     signingConfigs {

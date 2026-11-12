@@ -1,6 +1,7 @@
 # 10 - Android: signed GitHub Releases and in-app update
 
-Status: design (T14). Builds on the existing Android CI
+Status: implemented (T14); releases automatic on main since T16.1 (D7 supersedes
+the tag parts of D1/D2). Builds on the existing Android CI
 ([`.github/workflows/android.yml`](../.github/workflows/android.yml),
 [`android/README.md`](../android/README.md#ci-and-signing)). Reference
 implementation read (not copied verbatim): Buds Case Widget `Updater.kt`.
@@ -16,7 +17,7 @@ Android keeps all of these on an in-place update if and only if: same
 `applicationId` (`app.shadowassistant.android`), same signing key (or a v3
 rotation lineage from it), strictly higher `versionCode`.
 
-## Current state
+## Current state (before T14)
 
 - **CI** (`android.yml`): on `main` pushes / PRs / dispatch builds `ui/dist`,
   tests, lint, debug APK; with the four secrets (not on PRs) a signed release
@@ -49,6 +50,8 @@ rotation lineage from it), strictly higher `versionCode`.
 
 ### D1 — versionCode: keep `run_number`; decide "newer" by versionCode only
 
+(versionCode part still valid; the versionName and tag parts are replaced by D7.)
+
 - Keep `versionCode = github.run_number` for every CI build (main and tag). It is
   monotonic across both channels and already ≥ anything installed (≤ 3).
   Buds' semver formula is **not** adopted: a release `v0.2.0` → 200 would block
@@ -62,7 +65,7 @@ rotation lineage from it), strictly higher `versionCode`.
   release fixes it. Re-running a tag workflow reuses the run number: never
   replace a published APK.
 
-### D2 — Release trigger: tags `v*` in the same `android.yml`
+### D2 — Release trigger: tags `v*` in the same `android.yml` (replaced by D7)
 
 Same workflow so both channels share one `run_number` counter (a separate
 workflow has its own counter → collisions). Tag build: strict
@@ -133,6 +136,55 @@ AAD, blob format (`AppStorage.kt`, `BridgeStorage.kt`, `TokenCipher.kt`),
 component names of `MainActivity` and the `assist/` services (assist role).
 `allowBackup=false` is irrelevant for in-place updates.
 
+### D7 — Automatic release on main (T16.1, user decision)
+
+- **Trigger:** every push to `main` that runs `android.yml` (paths `android/**`,
+  `ui/**`, the workflow) and whose **app sources changed since the latest
+  release** publishes a release. "App sources": `git diff <latest release tag>
+  HEAD -- android ui` minus `*.md`, `android/app/src/test/**` and
+  `ui/src/**/*.test.ts` (`ui/dist` is copied into the APK by `copyUiBundle`;
+  `ui/` imports nothing outside itself). Diffing against the last release, not
+  the previous push, means a skipped/replaced run never loses a change. No
+  release yet → release; latest release unreadable or its tag missing → release
+  with a warning (harmless: same code, higher versionCode). Workflow-only,
+  docs-only or test-only changes build and test but do not release. PRs, forks
+  (`github.repository` check) and manual runs (`workflow_dispatch`) never release.
+- **versionCode** = `github.run_number` of `android.yml`, unchanged (D1). It is
+  monotonic (one counter for PRs, main and re-runs; a re-run keeps its number)
+  and already above every code built so far, so nothing installed is ever
+  "newer". Rejected: a semver formula (`X*10000+…`) — a jump below/above the
+  run number blocks updates; an offset — nothing to correct. Constraint: never
+  rename/recreate `android.yml` (a new workflow restarts `run_number` at 1);
+  if that ever happens, add a fixed offset above the last released code.
+- **versionName** has one source: `shadowVersionBase=X.Y` in
+  `android/gradle.properties`; Gradle derives `X.Y.<versionCode>` (local builds
+  without `-PshadowVersionCode`: code 1, name `X.Y.0`). `-PshadowVersionName`
+  and the workflow's `BASE_VERSION_NAME` are gone. The release tag is `v` +
+  the versionName read back from the built APK (`aapt2 dump badging`, patch
+  must equal the run number), so the app's strict `vX.Y.Z` tag rule and
+  `shadow-vX.Y.Z.apk` naming are unchanged. Bump `X.Y` by editing
+  `gradle.properties` (that commit itself releases).
+- **Manual `v*` tags: removed.** One release channel, one tag namespace
+  (`vX.Y.<run>`, created only by the release job at the built commit via
+  `target_commitish`). A manual tag would duplicate releases of the same code
+  and could collide with an automatic tag. Pushing a `v*` tag now runs nothing.
+- **Concurrency:** main runs are queued, never cancelled in progress (a run may
+  be publishing); a newer pending run replaces an older pending one, which is
+  fine because of the diff base above. Manual runs use their own concurrency
+  group (event name in the key) so they never replace a pending push run. PR
+  runs still cancel each other. The
+  release job keeps its own `android-release` group. Serial main runs publish
+  in increasing versionCode order; the `make_latest` check stays as a guard.
+- **Kept:** signing secrets only in the `apk` job; release fails without all
+  four secrets; `apksigner verify`; APK identity check; `update.json` from the
+  built APK; `release` job alone has `contents: write` and never sees secrets.
+  **Overwrite protection extended:** the job refuses an existing release, an
+  existing tag (it could point at another commit) and a leftover draft with
+  the same tag (all release pages scanned); `overwrite_files: false` (a real input of
+  `softprops/action-gh-release@v2`, default `true`, which skips an existing
+  asset instead of deleting it). v2 uploads to a draft and publishes after the
+  uploads, so `releases/latest` never shows a release without its assets.
+
 ## One-time migration if the phone has a debug build
 
 How to find out without `adb` and without risk: open the newest CI
@@ -162,8 +214,10 @@ refuses **without touching data**. Then choose (user decision, nothing automatic
 2. Repo settings → Actions → General → Workflow permissions: explicit
    `permissions: contents: write` in the release job is enough; check that no
    policy limits it. Optional: a tag ruleset so only you can create `v*` tags.
-3. After T14 is merged: push a tag `vX.Y.Z` (each tag needs explicit approval
-   to push), check the Release has `shadow-vX.Y.Z.apk` + `update.json`.
+3. After T16.1 is merged: the push to main itself releases (if `android/` or
+   `ui/` changed since the last release). Check the Release `vX.Y.<run>` has
+   `shadow-vX.Y.<run>.apk` + `update.json`. No tags to push. Optional: a tag
+   ruleset that lets only GitHub Actions create `v*` tags.
 4. Run the debug/release check above; if debug, pick A/B/C.
 5. First update via the shortcut: allow "Bilinmeyen uygulamaları yükle" for
    Shadow once, confirm the system install dialog.
@@ -173,8 +227,9 @@ refuses **without touching data**. Then choose (user decision, nothing automatic
 - JVM unit tests (no Android): `update.json` parse/validation, URL/host
   allowlist incl. redirect rejection, version decision (`>` only, equal and
   lower refused), SHA-256 compare, size caps.
-- CI: workflow lint by running it on a test tag in a fork or after merge
-  (cannot be verified locally; no push by agents).
+- CI: `actionlint` locally; the release path itself only runs on a real push to
+  main (no push by agents). `InstallSessionsTest` covers which install results
+  the update screen shows (T16.3).
 - Manual on phone: update from N to N+1 keeps token (no token prompt),
   permissions, assist role; wrong-signer APK gives the signer error; airplane
   mode gives a clean network error.
@@ -209,6 +264,4 @@ Order: 14.1 → 14.2; 14.3 → 14.4; 14.5 last. No `ui/`, `ShadowBridge.kt`,
    B (rotation) or C (debug key as release key).
 2. **Entry point:** shortcut only (D5), or also a UI menu item via a bridge
    method after T15 lands?
-3. **Release cadence:** releases only on manual tags (proposed), or also keep
-   using the per-push `shadow-release-apk` artifact for daily installs (both
-   work with D1)?
+3. ~~**Release cadence**~~ — decided (T16.1): automatic release on main, D7.
