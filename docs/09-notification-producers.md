@@ -35,7 +35,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
   connection ([`mcp-direct.ts`](../core/src/mcp-direct.ts)) reconnects lazily on the
   next call. So "the gateway is down" means "the HA MCP endpoint is unreachable",
   which the health check already measures (SSE headers + token, no tool call).
-  There is no HA REST or WebSocket client; the `ws` package is already a dependency.
+  There was no HA REST or WebSocket client; since T7.w.11.5 a read-only HA
+  WebSocket client ([`ha-client.ts`](../core/src/ha-client.ts)) reads HA's alerts.
 - **Backup.** [`deploy/backup/backup-data.ps1`](../deploy/backup/backup-data.ps1) runs
   as a daily scheduled task (03:30, 2 h limit,
   [`install-backup-task.ps1`](../deploy/backup/install-backup-task.ps1)) outside the
@@ -186,6 +187,45 @@ service the Core depends on going down, and Home Assistant's own alerts.
   unless a type is on the learned urgent list.
 - **Flap:** HA already dedupes by id; an update of the same id replaces the item
   without `renotify`.
+- Implemented (T7.w.11.5, persistent notifications only; repairs are T7.w.11.6):
+  [`ha-client.ts`](../core/src/ha-client.ts) (connection, auth, backoff, only the
+  commands in `READ_ONLY_COMMANDS` can be sent; T7.w.11.6 adds `repairs/list_issues`
+  there) and [`ha-producer.ts`](../core/src/ha-producer.ts) (keys, resolve on a
+  complete listing, `ha:access`, startup adoption of open and suppressed keys;
+  urgency in one function `haAlertUrgency`, normal until T7.w.11.10). Wired in
+  `index.ts` (off with one info line when `HA_URL` or `HA_CORE_TOKEN` is empty;
+  closed in the shutdown chain). No new setting. Tests with a local fake HA
+  WebSocket server in `core/test/ha-producer.test.ts`.
+- **Varsayılan — kullanıcı onayı bekliyor:**
+  - **Resolve grace 60 s:** an id missing from a `current` listing is resolved
+    only if still missing 60 s after it (a `removed` event resolves at once). HA
+    serves its WebSocket API early while starting and keeps persistent
+    notifications in memory only, so the first listing after an HA restart can
+    lack notifications its integrations recreate moments later; resolving at once
+    would clear "Tekrar gösterme" records and bring the items back unread. Not
+    chosen (more code, an extra read-only command): waiting for HA's `RUNNING`
+    state via `get_config`. To check against a real HA restart.
+  - Jitter ± 20 % of the delay (1 s → 0.8-1.2 s, 60 s → 48-72 s); the delay starts
+    over after the first successful command answer on a connection (not at
+    `auth_ok`, so an HA that accepts and drops at once still backs off).
+  - `auth_invalid` keeps retrying with the same backoff (up to every ~60 s); the
+    token comes from `.env`, so a fixed token needs a Core restart anyway.
+  - A long id is hashed as `pn:sha256:<64 hex>`; an HA notification without a
+    title gets "Home Assistant bildirimi"; title/body are trimmed and cut like the
+    store (200 / 2000), without leaving half a surrogate pair.
+  - An HA update of an item the user deleted ("Gördüm") recreates it (unread,
+    without renotify): the update is new content. An unchanged update or the same
+    set after a reconnect writes nothing, so a deleted item does not come back by
+    a reconnect.
+  - A malformed entry inside a `current` listing still counts as present
+    (fallback title, empty body), so it is never resolved by mistake; a `current`
+    event whose `notifications` is not an object is not a complete listing (ignored,
+    logged once).
+  - Dead links: a protocol-level ping (no HA command) every 30 s; no pong by the
+    next ping drops the socket. Handshake and auth answer timeouts 10 s; frames
+    over 8 MiB are refused.
+  - Logs hold counts and fixed texts only (no notification ids, titles, bodies,
+    URL, token or HA error messages).
 
 #### Learned urgency of HA alerts (T7.w.11.10)
 
@@ -369,7 +409,7 @@ resolves (and clears) them. Tests in `core/test/notification-suppressions.test.t
 - T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests. Implemented: [`backup-producer.ts`](../core/src/backup-producer.ts), wired in `index.ts` (started with the health monitor, closed in the shutdown chain); tests in `core/test/backup-producer.test.ts`.
 - T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests. Implemented: [`service-producer.ts`](../core/src/service-producer.ts), wired in `index.ts` (started after the health monitor, closed in the shutdown chain); tests in `core/test/service-producer.test.ts`.
 - T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
-- T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server.
+- T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server. Implemented: [`ha-client.ts`](../core/src/ha-client.ts) + [`ha-producer.ts`](../core/src/ha-producer.ts), wired in `index.ts` (started after the service producer, closed in the shutdown chain); tests in `core/test/ha-producer.test.ts` (see *(c)*, defaults awaiting approval there).
 - T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope.
 
 - T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests. Implemented: `notification_action` `suppress` + feature `notifications_suppress`, [`notification-suppressions.ts`](../core/src/notification-suppressions.ts), adoption in both producers (see *Dismiss options*, defaults awaiting approval there); tests in `core/test/notification-suppressions.test.ts`.

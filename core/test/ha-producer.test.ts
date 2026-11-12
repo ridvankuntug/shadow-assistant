@@ -1,0 +1,700 @@
+/**
+ * T7.w.11.5: HA alerts (docs/09 (c)): the read-only HA WebSocket client and the
+ * persistent-notification producer, against a local fake HA WebSocket server on
+ * 127.0.0.1 (never a real HA). Backoff timers and the producer's retry timer are
+ * fake; the sockets are real.
+ */
+import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
+import { test } from "node:test";
+import { WebSocketServer, type WebSocket } from "ws";
+import {
+  HA_BACKOFF_MAX_MS,
+  HaClient,
+  haBackoffMs,
+  haWebSocketUrl,
+  READ_ONLY_COMMANDS,
+  type HaConnection,
+  type HaTimers,
+} from "../src/ha-client.js";
+import {
+  HA_ACCESS_KEY,
+  HA_RESOLVE_GRACE_MS,
+  HA_SOURCE,
+  HaAlertsProducer,
+  clipText,
+  createHaAlerts,
+  haAlertUrgency,
+  haAlertsSettings,
+  pnKey,
+  type HaNotificationPort,
+} from "../src/ha-producer.js";
+import { MAX_BODY_CHARS, MAX_KEY_CHARS, MAX_TITLE_CHARS, type NotificationItem, type RaiseInput, type RaiseResult } from "../src/notifications.js";
+
+const TOKEN = "test-token-not-real";
+
+type Notif = { notification_id: string; title: string | null; message: string; created_at: string };
+const notif = (id: string, title: string | null, message = `${id} body`): Notif => ({
+  notification_id: id,
+  title,
+  message,
+  created_at: "2026-11-13T10:00:00+00:00",
+});
+
+/** A fake HA WebSocket API: auth + persistent_notification/subscribe, events pushed by the test. */
+class FakeHa {
+  readonly wss: WebSocketServer;
+  readonly notifications = new Map<string, Notif>();
+  /** Every message the clients sent, in order. */
+  readonly received: Array<Record<string, unknown>> = [];
+  acceptToken = true;
+  /** Answer the subscription with success: false. */
+  refuseSubscribe = false;
+  connections = 0;
+  private readonly subs = new Map<WebSocket, number>();
+
+  constructor() {
+    this.wss = new WebSocketServer({ host: "127.0.0.1", port: 0, path: "/api/websocket" });
+    this.wss.on("connection", (ws) => {
+      this.connections++;
+      ws.send(JSON.stringify({ type: "auth_required", ha_version: "2026.11.0" }));
+      ws.on("message", (data) => {
+        const msg = JSON.parse(data.toString()) as Record<string, unknown>;
+        this.received.push(msg);
+        if (msg.type === "auth") {
+          if (msg.access_token === TOKEN && this.acceptToken) ws.send(JSON.stringify({ type: "auth_ok", ha_version: "2026.11.0" }));
+          else {
+            ws.send(JSON.stringify({ type: "auth_invalid", message: "Invalid access token or password" }));
+            ws.close();
+          }
+        } else if (msg.type === "persistent_notification/subscribe") {
+          const id = msg.id as number;
+          if (this.refuseSubscribe) {
+            ws.send(JSON.stringify({ id, type: "result", success: false, error: { code: "unknown_command", message: "Unknown command." } }));
+            return;
+          }
+          this.subs.set(ws, id);
+          ws.send(JSON.stringify({ id, type: "result", success: true, result: null }));
+          this.event(ws, "current", [...this.notifications.values()]);
+        }
+      });
+      ws.on("close", () => this.subs.delete(ws));
+    });
+  }
+
+  async ready(): Promise<string> {
+    if (!this.wss.address()) await new Promise((r) => this.wss.once("listening", r));
+    return `http://127.0.0.1:${(this.wss.address() as AddressInfo).port}`;
+  }
+
+  event(ws: WebSocket, type: string, list: Notif[] | Record<string, unknown>): void {
+    const notifications = Array.isArray(list) ? Object.fromEntries(list.map((n) => [n.notification_id, n])) : list;
+    ws.send(JSON.stringify({ id: this.subs.get(ws), type: "event", event: { type, notifications } }));
+  }
+
+  /** Pushes an event to every subscriber (and updates the server's set). */
+  push(type: "added" | "updated" | "removed", n: Notif): void {
+    if (type === "removed") this.notifications.delete(n.notification_id);
+    else this.notifications.set(n.notification_id, n);
+    for (const ws of this.subs.keys()) this.event(ws, type, [n]);
+  }
+
+  /** Raw event to every subscriber. */
+  raw(event: unknown): void {
+    for (const [ws, id] of this.subs) ws.send(JSON.stringify({ id, type: "event", event }));
+  }
+
+  get subscribers(): number {
+    return this.subs.size;
+  }
+
+  dropAll(): void {
+    for (const ws of this.wss.clients) ws.terminate();
+  }
+
+  async close(): Promise<void> {
+    for (const ws of this.wss.clients) ws.terminate();
+    await new Promise((r) => this.wss.close(r));
+  }
+
+  commandTypes(): string[] {
+    return this.received.map((m) => String(m.type));
+  }
+}
+
+type Stored = Pick<NotificationItem, "source" | "key" | "urgency" | "title" | "body">;
+
+class FakeCenter implements HaNotificationPort {
+  readonly raises: RaiseInput[] = [];
+  readonly resolves: string[] = [];
+  readonly items = new Map<string, Stored>();
+  suppressedKeys: Array<{ source: string; key: string }> = [];
+  unavailable = false;
+  /** Sync markers (`pn:sync-*`, see `sync()`): seen, not recorded as items. */
+  readonly syncs = new Set<string>();
+  async raise(input: RaiseInput): Promise<RaiseResult> {
+    if (this.unavailable) return { ok: false, reason: "unavailable" };
+    if (input.key?.startsWith("pn:sync-")) {
+      this.syncs.add(input.key);
+      return { ok: true, item: { id: "n-0" } as NotificationItem, created: true };
+    }
+    this.raises.push(input);
+    if (this.suppressedKeys.some((s) => s.source === input.source && s.key === input.key)) return { ok: false, reason: "suppressed" };
+    const prev = this.items.get(input.key ?? "");
+    const item = { source: input.source, key: input.key, urgency: input.urgency ?? "normal", title: input.title, body: input.body ?? "" };
+    this.items.set(input.key ?? "", item);
+    return { ok: true, item: { ...item, id: "n-0", createdAt: "", updatedAt: "", readAt: null, raised: 1 } as NotificationItem, created: !prev };
+  }
+  async resolve(source: string, key: string): Promise<boolean> {
+    if (this.unavailable) throw new Error("unavailable");
+    if (key.startsWith("pn:sync-")) return true;
+    this.resolves.push(key);
+    this.suppressedKeys = this.suppressedKeys.filter((s) => !(s.source === source && s.key === key));
+    return this.items.delete(key);
+  }
+  async list(): Promise<Stored[]> {
+    if (this.unavailable) throw new Error("unavailable");
+    return [...this.items.values()];
+  }
+  async suppressed(): Promise<Array<{ source: string; key: string }>> {
+    return [...this.suppressedKeys];
+  }
+}
+
+/** Fake timers: nothing fires by itself. */
+class FakeTimers implements HaTimers {
+  private seq = 0;
+  readonly pending = new Map<number, { ms: number; fn: () => void }>();
+  /** Every delay ever set, in order. */
+  readonly delays: number[] = [];
+  set(fn: () => void, ms: number): unknown {
+    const id = ++this.seq;
+    this.pending.set(id, { ms, fn });
+    this.delays.push(ms);
+    return id;
+  }
+  clear(handle: unknown): void {
+    this.pending.delete(handle as number);
+  }
+  /** Fires the pending timers whose delay is at most `maxMs`. */
+  fire(maxMs = HA_BACKOFF_MAX_MS * 2): number {
+    let n = 0;
+    for (const [id, t] of [...this.pending]) {
+      if (t.ms > maxMs) continue;
+      this.pending.delete(id);
+      t.fn();
+      n++;
+    }
+    return n;
+  }
+}
+
+async function waitFor(cond: () => boolean, what: string, ms = 3_000): Promise<void> {
+  const until = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > until) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** Lets in-flight socket messages and producer rounds finish. */
+async function settle(producer?: HaAlertsProducer): Promise<void> {
+  for (let k = 0; k < 5; k++) {
+    await new Promise((r) => setTimeout(r, 10));
+    await producer?.idle();
+  }
+}
+
+const AUTH_TIMEOUT = 9_999_999;
+
+async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string } = {}) {
+  const ha = o.ha ?? new FakeHa();
+  const base = await ha.ready();
+  const center = o.center ?? new FakeCenter();
+  const logs: string[] = [];
+  const logger = { info: (m: string) => logs.push(m), warn: (m: string) => logs.push(m) };
+  const producerTimers = new FakeTimers();
+  const clientTimers = new FakeTimers();
+  const clock = { now: Date.parse("2026-11-13T12:00:00.000Z") };
+  const producer = new HaAlertsProducer({ notifications: center, logger, timers: producerTimers, now: () => clock.now });
+  const client = new HaClient({
+    url: haWebSocketUrl(base)!,
+    token: o.token ?? TOKEN,
+    logger,
+    handlers: producer,
+    timers: clientTimers,
+    random: () => 0.5,
+    heartbeatMs: 0,
+    authTimeoutMs: AUTH_TIMEOUT,
+  });
+  producer.start();
+  client.start();
+  const close = async () => {
+    await client.close();
+    await producer.close();
+    await ha.close();
+  };
+  /** Fires the client's reconnect timer (not the auth timeout). */
+  const reconnect = () => clientTimers.fire(HA_BACKOFF_MAX_MS * 2);
+  let syncs = 0;
+  /** Waits until every event HA sent before now has been reconciled (a marker notification goes through after them). */
+  const sync = async () => {
+    const id = `sync-${++syncs}`;
+    ha.push("added", notif(id, "sync"));
+    await waitFor(() => center.syncs.has(`pn:${id}`), id);
+    await producer.idle();
+  };
+  /** Ends the resolve grace of the last `current`. */
+  const passGrace = async () => {
+    await sync();
+    clock.now += HA_RESOLVE_GRACE_MS;
+    producerTimers.fire(HA_RESOLVE_GRACE_MS);
+    await settle(producer);
+  };
+  return { ha, center, logs, producer, client, producerTimers, clientTimers, clock, close, reconnect, sync, passGrace };
+}
+
+test("haWebSocketUrl: ws/wss from HA_URL, path prefix kept, query dropped; bad URLs refused", () => {
+  assert.equal(haWebSocketUrl("http://ha.example:8123"), "ws://ha.example:8123/api/websocket");
+  assert.equal(haWebSocketUrl("https://ha.example/"), "wss://ha.example/api/websocket");
+  assert.equal(haWebSocketUrl(" https://ha.example/prefix/?x=1#y "), "wss://ha.example/prefix/api/websocket");
+  assert.equal(haWebSocketUrl("ws://ha.example"), "ws://ha.example/api/websocket");
+  assert.equal(haWebSocketUrl("ftp://ha.example"), undefined);
+  assert.equal(haWebSocketUrl("not a url"), undefined);
+  assert.equal(haWebSocketUrl(""), undefined);
+});
+
+test("haAlertsSettings / createHaAlerts: off without HA_URL or HA_CORE_TOKEN (one info line, nothing raised)", async () => {
+  assert.deepEqual(haAlertsSettings({}), { off: "HA_URL or HA_CORE_TOKEN not set" });
+  assert.deepEqual(haAlertsSettings({ HA_URL: "http://ha.example", HA_CORE_TOKEN: "  " }), { off: "HA_URL or HA_CORE_TOKEN not set" });
+  assert.deepEqual(haAlertsSettings({ HA_URL: "", HA_CORE_TOKEN: "x" }), { off: "HA_URL or HA_CORE_TOKEN not set" });
+  assert.deepEqual(haAlertsSettings({ HA_URL: "nope", HA_CORE_TOKEN: "x" }), { off: "HA_URL is not an http(s) URL" });
+  assert.deepEqual(haAlertsSettings({ HA_URL: "http://ha.example", HA_CORE_TOKEN: " x " }), { url: "ws://ha.example/api/websocket", token: "x" });
+  const center = new FakeCenter();
+  const logs: string[] = [];
+  const alerts = createHaAlerts({ env: { HA_URL: "http://ha.example" }, notifications: center, logger: { info: (m) => logs.push(m), warn: (m) => logs.push(`W ${m}`) } });
+  assert.equal(alerts, undefined);
+  assert.deepEqual(logs, ["[shadow-core] ha alerts: off (HA_URL or HA_CORE_TOKEN not set)"]);
+  assert.equal(center.raises.length, 0);
+});
+
+test("pnKey: pn:<id> up to the store's key limit, sha256 beyond; clipText cuts like the store", () => {
+  assert.equal(pnKey("config_entry_discovery"), "pn:config_entry_discovery");
+  const fits = "a".repeat(MAX_KEY_CHARS - 3);
+  assert.equal(pnKey(fits), `pn:${fits}`);
+  const long = "b".repeat(MAX_KEY_CHARS - 2);
+  const k = pnKey(long);
+  assert.match(k, /^pn:sha256:[0-9a-f]{64}$/);
+  assert.ok(k.length <= MAX_KEY_CHARS);
+  assert.equal(pnKey(long), k, "stable");
+  assert.notEqual(pnKey(`${long}c`), k);
+  assert.equal(clipText("  x  ", 10), "x");
+  assert.equal(clipText(`${"a".repeat(4)}\u{1F600}`, 5), "aaaa", "no half surrogate pair");
+  assert.equal(haAlertUrgency({ kind: "pn", id: "http-login" }), "normal");
+  assert.deepEqual([...READ_ONLY_COMMANDS], ["persistent_notification/subscribe"]);
+});
+
+test("haBackoffMs: 1 → 2 → 4 … → 60 s, ± 20 % jitter", () => {
+  const mid = Array.from({ length: 9 }, (_, n) => haBackoffMs(n, () => 0.5));
+  assert.deepEqual(mid, [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000]);
+  assert.equal(haBackoffMs(0, () => 0), 800);
+  assert.equal(haBackoffMs(0, () => 1), 1_200);
+  assert.equal(haBackoffMs(10, () => 1), 72_000);
+  assert.equal(haBackoffMs(1_000, () => 0.5), 60_000, "no overflow");
+  assert.equal(haBackoffMs(0, () => Number.NaN), 1_000);
+});
+
+test("auth ok + current set: items raised (normal, pn: keys); only auth and the read-only subscribe are sent", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "Yeni cihaz bulundu"));
+  ha.notifications.set("b", notif("b", null, "  gövde  "));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 2, "two raises");
+    await settle(t.producer);
+    const byKey = new Map(t.center.raises.map((r) => [r.key, r]));
+    assert.deepEqual(byKey.get("pn:a"), { source: HA_SOURCE, key: "pn:a", urgency: "normal", title: "Yeni cihaz bulundu", body: "a body", renotify: true });
+    assert.deepEqual(byKey.get("pn:b"), { source: HA_SOURCE, key: "pn:b", urgency: "normal", title: "Home Assistant bildirimi", body: "gövde", renotify: true });
+    assert.deepEqual(t.ha.commandTypes(), ["auth", "persistent_notification/subscribe"]);
+    assert.equal(t.ha.received[0]!.access_token, TOKEN);
+    for (const line of t.logs) {
+      assert.ok(!line.includes(TOKEN), "token never logged");
+      assert.ok(!line.includes("Yeni cihaz") && !line.includes("gövde") && !line.includes("127.0.0.1"), `no text/host in logs: ${line}`);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+test("added / updated / removed: new item, update without renotify, unchanged writes nothing, removed resolves", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 1 && t.ha.subscribers === 1, "first raise");
+    t.ha.push("added", notif("c", "C"));
+    await waitFor(() => t.center.raises.length === 2, "added");
+    assert.deepEqual(t.center.raises[1], { source: HA_SOURCE, key: "pn:c", urgency: "normal", title: "C", body: "c body", renotify: true });
+    t.ha.push("updated", notif("c", "C2", "new body"));
+    await waitFor(() => t.center.raises.length === 3, "updated");
+    assert.deepEqual(t.center.raises[2], { source: HA_SOURCE, key: "pn:c", urgency: "normal", title: "C2", body: "new body", renotify: false });
+    t.ha.push("updated", notif("c", "C2", "new body"));
+    await t.sync();
+    assert.equal(t.center.raises.length, 3, "an unchanged update writes nothing");
+    t.ha.push("removed", notif("a", "A"));
+    await waitFor(() => t.center.resolves.length === 1, "removed");
+    assert.deepEqual(t.center.resolves, ["pn:a"]);
+    assert.deepEqual([...t.center.items.keys()], ["pn:c"]);
+  } finally {
+    await t.close();
+  }
+});
+
+test("disconnect resolves nothing; a reconnect with a smaller set resolves the missing id only", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  ha.notifications.set("b", notif("b", "B"));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 2, "initial");
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    await settle(t.producer);
+    assert.deepEqual(t.center.resolves, [], "a lost connection is never an empty list");
+    assert.equal(t.center.items.size, 2);
+    // HA lost `b` meanwhile (no event reached us).
+    t.ha.notifications.delete("b");
+    assert.equal(t.reconnect(), 1);
+    await t.sync();
+    assert.deepEqual(t.center.resolves, [], "not before the resolve grace");
+    t.clock.now += HA_RESOLVE_GRACE_MS - 1;
+    t.producerTimers.fire(HA_RESOLVE_GRACE_MS);
+    await settle(t.producer);
+    assert.deepEqual(t.center.resolves, [], "59.999 s: still waiting");
+    t.clock.now += 1;
+    t.producerTimers.fire(HA_RESOLVE_GRACE_MS);
+    await waitFor(() => t.center.resolves.length === 1, "resolve after the complete listing");
+    await settle(t.producer);
+    assert.deepEqual(t.center.resolves, ["pn:b"]);
+    assert.equal(t.center.raises.length, 2, "unchanged `a` not raised again");
+    assert.equal(t.ha.connections, 2);
+  } finally {
+    await t.close();
+  }
+});
+
+test("auth_invalid → one normal ha:access item; resolved on the next good connect", async () => {
+  const ha = new FakeHa();
+  ha.acceptToken = false;
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "ha:access");
+    assert.deepEqual(t.center.raises[0], {
+      source: HA_SOURCE,
+      key: HA_ACCESS_KEY,
+      urgency: "normal",
+      title: "HA uyarıları okunamıyor",
+      body: t.center.raises[0]!.body,
+      renotify: true,
+    });
+    // A second rejection does not raise again.
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    t.reconnect();
+    await waitFor(() => t.ha.connections === 2 && t.clientTimers.pending.size === 1, "second attempt");
+    await settle(t.producer);
+    assert.equal(t.center.raises.length, 1);
+    assert.equal(t.logs.filter((l) => l.includes("auth_invalid")).length, 1, "logged once per streak");
+    t.ha.acceptToken = true;
+    t.reconnect();
+    await waitFor(() => t.center.resolves.includes(HA_ACCESS_KEY) && t.center.items.has("pn:a"), "resolved + listed");
+    assert.deepEqual(t.center.resolves, [HA_ACCESS_KEY]);
+    assert.ok(!t.ha.commandTypes().some((c) => c !== "auth" && c !== "persistent_notification/subscribe"));
+  } finally {
+    await t.close();
+  }
+});
+
+test("client backoff: refused connections wait 1, 2, 4 s; a successful command result starts it over", async () => {
+  // A port with nothing listening.
+  const probe = new FakeHa();
+  const dead = await probe.ready();
+  await probe.close();
+  const timers = new FakeTimers();
+  const logs: string[] = [];
+  let connected = 0;
+  const client = new HaClient({
+    url: haWebSocketUrl(dead)!,
+    token: TOKEN,
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m) },
+    handlers: { onConnected: () => connected++, onDisconnected: () => {}, onAuthInvalid: () => {} },
+    timers,
+    random: () => 0.5,
+    heartbeatMs: 0,
+    authTimeoutMs: AUTH_TIMEOUT,
+  });
+  try {
+    client.start();
+    const backoff = () => timers.delays.filter((d) => d !== AUTH_TIMEOUT);
+    await waitFor(() => backoff().length === 1, "first retry");
+    timers.fire();
+    await waitFor(() => backoff().length === 2, "second retry");
+    timers.fire();
+    await waitFor(() => backoff().length === 3, "third retry");
+    assert.deepEqual(backoff(), [1_000, 2_000, 4_000]);
+    assert.equal(logs.filter((l) => l.includes("connection error")).length, 1, "one warning per outage");
+    assert.ok(logs.every((l) => !l.includes("127.0.0.1")), "no host in logs");
+    assert.equal(connected, 0);
+  } finally {
+    await client.close();
+  }
+  assert.equal(timers.pending.size, 0, "close stops reconnecting");
+
+  // Healthy connection: after the subscribe result the next drop waits 1 s again.
+  const ha = new FakeHa();
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.ha.subscribers === 1, "subscribed");
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "retry 1");
+    t.ha.refuseSubscribe = true; // auth ok, but no successful command: the backoff keeps growing
+    t.reconnect();
+    await waitFor(() => t.clientTimers.delays.filter((d) => d !== AUTH_TIMEOUT).length === 2, "retry 2");
+    t.ha.refuseSubscribe = false;
+    t.reconnect();
+    await waitFor(() => t.ha.subscribers === 1, "subscribed again");
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.delays.filter((d) => d !== AUTH_TIMEOUT).length === 3, "retry 3");
+    assert.deepEqual(t.clientTimers.delays.filter((d) => d !== AUTH_TIMEOUT), [1_000, 2_000, 1_000]);
+    assert.ok(t.logs.some((l) => l.includes("subscription refused (unknown_command)")));
+  } finally {
+    await t.close();
+  }
+});
+
+test("long notification ids are hashed; title/body cut to the store limits", async () => {
+  const ha = new FakeHa();
+  const longId = `x${"y".repeat(300)}`;
+  ha.notifications.set(longId, notif(longId, "T".repeat(500), "B".repeat(5_000)));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "raise");
+    const r = t.center.raises[0]!;
+    assert.equal(r.key, pnKey(longId));
+    assert.match(r.key!, /^pn:sha256:[0-9a-f]{64}$/);
+    assert.equal(r.title.length, MAX_TITLE_CHARS);
+    assert.equal(r.body!.length, MAX_BODY_CHARS);
+    t.ha.push("removed", notif(longId, null));
+    await waitFor(() => t.center.resolves.length === 1, "resolve");
+    assert.deepEqual(t.center.resolves, [pnKey(longId)]);
+  } finally {
+    await t.close();
+  }
+});
+
+test("startup adoption: open ha items count as open; unchanged ones are not re-raised, ended ones resolved", async () => {
+  const center = new FakeCenter();
+  center.items.set("pn:a", { source: HA_SOURCE, key: "pn:a", urgency: "normal", title: "A", body: "a body" });
+  center.items.set("pn:old", { source: HA_SOURCE, key: "pn:old", urgency: "normal", title: "Old", body: "" });
+  center.items.set(HA_ACCESS_KEY, { source: HA_SOURCE, key: HA_ACCESS_KEY, urgency: "normal", title: "HA uyarıları okunamıyor", body: "" });
+  center.items.set("service:home-assistant", { source: "service", key: "service:home-assistant", urgency: "normal", title: "x", body: "" });
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha, center });
+  try {
+    await waitFor(() => t.center.resolves.length === 1, "ha:access resolved at once");
+    await t.passGrace();
+    assert.deepEqual(t.center.resolves, [HA_ACCESS_KEY, "pn:old"]);
+    assert.equal(t.center.raises.length, 0, "an adopted unchanged item is not raised again");
+    assert.ok(t.center.items.has("service:home-assistant"), "other sources untouched");
+  } finally {
+    await t.close();
+  }
+});
+
+test("suppressed keys are adopted: an ended one is resolved (record cleared), an ongoing one is not raised", async () => {
+  const center = new FakeCenter();
+  center.suppressedKeys = [
+    { source: HA_SOURCE, key: "pn:gone" },
+    { source: HA_SOURCE, key: "pn:still" },
+    { source: "service", key: "pn:gone" },
+  ];
+  const ha = new FakeHa();
+  ha.notifications.set("still", notif("still", "S"));
+  const t = await setup({ ha, center });
+  try {
+    await t.passGrace();
+    assert.deepEqual(t.center.resolves, ["pn:gone"]);
+    assert.equal(t.center.raises.length, 0);
+    assert.deepEqual(t.center.suppressedKeys.map((s) => `${s.source}/${s.key}`), ["ha/pn:still", "service/pn:gone"]);
+    // A raise answered `suppressed` counts as open: its removal resolves it.
+    t.ha.push("added", notif("new", "N"));
+    await waitFor(() => t.center.raises.length === 1, "raise new");
+    t.center.suppressedKeys.push({ source: HA_SOURCE, key: "pn:new" });
+    t.ha.push("updated", notif("new", "N2"));
+    await waitFor(() => t.center.raises.length === 2, "update answered suppressed");
+    t.ha.push("updated", notif("new", "N3"));
+    await t.sync();
+    assert.equal(t.center.raises.length, 2, "a suppressed key is not updated");
+    t.ha.push("removed", notif("new", null));
+    await waitFor(() => t.center.resolves.includes("pn:new"), "resolve new");
+  } finally {
+    await t.close();
+  }
+});
+
+test("unreadable inbox: nothing raised until the startup adoption succeeds (retried)", async () => {
+  const center = new FakeCenter();
+  center.unavailable = true;
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha, center });
+  try {
+    await waitFor(() => t.ha.subscribers === 1, "subscribed");
+    await settle(t.producer);
+    assert.equal(t.center.raises.length, 0);
+    assert.ok(t.logs.some((l) => l.includes("startup reconcile retried later")));
+    assert.deepEqual([...t.producerTimers.pending.values()].map((p) => p.ms), [60_000]);
+    center.unavailable = false;
+    t.clock.now += 59_999;
+    t.producerTimers.fire();
+    await settle(t.producer);
+    assert.equal(t.center.raises.length, 0, "not before 60 s");
+    t.clock.now += 1;
+    t.producerTimers.fire();
+    await waitFor(() => t.center.raises.length === 1, "raised after retry");
+  } finally {
+    await t.close();
+  }
+});
+
+test("unknown event shapes and bad frames are ignored (logged once); the set is kept", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "raise");
+    t.ha.raw({ type: "current", notifications: [] });
+    t.ha.raw({ type: "weird", notifications: {} });
+    t.ha.raw("nope");
+    for (const ws of t.ha.wss.clients) ws.send("{not json");
+    await t.passGrace();
+    assert.deepEqual(t.center.resolves, [], "a malformed `current` is not a complete listing");
+    assert.equal(t.logs.filter((l) => l.includes("unexpected notification event shape")).length, 1);
+    // A malformed entry in a real listing still counts as present (fallback title).
+    t.ha.raw({ type: "current", notifications: { a: notif("a", "A"), b: 42 } });
+    await waitFor(() => t.center.raises.length === 2, "b raised");
+    assert.deepEqual(t.center.raises[1], { source: HA_SOURCE, key: "pn:b", urgency: "normal", title: "Home Assistant bildirimi", body: "", renotify: true });
+    assert.deepEqual(t.center.resolves, []);
+  } finally {
+    await t.close();
+  }
+});
+
+test("read-only: a command outside READ_ONLY_COMMANDS is refused and never sent", async () => {
+  const ha = new FakeHa();
+  const base = await ha.ready();
+  let conn: HaConnection | undefined;
+  const client = new HaClient({
+    url: haWebSocketUrl(base)!,
+    token: TOKEN,
+    logger: { info: () => {}, warn: () => {} },
+    handlers: { onConnected: (c) => (conn = c), onDisconnected: () => {}, onAuthInvalid: () => {} },
+    timers: new FakeTimers(),
+    heartbeatMs: 0,
+  });
+  try {
+    client.start();
+    await waitFor(() => conn !== undefined, "connected");
+    await assert.rejects(conn!.command("persistent_notification/dismiss", { notification_id: "a" }), /not allowed/);
+    await assert.rejects(conn!.command("call_service", { domain: "x" }), /not allowed/);
+    await settle();
+    assert.deepEqual(ha.commandTypes(), ["auth"]);
+  } finally {
+    await client.close();
+    await ha.close();
+  }
+});
+
+test("close: the socket is closed, pending commands rejected, no reconnect", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const t = await setup({ ha });
+  await waitFor(() => t.ha.subscribers === 1, "subscribed");
+  await t.client.close();
+  await waitFor(() => t.ha.subscribers === 0, "server saw the close");
+  await settle(t.producer);
+  assert.equal(t.clientTimers.pending.size, 0);
+  assert.deepEqual(t.center.resolves, [], "closing resolves nothing");
+  await t.close();
+});
+
+test("heartbeat: no pong before the next ping drops the socket and reconnects", async () => {
+  const ha = new FakeHa();
+  const base = await ha.ready();
+  const timers = new FakeTimers();
+  let connects = 0;
+  let disconnects = 0;
+  const client = new HaClient({
+    url: haWebSocketUrl(base)!,
+    token: TOKEN,
+    logger: { info: () => {}, warn: () => {} },
+    handlers: { onConnected: () => connects++, onDisconnected: () => disconnects++, onAuthInvalid: () => {} },
+    timers,
+    random: () => 0.5,
+    heartbeatMs: 30_000,
+    authTimeoutMs: AUTH_TIMEOUT,
+  });
+  try {
+    client.start();
+    await waitFor(() => connects === 1, "connected");
+    // First tick: ping sent; the server's ws answers with a pong.
+    timers.fire(30_000);
+    await settle();
+    timers.fire(30_000);
+    await settle();
+    assert.equal(disconnects, 0, "answered pings keep the connection");
+    // Stop the server from answering pings: pause the server-side socket.
+    for (const ws of ha.wss.clients) (ws as unknown as { _socket: { pause(): void } })._socket.pause();
+    timers.fire(30_000);
+    timers.fire(30_000);
+    await waitFor(() => disconnects === 1, "dropped");
+  } finally {
+    await client.close();
+    await ha.close();
+  }
+});
+
+test("HA restart: a listing missing ids resolves nothing during the grace; ids back by then are neither resolved nor re-raised", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  ha.notifications.set("b", notif("b", "B"));
+  const center = new FakeCenter();
+  center.suppressedKeys = [{ source: HA_SOURCE, key: "pn:b" }];
+  const t = await setup({ ha, center });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "a raised");
+    await t.passGrace();
+    // HA restarts: its WebSocket API is up before the integrations recreate their notifications.
+    t.ha.notifications.clear();
+    t.ha.dropAll();
+    await waitFor(() => t.clientTimers.pending.size === 1, "reconnect scheduled");
+    t.reconnect();
+    await waitFor(() => t.ha.subscribers === 1, "subscribed after the restart");
+    await t.sync();
+    assert.deepEqual(t.center.resolves, []);
+    t.ha.push("added", notif("a", "A"));
+    t.ha.push("added", notif("b", "B"));
+    // A `removed` event still resolves at once.
+    t.ha.push("added", notif("c", "C"));
+    await waitFor(() => t.center.items.has("pn:c"), "c raised");
+    t.ha.push("removed", notif("c", "C"));
+    await waitFor(() => t.center.resolves.includes("pn:c"), "removed resolves at once");
+    await t.passGrace();
+    assert.deepEqual(t.center.resolves, ["pn:c"]);
+    assert.deepEqual(t.center.raises.map((r) => r.key), ["pn:a", "pn:c"], "a and the suppressed b not raised again");
+    assert.deepEqual(t.center.suppressedKeys, [{ source: HA_SOURCE, key: "pn:b" }], "suppression kept");
+  } finally {
+    await t.close();
+  }
+});
