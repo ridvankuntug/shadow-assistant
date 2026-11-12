@@ -403,7 +403,7 @@ export class Session {
       const v = await center.list();
       this.emit({ type: "notifications", id, items: v.items, unread: v.unread });
     } catch (err) {
-      // The store already logged why the file could not be read.
+      // The store logs why the file could not be read (once, when it became unreadable).
       if (err instanceof NotificationsUnavailableError) {
         this.error("notifications_unavailable", "notifications could not be read", id);
         return;
@@ -2253,7 +2253,7 @@ export class NotificationCenter {
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.chain.then(fn);
     this.chain = run.catch((err: unknown) => {
-      // An unreadable file is logged by the store, once per call.
+      // An unreadable file is logged by the store, once per spell (when it becomes unreadable and when it recovers).
       if (err instanceof NotificationsUnavailableError) this.lastUnavailable = true;
       else this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`);
     }).then(() => this.syncRetry());

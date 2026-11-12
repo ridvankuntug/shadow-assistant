@@ -384,6 +384,16 @@ only after the previous one finished, so checks never overlap.
 A disabled service (in the file, or by a missing environment variable) is
 reported as `disabled` and never checked.
 
+**Hysteresis (T7.w.13).** A service shown as `ok` or `loading` is shown as
+`down` only after 2 failed checks in a row (`DEFAULT_HEALTH_DOWN_AFTER`,
+`core/src/health.ts`; not an environment setting): one lost check (a timeout
+while the PC is busy, a service restart) keeps the shown status and is only
+logged, and a real outage still shows within two intervals (60 s at the
+default 30 s). A single check that is not `down` is shown at once (recovery is
+not delayed), and the first round shows what it found. Clients (`services`),
+`GET /health` and the tray all see the shown status, never the raw check; a
+held-back failure updates only `checkedAt`, so it sends no frame.
+
 `items` is the full list in `services.yaml` order. It is sent to each
 authenticated client after `welcome` + `state` (once the first round has
 finished) and to all clients whenever a `status` or `detail` changes;

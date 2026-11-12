@@ -186,7 +186,10 @@ These go to a model on purpose:
    and the turn goes to the model (`target_refused`, always a fallback,
    whatever `on_tool_error` says). The rule's `domains` cannot widen this;
    listing `switch` and `fan` only keeps a name shared with a light ambiguous.
-   Light-level rules have no such check.
+   **Light-level rules** (`light__HassLightSet`, T7.w.13) check only the deny
+   name words (`staticDenyNameFilter`, the same list, also with learning off):
+   "garaj lambasını yüzde 50 yap" goes to the model like "garaj lambasını aç"
+   (`target_refused`). The domain boundary is the rule's `domains` (lights).
 4. **Sensor rules.** Numeric `device_class: temperature|humidity` sensors (and
    `climate` current values) are filtered:
    - by the spoken name (area, label or name words);
@@ -293,7 +296,7 @@ name; the domain ban and the switch `device_class: outlet` check do not depend
 on wording. An entry of several words ("su pompası") refuses a target when one
 name, alias or area has those words one after the other, each matched the same
 way ("Bahçe Su Pompasının Prizi"; T7.w.12); words of two different names are
-never joined. The same list also guards the static turn-on / off rules (above). A learned pattern never stores a
+never joined. The same list also guards the static turn-on / off and light-level rules (above). A learned pattern never stores a
 word that is a name or area word of the home (live context names, aliases and
 areas, and every `direct.area_aliases` name), in any suffixed form: a stem match,
 or the word starting with a name word of 3+ letters, with k/ğ, t/d, p/b folded

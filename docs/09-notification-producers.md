@@ -223,12 +223,13 @@ connect. Outside the window nothing changes.
   The window is a Core setting with this default.
 - Normal items are never spoken, so quiet hours do not touch them.
 
-Proposal for what happens after 09:00 (open question 1): an urgent item raised
-in quiet hours goes to the pending-speech set. At 09:00 nothing is spoken by
-itself (no device is known to be near a person); the first speech-enabled
-connect or the first turn after 09:00 speaks it once if it is still unread,
-unresolved and not suppressed. The alternative is never to speak it later (it
-stays an unread urgent notification).
+Decided (T16.3, was open question 1): an urgent item raised in quiet hours
+goes to the pending-speech set. At 09:00 nothing is spoken by itself (no device
+is known to be near a person); the **first speech-enabled connection after
+09:00** speaks it **once**, on one socket, if it is still unread and unresolved
+(and not suppressed). Read, delete or resolve before then cancels it; after it
+was spoken once it is never spoken again. Not chosen: never speaking it later.
+Not implemented yet: quiet hours and pending speech are T7.w.11.4 / T7.w.11.9.
 
 ### Dismiss options: "Gördüm" vs "Tekrar gösterme"
 
@@ -283,7 +284,7 @@ The client action and its protocol shape (extra to delete) are specified in
 
 - T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests.
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
-- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour per open question 1; tests with a fake clock.
+- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock.
 
 - T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests.
 
@@ -294,15 +295,16 @@ The client action and its protocol shape (extra to delete) are specified in
 Decided (moved to the sections above): 72 h without a successful backup is
 urgent (spoken); HA down for 30 min is urgent (the item raised at 90 s stays
 normal until then); quiet hours 00:00-09:00, in which urgent items are shown but
-not spoken; `HA_CORE_TOKEN` belongs to an admin user and is used for the
+not spoken, and an urgent item from that window that is still unread and
+unresolved is spoken once on the first speech-enabled connection after 09:00; `HA_CORE_TOKEN` belongs to an admin user and is used for the
 WebSocket API and repairs; "Gördüm" deletes (the item may come back once after a
 Core restart while the condition lasts, accepted) and "Tekrar gösterme"
 suppresses it while the condition lasts; vault and memory health join the
 service producer.
 
-1. **After quiet hours:** is an urgent item raised between 00:00 and 09:00 spoken
-   once later (proposal: on the first speech-enabled connect or turn after 09:00,
-   if still unread and unresolved), or never spoken?
+1. ~~**After quiet hours**~~ — decided (T16.3): spoken once on the first
+   speech-enabled connection after 09:00 if still unread and unresolved; see
+   *Quiet hours for urgent speech*.
 2. **Alert type key:** is the proposed key (normalized `notification_id` prefix;
    repairs `domain` + `translation_key`/`issue_id`) right, and how is a variable
    suffix recognized (digits/UUID tail)?

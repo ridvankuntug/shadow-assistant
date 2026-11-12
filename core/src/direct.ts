@@ -127,7 +127,7 @@ export function directCallArgs(plan: DirectPlan, res: Extract<Resolution, { stat
 export type TargetResolution = Resolution | { status: "refused" };
 
 /**
- * `resolveWithAliases()`, then the plan's `targetFilter` (learned and static switch rules)
+ * `resolveWithAliases()`, then the plan's `targetFilter` (learned rules, static switch and light-set rules)
  * on the one resolved entity: a refused target is never called. Without a
  * filter this is exactly `resolveWithAliases()`.
  */

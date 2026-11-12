@@ -368,6 +368,30 @@ test("an unreadable file is never overwritten: operations report unavailable (ne
   assert.deepEqual(disk(dir).items.map((i) => i.title), ["kept", "new"]);
 });
 
+test("an unreadable file is logged only when it becomes unreadable and when it can be read again (T16.3)", async () => {
+  const dir = freshDir();
+  const logs: string[] = [];
+  const { fs, state } = flakyFs();
+  const store = new NotificationStore({ coalesceMs: 0, dir, fs, retryDelaysMs: [], log: (m) => logs.push(m) });
+  const unreadableLogs = () => logs.filter((l) => l.includes("could not be read"));
+  const recoveredLogs = () => logs.filter((l) => l.includes("can be read again"));
+
+  state.failRead = true;
+  // Many failed calls in one spell (the center retries once a minute): one line.
+  for (let i = 0; i < 5; i++) await assert.rejects(store.unreadCount(), NotificationsUnavailableError);
+  assert.deepEqual(await store.raise({ source: "test", title: "x" }), { ok: false, reason: "unavailable" });
+  assert.deepEqual(unreadableLogs(), ["[shadow-core] notifications file could not be read: EACCES"]);
+  assert.equal(recoveredLogs().length, 0);
+
+  state.failRead = false;
+  assert.equal(await store.unreadCount(), 0);
+  assert.deepEqual(recoveredLogs(), ["[shadow-core] notifications file can be read again"]);
+  // Later successful calls log nothing more.
+  await store.list();
+  assert.equal(recoveredLogs().length, 1);
+  assert.equal(unreadableLogs().length, 1);
+});
+
 test("an invalid file that cannot be moved aside is not replaced by an empty store", async () => {
   const dir = freshDir();
   mkdirSync(dir, { recursive: true });

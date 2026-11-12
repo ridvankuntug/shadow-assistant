@@ -162,6 +162,12 @@ export class NotificationStore {
   private chain: Promise<unknown> = Promise.resolve();
   /** In-memory changes not yet on disk (a coalesced change, or a failed write). */
   private pending = false;
+  /**
+   * The last load failed. The center retries once a minute while the file is
+   * unreadable (T7.w.13), so the log line is written only when this flips
+   * (could not be read / can be read again), not on every failed call (T16.3).
+   */
+  private unreadable = false;
   private readonly setTimer: (fn: () => void, ms: number) => () => void;
   /** Cancels the scheduled coalesced write; undefined when none is scheduled. */
   private cancelScheduled: (() => void) | undefined;
@@ -326,7 +332,8 @@ export class NotificationStore {
    * from a failed write) is written at once with `coalesceMs` 0, else within
    * `coalesceMs`. Rejects with NotificationsUnavailableError when the file
    * cannot be loaded; nothing is then written, so the file on disk is never
-   * replaced by an empty inbox. A write failure is logged; `fn`'s result
+   * replaced by an empty inbox. An unreadable file is logged once when it
+   * becomes unreadable and once when it can be read again. A write failure is logged; `fn`'s result
    * still stands (the change is kept in memory and retried by the next write).
    */
   private change<T>(fn: (inbox: Inbox) => { result: T; changed: boolean }): Promise<T> {
@@ -335,8 +342,15 @@ export class NotificationStore {
       try {
         inbox = await this.load();
       } catch (err) {
-        this.o.log?.(`[shadow-core] notifications file could not be read: ${errName(err)}`);
+        if (!this.unreadable) {
+          this.unreadable = true;
+          this.o.log?.(`[shadow-core] notifications file could not be read: ${errName(err)}`);
+        }
         throw new NotificationsUnavailableError();
+      }
+      if (this.unreadable) {
+        this.unreadable = false;
+        this.o.log?.("[shadow-core] notifications file can be read again");
       }
       const { result, changed } = fn(inbox);
       if (changed) this.pending = true;
