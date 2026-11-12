@@ -86,6 +86,17 @@ service the Core depends on going down, and Home Assistant's own alerts.
     (spoken once). Decided: no successful backup for 72 h is urgent.
   - `result: ok` → resolve `backup:failed` and `backup:stale`.
 - Flap: not applicable (one run per day); dedupe by `runId`.
+- Implemented (T7.w.11.2, [`backup-producer.ts`](../core/src/backup-producer.ts)). Details
+  the rules above leave open: a `running` run that is not stuck changes nothing (open
+  items wait for its result); a failure resolves `backup:stale` (it explains it); an
+  invalid file keeps the open items, a removed file resolves them; an adopted
+  `backup:failed` is renotified only if the run in the file ended after the item's
+  last update.
+- **Varsayılan — kullanıcı onayı bekliyor:** with `lastSuccessAt: null` (no run ever
+  succeeded) the 72 h urgency counts from the earliest known start: the earliest
+  `startedAt` seen since the Core started, or the `createdAt` of an open backup item
+  adopted at startup. `backup:stale` needs no reference then (a failed or stuck run
+  already shows `backup:failed`).
 
 ### (b) Core services down / back
 
@@ -282,7 +293,7 @@ The client action and its protocol shape (extra to delete) are specified in
 ## Implementation tasks
 
 - T7.w.11.1 — Backup status file: `backup-data.ps1` writes `backup/status.json` (start/end, stage, lastSuccessAt; setup inside `try`; `-WhatIf` none; excluded from the archive); docs/05 note.
-- T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests.
+- T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests. Implemented: [`backup-producer.ts`](../core/src/backup-producer.ts), wired in `index.ts` (started with the health monitor, closed in the shutdown chain); tests in `core/test/backup-producer.test.ts`.
 - T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests.
 - T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
 - T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server.

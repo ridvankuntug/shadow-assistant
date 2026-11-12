@@ -14,6 +14,7 @@ import { DevNotes, TurnNotes } from "./dev-notes.js";
 import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
+import { BackupProducer, backupStatusPath } from "./backup-producer.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
 import { LEARNED_RULES_DIR, LearnedRuleStore } from "./learn/store.js";
@@ -312,10 +313,21 @@ export async function main(): Promise<void> {
   }
   devTab = new DevelopmentTab({ rules: learnedRules, toolNotes, turnNotes, managers: cfg.devDevices, logger });
   await devTab.view(); // the first badge count, for /health `inbox`
-  // The home's notification inbox (docs/08 T7.w.5). No producer yet: later ones call notificationCenter.raise()/resolve().
+  // The home's notification inbox (docs/08 T7.w.5); producers call notificationCenter.raise()/resolve() (docs/09).
   const notificationStore = new NotificationStore({ dir: join(cfg.dataDir, NOTIFICATIONS_DIR), log: (m) => logger.warn(m) });
   const notificationCenter = new NotificationCenter({ store: notificationStore, logger });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
+  // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
+  // Startup adoption reads the store directly (the center's list drops the dedupe key).
+  const backupProducer = new BackupProducer({
+    statusFile: backupStatusPath(cfg.dataDir),
+    notifications: {
+      raise: (input) => notificationCenter.raise(input),
+      resolve: (source, key) => notificationCenter.resolve(source, key),
+      list: () => notificationStore.list(),
+    },
+    logger,
+  });
   const tierServices = cfg.router?.tierServices;
   const stt = new WhisperClient(cfg.whisper?.enabled ? cfg.whisper.url : undefined, cfg.whisper?.timeoutMs);
   const tts = new PiperTtsClient(cfg.tts?.enabled ? cfg.tts.url : undefined, cfg.tts?.timeoutMs);
@@ -396,6 +408,7 @@ export async function main(): Promise<void> {
   );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
+  backupProducer.start();
   // List the remote services once now, so the first session gets their tools and instructions.
   void gateway.warm();
   logger.info(`[shadow-core] mcp gateway: ${gateway.services.join(", ") || "no services"}`);
@@ -413,6 +426,7 @@ export async function main(): Promise<void> {
           { name: "maintenance", run: () => maintenance?.close() },
           { name: "background", run: () => background.abort() },
           { name: "health monitor", run: () => monitor.close() },
+          { name: "backup producer", run: () => backupProducer.close() },
           // Closes every socket; each session flushes its conversation log lines.
           { name: "server", run: () => server.close() },
           // Closes the model sessions and flushes the continuity pointers.
