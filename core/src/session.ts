@@ -2009,8 +2009,9 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  *
  * While the store cannot read its file, `list()`, `act()` and `resolve()`
  * reject with NotificationsUnavailableError (the session answers
- * `notifications_unavailable`), `raise()` answers `unavailable`, and
- * `unread` keeps its last value.
+ * `notifications_unavailable`), `raise()` answers `unavailable`, `unread`
+ * keeps its last value and `unavailable` is true (/health `inbox`, T7.w.12)
+ * until a later call reads the file again (`refresh()`, `list()`, an action, a producer call).
  */
 export class NotificationCenter {
   /** Attached sockets → attach order. */
@@ -2021,6 +2022,8 @@ export class NotificationCenter {
   /** One counter for attach and turn order (no clock ties). */
   private seq = 0;
   private lastUnread = 0;
+  /** The last store call could not read the file (cleared by the next one that could). */
+  private lastUnavailable = false;
   /** Serializes store calls, their broadcasts and the unread count. */
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -2031,7 +2034,23 @@ export class NotificationCenter {
     return this.lastUnread;
   }
 
-  /** Re-reads the unread count from the store. Never rejects: an unreadable file keeps the last count (startup: 0). */
+  /**
+   * The notifications file could not be read on the last attempt (sync, for /health
+   * `inbox.notificationsUnavailable`): `unread` is then a stale count (startup: 0), not "nothing unread".
+   */
+  get unavailable(): boolean {
+    return this.lastUnavailable;
+  }
+
+  /**
+   * The notification fields of GET /health `inbox` (loopback only): `notifications` is the
+   * unread count as before; `notificationsUnavailable` (T7.w.12) tells a stale count apart from a real 0.
+   */
+  healthInbox(): { notifications: number; notificationsUnavailable: boolean } {
+    return { notifications: this.lastUnread, notificationsUnavailable: this.lastUnavailable };
+  }
+
+  /** Re-reads the unread count from the store. Never rejects: an unreadable file keeps the last count (startup: 0) and sets `unavailable`. */
   refresh(): Promise<number> {
     return this.serial(() => this.recount()).catch(() => this.lastUnread);
   }
@@ -2060,7 +2079,11 @@ export class NotificationCenter {
   raise(input: RaiseInput): Promise<RaiseResult> {
     return this.serial(async () => {
       const r = await this.o.store.raise(input);
-      if (!r.ok) return r;
+      if (!r.ok) {
+        if (r.reason === "unavailable") this.lastUnavailable = true;
+        else await this.settle();
+        return r;
+      }
       const speak = r.item.urgency === "urgent" && (r.created || input.renotify === true);
       this.broadcast({ type: "notification", item: notificationInfo(r.item) }, speak ? this.speaker() : undefined);
       await this.recount();
@@ -2075,7 +2098,10 @@ export class NotificationCenter {
   resolve(source: string, key: string): Promise<boolean> {
     return this.serial(async () => {
       const item = await this.o.store.resolve(source, key);
-      if (!item) return false;
+      if (!item) {
+        await this.settle();
+        return false;
+      }
       this.broadcast({ type: "notification_removed", notificationId: item.id });
       await this.recount();
       return true;
@@ -2086,7 +2112,11 @@ export class NotificationCenter {
   list(): Promise<{ items: NotificationInfo[]; unread: number }> {
     return this.serial(async () => {
       const items = await this.o.store.list(notificationInfo);
-      return { items, unread: items.filter((i) => i.readAt === null).length };
+      const unread = items.filter((i) => i.readAt === null).length;
+      // The file was read: this is the current count (also after an unreadable spell).
+      this.lastUnread = unread;
+      this.lastUnavailable = false;
+      return { items, unread };
     });
   }
 
@@ -2097,23 +2127,31 @@ export class NotificationCenter {
    */
   act(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
     return this.serial(async () => {
-      if (action === "delete") {
-        if (!(await this.o.store.delete(notificationId))) return unknownNotification();
-        this.o.logger.info(`[shadow-core] notification ${notificationId} deleted by device ${device}`);
-        this.broadcast({ type: "notification_removed", notificationId });
-        await this.recount();
-        return { ok: true };
-      }
-      const before = await this.o.store.get(notificationId);
-      if (!before) return unknownNotification();
-      const after = action === "read" ? await this.o.store.markRead(notificationId) : await this.o.store.markUnread(notificationId);
-      if (!after) return unknownNotification();
-      if (after.readAt !== before.readAt) {
-        this.broadcast({ type: "notification", item: notificationInfo(after) });
-        await this.recount();
-      }
-      return { ok: true };
+      const r = await this.actOnStore(device, notificationId, action);
+      // Every answer here read the file; one that changed nothing has not recounted yet.
+      await this.settle();
+      return r;
     });
+  }
+
+  /** `act()` on the chain: the store call, its broadcast and the recount of a change. */
+  private async actOnStore(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
+    if (action === "delete") {
+      if (!(await this.o.store.delete(notificationId))) return unknownNotification();
+      this.o.logger.info(`[shadow-core] notification ${notificationId} deleted by device ${device}`);
+      this.broadcast({ type: "notification_removed", notificationId });
+      await this.recount();
+      return { ok: true };
+    }
+    const before = await this.o.store.get(notificationId);
+    if (!before) return unknownNotification();
+    const after = action === "read" ? await this.o.store.markRead(notificationId) : await this.o.store.markUnread(notificationId);
+    if (!after) return unknownNotification();
+    if (after.readAt !== before.readAt) {
+      this.broadcast({ type: "notification", item: notificationInfo(after) });
+      await this.recount();
+    }
+    return { ok: true };
   }
 
   /** Waits for the changes in flight, then retries a failed store write (shutdown). Never rejects. */
@@ -2139,8 +2177,23 @@ export class NotificationCenter {
     }
   }
 
+  /**
+   * After a call that answered without recounting (nothing changed, unknown id, a full
+   * store): if the flag is still set from an unreadable spell, recount now, so /health
+   * shows the real count again. A recount that still cannot read leaves the flag set.
+   */
+  private async settle(): Promise<void> {
+    if (!this.lastUnavailable) return;
+    try {
+      await this.recount();
+    } catch (err) {
+      if (!(err instanceof NotificationsUnavailableError)) throw err;
+    }
+  }
+
   private async recount(): Promise<number> {
     this.lastUnread = await this.o.store.unreadCount();
+    this.lastUnavailable = false;
     return this.lastUnread;
   }
 
@@ -2148,7 +2201,8 @@ export class NotificationCenter {
     const run = this.chain.then(fn);
     this.chain = run.catch((err: unknown) => {
       // An unreadable file is logged by the store, once per call.
-      if (!(err instanceof NotificationsUnavailableError)) this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`);
+      if (err instanceof NotificationsUnavailableError) this.lastUnavailable = true;
+      else this.o.logger.warn(`[shadow-core] notifications failed: ${(err as Error)?.name ?? "error"}`);
     });
     return run;
   }

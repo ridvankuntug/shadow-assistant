@@ -10,9 +10,16 @@ shell) uses. TypeScript types for all frames live in a single module:
   (`status` and `detail` as in *Service health*; `status` is `unknown` before the first check round and
   `detail` is present only when the check set one. No URLs, tokens or error messages.)
   Only for requests from a loopback address (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`; the tray on the
-  same machine) the body also has `"inbox":{"dev":<open>,"notifications":<unread>}`: the
-  Development badge count (see *Development*) and the number of unread notifications (see
-  *Notifications*), numbers only. Remote callers get the body without `inbox`.
+  same machine) the body also has
+  `"inbox":{"dev":<open>,"notifications":<unread>,"notificationsUnavailable":<bool>}`: the
+  Development badge count (see *Development*), the number of unread notifications (see
+  *Notifications*) and whether the notifications file could not be read on the last attempt
+  (added in protocol 1 without a version bump, T7.w.12). While `notificationsUnavailable` is
+  `true`, `notifications` is the last count read (0 if none since startup), not a real count:
+  show the inbox as unreadable ("!"), not as empty. It turns `false` again with the next call
+  that reads the file (a `notifications_list`, an action, a producer's call). Older Cores omit the field;
+  treat a missing field as `false`. Numbers and a flag only, no titles. Remote callers get the
+  body without `inbox`.
 - Device state: `POST http://<core-host>:<CORE_PORT>/device/state` (bearer token; see *Device state*).
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on

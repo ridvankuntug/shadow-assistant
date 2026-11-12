@@ -28,11 +28,13 @@
 # from services.yaml (read / write / confirm, confirm_inputs, CORE_READ_ONLY).
 # A rule's `permission` can only raise that level, never lower it.
 #
-# Turn-on rules (tool intent__HassTurnOn) only ever switch on a light or a plug
-# (a `switch` with device_class: outlet), whatever their `domains` say: a switch
-# without a device class (it may drive a door relay) or a fan is resolved but
-# not called, and the request goes to the model. Turn-off rules are not limited
-# this way. This is a Core rule, not a setting.
+# Turn-on and turn-off rules (tools intent__HassTurnOn / intent__HassTurnOff)
+# only ever switch a light or a plug (a `switch` with device_class: outlet),
+# whatever their `domains` say, and never a target whose name, alias or area
+# has a deny name word (learning.deny_name_words below plus the Core's own
+# list, also with learning off): a switch without a device class (it may drive
+# a door relay or a pump), a fan or a "Kapı rölesi" plug is resolved but not
+# called, and the request goes to the model. This is a Core rule, not a setting.
 
 version: 1
 
@@ -117,7 +119,9 @@ learning:
   # Added to the Core's own list (kapı, kilit, garaj, alarm, kepenk, panjur,
   # vana, siren, door, lock, garage, gate, valve, shutter): a target whose name,
   # alias or area has a word starting with one ("kilidi", "kapısı"; not inside
-  # a word: "clock" is not "lock") is never learned or run. Generic words only.
+  # a word: "clock" is not "lock") is never learned or run, and the static
+  # turn-on / off rules leave it to the model. A several-word entry ("su pompası")
+  # matches those words one after the other. Generic words only.
   deny_name_words: [kapı, kilit, garaj, alarm, kepenk, panjur, vana, kombi, ocak, fırın]
   # Device words that may follow the spoken name in the entity name, per domain.
   keywords:
@@ -176,8 +180,9 @@ rules:
   # "<ad>'ı aç", "<ad>u kapat": the name may carry an accusative suffix with
   # or without an apostrophe. Only these domains are ever touched at tier 0;
   # locks, covers, alarms and the like always go through the model. device-on
-  # still lists switch and fan so a name shared with a light stays ambiguous,
-  # but it only turns on lights and outlet switches (see the top of the file).
+  # and device-off still list switch and fan so a name shared with a light stays
+  # ambiguous, but they only switch lights and outlet switches (see the top of
+  # the file).
   - id: device-on
     tier: 0
     patterns:

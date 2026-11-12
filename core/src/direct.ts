@@ -16,9 +16,10 @@
  * summarise it with a template.
  *
  * Learned rules (T7.w.2) run through the same code; their plan carries a
- * `targetFilter` (safety layer 3, docs/08), and so do static turn-on rules
- * (only lights and `device_class: outlet` switches, T7.w.10): a resolved
- * entity it refuses is not called and the turn falls back to the model.
+ * `targetFilter` (safety layer 3, docs/08), and so do static turn-on / off
+ * rules (only lights and `device_class: outlet` switches, T7.w.10 / T7.w.12,
+ * and no deny name word): a resolved entity it refuses is not called and the
+ * turn falls back to the model.
  */
 import { LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import {
@@ -98,7 +99,7 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
   if (res.status === "none") return failOr("name_not_found", m.not_found);
   if (res.status === "ambiguous") return failOr("name_ambiguous", m.ambiguous);
   // Always the model, whatever `direct.on_tool_error` says: nothing was called, and a
-  // refused target (a static turn-on rule's non-plug switch, a learned rule's denied
+  // refused target (a static switch rule's non-plug switch or denied name, a learned rule's denied
   // target) is one the model should handle, not one to answer "not found" for.
   if (res.status === "refused") return { kind: "fallback", reason: "target_refused" };
   if (plan.tool === LIGHT_SET_TOOL && plan.brightness === undefined) return failOr("no_brightness", m.failed);
@@ -125,7 +126,7 @@ export function directCallArgs(plan: DirectPlan, res: Extract<Resolution, { stat
 export type TargetResolution = Resolution | { status: "refused" };
 
 /**
- * `resolveWithAliases()`, then the plan's `targetFilter` (learned and static turn-on rules)
+ * `resolveWithAliases()`, then the plan's `targetFilter` (learned and static switch rules)
  * on the one resolved entity: a refused target is never called. Without a
  * filter this is exactly `resolveWithAliases()`.
  */

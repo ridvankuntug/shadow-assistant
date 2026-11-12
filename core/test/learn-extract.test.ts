@@ -279,6 +279,39 @@ describe("extractPattern: target check (layer 3)", () => {
     assert.equal(allow(plug("Bahçekapısı Prizi")), true);
   });
 
+  test("a several-word deny entry matches consecutive words of one name (T7.w.12)", () => {
+    const multi: LearnPolicy = {
+      config: parseRouterConfig(`${YAML}  deny_name_words: [su pompası, akvaryum]\n`),
+      confirmDeviceClasses: new Set(),
+    };
+    assert.ok(multi.config.learning.denyNameWords.has("su pompasi"), "folded, the space kept");
+    const allow = learnTargetFilter(multi);
+    const plug = (names: string, areas: string[] = []) => ent(names, "switch", { areas, attributes: { device_class: "outlet" } });
+    for (const [names, areas] of [
+      ["Su Pompası"],
+      ["Bahçe Su Pompası Prizi"],
+      ["Su Pompasının Prizi"],
+      ["Masa Prizi, Su Pompası"],
+      ["Masa Prizi", ["Su Pompası Odası"]],
+      ["Akvaryum Prizi"],
+    ] as [string, string[]?][]) {
+      assert.equal(allow(plug(names, areas ?? [])), false, `${names} / ${(areas ?? []).join(",")}`);
+    }
+    // Not consecutive, another order, inside a word, or split over a name and an area: allowed.
+    for (const [names, areas] of [
+      ["Su Isıtıcı Pompası"],
+      ["Pompası Su"],
+      ["Asu Pompası"],
+      ["Su", ["Pompası"]],
+      ["Masa Prizi"],
+    ] as [string, string[]?][]) {
+      assert.equal(allow(plug(names, areas ?? [])), true, `${names} / ${(areas ?? []).join(",")}`);
+    }
+    // One-word entries keep the whole-word rule.
+    assert.equal(allow(plug("Wall Clock")), true);
+    assert.equal(allow(plug("Front Door Lock")), false);
+  });
+
   test("isDenyWord: start of the word, softened stem, never inside", () => {
     assert.equal(isDenyWord("lock", "lock"), true);
     assert.equal(isDenyWord("locked", "lock"), true);

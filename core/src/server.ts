@@ -44,11 +44,11 @@ export interface CoreServerOptions {
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
-   * Counts for GET /health `inbox` (e.g. `{ dev: 3, notifications: 1 }`), sent **only** to
-   * loopback requests (the tray on the same machine): numbers, no titles.
+   * Counts for GET /health `inbox` (e.g. `{ dev: 3, notifications: 1, notificationsUnavailable: false }`),
+   * sent **only** to loopback requests (the tray on the same machine): numbers and flags, no titles.
    * Remote callers get the body without `inbox`.
    */
-  inbox?: () => Record<string, number>;
+  inbox?: () => Record<string, number | boolean>;
   /** Development badge count (T7.w.4): every change goes to every authenticated socket as `dev_count`. */
   devCount?: DevCountSource;
   /**

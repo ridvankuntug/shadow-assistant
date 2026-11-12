@@ -364,7 +364,8 @@ export async function main(): Promise<void> {
     // Name, flag, status and short detail code only: no URL or token leaves through /health.
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
     // Loopback requests only (the tray): the Development badge count and unread notifications, no titles.
-    inbox: () => ({ dev: devTab?.open ?? 0, notifications: notificationCenter.unread }),
+    // `notificationsUnavailable`: the file could not be read, `notifications` is then not a real count (T7.w.12).
+    inbox: () => ({ dev: devTab?.open ?? 0, ...notificationCenter.healthInbox() }),
     devCount: devTab,
     features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications"],
     serviceHealth: monitor,

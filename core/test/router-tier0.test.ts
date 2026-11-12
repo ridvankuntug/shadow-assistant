@@ -19,7 +19,8 @@ import {
   matchRules,
   parseRouterConfig,
   RouterConfigError,
-  staticTurnOnTarget,
+  hasDenyName,
+  staticSwitchTarget,
   TIER0_MAX_CHARS,
   type DirectPlan,
 } from "../src/router-config.js";
@@ -399,9 +400,9 @@ describe("long input", () => {
   });
 });
 
-// ------------------------------------------------------------------ static turn-on targets (T7.w.10)
+// ------------------------------------------------------------------ static switch targets (T7.w.10, T7.w.12)
 
-describe("static turn-on rules: lights and outlet switches only", () => {
+describe("static turn-on / off rules: lights and outlet switches only", () => {
   /** Generic fake home: one entity per kind, each with its own name word. */
   const HOME = JSON.stringify({
     result: [
@@ -430,27 +431,28 @@ describe("static turn-on rules: lights and outlet switches only", () => {
     return { outcome, calls };
   }
 
-  test("turn-on plans carry the filter, turn-off and light-level plans do not", () => {
-    assert.equal(planOf("tavan ışığını aç").targetFilter, staticTurnOnTarget);
-    assert.equal(planOf("vantilatörü aç").targetFilter, staticTurnOnTarget);
-    assert.equal(planOf("vantilatörü çalıştır").targetFilter, staticTurnOnTarget);
-    assert.equal(planOf("tavan ışığını kapat").targetFilter, undefined);
-    assert.equal(planOf("kontaktörü kapat").targetFilter, undefined);
+  test("turn-on and turn-off plans share one filter, light-level plans have none", () => {
+    const shared = cfg.direct.switchTargetFilter;
+    assert.equal(planOf("tavan ışığını aç").targetFilter, shared);
+    assert.equal(planOf("vantilatörü aç").targetFilter, shared);
+    assert.equal(planOf("vantilatörü çalıştır").targetFilter, shared);
+    assert.equal(planOf("tavan ışığını kapat").targetFilter, shared);
+    assert.equal(planOf("kontaktörü kapat").targetFilter, shared);
     assert.equal(planOf("tavan ışığını yüzde 50 yap").targetFilter, undefined);
   });
 
-  test("staticTurnOnTarget: light, outlet switch; nothing else", () => {
+  test("staticSwitchTarget: light, outlet switch; nothing else", () => {
     const byName = new Map(parseLiveContext(HOME).map((e) => [e.names[0], e]));
-    const ok = (n: string) => staticTurnOnTarget(byName.get(n) as Parameters<typeof staticTurnOnTarget>[0]);
+    const ok = (n: string) => staticSwitchTarget(byName.get(n) as Parameters<typeof staticSwitchTarget>[0]);
     assert.equal(ok("Tavan Işık"), true);
     assert.equal(ok("Masa Prizi"), true);
     assert.equal(ok("Röle Işık"), false, "switch without a device class");
     assert.equal(ok("Kontaktör"), false, "switch with another device class");
     assert.equal(ok("Vantilatör"), false, "fan");
     for (const domain of ["lock", "cover", "valve", "alarm_control_panel", "media_player"]) {
-      assert.equal(staticTurnOnTarget({ names: ["X"], domain, state: "off", areas: [], attributes: { device_class: "outlet" } }), false, domain);
+      assert.equal(staticSwitchTarget({ names: ["X"], domain, state: "off", areas: [], attributes: { device_class: "outlet" } }), false, domain);
     }
-    assert.equal(staticTurnOnTarget({ names: ["X"], domain: "switch", state: "off", areas: [], attributes: { device_class: " Outlet " } }), true);
+    assert.equal(staticSwitchTarget({ names: ["X"], domain: "switch", state: "off", areas: [], attributes: { device_class: " Outlet " } }), true);
   });
 
   test("a light and an outlet switch are turned on at tier 0", async () => {
@@ -479,16 +481,24 @@ describe("static turn-on rules: lights and outlet switches only", () => {
     assert.equal(missing.outcome.kind, "reply");
   });
 
-  test("turn-off rules are unchanged: a switch without a device class and a fan are still switched off", async () => {
-    for (const [text, name] of [
-      ["röle ışığını kapat", "Röle Işık"],
-      ["vantilatörü kapat", "Vantilatör"],
+  test("turn-off has the same boundary (T7.w.12): a light and an outlet switch are switched off at tier 0", async () => {
+    for (const [text, name, domain] of [
+      ["tavan ışığını kapat", "Tavan Işık", "light"],
+      ["masa prizini kapat", "Masa Prizi", "switch"],
     ] as const) {
       const { outcome, calls } = await run(text);
       assert.equal(outcome.kind, "reply", text);
-      assert.match(calls[1] ?? "", new RegExp(`^intent__HassTurnOff .*"${name}"`), text);
+      assert.match(calls[1] ?? "", new RegExp(`^intent__HassTurnOff .*"${name}".*"${domain}"`), text);
     }
   });
+
+  for (const text of ["röle ışığını kapat", "kontaktörü kapat", "vantilatörü kapat"]) {
+    test(`'${text}' (T7.w.12): resolved but not switched off, falls back to the model`, async () => {
+      const { outcome, calls } = await run(text);
+      assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+      assert.equal(calls.length, 1, "only the live context was read");
+    });
+  }
 
   test("the filter is a code rule: a router.yaml turn-on rule listing other domains cannot widen it", async () => {
     const custom = parseRouterConfig(`
@@ -505,5 +515,96 @@ rules:
     const { outcome, calls } = await run("vantilatörü aç", true, custom);
     assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
     assert.equal(calls.length, 1);
+  });
+});
+
+// ------------------------------------------------------------------ deny name words on static rules (T7.w.12)
+
+describe("static turn-on / off rules: deny name words", () => {
+  /** Plugs and lights whose names hold (or only look like they hold) a deny word. */
+  const HOME = JSON.stringify({
+    result: [
+      "Live Context: An overview of the areas and the devices in this smart home:",
+      ...["- names: Kapı Rölesi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Kilitli Dolap", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Kombi Prizi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Garaj Lambası", "  domain: light", "  state: 'off'"],
+      ...["- names: Clock Prizi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Su Pompası", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Masa Prizi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Bahçe Prizi, Avlu Kapısı", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+      ...["- names: Çalışma Prizi", "  domain: switch", "  state: 'off'", "  areas: Garaj", "  attributes:", "    device_class: outlet"],
+    ].join("\n"),
+  });
+
+  async function run(text: string, config = cfg) {
+    const hit = matchRules(config, prepareText(text, config.fillers));
+    assert.ok(hit?.tier === 0, `no tier-0 match for '${text}'`);
+    const calls: string[] = [];
+    const call: GatedCall = async (tool, args) => {
+      calls.push(`${tool} ${JSON.stringify(args)}`);
+      return { status: "ok", result: { text: tool === "homeassistant__GetLiveContext" ? HOME : "{}", isError: false } };
+    };
+    const outcome = await runDirectPlan(hit.plan, call, { fallbackOnError: true });
+    return { outcome, calls };
+  }
+
+  // Core words (kapı, kilit, garaj), a router.yaml word (kombi); a suffixed word; a light; an area; an alias ("Avlu Kapısı").
+  for (const verb of ["aç", "kapat"]) {
+    for (const name of ["kapı rölesini", "kilitli dolabı", "kombi prizini", "garaj lambasını", "çalışma prizini", "bahçe prizini"]) {
+      const text = `${name} ${verb}`;
+      test(`'${text}': a deny word in the name or area, falls back to the model`, async () => {
+        const { outcome, calls } = await run(text);
+        assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+        assert.equal(calls.length, 1, "only the live context was read");
+      });
+    }
+  }
+
+  test("a deny word inside another word does not refuse ('clock' is not 'lock'); a plain plug is switched", async () => {
+    for (const [text, name] of [
+      ["clock prizini aç", "Clock Prizi"],
+      ["clock prizini kapat", "Clock Prizi"],
+      ["masa prizini aç", "Masa Prizi"],
+    ] as const) {
+      const { outcome, calls } = await run(text);
+      assert.equal(outcome.kind, "reply", text);
+      assert.match(calls[1] ?? "", new RegExp(`"${name}"`), text);
+    }
+  });
+
+  test("a several-word router.yaml entry refuses the static rules too", async () => {
+    const custom = parseRouterConfig(`
+version: 1
+learning:
+  enabled: false
+  deny_name_words: [su pompası]
+rules:
+  - id: any-on
+    tier: 0
+    patterns: ["<ad> aç"]
+    service: home-assistant
+    tool: intent__HassTurnOn
+    domains: [light, switch]
+    reply: "Tamam."
+`);
+    const { outcome, calls } = await run("su pompasını aç", custom);
+    assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+    assert.equal(calls.length, 1);
+    // The Core's own words stay with learning off and a router.yaml list without them.
+    assert.deepEqual((await run("kapı rölesini aç", custom)).outcome, { kind: "fallback", reason: "target_refused" });
+    // Without the entry the same plug is switched on (the default router.yaml does not list it).
+    assert.equal((await run("su pompasını aç")).outcome.kind, "reply");
+  });
+
+  test("hasDenyName: whole words, consecutive words of one name, never joined across names", () => {
+    const e = (names: string[], areas: string[] = []) => ({ names, domain: "switch", state: "off", areas, attributes: {} });
+    assert.equal(hasDenyName(e(["Kapı Rölesi"]), ["kapi"]), true);
+    assert.equal(hasDenyName(e(["Wall Clock"]), ["lock"]), false);
+    assert.equal(hasDenyName(e(["Bahçe Su Pompası"]), ["su pompasi"]), true);
+    assert.equal(hasDenyName(e(["Su", "Pompası"]), ["su pompasi"]), false);
+    assert.equal(hasDenyName(e(["Su"], ["Pompası"]), ["su pompasi"]), false);
+    assert.equal(hasDenyName(e(["Pompası Su"]), ["su pompasi"]), false);
+    assert.equal(hasDenyName(e(["Su Pompası"]), []), false);
   });
 });

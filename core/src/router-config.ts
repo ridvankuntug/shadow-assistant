@@ -36,19 +36,83 @@ export const LIGHT_SET_TOOL = "light__HassLightSet";
 export const SWITCH_TOOLS = ["intent__HassTurnOn", "intent__HassTurnOff"] as const;
 export const DIRECT_TOOLS = [...SWITCH_TOOLS, LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL] as const;
 
+export const isSwitchTool = (t: string): t is (typeof SWITCH_TOOLS)[number] => (SWITCH_TOOLS as readonly string[]).includes(t);
+
 /**
- * Targets a static tier-0 turn-on rule (tool `intent__HassTurnOn`: "aç", "yak",
- * "çalıştır") may switch on, whatever its router.yaml `domains` list: a light,
- * or a plug — a `switch` with positive evidence (`device_class: outlet`). A
- * switch without a device class can drive a door relay or a heater, and a fan
- * is not low-risk: such a target is resolved (so a name shared with a light
- * stays ambiguous) but not called, and the turn goes to the model (T7.w.10,
- * docs/08). Turn-off rules have no such filter.
+ * Targets a static tier-0 switch rule (tool `intent__HassTurnOn` / `intent__HassTurnOff`:
+ * "aç", "yak", "çalıştır", "kapat", "söndür") may switch, whatever its router.yaml
+ * `domains` list: a light, or a plug — a `switch` with positive evidence
+ * (`device_class: outlet`). A switch without a device class can drive a door
+ * relay, a pump or a fridge plug, and a fan is not low-risk: such a target is
+ * resolved (so a name shared with a light stays ambiguous) but not called, and
+ * the turn goes to the model (turn-on T7.w.10, turn-off T7.w.12; docs/08).
+ * The name check (`hasDenyName`) is added by `staticSwitchTargetFilter`.
  */
-export function staticTurnOnTarget(entity: LiveEntity): boolean {
+export function staticSwitchTarget(entity: LiveEntity): boolean {
   if (entity.domain === "light") return true;
   const raw = entity.attributes.device_class;
   return entity.domain === "switch" && typeof raw === "string" && raw.trim().toLowerCase() === "outlet";
+}
+
+/**
+ * The `targetFilter` of every static switch plan: `staticSwitchTarget` and no
+ * deny name word (`hasDenyName`, the same check learned rules use, T7.w.12):
+ * a plug named "Kapı rölesi" is not switched without the model. `deny` is
+ * folded (CompiledLearning.denyNameWords).
+ */
+export function staticSwitchTargetFilter(deny: Iterable<string>): (entity: LiveEntity) => boolean {
+  const phrases = denyPhrases(deny);
+  return (entity) => staticSwitchTarget(entity) && !hasDenyPhrase(entity, phrases);
+}
+
+/** A final consonant softened before a vowel suffix ("kilit" → "kilidi", "kepenk" → "kepengi"), folded. */
+const SOFTENED: Readonly<Record<string, string>> = { t: "d", k: "g", p: "b" };
+
+/**
+ * Whether one folded name word is the folded deny word `deny`: the whole word,
+ * with or without a Turkish suffix — the word starts with it, or with its
+ * softened stem before a suffix ("kilit", "kilitli", "kilidi", "kapısı",
+ * "locks"). A deny word *inside* a word does not count (T7.w.10): "Wall Clock"
+ * is not a lock. So a compound ("Bahçekapısı") is not caught by its name; the
+ * domain ban (NEVER_LEARNABLE_DOMAINS) and the switch device-class check are
+ * the guards that do not depend on wording.
+ */
+export function isDenyWord(word: string, deny: string): boolean {
+  if (deny === "" || word.length < deny.length) return false;
+  if (word.startsWith(deny)) return true;
+  const soft = SOFTENED[deny.slice(-1)];
+  return soft !== undefined && word.length > deny.length && word.startsWith(deny.slice(0, -1) + soft);
+}
+
+/** Folded deny entries split into their words; an entry with no word is dropped. */
+function denyPhrases(deny: Iterable<string>): string[][] {
+  return [...deny].map((d) => d.split(" ").filter((w) => w !== "")).filter((p) => p.length > 0);
+}
+
+function hasDenyPhrase(entity: LiveEntity, phrases: readonly (readonly string[])[]): boolean {
+  if (phrases.length === 0) return false;
+  for (const n of [...entity.names, ...entity.areas]) {
+    const words = fold(cleanTurkish(n))
+      .split(" ")
+      .filter((w) => w !== "");
+    for (const p of phrases) {
+      for (let i = 0; i + p.length <= words.length; i++) {
+        if (p.every((d, j) => isDenyWord(words[i + j] as string, d))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the entity's name, an alias or an area holds a deny entry (folded):
+ * a one-word entry as one whole word (`isDenyWord`: suffix allowed, never
+ * inside a word), a several-word entry ("kapı zili") as that many consecutive
+ * words of one name, each matched by `isDenyWord` ("Kapı Zilinin Prizi").
+ * Words of two different names or areas are never joined.
+ */
+export function hasDenyName(entity: LiveEntity, deny: Iterable<string>): boolean {
+  return hasDenyPhrase(entity, denyPhrases(deny));
 }
 export type DirectTool = (typeof DIRECT_TOOLS)[number];
 export type SensorKind = "temperature" | "humidity";
@@ -130,9 +194,10 @@ export const NEVER_LEARNABLE_DOMAINS: ReadonlySet<string> = new Set([
   "automation",
 ]);
 /**
- * Name words that always refuse a target (its name, aliases or areas; matched
- * as a whole folded word with or without a suffix — "kilidi", "kapısı" — never
- * as a substring: "Wall Clock" is not "lock", learn/extract.ts isDenyWord). The
+ * Name words that always refuse a target of a learned rule or a static switch
+ * rule (its name, aliases or areas; matched as a whole folded word with or
+ * without a suffix — "kilidi", "kapısı" — never as a substring: "Wall Clock"
+ * is not "lock"; a several-word entry as consecutive words: hasDenyName). The
  * router.yaml `learning.deny_name_words` list is added to these: an empty or
  * shorter list there can never re-allow a door or an alarm.
  */
@@ -427,7 +492,7 @@ export interface DirectPlan {
   /**
    * The resolved entity must pass this check, else the plan falls back to the
    * model. Learned rules: safety layer 3 (docs/08). Static rules: only the
-   * turn-on rules (`staticTurnOnTarget`); every other static rule has none.
+   * switch rules (turn on / off: `staticSwitchTargetFilter`); every other static rule has none.
    */
   targetFilter?: (entity: LiveEntity) => boolean;
 }
@@ -453,6 +518,8 @@ export interface CompiledRouterConfig {
     areaAliases: string[][];
     maxItems: number;
     messages: DirectMessages;
+    /** `targetFilter` of the static switch plans (`staticSwitchTargetFilter` over `learning.denyNameWords`). */
+    switchTargetFilter: (entity: LiveEntity) => boolean;
   };
   rules: CompiledRule[];
   learning: CompiledLearning;
@@ -494,6 +561,7 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
     }),
   }));
   if (problems.length > 0) throw new RouterConfigError(problems);
+  const denyNameWords = new Set([...BASE_DENY_NAME_WORDS, ...cfg.learning.deny_name_words].map(normWord).filter((w) => w !== ""));
   return {
     fillers: cfg.fillers,
     tier1: { maxWords: cfg.tier1.max_words },
@@ -508,6 +576,8 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
       areaAliases: cfg.direct.area_aliases,
       maxItems: cfg.direct.max_items,
       messages: cfg.direct.messages,
+      // Also with learning off: the deny words guard the static switch rules too (T7.w.12).
+      switchTargetFilter: staticSwitchTargetFilter(denyNameWords),
     },
     rules,
     learning: {
@@ -517,7 +587,7 @@ export function compileRouterConfig(doc: unknown): CompiledRouterConfig {
       // Validated above to lie inside the ceilings; filtered again so the sets can never hold more.
       tools: new Set(cfg.learning.tools.filter(isLearnableTool)),
       domains: new Set(cfg.learning.domains.filter(isLearnableDomain)),
-      denyNameWords: new Set([...BASE_DENY_NAME_WORDS, ...cfg.learning.deny_name_words].map(normWord).filter((w) => w !== "")),
+      denyNameWords,
       keywords: Object.fromEntries(Object.entries(cfg.learning.keywords).filter(([d]) => isLearnableDomain(d))),
       replies: { ...DEFAULT_LEARN_REPLIES, ...cfg.learning.replies },
     },
@@ -646,7 +716,7 @@ export function matchRules(cfg: CompiledRouterConfig, text: MatchText): RuleMatc
           replyMany: rule.reply_many,
           maxItems: cfg.direct.maxItems,
           messages: cfg.direct.messages,
-          ...(rule.tool === "intent__HassTurnOn" ? { targetFilter: staticTurnOnTarget } : {}),
+          ...(rule.tool !== undefined && isSwitchTool(rule.tool) ? { targetFilter: cfg.direct.switchTargetFilter } : {}),
         },
       };
     }

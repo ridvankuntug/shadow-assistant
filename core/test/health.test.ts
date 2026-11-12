@@ -541,6 +541,15 @@ test("server: GET /health has `inbox` only for loopback requests", async () => {
   } finally {
     await server.close();
   }
+  // T7.w.12: the notifications flag is passed through as a JSON boolean, next to the counts.
+  const flagged = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),
+    logger: quiet,
+    inbox: () => ({ dev: 1, notifications: 0, notificationsUnavailable: true }),
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  assert.deepEqual((await getFrom(flagged, "/health", "127.0.0.1")).body.inbox, { dev: 1, notifications: 0, notificationsUnavailable: true });
+  assert.equal("inbox" in (await getFrom(flagged, "/health", "192.0.2.10")).body, false);
   // Without an inbox source nobody gets the field.
   const plain = createCoreServer({
     tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),

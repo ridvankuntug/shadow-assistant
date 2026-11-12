@@ -356,8 +356,11 @@ test("an unreadable notifications file: list and actions answer notifications_un
   const content = readFileSync(file, "utf8");
 
   state.failRead = true;
-  // Startup does not fail: the count stays 0.
+  assert.deepEqual(h.center.healthInbox(), { notifications: 0, notificationsUnavailable: false }, "nothing read yet");
+  // Startup does not fail: the count stays 0, and /health can tell it is not a real 0 (T7.w.12).
   assert.equal(await h.center.refresh(), 0);
+  assert.equal(h.center.unavailable, true);
+  assert.deepEqual(h.center.healthInbox(), { notifications: 0, notificationsUnavailable: true });
   const a = h.connect("phone");
   const b = h.connect("browser");
   const listed = await a.ask({ type: "notifications_list" });
@@ -375,9 +378,76 @@ test("an unreadable notifications file: list and actions answer notifications_un
   assert.equal(readFileSync(file, "utf8"), content, "the file must not be replaced by an empty inbox");
   assert.deepEqual(readdirSync(join(h.dir, "notifications")), [NOTIFICATIONS_FILE]);
 
+  assert.deepEqual(h.center.healthInbox(), { notifications: 0, notificationsUnavailable: true }, "still unavailable after the failed calls");
+
   state.failRead = false;
   const back = await a.list();
   assert.deepEqual(back.items.map((i) => i.title), ["Korunan"]);
   assert.equal(back.unread, 1);
+  // A list that could read the file is enough: the real count, no longer unavailable.
+  assert.deepEqual(h.center.healthInbox(), { notifications: 1, notificationsUnavailable: false });
   assert.equal(await h.center.refresh(), 1);
+  assert.equal(h.center.unavailable, false);
+});
+
+test("/health inbox (T7.w.12): a producer's failed raise marks the count unavailable, refresh() clears it", async () => {
+  const state = { failRead: true };
+  const fs: AtomicFs = {
+    mkdir: (p, o) => nodeFs.mkdir(p, o),
+    open: (p, f, m) => nodeFs.open(p, f, m),
+    rename: (a, b) => nodeFs.rename(a, b),
+    unlink: (p) => nodeFs.unlink(p),
+    readFile: (p, e) => (state.failRead ? Promise.reject(Object.assign(new Error("simulated"), { code: "EACCES" })) : nodeFs.readFile(p, e)),
+    readdir: (p) => nodeFs.readdir(p),
+  };
+  const h = home({ fs });
+  assert.deepEqual(await h.center.raise({ source: "test", title: "Yeni" }), { ok: false, reason: "unavailable" });
+  assert.deepEqual(h.center.healthInbox(), { notifications: 0, notificationsUnavailable: true });
+  state.failRead = false;
+  assert.equal(await h.center.refresh(), 0);
+  assert.deepEqual(h.center.healthInbox(), { notifications: 0, notificationsUnavailable: false }, "a real 0 now");
+  const r = await h.center.raise({ source: "test", title: "Yeni" });
+  assert.ok(r.ok);
+  assert.deepEqual(h.center.healthInbox(), { notifications: 1, notificationsUnavailable: false });
+});
+
+test("/health inbox (T7.w.12): a call that reads the file but changes nothing clears the flag too", async () => {
+  const state = { failRead: false };
+  const fs: AtomicFs = {
+    mkdir: (p, o) => nodeFs.mkdir(p, o),
+    open: (p, f, m) => nodeFs.open(p, f, m),
+    rename: (a, b) => nodeFs.rename(a, b),
+    unlink: (p) => nodeFs.unlink(p),
+    readFile: (p, e) => (state.failRead ? Promise.reject(Object.assign(new Error("simulated"), { code: "EACCES" })) : nodeFs.readFile(p, e)),
+    readdir: (p) => nodeFs.readdir(p),
+  };
+  const h = home({ fs });
+  // An item already on disk, read by the user (so a second "read" changes nothing).
+  const seeded = new NotificationStore({ dir: join(h.dir, "notifications"), coalesceMs: 0 });
+  const kept = await seeded.raise({ source: "test", key: "k", title: "Okunmuş" });
+  assert.ok(kept.ok);
+  await seeded.markRead(kept.item.id);
+
+  const unreadable = async () => {
+    // A fresh center and store each time: nothing loaded yet, the file must be read.
+    const store = new NotificationStore({ dir: join(h.dir, "notifications"), log: () => {}, fs, retryDelaysMs: [] });
+    const center = new NotificationCenter({ store, logger: { info: () => {}, warn: () => {} } });
+    state.failRead = true;
+    await center.refresh();
+    assert.equal(center.unavailable, true);
+    state.failRead = false;
+    return center;
+  };
+  const cases: Array<[string, (c: NotificationCenter) => Promise<unknown>]> = [
+    ["idempotent read", (c) => c.act("phone", kept.item.id, "read")],
+    ["delete of an unknown id", (c) => c.act("phone", "n-0000000000000000", "delete")],
+    ["read of an unknown id", (c) => c.act("phone", "n-0000000000000000", "read")],
+    ["resolve of an unknown key", (c) => c.resolve("test", "no-such-key")],
+    ["an invalid raise", (c) => c.raise({ source: "Not Valid", title: "x" })],
+  ];
+  for (const [what, call] of cases) {
+    const center = await unreadable();
+    await call(center);
+    assert.deepEqual(center.healthInbox(), { notifications: 0, notificationsUnavailable: false }, what);
+  }
 });

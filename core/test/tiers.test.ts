@@ -52,6 +52,8 @@ const LIVE = JSON.stringify({
     "- names: Su Isıtıcısı, Kettle",
     "  domain: switch",
     "  state: 'off'",
+    "  attributes:",
+    "    device_class: outlet",
     "- names: Ön Kapı",
     "  domain: lock",
     "  state: locked",
@@ -140,22 +142,25 @@ rules:
     patterns: ["* derin analiz *"]
 `;
 
-const services = parseServices(
-  [
-    "services:",
-    "  - name: home-assistant",
-    "    kind: mcp",
-    "    url: http://localhost:1/sse",
-    "    permission: confirm",
-    "    tools:",
-    '      "homeassistant__GetLiveContext": read',
-    '      "intent__HassTurnOn": write',
-    '      "intent__HassTurnOff": write',
-    "    confirm_inputs:",
-    "      domain: [lock]",
-  ].join("\n"),
-  {},
-).services;
+/** `confirmDomains`: services.yaml `confirm_inputs.domain` (default: locks only). */
+const servicesWith = (confirmDomains: readonly string[]) =>
+  parseServices(
+    [
+      "services:",
+      "  - name: home-assistant",
+      "    kind: mcp",
+      "    url: http://localhost:1/sse",
+      "    permission: confirm",
+      "    tools:",
+      '      "homeassistant__GetLiveContext": read',
+      '      "intent__HassTurnOn": write',
+      '      "intent__HassTurnOff": write',
+      "    confirm_inputs:",
+      `      domain: [${confirmDomains.join(", ")}]`,
+    ].join("\n"),
+    {},
+  ).services;
+const services = servicesWith(["lock"]);
 
 const MODELS = { 1: "m-haiku", 2: "m-sonnet", 3: "m-opus" } as const;
 
@@ -191,7 +196,9 @@ class MockAgent implements AgentRunner {
 }
 
 let counter = 0;
-function harness(opts: { ha?: MockHa; agent?: MockAgent; readOnly?: boolean; yaml?: string; noDirect?: boolean } = {}) {
+function harness(
+  opts: { ha?: MockHa; agent?: MockAgent; readOnly?: boolean; yaml?: string; noDirect?: boolean; confirmDomains?: readonly string[] } = {},
+) {
   const frames: ServerFrame[] = [];
   const waiters: Array<() => void> = [];
   const usage: UsageRecord[] = [];
@@ -210,7 +217,7 @@ function harness(opts: { ha?: MockHa; agent?: MockAgent; readOnly?: boolean; yam
   const session = new Session(
     {
       agent,
-      policy: new PermissionPolicy(services, { readOnly: opts.readOnly }),
+      policy: new PermissionPolicy(opts.confirmDomains ? servicesWith(opts.confirmDomains) : services, { readOnly: opts.readOnly }),
       router,
       stt: { transcribe: async () => ({ text: "" }) },
       tts: {
@@ -342,18 +349,31 @@ async function convLines(h: ReturnType<typeof harness>): Promise<Array<Record<st
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-// A turn-on rule never calls a lock (T7.w.10: lights and outlet switches only), so the
-// confirm_inputs path is exercised through a turn-off rule of the test config.
-test("tier 0 confirm via confirm_inputs (domain lock): approved by button → called", async () => {
-  const h = harness();
-  const turn = h.say("ön kapıyı kilitle");
+// Static switch rules never call a lock (turn-on T7.w.10, turn-off T7.w.12: lights and
+// outlet switches only), so the confirm_inputs path is exercised on a plug whose domain
+// the services config lists.
+test("tier 0 confirm via confirm_inputs (domain switch): approved by button → called", async () => {
+  const h = harness({ confirmDomains: ["lock", "switch"] });
+  const turn = h.say("su ısıtıcısını aç");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
-  assert.equal(req.tool, "intent__HassTurnOff");
+  assert.equal(req.tool, "intent__HassTurnOn");
   assert.equal(h.ha.writes.length, 0, "nothing runs before the answer");
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: true });
   await turn;
-  assert.deepEqual(h.ha.writes[0]?.args, { name: "Ön Kapı", domain: ["lock"] });
-  assert.equal(done(h), "Tamam, ön kapı kilitlendi.");
+  assert.deepEqual(h.ha.writes[0]?.args, { name: "Su Isıtıcısı", domain: ["switch"] });
+  assert.equal(done(h), "Tamam, su ısıtıcısı açıldı.");
+});
+
+test("static turn-off rule whose domains list a lock: the lock is not called, the model gets the turn (T7.w.12)", async () => {
+  const h = harness();
+  await h.say("ön kapıyı kilitle");
+  assert.equal(h.of("confirm_request").length, 0);
+  assert.equal(h.ha.writes.length, 0);
+  assert.equal(h.agent.calls.length, 1);
+  assert.equal(done(h), "Model cevabı.");
+  const fb = (await convLines(h)).filter((l) => l.kind === "route" && l.tier === 0 && l.fallback !== undefined);
+  assert.deepEqual(fb.map((l) => l.fallback), ["target_refused"]);
+  assert.equal(h.usage[0]?.outcome, "fallback");
 });
 
 test("static turn-on rule whose domains list a lock: the lock is not called, the model gets the turn (T7.w.10)", async () => {
@@ -381,7 +401,7 @@ test("static turn-on rule on a switch without a device class: not called, the mo
 
 test("tier 0 confirm declined → not called, short reply, no model fallback", async () => {
   const h = harness();
-  const turn = h.say("ön kapıyı kilitle");
+  const turn = h.say("su ısıtıcısını kapat");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: false });
   await turn;
@@ -649,7 +669,7 @@ test("escalation after tools but without a fork id restarts tier 2 from the user
 
 test("tier 0 denied by the user is recorded as outcome denied", async () => {
   const h = harness();
-  const turn = h.say("ön kapıyı kilitle");
+  const turn = h.say("su ısıtıcısını kapat");
   const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
   await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: false });
   await turn;
