@@ -275,7 +275,7 @@ and `speechOn()`; inside the window `speechOn()` stops before using any pending
 id up. Core setting `CORE_QUIET_HOURS` (`HH:MM-HH:MM`, Core host local time,
 start included, end excluded, may cross midnight; `off` = none), wired in
 `index.ts`; `.env.example`, docs/02 and docs/05 updated. "Not suppressed" is
-not checked yet: suppression is T7.w.11.7.
+checked too since T7.w.11.7: a suppressed key is never raised, so it never becomes pending.
 
 - A socket already connected with speech on when the window ends speaks
   nothing by itself: the pending items are spoken on the next speech-enabled
@@ -310,6 +310,36 @@ actions, so the user can choose:
 The client action and its protocol shape (extra to delete) are specified in
 `docs/02` when implemented.
 
+Implemented (T7.w.11.7, Core only; the UI is T7.w.11.8): `notification_action`
+`action:"suppress"`, advertised by the feature `notifications_suppress`
+([docs/02](02-core-protocol.md#notifications)). It deletes the item like
+`delete` (same broadcast) and records `{source, key, at}` in
+`<SHADOW_DATA_DIR>/notifications/suppressed.json`
+([`notification-suppressions.ts`](../core/src/notification-suppressions.ts),
+atomic writes). `NotificationCenter.raise` answers `suppressed` for a recorded
+key (nothing created, broadcast, spoken or pending); `resolve(source, key)`
+removes the record. Producers adopt `NotificationCenter.suppressed()` at
+startup as open keys and count a `suppressed` raise as open, so recovery still
+resolves (and clears) them. Tests in `core/test/notification-suppressions.test.ts`.
+
+- **Varsayılan — kullanıcı onayı bekliyor:** the protocol shape is a new
+  `action` value on the existing `notification_action` frame (not a new frame),
+  plus the feature name `notifications_suppress` so a client shows the button
+  only on a Core that supports it.
+- **Varsayılan — kullanıcı onayı bekliyor:** `suppress` on a keyless item (a
+  one-off item, nothing can recur) only deletes it; no record, no error.
+- **Varsayılan — kullanıcı onayı bekliyor:** an unreadable or invalid
+  `suppressed.json` means "nothing suppressed" (items are shown again, never
+  lost); an invalid one is quarantined, an unreadable one is never overwritten
+  and changes made meanwhile (additions and removals) are kept in memory and
+  applied once it can be read; a producer does not adopt "nothing suppressed"
+  but keeps running (only an unreadable inbox blocks its startup adoption),
+  logs the unreadable suppression list once and re-reads it on later rounds,
+  adopting its keys once it can be read. At most 1000 records (a new one beyond is not recorded, logged).
+- **Varsayılan — kullanıcı onayı bekliyor:** no expiry: a record stays until
+  its producer resolves the key (a key no producer resolves any more, e.g. a
+  removed service, stays suppressed).
+
 ## Tests
 
 - Fake clock + fake center (records `raise`/`resolve`) for every producer.
@@ -342,7 +372,7 @@ The client action and its protocol shape (extra to delete) are specified in
 - T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server.
 - T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope.
 
-- T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests.
+- T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests. Implemented: `notification_action` `suppress` + feature `notifications_suppress`, [`notification-suppressions.ts`](../core/src/notification-suppressions.ts), adoption in both producers (see *Dismiss options*, defaults awaiting approval there); tests in `core/test/notification-suppressions.test.ts`.
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
 - T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock. Implemented: `canSpeak` + `CORE_QUIET_HOURS` (see *Quiet hours for urgent speech*, defaults awaiting approval there); tests in `core/test/quiet-hours.test.ts` and `session-notifications.test.ts`.
 

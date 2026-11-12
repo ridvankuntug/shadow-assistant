@@ -65,6 +65,7 @@ import type {
   ServerFrame,
   SpeechMode,
 } from "./protocol.js";
+import type { SuppressionRecord, SuppressionStore } from "./notification-suppressions.js";
 import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
@@ -2006,6 +2007,11 @@ export interface NotificationCenterOptions {
   quietHours?: QuietHours | null;
   /** Clock for the quiet-hours check (tests: a fake). Default: the real local time. */
   now?: () => Date;
+  /**
+   * "Tekrar gösterme" records (T7.w.11.7, docs/09). Absent: no suppression (the
+   * `suppress` action then deletes like `delete` and records nothing).
+   */
+  suppressions?: Pick<SuppressionStore, "has" | "add" | "remove" | "list" | "flush">;
 }
 
 /** The retry never keeps the process alive; shutdown calls close(). */
@@ -2056,6 +2062,14 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * raised and broadcast but no socket gets `speak: true`; it is pending speech,
  * and a `speechOn()` inside the window speaks nothing and keeps the ids. After
  * the window the next `speechOn()` speaks them once (see `canSpeak`).
+ *
+ * Suppression ("Tekrar gösterme", T7.w.11.7, `suppressions`): the `suppress`
+ * action deletes the item like `delete` (same broadcast) and records its
+ * `source` + `key`. While the record exists, `raise()` of that key answers
+ * `suppressed` and creates, changes, broadcasts and speaks nothing (no pending
+ * speech either). `resolve(source, key)` removes the record (the condition
+ * ended), so the next occurrence is shown again. Producers adopt the records
+ * at startup (`suppressed()`) like their open items.
  *
  * While the store cannot read its file, `list()`, `act()` and `resolve()`
  * reject with NotificationsUnavailableError (the session answers
@@ -2136,6 +2150,7 @@ export class NotificationCenter {
    */
   raise(input: RaiseInput): Promise<RaiseResult> {
     return this.serial(async () => {
+      if (await this.isSuppressed(input?.source, input?.key)) return { ok: false, reason: "suppressed" } as const;
       const r = await this.o.store.raise(input);
       if (!r.ok) {
         if (r.reason === "unavailable") this.lastUnavailable = true;
@@ -2154,11 +2169,15 @@ export class NotificationCenter {
 
   /**
    * Producer API: removes the keyed item (the condition is over) and broadcasts the removal. Resolves whether one was removed;
-   * rejects with NotificationsUnavailableError when the file cannot be read (the producer retries later).
+   * rejects with NotificationsUnavailableError when the file cannot be read (the producer retries later). Also removes a
+   * "Tekrar gösterme" record of the key (T7.w.11.7), after the store call, so a rejected call leaves it for the retry.
    */
   resolve(source: string, key: string): Promise<boolean> {
     return this.serial(async () => {
       const item = await this.o.store.resolve(source, key);
+      if (this.o.suppressions && (await this.o.suppressions.remove(source, key))) {
+        this.o.logger.info(`[shadow-core] notification suppression of a "${source}" key ended (resolved)`);
+      }
       if (!item) {
         await this.settle();
         return false;
@@ -2186,13 +2205,27 @@ export class NotificationCenter {
         // Checked again after each read: the socket may close or turn speech off meanwhile.
         if (!this.listeners.has(listener) || !this.canSpeak(listener)) return;
         const item = await this.o.store.get(id);
+        // A suppressed key is never spoken (suppress deletes the item; this guards a record added otherwise).
+        const suppressed = item !== undefined && (await this.isSuppressed(item.source, item.key));
+        // Only after the last await: an id is used up only by a socket that can still speak it.
         if (!this.listeners.has(listener) || !this.canSpeak(listener)) return;
         if (!this.pendingSpeech.delete(id)) continue;
-        if (!item || item.urgency !== "urgent" || item.readAt !== null) continue;
+        if (!item || suppressed || item.urgency !== "urgent" || item.readAt !== null) continue;
         safe(() => listener.deliver({ type: "notification", item: notificationInfo(item), speak: true }), undefined);
       }
       await this.settle();
     }).catch(() => {});
+  }
+
+  /**
+   * The "Tekrar gösterme" records (T7.w.11.7) of `source` (all when absent): producers adopt them at
+   * startup like their open items, so a condition that ended while the Core was down still clears its
+   * record. Rejects while the suppression file cannot be read (SuppressionsUnavailableError): the
+   * producer keeps running and re-reads it later, instead of adopting "nothing suppressed".
+   */
+  async suppressed(source?: string): Promise<Array<Pick<SuppressionRecord, "source" | "key">>> {
+    const all = this.o.suppressions ? await this.o.suppressions.list() : [];
+    return all.filter((r) => source === undefined || r.source === source).map((r) => ({ source: r.source, key: r.key }));
   }
 
   /** All items (most recently updated first) and the unread count. */
@@ -2210,7 +2243,9 @@ export class NotificationCenter {
   /**
    * One user action by `device` (from its token). `read` / `unread` are
    * idempotent (no broadcast when nothing changed); `delete` of an unknown
-   * or already deleted item is `unknown_item`.
+   * or already deleted item is `unknown_item`. `suppress` (T7.w.11.7) is
+   * `delete` plus a "Tekrar gösterme" record of the item's `source` + `key`
+   * (a keyless item cannot recur: it is only deleted).
    */
   act(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
     return this.serial(async () => {
@@ -2223,6 +2258,20 @@ export class NotificationCenter {
 
   /** `act()` on the chain: the store call, its broadcast and the recount of a change. */
   private async actOnStore(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
+    if (action === "suppress") {
+      const item = await this.o.store.get(notificationId);
+      if (!item) return unknownNotification();
+      if (!(await this.o.store.delete(notificationId))) return unknownNotification();
+      this.pendingSpeech.delete(notificationId);
+      // After the delete: an unreadable inbox rejects above and records nothing.
+      const recorded = item.key !== undefined && this.o.suppressions ? await this.o.suppressions.add(item.source, item.key) : false;
+      this.o.logger.info(
+        `[shadow-core] notification ${notificationId} deleted by device ${device} (${recorded ? "not shown again until resolved" : "suppress: nothing recorded"})`,
+      );
+      this.broadcast({ type: "notification_removed", notificationId });
+      await this.recount();
+      return { ok: true };
+    }
     if (action === "delete") {
       if (!(await this.o.store.delete(notificationId))) return unknownNotification();
       this.pendingSpeech.delete(notificationId);
@@ -2246,7 +2295,20 @@ export class NotificationCenter {
 
   /** Waits for the changes in flight, then retries a failed store write (shutdown). Never rejects. */
   flush(): Promise<void> {
-    return this.serial(() => this.o.store.flush()).catch(() => {});
+    return this.serial(async () => {
+      await this.o.store.flush();
+      await this.o.suppressions?.flush();
+    }).catch(() => {});
+  }
+
+  /** Whether a raise / pending speech of `source` + `key` is suppressed. Keyless or no store: never. Never rejects. */
+  private async isSuppressed(source: unknown, key: unknown): Promise<boolean> {
+    if (!this.o.suppressions || typeof source !== "string" || typeof key !== "string") return false;
+    try {
+      return await this.o.suppressions.has(source, key);
+    } catch {
+      return false;
+    }
   }
 
   /** Stops the retry read (shutdown); no new one is scheduled afterwards. Calls still work. */

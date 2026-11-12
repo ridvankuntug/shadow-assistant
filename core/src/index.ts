@@ -27,6 +27,7 @@ import { createGatewaySdkServers } from "./gateway-sdk.js";
 import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from "./mcp-direct.js";
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
 import { formatQuietHours, NOTIFICATIONS_DIR, NotificationStore } from "./notifications.js";
+import { SuppressionStore } from "./notification-suppressions.js";
 import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
@@ -319,7 +320,14 @@ export async function main(): Promise<void> {
   // Quiet hours (docs/09, T7.w.11.9): no urgent speech in this window (Core host local time).
   if (cfg.quietHoursWarning) logger.warn(`[shadow-core] ${cfg.quietHoursWarning}`);
   logger.info(`[shadow-core] quiet hours for urgent speech: ${cfg.quietHours ? formatQuietHours(cfg.quietHours) : "off"}`);
-  const notificationCenter = new NotificationCenter({ store: notificationStore, logger, quietHours: cfg.quietHours });
+  // "Tekrar gösterme" records next to the inbox (docs/09, T7.w.11.7): source + key only.
+  const notificationSuppressions = new SuppressionStore({ dir: join(cfg.dataDir, NOTIFICATIONS_DIR), log: (m) => logger.warn(m) });
+  const notificationCenter = new NotificationCenter({
+    store: notificationStore,
+    logger,
+    quietHours: cfg.quietHours,
+    suppressions: notificationSuppressions,
+  });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
   // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
   // Startup adoption reads the store directly (the center's list drops the dedupe key).
@@ -329,6 +337,7 @@ export async function main(): Promise<void> {
       raise: (input) => notificationCenter.raise(input),
       resolve: (source, key) => notificationCenter.resolve(source, key),
       list: () => notificationStore.list(),
+      suppressed: () => notificationCenter.suppressed(),
     },
     logger,
   });
@@ -355,6 +364,7 @@ export async function main(): Promise<void> {
       raise: (input) => notificationCenter.raise(input),
       resolve: (source, key) => notificationCenter.resolve(source, key),
       list: () => notificationStore.list(),
+      suppressed: () => notificationCenter.suppressed(),
     },
     logger,
   });
@@ -393,7 +403,7 @@ export async function main(): Promise<void> {
     // `notificationsUnavailable`: the file could not be read, `notifications` is then not a real count (T7.w.12).
     inbox: () => ({ dev: devTab?.open ?? 0, ...notificationCenter.healthInbox() }),
     devCount: devTab,
-    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications"],
+    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications", "notifications_suppress"],
     serviceHealth: monitor,
     deviceState,
   });

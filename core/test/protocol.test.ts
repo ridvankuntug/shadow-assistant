@@ -164,7 +164,8 @@ test("notifications_list / notification_action (feature notifications): ids and 
       action,
     });
   }
-  assert.deepEqual([...NOTIFICATION_ACTIONS], ["read", "unread", "delete"]);
+  // `suppress` ("Tekrar gösterme", T7.w.11.7) was added within protocol 1; the old three are unchanged.
+  assert.deepEqual([...NOTIFICATION_ACTIONS], ["read", "unread", "delete", "suppress"]);
   bad({ type: "notifications_list" });
   bad({ type: "notifications_list", id: "" });
   bad({ type: "notifications_list", id: 5 });

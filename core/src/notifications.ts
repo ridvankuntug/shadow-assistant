@@ -77,9 +77,12 @@ export type RaiseResult =
   | { ok: true; item: NotificationItem; created: boolean }
   /**
    * `invalid`: bad input (a producer bug); `full`: keyless raise at the hard
-   * limit; `unavailable`: the file could not be read.
+   * limit; `unavailable`: the file could not be read; `suppressed` (NotificationCenter only, never the
+   * store, T7.w.11.7): the user chose "Tekrar gösterme" for this source + key and the condition has not
+   * resolved yet, so nothing was created, changed, broadcast or spoken. A producer counts the key as open
+   * (it must still `resolve` it when the condition ends: that removes the suppression).
    */
-  | { ok: false; reason: "invalid" | "full" | "unavailable" };
+  | { ok: false; reason: "invalid" | "full" | "unavailable" | "suppressed" };
 
 /**
  * Quiet hours for urgent speech (T7.w.11.9, docs/09): a daily window

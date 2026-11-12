@@ -61,13 +61,13 @@ refuses to start.
 | `{"type":"dev_list","id":"d1"}` | Ask for the Development items (feature `dev`). See *Development*. |
 | `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"\|"remove_rule"}` | One action on one Development item (feature `dev`). See *Development*. |
 | `{"type":"notifications_list","id":"q1"}` | Ask for the notification inbox (feature `notifications`). See *Notifications*. |
-| `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"}` | One action on one notification (feature `notifications`). See *Notifications*. |
+| `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"\|"suppress"}` | One action on one notification (feature `notifications`; `suppress` only with `notifications_suppress`). See *Notifications*. |
 
 ## Core → Client
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -106,6 +106,7 @@ The protocol number stays 1.
 | `usage_limit` | The Core reports a reached subscription usage limit as `error usage_limit` (+ `retryAt`). |
 | `dev` | The Development tab is available: `dev_list` / `dev_action` are answered and `dev_count` is sent. Without it clients hide the tab and its badge. |
 | `notifications` | The notification inbox is available: `notifications_list` / `notification_action` are answered and `notification` / `notification_removed` are sent. Without it clients hide the inbox and its badge. |
+| `notifications_suppress` | `notification_action` also accepts `action:"suppress"` ("Tekrar gösterme", see *Notifications*). Without it clients offer only `delete` (an older Core answers `suppress` with `bad_request`). |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -283,7 +284,8 @@ them or the producer resolves them.
 
 - `notifications_list` is answered with `notifications` (same `id`): every item,
   most recently updated first, and `unread`.
-- `notification_action` `action` is one of `read`, `unread` and `delete`. It is
+- `notification_action` `action` is one of `read`, `unread`, `delete` and
+  `suppress` (the last with the feature `notifications_suppress`). It is
   answered with a fresh `notifications` frame (same `id`). `read` / `unread` are
   idempotent (repeating one changes nothing and broadcasts nothing). Errors
   (with `id`): an unknown or already deleted `notificationId` → `unknown_item`;
@@ -317,6 +319,23 @@ them or the producer resolves them.
   itself when the window ends, not even by a socket already connected with
   speech on: the next socket that turns speech on after the window speaks it
   once (same rules as above: still existing, urgent and unread).
+- **`suppress` ("Tekrar gösterme", T7.w.11.7)** deletes the item exactly like
+  `delete` (same `notifications` reply, same `notification_removed` broadcast
+  to every socket) and also keeps that condition from being shown again while
+  it lasts: the Core records the item's producer `source` + dedupe key (never
+  sent to clients) in `<SHADOW_DATA_DIR>/notifications/suppressed.json`
+  (source, key and time only, no title or body). While the record exists the
+  producer's raises of that key create, change, broadcast and speak nothing
+  (no pending speech either). When the producer sees the condition end it
+  resolves the key, which removes the record, so the next occurrence is shown
+  again. The record survives a Core restart; producers adopt it at startup,
+  so a condition that ended while the Core was down still clears it. `delete`
+  records nothing ("Gördüm": a condition that lasts may come back once after
+  a Core restart). `suppress` on an item without a producer key (a one-off
+  item) only deletes it. Errors as for `delete`. An unreadable or invalid
+  `suppressed.json` is logged and treated as empty (items are shown, never
+  lost); an invalid one is kept as `suppressed.json.corrupt-<ts>`. Added within
+  protocol 1: a new action value only; clients that never send it see no change.
 - There is no push to a phone whose app is not connected; it sees the items in
   `notifications_list` on its next connect.
 - While the Core cannot read its notifications file (locked or otherwise

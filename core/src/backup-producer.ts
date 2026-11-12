@@ -38,7 +38,12 @@
  * are read from the store and adopted as raised, so recovery resolves them and
  * an unchanged condition is not raised again. An adopted `backup:failed` item
  * is treated as a new failure (renotify) only when the status run ended after
- * the item was last updated.
+ * the item was last updated. Keys the user suppressed ("Tekrar gösterme",
+ * T7.w.11.7) are adopted as open too, so a condition that ended while the
+ * Core was down still resolves them (which clears the suppression); a raise
+ * answered `suppressed` also counts as open. Only an unreadable inbox blocks
+ * the rounds; an unreadable suppression list is logged once and re-read every
+ * round (its keys are adopted once it can be read), the rounds run meanwhile.
  *
  * Texts are Turkish; they never hold remote names, paths or error text (the
  * script does not write the error either, only the stage).
@@ -75,6 +80,8 @@ export interface BackupNotificationPort {
   resolve(source: string, key: string): Promise<boolean>;
   /** Every item (any source); rejects when the inbox cannot be read. */
   list(): Promise<ReadonlyArray<Pick<NotificationItem, "source" | "key" | "urgency" | "title" | "body" | "createdAt" | "updatedAt">>>;
+  /** Suppressed keys (NotificationCenter.suppressed, T7.w.11.7); absent = none. Rejects when unreadable (re-read every round). */
+  suppressed?(): Promise<ReadonlyArray<{ source: string; key: string }>>;
 }
 
 export interface BackupProducerOptions {
@@ -189,6 +196,9 @@ export class BackupProducer {
   /** An invalid / unreadable file was logged; cleared by a valid read or a missing file. */
   private loggedBad = false;
   private loggedAdoptFailure = false;
+  /** The suppressed keys were read and adopted (T7.w.11.7); until then re-read every round. */
+  private suppressedAdopted = false;
+  private loggedSuppressedFailure = false;
   private running: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
@@ -244,6 +254,7 @@ export class BackupProducer {
 
   private async round(): Promise<void> {
     if (!this.adopted && !(await this.adopt())) return;
+    if (!this.suppressedAdopted) await this.adoptSuppressed();
     const read = await this.read();
     if (read === "bad") return; // logged once; the open items stay as they are
     if (read === "missing") {
@@ -284,6 +295,30 @@ export class BackupProducer {
     }
     this.adopted = true;
     return true;
+  }
+
+  /**
+   * Suppressed keys (T7.w.11.7): open with no known text, so this round either resolves them or
+   * raises (answered `suppressed`, nothing shown) and records the current text. An unreadable
+   * suppression list does not stop the rounds (a raise is then not treated as suppressed): logged
+   * once and re-read next round.
+   */
+  private async adoptSuppressed(): Promise<void> {
+    let suppressed: Awaited<ReturnType<NonNullable<BackupNotificationPort["suppressed"]>>>;
+    try {
+      suppressed = (await this.o.notifications.suppressed?.()) ?? [];
+    } catch {
+      if (!this.loggedSuppressedFailure) {
+        this.loggedSuppressedFailure = true;
+        this.o.logger.warn("[shadow-core] backup producer: suppression list (suppressed.json) unreadable; re-read next round");
+      }
+      return;
+    }
+    for (const s of suppressed) {
+      if (s.source !== BACKUP_SOURCE || (s.key !== BACKUP_KEY_FAILED && s.key !== BACKUP_KEY_STALE) || this.open.has(s.key)) continue;
+      this.open.set(s.key, { urgency: "normal", title: "", body: "", runId: undefined, updatedAt: 0 });
+    }
+    this.suppressedAdopted = true;
   }
 
   /** The current status, "missing" (no file) or "bad" (unreadable / invalid, logged once). */
@@ -427,11 +462,16 @@ export class BackupProducer {
       body: want.body,
       renotify,
     });
-    if (!r.ok) {
+    if (!r.ok && r.reason !== "suppressed") {
       if (r.reason !== "unavailable") this.o.logger.warn(`[shadow-core] backup producer: ${key} raise refused (${r.reason})`);
       return;
     }
+    // Suppressed ("Tekrar gösterme"): nothing shown, but the key is open, so its recovery resolves it.
     this.open.set(key, { urgency: want.urgency, title: want.title, body: want.body, runId: want.runId, updatedAt: undefined });
+    if (!r.ok) {
+      this.o.logger.info(`[shadow-core] backup producer: ${key} suppressed by the user; not shown until it resolves`);
+      return;
+    }
     this.o.logger.info(`[shadow-core] backup producer: ${key} raised (${want.urgency}${renotify ? ", renotify" : ""})`);
   }
 }

@@ -31,6 +31,12 @@
  * one counts as already escalated; its `createdAt` counts as an opening for
  * the flap guard), so a service that recovered while the Core was down is
  * resolved by the normal back rule and an unchanged outage is not raised again.
+ * Keys the user suppressed ("Tekrar gösterme", T7.w.11.7) are adopted as open
+ * (and as deleted: no text updates) too, so a recovery while the Core was down
+ * still resolves them, which clears the suppression; a raise answered
+ * `suppressed` also counts as open. Only an unreadable inbox blocks the
+ * evaluation; an unreadable suppression list is logged once and re-read after
+ * RETRY_MS (its keys are adopted once it can be read), evaluation runs meanwhile.
  *
  * Producer state is in memory (docs/09 common rules). Texts are Turkish and
  * never hold hosts, URLs or error messages: only the monitor's fixed detail
@@ -113,6 +119,8 @@ export interface ServiceNotificationPort {
   resolve(source: string, key: string): Promise<boolean>;
   /** Every item (any source); rejects when the inbox cannot be read. */
   list(): Promise<ReadonlyArray<Pick<NotificationItem, "source" | "key" | "urgency" | "title" | "body" | "createdAt">>>;
+  /** Suppressed keys (NotificationCenter.suppressed, T7.w.11.7); absent = none. Rejects when unreadable (re-read after RETRY_MS). */
+  suppressed?(): Promise<ReadonlyArray<{ source: string; key: string }>>;
 }
 
 /** The part of HealthMonitor the producer reads (shown statuses). */
@@ -193,6 +201,11 @@ export class ServiceProducer {
   private loggedAdoptFailure = false;
   /** No startup reconcile attempt before this (after a failed one). */
   private adoptRetryAt: number | undefined;
+  /** The suppressed keys were read and adopted (T7.w.11.7); until then re-read after RETRY_MS. */
+  private suppressedAdopted = false;
+  private loggedSuppressedFailure = false;
+  /** No suppression list read before this (after a failed one). */
+  private suppressedRetryAt: number | undefined;
   private running: Promise<void> | null = null;
   private again = false;
   private started = false;
@@ -277,9 +290,15 @@ export class ServiceProducer {
         return this.arm(this.adoptRetryAt);
       }
     }
+    let next: number | undefined;
+    if (!this.suppressedAdopted) {
+      if (this.suppressedRetryAt === undefined || this.now() >= this.suppressedRetryAt) {
+        this.suppressedRetryAt = (await this.adoptSuppressed()) ? undefined : this.now() + RETRY_MS;
+      }
+      next = this.suppressedRetryAt;
+    }
     const snap = this.o.monitor.snapshot();
     if (snap) this.observe(snap);
-    let next: number | undefined;
     for (const t of this.tracks.values()) {
       if (this.closed) return;
       const due = await this.stepOrWait(t, this.now());
@@ -310,6 +329,34 @@ export class ServiceProducer {
       if (Number.isFinite(createdAt)) t.openings.push(createdAt);
     }
     this.adopted = true;
+    return true;
+  }
+
+  /**
+   * Suppressed keys (T7.w.11.7): open (so recovery resolves them) and deleted (no item to update).
+   * False when the suppression list could not be read: logged once; evaluation goes on (a raise is
+   * then not treated as suppressed) and the list is re-read after RETRY_MS.
+   */
+  private async adoptSuppressed(): Promise<boolean> {
+    let suppressed: Awaited<ReturnType<NonNullable<ServiceNotificationPort["suppressed"]>>>;
+    try {
+      suppressed = (await this.o.notifications.suppressed?.()) ?? [];
+    } catch {
+      if (!this.loggedSuppressedFailure) {
+        this.loggedSuppressedFailure = true;
+        this.o.logger.warn("[shadow-core] service producer: suppression list (suppressed.json) unreadable; re-read later");
+      }
+      return false;
+    }
+    const byKey = new Map([...this.tracks.values()].map((t) => [t.def.key, t]));
+    for (const s of suppressed) {
+      if (s.source !== SERVICE_SOURCE) continue;
+      const t = byKey.get(s.key);
+      if (!t || t.open) continue;
+      t.open = { urgency: "normal", title: "", body: "", escalated: false };
+      t.deleted = true;
+    }
+    this.suppressedAdopted = true;
     return true;
   }
 
@@ -409,10 +456,18 @@ export class ServiceProducer {
       t.failed = true;
       return now + RETRY_MS;
     }
-    if (!r.ok) {
+    if (!r.ok && r.reason !== "suppressed") {
       if (r.reason !== "unavailable") this.o.logger.warn(`[shadow-core] service producer: ${t.def.key} raise refused (${r.reason})`);
       t.failed = true;
       return now + RETRY_MS;
+    }
+    if (!r.ok) {
+      // Suppressed ("Tekrar gösterme"): nothing shown, but the key is open, so its recovery resolves it.
+      t.deleted = true;
+      t.open = { urgency: want.urgency, title: want.title, body: want.body, escalated: want.escalated };
+      if (opening) t.openings.push(now);
+      this.o.logger.info(`[shadow-core] service producer: ${t.def.key} suppressed by the user; not shown until it resolves`);
+      return undefined;
     }
     t.deleted = false;
     t.open = { urgency: want.urgency, title: want.title, body: want.body, escalated: want.escalated };

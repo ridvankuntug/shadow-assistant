@@ -130,9 +130,13 @@ export interface DevActionFrame {
   action: DevAction;
 }
 
-/** Inbox actions (docs/08-learning-fast-path.md, T7.w.5). `read` / `unread` are shared across devices. */
-export type NotificationAction = "read" | "unread" | "delete";
-export const NOTIFICATION_ACTIONS: readonly NotificationAction[] = ["read", "unread", "delete"];
+/**
+ * Inbox actions (docs/08-learning-fast-path.md, T7.w.5). `read` / `unread` are shared across devices.
+ * `suppress` ("Tekrar gösterme", T7.w.11.7, feature `notifications_suppress`): deletes the item like
+ * `delete` and keeps its producer key from being shown again until the condition ends (docs/09).
+ */
+export type NotificationAction = "read" | "unread" | "delete" | "suppress";
+export const NOTIFICATION_ACTIONS: readonly NotificationAction[] = ["read", "unread", "delete", "suppress"];
 
 /** Asks for the inbox (feature `notifications`); answered by `notifications` or `error`. */
 export interface NotificationsListFrame {
@@ -192,7 +196,7 @@ export type ErrorCode =
  * Optional capabilities a Core lists in `welcome.features`. Clients must
  * ignore names they do not know; a missing name means the feature is off.
  */
-export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications";
+export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications" | "notifications_suppress";
 
 export interface HistoryItem {
   id: string;
