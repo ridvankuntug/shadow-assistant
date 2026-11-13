@@ -45,11 +45,23 @@
     Replace an existing task with the same name.
 .PARAMETER StartNow
     Start the task right after registering it.
+.PARAMETER NoShortcut
+    Do not create the Start menu shortcut.
+.PARAMETER ShortcutOnly
+    Only create (or refresh) the Start menu shortcut; the task is left as it is.
+
+.NOTES
+    Start menu shortcut: "Shadow Assistant" in the current user's Start menu
+    Programs folder. It starts the task (schtasks /run), not the exe, so a
+    start by hand uses the same arguments as the sign-in start; a second start
+    while the task runs is ignored. uninstall-core-task.ps1 removes it.
 
 .EXAMPLE
     .\install-core-task.ps1 -WhatIf
 .EXAMPLE
     .\install-core-task.ps1 -StartNow
+.EXAMPLE
+    .\install-core-task.ps1 -ShortcutOnly
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -61,11 +73,32 @@ param(
     [string] $LogDir,
     [ValidateRange(0, 3600)] [int] $LogonDelaySeconds = 30,
     [switch] $Force,
-    [switch] $StartNow
+    [switch] $StartNow,
+    [switch] $NoShortcut,
+    [switch] $ShortcutOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Install-StartMenuShortcut([string] $TaskFullName, [string] $IconPath) {
+    $programs = [Environment]::GetFolderPath('Programs')
+    $link = Join-Path $programs 'Shadow Assistant.lnk'
+    $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+    if (-not $PSCmdlet.ShouldProcess($link, 'Create Start menu shortcut')) { return }
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $sc = $shell.CreateShortcut($link)
+        $sc.TargetPath = $schtasks
+        $sc.Arguments = "/run /tn `"$TaskFullName`""
+        $sc.WindowStyle = 7  # minimised: schtasks is a console program
+        $sc.Description = 'Shadow Assistant tepsi uygulamasını başlatır (zamanlanmış görev).'
+        if (Test-Path -LiteralPath $IconPath -PathType Leaf) { $sc.IconLocation = "$IconPath,0" }
+        $sc.Save()
+    }
+    finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+    Write-Output "Start menu shortcut: $link"
+}
 
 if (-not $RepoRoot) { $RepoRoot = $env:SHADOW_REPO_ROOT }
 if (-not $RepoRoot) { $RepoRoot = Join-Path $PSScriptRoot '..\..' }
@@ -81,6 +114,14 @@ $TrayPath = [IO.Path]::GetFullPath($TrayPath)
 
 if (-not $TaskPath.StartsWith('\')) { $TaskPath = '\' + $TaskPath }
 if (-not $TaskPath.EndsWith('\')) { $TaskPath = $TaskPath + '\' }
+
+if ($ShortcutOnly) {
+    if (-not (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue)) {
+        throw "Task $TaskPath$TaskName is not registered; install it first (without -ShortcutOnly)."
+    }
+    Install-StartMenuShortcut "$TaskPath$TaskName" $TrayPath
+    return
+}
 
 # Same checks the tray app makes before starting the Core.
 $problems = @()
@@ -146,6 +187,8 @@ if ($PSCmdlet.ShouldProcess("$TaskPath$TaskName", $verb)) {
     }
     Write-Output "Registered $TaskPath$TaskName."
 }
+
+if (-not $NoShortcut) { Install-StartMenuShortcut "$TaskPath$TaskName" $TrayPath }
 
 if ($StartNow -and $PSCmdlet.ShouldProcess("$TaskPath$TaskName", 'Start scheduled task')) {
     Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath

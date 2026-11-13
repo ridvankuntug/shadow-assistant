@@ -209,6 +209,12 @@ Options: `-TrayPath`, `-NodePath`, `-RepoRoot`, `-LogDir`, `-LogonDelaySeconds`
 (default 30), `-Force` (replace an existing task). Re-run with `-Force` after
 moving the repo or changing Node.js.
 
+The installer also creates a **Shadow Assistant** shortcut in your Start menu
+(skip with `-NoShortcut`). It starts the task, so after **Çıkış** you can bring
+the tray app back without signing out; a click while it already runs does
+nothing. `.\install-core-task.ps1 -ShortcutOnly` adds just the shortcut to an
+existing task; the uninstaller removes it.
+
 **Switching from the earlier run-core.ps1 task:** `-Force` replaces the task
 definition but not a running instance. Run `.\uninstall-core-task.ps1` first
 (stops the old task and its Core), then publish and install as above.

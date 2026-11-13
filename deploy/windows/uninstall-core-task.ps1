@@ -7,7 +7,8 @@
     ShadowTray.exe started from this repository (e.g. started by hand) and
     any node.exe process still running this repository's core\dist\index.js
     (a child an older run-core.ps1 task may leave behind). Stopping the tray
-    app also ends its Core (job object). Log files are kept.
+    app also ends its Core (job object). Also removes the "Shadow Assistant"
+    Start menu shortcut. Log files are kept.
     Nothing is changed with -WhatIf.
 
 .PARAMETER TaskName
@@ -48,6 +49,12 @@ else {
         Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false
         Write-Output "Removed $TaskPath$TaskName."
     }
+}
+
+$link = Join-Path ([Environment]::GetFolderPath('Programs')) 'Shadow Assistant.lnk'
+if ((Test-Path -LiteralPath $link -PathType Leaf) -and $PSCmdlet.ShouldProcess($link, 'Remove Start menu shortcut')) {
+    Remove-Item -LiteralPath $link -Force
+    Write-Output "Removed Start menu shortcut $link."
 }
 
 # A tray app started from this repo (task or by hand). Killing it closes its
