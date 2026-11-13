@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { notificationToggleAction, type NotificationsView } from "../assistant/state.ts";
+import { notificationToggleAction, urgencyFeedbackOffered, type NotificationsView } from "../assistant/state.ts";
 import type { NotificationAction, NotificationInfo } from "../protocol/types.ts";
 import { Drawer } from "./Panels.tsx";
 import {
   NOTIFICATION_ACTION_LABEL,
   NOTIFICATION_DISMISS_HINT,
+  NOTIFICATION_FEEDBACK_SENT,
   formatTime,
   notificationSourceText,
   notificationsErrorText,
@@ -16,6 +17,8 @@ type Props = {
   connected: boolean;
   /** The Core has `notifications_suppress`: offer "Tekrar gösterme" next to "Gördüm". */
   canSuppress: boolean;
+  /** The Core has `ha_urgency_feedback`: offer "Bu acildi" / "Acil değildi" on Home Assistant items. */
+  canFeedback?: boolean;
   onRefresh: () => void;
   onAction: (notificationId: string, action: NotificationAction) => void;
   onClose: () => void;
@@ -23,6 +26,9 @@ type Props = {
 
 /** The two actions that clear an item. */
 type Dismiss = "delete" | "suppress";
+/** The two urgency signals of a Home Assistant item. */
+type Feedback = "urgent_yes" | "urgent_no";
+const FEEDBACK: readonly Feedback[] = ["urgent_yes", "urgent_no"];
 
 const CONFIRM_TEXT: Record<Dismiss, { question: string; yes: string }> = {
   delete: { question: "Bu bildirim kaldırılsın mı?", yes: "Evet, kaldır" },
@@ -39,12 +45,14 @@ const timeText = (iso: string) => {
  * Per item "Okundu" / "Okunmadı", "Gördüm" (`delete`) and, with the Core
  * feature `notifications_suppress`, "Tekrar gösterme" (`suppress`). Both
  * clearing actions ask first, with a short hint of what they mean (an item is
- * only ever removed by the user). Opening the panel or
+ * only ever removed by the user). On a Home Assistant item (source `ha`), with
+ * the Core feature `ha_urgency_feedback`, also "Bu acildi" / "Acil değildi"
+ * (one urgency signal each; no question, nothing in the inbox changes). Opening the panel or
  * hearing an item spoken does not mark it read. The caller sends
  * `notifications_list` when the panel opens and renders it only with the Core
  * feature `notifications`.
  */
-export function NotificationsPanel({ notifications, connected, canSuppress, onRefresh, onAction, onClose }: Props) {
+export function NotificationsPanel({ notifications, connected, canSuppress, canFeedback = false, onRefresh, onAction, onClose }: Props) {
   /** Item and clearing action whose confirm question is shown. */
   const [confirming, setConfirming] = useState<{ id: string; action: Dismiss } | null>(null);
   const busy = notifications.status === "loading";
@@ -54,6 +62,34 @@ export function NotificationsPanel({ notifications, connected, canSuppress, onRe
 
   const label = (item: NotificationInfo, action: NotificationAction) =>
     acting?.notificationId === item.id && acting.action === action ? "İşleniyor…" : NOTIFICATION_ACTION_LABEL[action];
+
+  const feedbackButtons = (item: NotificationInfo) => {
+    if (!urgencyFeedbackOffered(item, canFeedback)) return null;
+    // Only once the Core accepted it (its reply arrived); an error or timeout shows its own message.
+    const sent = notifications.feedback?.notificationId === item.id ? notifications.feedback.action : undefined;
+    return (
+      <div className="memory-actions" role="group" aria-label={`Aciliyet: ${item.title}`}>
+        {FEEDBACK.map((a) => (
+          <button
+            key={a}
+            type="button"
+            className="btn btn-ghost"
+            disabled={!usable}
+            aria-pressed={sent === a}
+            aria-label={`${label(item, a)}: ${item.title}`}
+            onClick={() => onAction(item.id, a)}
+          >
+            {label(item, a)}
+          </button>
+        ))}
+        {sent && (
+          <span className="hint" role="status">
+            {NOTIFICATION_FEEDBACK_SENT[sent]}
+          </span>
+        )}
+      </div>
+    );
+  };
 
   const actionButtons = (item: NotificationInfo) => {
     // A "Tekrar gösterme" question is dropped if the Core (after a reconnect) no longer offers it.
@@ -165,6 +201,7 @@ export function NotificationsPanel({ notifications, connected, canSuppress, onRe
                 {n.raised > 1 && ` · ${n.raised} kez`}
               </span>
               {actionButtons(n)}
+              {feedbackButtons(n)}
             </li>
           ))}
         </ul>

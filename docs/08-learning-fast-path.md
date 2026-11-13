@@ -603,7 +603,7 @@ Behind a new feature flag `dev` in `welcome.features`, mirroring the memory fram
 | Direction | Frame | Fields |
 |---|---|---|
 | client → Core | `dev_list` | `id` |
-| client → Core | `dev_action` | `id`, `itemId`, `action`: `add_rule` \| `ignore` \| `fixed` \| `remove_rule` (T7.w.8) |
+| client → Core | `dev_action` | `id`, `itemId`, `action`: `add_rule` \| `ignore` \| `fixed` \| `remove_rule` (T7.w.8) \| `accept` (T7.w.11.10, feature `ha_urgency_feedback`) |
 | Core → client | `dev` | `id` (request id), `items[]`, `open` (badge count), `canManage` |
 | Core → all authenticated sockets | `dev_count` | `open` (sent when it changes; clients do not announce features, so a client that does not know the frame ignores it) |
 
@@ -623,6 +623,12 @@ not do it), `bad_request` (malformed frame; the existing code, no new `bad_frame
 
 Badge count `open` = candidates + suspended rules + open notes. Active rules are
 listed (so "Kaldır" can be offered) but never counted.
+
+Suggestion kinds (notes the Core derives, not from a dev-notes file):
+
+| Kind | Source | Actions |
+|---|---|---|
+| `ha_urgency` (T7.w.11.10, feature `ha_urgency_feedback`) | Learned urgency of HA alerts ([docs/09](09-notification-producers.md#learned-urgency-of-ha-alerts-t7w1110)): 3 same-direction "Bu acildi" / "Acil değildi" signals for one alert type that differ from its current level; "HA uyarı türü “<type>” acil sayılsın mı?" / "… acil saymayalım mı?" | `accept` ("Kabul": the level changes, counter cleared) and `ignore` ("Yok say": level kept, counter cleared); always `open` while listed, counted in `open`; any device |
 
 ### Authorization
 

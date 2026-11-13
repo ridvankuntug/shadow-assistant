@@ -194,6 +194,7 @@ export const DEV_ACTION_LABEL: Record<DevAction, string> = {
   ignore: "Yok say",
   fixed: "Düzeltildi",
   remove_rule: "Kaldır",
+  accept: "Kabul",
 };
 
 /** Button label for an action on an item: `add_rule` on a suspended rule is "Yeniden aç". */
@@ -252,6 +253,7 @@ const DEV_KIND: Record<string, string> = {
   wandering: "Uzayan tur",
   tool_error: "Araç hatası",
   rule_suspended: "Askıya alınan kural",
+  ha_urgency: "Ev uyarısı aciliyet önerisi",
 };
 
 /** Note kind heading; unknown kinds as-is. */
@@ -327,6 +329,14 @@ export const NOTIFICATION_ACTION_LABEL: Record<NotificationAction, string> = {
   unread: "Okunmadı",
   delete: "Gördüm",
   suppress: "Tekrar gösterme",
+  urgent_yes: "Bu acildi",
+  urgent_no: "Acil değildi",
+};
+
+/** Shown on an item after its urgency signal was sent (the Core suggests a change after three). */
+export const NOTIFICATION_FEEDBACK_SENT: Record<"urgent_yes" | "urgent_no", string> = {
+  urgent_yes: "Kaydedildi: acildi. Üç kez aynı yönde olunca Geliştirme'de öneri çıkar.",
+  urgent_no: "Kaydedildi: acil değildi. Üç kez aynı yönde olunca Geliştirme'de öneri çıkar.",
 };
 
 /**

@@ -17,7 +17,15 @@ import {
   clipForSpeech,
   type CoreClientLike,
 } from "./controller.ts";
-import { derivePhase, devBadgeCount, notificationsBadgeCount, notificationsSuppressAvailable, notificationsUnavailable } from "./state.ts";
+import {
+  derivePhase,
+  devBadgeCount,
+  devItemActions,
+  notificationsBadgeCount,
+  notificationsSuppressAvailable,
+  notificationsUnavailable,
+  notificationsUrgencyFeedbackAvailable,
+} from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void };
@@ -1498,6 +1506,24 @@ describe("development panel (T7.w.4c)", () => {
     expect(m.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "r-1", action: "add_rule" }]);
   });
 
+  it("T7.w.11.10: an HA urgency suggestion offers Kabul (accept) and Yok say (ignore) on any device", () => {
+    const sug: DevItem = { ...note(), itemId: "h-1", kind: "ha_urgency", message: "HA uyarı türü “pn:x” acil sayılsın mı?" };
+    const t = ready(frame("t1", false, [sug]));
+    expect(devItemActions(sug, false)).toEqual(["accept", "ignore"]);
+    expect(devItemActions({ ...sug, status: "ignored" }, true)).toEqual([]);
+    expect(t.controller.devAction("h-1", "fixed")).toBe(false);
+    expect(t.controller.devAction("h-1", "add_rule")).toBe(false);
+    expect(t.controller.devAction("n-1", "accept")).toBe(false); // accept is only for suggestions
+    expect(t.sent).toEqual([]);
+    expect(t.controller.devAction("h-1", "accept")).toBe(true);
+    expect(t.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "h-1", action: "accept" }]);
+    t.receive(frame("t2", false, [], 0));
+    expect(t.controller.getState().dev).toMatchObject({ status: "ready", open: 0 });
+    const u = ready(frame("t1", false, [sug]));
+    expect(u.controller.devAction("h-1", "ignore")).toBe(true);
+    expect(u.sent).toEqual([{ type: "dev_action", id: "t2", itemId: "h-1", action: "ignore" }]);
+  });
+
   it("only actions valid for the listed item are sent", () => {
     const t = ready(frame("t1", true, [rule("active"), note("fixed"), { ...rule("suspended"), itemId: "r-2" }]));
     expect(t.controller.devAction("r-1", "add_rule")).toBe(false); // already active
@@ -1741,6 +1767,43 @@ describe("notification inbox (T7.w.5c)", () => {
     t.receive({ type: "error", id: "t2", code: "unknown_item", message: "gone" });
     expect(t.controller.getState().notifications).toMatchObject({ status: "ready", acting: null, errorCode: null });
     expect(t.controller.getState().notifications.items?.map((i) => i.id)).toEqual(["n-2"]);
+  });
+
+  it("T7.w.11.10: urgent_yes / urgent_no only on ha items and only with ha_urgency_feedback", () => {
+    const old = inbox([item("n-1", { source: "ha" })]);
+    expect(notificationsUrgencyFeedbackAvailable(old.controller.getState())).toBe(false);
+    old.sent.length = 0;
+    expect(old.controller.notificationAction("n-1", "urgent_yes")).toBe(false);
+    expect(old.controller.notificationAction("n-1", "urgent_no")).toBe(false);
+    expect(old.sent).toEqual([]);
+
+    const t = inbox([item("n-1", { source: "ha" }), item("n-2", { source: "service" })], ["ha_urgency_feedback"]);
+    expect(notificationsUrgencyFeedbackAvailable(t.controller.getState())).toBe(true);
+    t.sent.length = 0;
+    expect(t.controller.notificationAction("n-2", "urgent_yes")).toBe(false); // not a Home Assistant item
+    expect(t.controller.notificationAction("nope", "urgent_yes")).toBe(false);
+    expect(t.sent).toEqual([]);
+    expect(t.controller.notificationAction("n-1", "urgent_yes")).toBe(true);
+    expect(t.sent).toEqual([{ type: "notification_action", id: "t2", notificationId: "n-1", action: "urgent_yes" }]);
+    expect(t.controller.getState().notifications).toMatchObject({ status: "loading", acting: { notificationId: "n-1", action: "urgent_yes" } });
+    expect(t.controller.getState().notifications.feedback ?? null).toBeNull(); // not before the Core's reply
+    t.receive(list("t2", [item("n-1", { source: "ha" }), item("n-2", { source: "service" })]));
+    expect(t.controller.getState().notifications).toMatchObject({
+      status: "ready",
+      acting: null,
+      feedback: { notificationId: "n-1", action: "urgent_yes" },
+    });
+    expect(t.controller.getState().notifications.items).toHaveLength(2); // nothing removed
+    expect(t.controller.notificationAction("n-1", "urgent_no")).toBe(true);
+    expect(t.sent[1]).toEqual({ type: "notification_action", id: "t3", notificationId: "n-1", action: "urgent_no" });
+    // A refusal (e.g. type not known yet) stays in the panel.
+    t.receive({ type: "error", id: "t3", code: "not_allowed", message: "not yet" });
+    expect(t.controller.getState().notifications).toMatchObject({
+      status: "error",
+      errorCode: "not_allowed",
+      feedback: { notificationId: "n-1", action: "urgent_yes" }, // the refused urgent_no is never shown as saved
+    });
+    expect(t.controller.getState().notice).toBeNull();
   });
 
   it("other inbox errors stay in the panel (no chat notice) and keep the list", () => {

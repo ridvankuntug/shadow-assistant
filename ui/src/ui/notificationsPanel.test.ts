@@ -57,3 +57,58 @@ describe("NotificationsPanel dismiss actions (T7.w.11.8)", () => {
     expect(html).toMatch(/title="[^"]*durum sürdükçe gösterilmez/);
   });
 });
+
+describe("NotificationsPanel urgency feedback (T7.w.11.10)", () => {
+  const haView: NotificationsView = {
+    ...view,
+    items: [
+      { ...view.items![0]!, id: "n-ha", source: "ha", title: "Giriş denemesi" },
+      { ...view.items![0]!, id: "n-svc", source: "service", title: "Servis durdu" },
+    ],
+  };
+  const renderHa = (canFeedback: boolean | undefined) =>
+    renderToStaticMarkup(
+      createElement(NotificationsPanel, {
+        notifications: haView,
+        connected: true,
+        canSuppress: true,
+        ...(canFeedback === undefined ? {} : { canFeedback }),
+        onRefresh: () => {},
+        onAction: () => {},
+        onClose: () => {},
+      }),
+    );
+
+  it("with ha_urgency_feedback: \"Bu acildi\" / \"Acil değildi\" only on the Home Assistant item", () => {
+    const html = renderHa(true);
+    expect(html).toContain('aria-label="Bu acildi: Giriş denemesi"');
+    expect(html).toContain('aria-label="Acil değildi: Giriş denemesi"');
+    expect(html).not.toContain("Bu acildi: Servis durdu");
+    expect(html).not.toContain("Acil değildi: Servis durdu");
+    expect(html.match(/>Bu acildi<\/button>/g)).toHaveLength(1);
+  });
+
+  it("\"Kaydedildi\" only for the signal the Core accepted (view.feedback)", () => {
+    const html = (feedback: NotificationsView["feedback"]) =>
+      renderToStaticMarkup(
+        createElement(NotificationsPanel, {
+          notifications: { ...haView, feedback },
+          connected: true,
+          canSuppress: false,
+          canFeedback: true,
+          onRefresh: () => {},
+          onAction: () => {},
+          onClose: () => {},
+        }),
+      );
+    expect(html(null)).not.toContain("Kaydedildi");
+    const sent = html({ notificationId: "n-ha", action: "urgent_no" });
+    expect(sent).toContain("Kaydedildi: acil değildi");
+    expect(sent).toContain('aria-pressed="true" aria-label="Acil değildi: Giriş denemesi"');
+  });
+
+  it("without the feature (older Core, or prop absent): no feedback buttons", () => {
+    expect(renderHa(false)).not.toContain("Bu acildi");
+    expect(renderHa(undefined)).not.toContain("Acil değildi");
+  });
+});

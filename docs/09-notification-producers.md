@@ -193,7 +193,7 @@ service the Core depends on going down, and Home Assistant's own alerts.
   commands in `READ_ONLY_COMMANDS` can be sent; T7.w.11.6 adds `repairs/list_issues`
   there) and [`ha-producer.ts`](../core/src/ha-producer.ts) (keys, resolve on a
   complete listing, `ha:access`, startup adoption of open and suppressed keys;
-  urgency in one function `haAlertUrgency`, normal until T7.w.11.10). Wired in
+  urgency: since T7.w.11.10 learned per alert type, see below). Wired in
   `index.ts` (off with one info line when `HA_URL` or `HA_CORE_TOKEN` is empty;
   closed in the shutdown chain). No new setting. Tests with a local fake HA
   WebSocket server in `core/test/ha-producer.test.ts`.
@@ -205,7 +205,7 @@ service the Core depends on going down, and Home Assistant's own alerts.
   `dismissed_version`) are skipped, so ignoring an issue in HA resolves its item.
   `ha:access` now has two causes (token rejected, `unauthorized` list answer) and
   is resolved only when both are known good; adoption covers `repair:` items and
-  suppressed `repair:` keys. Urgency through `haAlertUrgency` (normal). Tests in
+  suppressed `repair:` keys. Urgency learned per type (T7.w.11.10). Tests in
   `core/test/ha-producer.test.ts` (fake server on 127.0.0.1).
 - **Varsayılan — kullanıcı onayı bekliyor:**
   - **Resolve grace 60 s:** an id missing from a `current` listing is resolved
@@ -276,11 +276,31 @@ service the Core depends on going down, and Home Assistant's own alerts.
 #### Learned urgency of HA alerts (T7.w.11.10)
 
 Decided: which HA alerts are urgent is learned over time, with the user's consent
-each time. Design only; no code yet.
+each time.
 
-- **Start:** HA's failed-login notification is urgent (e.g. the `http.login_attempts`
-  / `ip_ban` persistent notification; candidate names, to be confirmed against a
-  real HA before coding). Every other HA alert is normal.
+Implemented (T7.w.11.10): [`ha-urgency.ts`](../core/src/ha-urgency.ts)
+(`HaUrgencyStore`: type keys, counter, suggestions, Kabul / Yok say, record file;
+`haUrgencyFeedback`: the `urgent_yes` / `urgent_no` port of `NotificationCenter`),
+[`ha-producer.ts`](../core/src/ha-producer.ts) (every alert carries its type key,
+`haAlertType`; the level is read from the store in the raise call, so an open
+item keeps its urgency until its text changes and it is raised again; a failing
+store means normal), `NotificationCenter.act` (`urgent_yes` / `urgent_no`) and
+`DevelopmentTab` (`kind:"ha_urgency"` items, `accept` / `ignore`) in
+[`session.ts`](../core/src/session.ts), wired in `index.ts` (the store's changes
+recount the Development badge; flushed at shutdown). Protocol: feature
+`ha_urgency_feedback`, `notification_action` `urgent_yes` / `urgent_no`,
+`dev_action` `accept`, Development kind `ha_urgency`
+([docs/02](02-core-protocol.md#notifications)). UI: "Bu acildi" / "Acil değildi"
+on `source:"ha"` items with the feature (`NotificationsPanel.tsx`), "Kabul" /
+"Yok say" on the suggestion (`DevPanel.tsx`). Tests in
+`core/test/ha-urgency.test.ts` and `core/test/ha-producer.test.ts` (*learned
+urgency*), UI in `controller.test.ts`, `notificationsPanel.test.ts`,
+`devPanel.test.ts`.
+
+- **Start:** HA's failed-login notifications are urgent: `pn:http-login` and
+  `pn:ip-ban` (HA's `NOTIFICATION_ID_LOGIN` / `NOTIFICATION_ID_BAN` in
+  `homeassistant/components/http/ban.py`; **to be confirmed against a real HA**).
+  Every other HA alert is normal.
 - **Alert type key** (proposal): persistent notifications use `pn:<notification_id>`
   with a variable suffix stripped (normalized prefix, e.g. `http-login`, not
   `http-login-<n>`); repairs use `repair:<domain>:<translation_key>`, falling back
@@ -309,6 +329,45 @@ each time. Design only; no code yet.
   urgent item (see below); the failed-login start is no exception.
 - **Record:** type key, direction, counter, approved level; no title/body, no
   secrets (like the suppression record). Where it lives is open question 5.
+- **Varsayılan — kullanıcı onayı bekliyor (open question 2, type key):**
+  `pn:<notification_id>` with one variable tail stripped: `-<digits>`,
+  `_<digits>`, or a UUID / hex tail of 8+ characters after `-` / `_`
+  (`backup_failed_12` → `pn:backup_failed`; `http-login` stays). An id that is
+  only digits or only hex (8+), as HA generates when a notification is created
+  without an id, is the one anonymous type `pn:*`. Repairs:
+  `repair:<domain>:<translation_key>`, `issue_id` without one. A key over 128
+  characters is hashed (`pn:sha256:` / `repair:sha256:`). Never title/body text.
+- **Varsayılan — kullanıcı onayı bekliyor (open question 3, signals):** only the
+  explicit "Bu acildi" / "Acil değildi" buttons count; reactions (opening the
+  item quickly, "Tekrar gösterme") are not counted. Alternative from the design:
+  count them as weaker signals. One signal per inbox item: a second tap on the
+  same item in the same direction is not counted again (in memory; a tap in the
+  other direction is counted and resets the run).
+- **Varsayılan — kullanıcı onayı bekliyor (open question 4, threshold):** 3
+  same-direction signals; an opposite signal resets the counter to 1 in the new
+  direction. A suggestion is shown only when the direction differs from the
+  type's current level (e.g. "acildi" ×3 on the already urgent failed-login type
+  suggests nothing); the counter stops at 999.
+- **Varsayılan — kullanıcı onayı bekliyor (open question 5, record):** a separate
+  small file next to `suppressed.json`:
+  `<SHADOW_DATA_DIR>/notifications/ha-urgency.json`
+  (`{version:1, items:[{type, direction?, count, firstAt?, lastAt?, level?}]}`,
+  atomic writes). A corrupt file is quarantined (`.corrupt-<ts>`) and empty; an
+  unreadable one is logged once, never overwritten, start levels are used and
+  feedback / Kabul / Yok say answer an error until it can be read again; the
+  producer is never blocked. At most 500 types (a new one beyond is not
+  recorded, logged). The `firstAt` / `lastAt` times are for the Development
+  tab's `firstSeen` / `lastSeen`.
+- **Varsayılan — kullanıcı onayı bekliyor:** "Kabul" / "Yok say" work on any
+  device (not limited to `CORE_DEV_DEVICES`: they change which HA alerts are
+  spoken, not how the home is controlled), and "Kabul" asks no second question
+  (the suggestion itself is the question).
+- **Varsayılan — kullanıcı onayı bekliyor:** feedback on a repair item whose type
+  is not known yet (the Core has not listed repairs from HA since it started, so
+  its `translation_key` is unknown) answers `not_allowed` instead of guessing the
+  `issue_id` type; a `pn:` item's type is derived from its key. Feedback on the
+  `ha:access` item ("HA uyarıları okunamıyor") or any non-`ha` item →
+  `bad_request`.
 
 ### Urgent items while no client is connected (protocol change, proposed)
 
@@ -462,7 +521,7 @@ resolves (and clears) them. Tests in `core/test/notification-suppressions.test.t
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
 - T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock. Implemented: `canSpeak` + `CORE_QUIET_HOURS` (see *Quiet hours for urgent speech*, defaults awaiting approval there); tests in `core/test/quiet-hours.test.ts` and `session-notifications.test.ts`.
 
-- T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests.
+- T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests. Implemented: [`ha-urgency.ts`](../core/src/ha-urgency.ts) + producer / center / Development tab / UI (see *Learned urgency of HA alerts*, defaults awaiting approval there); tests in `core/test/ha-urgency.test.ts`, `core/test/ha-producer.test.ts`, UI tests.
 
 11.1→11.2, 11.5→11.6, 11.7→11.8, 11.4→11.9, 11.5→11.10 are ordered; 11.3 stands alone.
 
@@ -483,12 +542,16 @@ service producer.
    *Quiet hours for urgent speech*.
 2. **Alert type key:** is the proposed key (normalized `notification_id` prefix;
    repairs `domain` + `translation_key`/`issue_id`) right, and how is a variable
-   suffix recognized (digits/UUID tail)?
+   suffix recognized (digits/UUID tail)? — **Varsayılan — kullanıcı onayı
+   bekliyor:** implemented as proposed (see *Learned urgency of HA alerts*).
 3. **Reaction signal:** do reactions (opening quickly, "Tekrar gösterme") count
-   as feedback, or only the explicit "Bu acildi" / "Acil değildi" buttons?
+   as feedback, or only the explicit "Bu acildi" / "Acil değildi" buttons? —
+   **Varsayılan — kullanıcı onayı bekliyor:** only the explicit buttons.
 4. **Threshold:** is 3 same-direction signals (opposite resets) right for HA
-   alerts, or should it differ from docs/08?
+   alerts, or should it differ from docs/08? — **Varsayılan — kullanıcı onayı
+   bekliyor:** 3, an opposite signal resets to 1.
 5. **Where the record lives:** a separate small persisted file next to the
-   suppression record, or the same store?
+   suppression record, or the same store? — **Varsayılan — kullanıcı onayı
+   bekliyor:** separate file `notifications/ha-urgency.json`.
 
 (HA alerts urgency is decided: learned, see T7.w.11.10.)

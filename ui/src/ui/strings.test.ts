@@ -68,7 +68,9 @@ describe("development panel texts", () => {
     expect(devStatusText("brand_new")).toBe("brand_new");
     expect(devKindText("missing_capability")).toBe("Eksik yetenek");
     expect(devKindText("future_kind")).toBe("future_kind");
-    expect(DEV_ACTION_LABEL).toEqual({ add_rule: "Kuralı ekle", ignore: "Yok say", fixed: "Düzeltildi", remove_rule: "Kaldır" });
+    expect(DEV_ACTION_LABEL).toEqual({ add_rule: "Kuralı ekle", ignore: "Yok say", fixed: "Düzeltildi", remove_rule: "Kaldır", accept: "Kabul" });
+    expect(devKindText("ha_urgency")).toBe("Ev uyarısı aciliyet önerisi");
+    expect(devConfirmText("accept", "open")).toBeNull(); // "Kabul" asks nothing more: the suggestion is the question
   });
 
   it("T7.w.8: \"Yeniden aç\" on a suspended rule; add, re-open and remove ask first, the others do not", () => {

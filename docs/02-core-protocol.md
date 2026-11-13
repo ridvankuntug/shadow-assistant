@@ -59,15 +59,15 @@ refuses to start.
 | `{"type":"memory_list","id":"m1"}` | Ask for the memory contents (feature `memory`). See *Memory*. |
 | `{"type":"memory_delete","id":"m2","entryId":"m-7f3a9c"}` | Delete one memory entry (feature `memory`). See *Memory*. |
 | `{"type":"dev_list","id":"d1"}` | Ask for the Development items (feature `dev`). See *Development*. |
-| `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"\|"remove_rule"}` | One action on one Development item (feature `dev`). See *Development*. |
+| `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"\|"remove_rule"\|"accept"}` | One action on one Development item (feature `dev`; `accept` only with `ha_urgency_feedback`). See *Development*. |
 | `{"type":"notifications_list","id":"q1"}` | Ask for the notification inbox (feature `notifications`). See *Notifications*. |
-| `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"\|"suppress"}` | One action on one notification (feature `notifications`; `suppress` only with `notifications_suppress`). See *Notifications*. |
+| `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"\|"suppress"\|"urgent_yes"\|"urgent_no"}` | One action on one notification (feature `notifications`; `suppress` only with `notifications_suppress`; `urgent_yes` / `urgent_no` only with `ha_urgency_feedback`). See *Notifications*. |
 
 ## Core → Client
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -107,6 +107,7 @@ The protocol number stays 1.
 | `dev` | The Development tab is available: `dev_list` / `dev_action` are answered and `dev_count` is sent. Without it clients hide the tab and its badge. |
 | `notifications` | The notification inbox is available: `notifications_list` / `notification_action` are answered and `notification` / `notification_removed` are sent. Without it clients hide the inbox and its badge. |
 | `notifications_suppress` | `notification_action` also accepts `action:"suppress"` ("Tekrar gösterme", see *Notifications*). Without it clients offer only `delete` (an older Core answers `suppress` with `bad_request`). |
+| `ha_urgency_feedback` | Learned urgency of Home Assistant alerts (T7.w.11.10): `notification_action` also accepts `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") on `source:"ha"` items, and the Development tab may list `kind:"ha_urgency"` suggestions that take `dev_action` `accept` ("Kabul") or `ignore` ("Yok say"). Without it clients offer neither (an older Core answers both actions with `bad_request`). |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -127,7 +128,7 @@ Agent SDK's `mcp__<service>__` prefix.
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
 | `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted). |
-| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). |
+| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). `notification_action` `urgent_yes` / `urgent_no`: the item's Home Assistant alert type is not known yet (a repair the Core has not listed from HA since it started; try again later). |
 | `notifications_unavailable` | `notifications_list` / `notification_action` while the Core cannot read its notifications file (see *Notifications*): the inbox is unknown, not empty. |
 | `internal` | Unexpected server error. |
 
@@ -218,7 +219,7 @@ actions, never a push or a sound.
 |---|---|
 | `itemId` | Opaque id; send it back as `dev_action.itemId`. |
 | `type` | `rule` (learned rule) or `note` (dev-note). |
-| `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`, `unknown_name`) or `learned_rule`. Clients show unknown kinds as-is. |
+| `kind` | Note kind (`new_tool`, `tool_added`, `tool_removed`, `rule_unmatched`, `missing_capability`, `wandering`, `tool_error`, `rule_suspended`, `unknown_name`, `ha_urgency`) or `learned_rule`. Clients show unknown kinds as-is. |
 | `status` | Rules: `candidate`, `active`, `suspended`. Notes: `open`, `ignored`, `fixed`. Clients show unknown values as-is. |
 | `count`, `firstSeen`, `lastSeen` | Occurrences / observations and ISO 8601 times, as stored. |
 | `rule` | Only on rules: pattern `tokens` (slots `<ad>` device name, `<sayi>` number), `tool`, `domains`, optional `numberRange` (not sent today: the rule file keeps no range), `observations`. |
@@ -248,6 +249,20 @@ entity for a spoken name) keeps that name only in the Core's local
   (unset = nobody), or a suspended rule the current router.yaml no longer
   allows → `not_allowed`; a malformed frame (missing `itemId`, unknown
   `action`) → `bad_request`.
+- **HA urgency suggestions** (T7.w.11.10, feature `ha_urgency_feedback`): a
+  `type:"note"` item with `kind:"ha_urgency"`, `status:"open"` (counted in
+  `open`), `message` "HA uyarı türü “<type>” acil sayılsın mı?" or "… acil
+  saymayalım mı?" (`<type>` is the alert type key, e.g. `pn:http-login`), `count`
+  the same-direction signals, `firstSeen` / `lastSeen` the first and last of
+  them. Its `itemId` is `h-…` and stands for one type **and** direction.
+  `dev_action` `accept` ("Kabul") sets the type's level to the suggested one,
+  `ignore` ("Yok say") keeps it; both clear the counter, so the item leaves the
+  list. Any device may do either (`canManage` is not needed: it changes only
+  which HA alerts are spoken). `fixed`, `add_rule` and `remove_rule` on it →
+  `not_allowed`; `accept` on any other item → `not_allowed`; a suggestion that
+  changed meanwhile (an opposite signal reset it) → `unknown_item`. Added
+  within protocol 1: a new `kind` and a new `action` value; an older client
+  shows the item as a note whose "Yok say" works.
 - The device is the one from the token, never `hello.client`.
 - `dev_count` is sent to every authenticated socket when the badge count
   changes, only by a Core with the feature `dev` (clients that do not know the
@@ -336,6 +351,21 @@ them or the producer resolves them.
   `suppressed.json` is logged and treated as empty (items are shown, never
   lost); an invalid one is kept as `suppressed.json.corrupt-<ts>`. Added within
   protocol 1: a new action value only; clients that never send it see no change.
+- **`urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi", T7.w.11.10,
+  feature `ha_urgency_feedback`)** give one urgency signal for the item's Home
+  Assistant alert **type** (not the item): only on `source:"ha"` alert items
+  (an item of another source, or the `ha` access item "HA uyarıları okunamıyor",
+  → `bad_request`). Nothing in the inbox changes and nothing is broadcast; the
+  answer is the fresh `notifications` frame. A second signal of the same item in
+  the same direction is not counted again. After 3 signals in one direction that
+  differs from the type's current level the Development tab lists a suggestion
+  (see *Development*); only "Kabul" there changes the level, and only for items
+  raised afterwards (an open item keeps its urgency until the producer raises it
+  again). Errors: unknown `notificationId` → `unknown_item`; type not known yet
+  → `not_allowed`; the record file could not be read or written → `internal`.
+  The Core keeps type key, direction, counter and approved level in
+  `<SHADOW_DATA_DIR>/notifications/ha-urgency.json` (no title, body or item id).
+  Added within protocol 1: new action values only.
 - There is no push to a phone whose app is not connected; it sees the items in
   `notifications_list` on its next connect.
 - While the Core cannot read its notifications file (locked or otherwise

@@ -66,6 +66,7 @@ import type {
   SpeechMode,
 } from "./protocol.js";
 import type { SuppressionRecord, SuppressionStore } from "./notification-suppressions.js";
+import type { HaUrgencyStore, UrgencyFeedbackPort, UrgencySuggestion } from "./ha-urgency.js";
 import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
@@ -1700,6 +1701,8 @@ export interface DevelopmentSources {
   toolNotes?: Pick<DevNotes, "read" | "setStatus">;
   /** `dev-notes/turns.json` (T7.w.3). */
   turnNotes?: Pick<TurnNotes, "read" | "setStatus">;
+  /** HA alert urgency suggestions (T7.w.11.10): `kind: "ha_urgency"` items with `accept` / `ignore`. */
+  haUrgency?: Pick<HaUrgencyStore, "suggestions" | "accept" | "dismiss">;
   /** CORE_DEV_DEVICES: devices that may `add_rule` / `remove_rule`; empty = nobody (fail closed). */
   managers: readonly string[];
   logger: Logger;
@@ -1723,9 +1726,28 @@ const RULE_MESSAGES: Record<string, string> = {
   suspended: "öğrenilen kural askıya alındı",
 };
 
-/** Opaque item ids: `r-<rule id>`, `t-<hash>` (tools.json), `n-<hash>` (turns.json). The hash is of the note's key. */
+/**
+ * Opaque item ids: `r-<rule id>`, `t-<hash>` (tools.json), `n-<hash>` (turns.json), `h-<hash>` (HA urgency
+ * suggestion). The hash is of the note's key; for a suggestion of its type key and direction, so an id
+ * never stands for the opposite suggestion.
+ */
 const ruleItemId = (id: string) => `r-${id}`;
-const noteItemId = (prefix: "t" | "n", key: string) => `${prefix}-${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+const noteItemId = (prefix: "t" | "n" | "h", key: string) => `${prefix}-${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+const urgencyItemId = (s: Pick<UrgencySuggestion, "type" | "direction">) => noteItemId("h", `${s.type}\u0000${s.direction}`);
+
+/** The suggestion as a Development note (`kind: "ha_urgency"`, always `open` while listed). */
+function urgencyItem(s: UrgencySuggestion): DevItem {
+  return {
+    itemId: urgencyItemId(s),
+    type: "note",
+    kind: "ha_urgency",
+    status: "open",
+    message: s.direction === "urgent" ? `HA uyarı türü “${s.type}” acil sayılsın mı?` : `HA uyarı türü “${s.type}” acil saymayalım mı?`,
+    count: s.count,
+    firstSeen: s.firstAt,
+    lastSeen: s.lastAt,
+  };
+}
 
 interface NoteLike {
   kind: string;
@@ -1845,7 +1867,26 @@ export class DevelopmentTab {
     }
     if (itemId.startsWith("r-")) return this.actOnRule(device, itemId, action);
     if (itemId.startsWith("t-") || itemId.startsWith("n-")) return this.actOnNote(device, itemId, action);
+    if (itemId.startsWith("h-")) return this.actOnUrgency(device, itemId, action);
     return unknownItem();
+  }
+
+  /**
+   * An HA urgency suggestion (T7.w.11.10): `accept` ("Kabul") sets the type's level, `ignore`
+   * ("Yok say") keeps it; both clear the counter, so the item leaves the list. Any device (it
+   * changes only whether an HA alert type is spoken, not how the home is controlled).
+   */
+  private async actOnUrgency(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
+    const store = this.o.haUrgency;
+    if (!store) return unknownItem();
+    const s = (await store.suggestions()).find((x) => urgencyItemId(x) === itemId);
+    if (!s) return unknownItem();
+    if (action !== "accept" && action !== "ignore") return notAllowed();
+    const r = action === "accept" ? await store.accept(s.type, s.direction) : await store.dismiss(s.type, s.direction);
+    if (r === "unknown") return unknownItem();
+    if (r === "unavailable") return { ok: false, code: "internal", message: "the HA urgency record could not be stored" };
+    this.o.logger.info(`[shadow-core] ha urgency suggestion ${action === "accept" ? "accepted" : "ignored"} by device ${device}`);
+    return { ok: true };
   }
 
   private async actOnRule(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
@@ -1907,6 +1948,7 @@ export class DevelopmentTab {
         return { ok: false, code: "internal", message: "the rule could not be stored" };
       }
       case "fixed":
+      case "accept":
         return notValid();
     }
   }
@@ -1914,7 +1956,7 @@ export class DevelopmentTab {
   private async actOnNote(device: string, itemId: string, action: DevAction): Promise<DevActResult> {
     const found = await this.findNote(itemId);
     if (!found) return unknownItem();
-    if (action === "add_rule" || action === "remove_rule") return notAllowed();
+    if (action === "add_rule" || action === "remove_rule" || action === "accept") return notAllowed();
     const status: NoteStatus = action === "ignore" ? "ignored" : "fixed";
     if (!(await found.set(status))) return unknownItem();
     this.o.logger.info(`[shadow-core] dev-note ${itemId} marked ${status} by device ${device}`);
@@ -1940,15 +1982,17 @@ export class DevelopmentTab {
   }
 
   private async collect(): Promise<{ items: DevItem[]; open: number }> {
-    const [rules, tools, turns] = await Promise.all([
+    const [rules, tools, turns, urgency] = await Promise.all([
       this.o.rules ? this.o.rules.list() : Promise.resolve([]),
       this.o.toolNotes ? this.o.toolNotes.read().then((f) => f.notes) : Promise.resolve([]),
       this.o.turnNotes ? this.o.turnNotes.read().then((f) => f.notes) : Promise.resolve([]),
+      this.o.haUrgency ? this.o.haUrgency.suggestions() : Promise.resolve([]),
     ]);
     const ruleItems = rules.filter((r) => LISTED_RULE_STATUSES.has(r.status)).map(ruleItem);
     const noteItems = [
       ...tools.map((n) => noteItem(noteItemId("t", toolNoteKey(n)), n)),
       ...turns.map((n) => noteItem(noteItemId("n", turnNoteKey(n)), n)),
+      ...urgency.map(urgencyItem),
     ].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
     const open =
       ruleItems.filter((i) => i.status === "candidate" || i.status === "suspended").length +
@@ -2012,6 +2056,11 @@ export interface NotificationCenterOptions {
    * `suppress` action then deletes like `delete` and records nothing).
    */
   suppressions?: Pick<SuppressionStore, "has" | "add" | "remove" | "list" | "flush">;
+  /**
+   * "Bu acildi" / "Acil değildi" (T7.w.11.10, `urgent_yes` / `urgent_no`). Absent: those
+   * actions answer `bad_request`.
+   */
+  urgencyFeedback?: UrgencyFeedbackPort;
 }
 
 /** The retry never keeps the process alive; shutdown calls close(). */
@@ -2021,7 +2070,9 @@ const unrefRetryTimer = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(t);
 };
 
-export type NotificationActResult = { ok: true } | { ok: false; code: Extract<ErrorCode, "unknown_item">; message: string };
+export type NotificationActResult =
+  | { ok: true }
+  | { ok: false; code: Extract<ErrorCode, "unknown_item" | "bad_request" | "not_allowed" | "internal">; message: string };
 
 /** The item as clients see it: the stored fields without the producer's dedupe `key`. */
 export function notificationInfo(item: NotificationItem): NotificationInfo {
@@ -2258,6 +2309,17 @@ export class NotificationCenter {
 
   /** `act()` on the chain: the store call, its broadcast and the recount of a change. */
   private async actOnStore(device: string, notificationId: string, action: NotificationAction): Promise<NotificationActResult> {
+    if (action === "urgent_yes" || action === "urgent_no") {
+      // A signal for the item's alert type (T7.w.11.10): nothing in the inbox changes, nothing is broadcast.
+      const feedback = this.o.urgencyFeedback;
+      if (!feedback) return { ok: false, code: "bad_request", message: "urgency feedback is disabled" };
+      const item = await this.o.store.get(notificationId);
+      if (!item) return unknownNotification();
+      const r = await feedback.feedback(item, action === "urgent_yes" ? "urgent" : "normal");
+      // No item id or type in the log (the type can hold an HA notification id).
+      if (r.ok) this.o.logger.info(`[shadow-core] notification urgency feedback (${action}) by device ${device}`);
+      return r;
+    }
     if (action === "suppress") {
       const item = await this.o.store.get(notificationId);
       if (!item) return unknownNotification();

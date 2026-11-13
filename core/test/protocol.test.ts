@@ -129,7 +129,10 @@ test("dev_list / dev_action (feature dev): ids and action required; unknown fiel
     });
   }
   // `remove_rule` added by T7.w.8 (additive, protocol stays 1).
-  assert.deepEqual([...DEV_ACTIONS], ["add_rule", "ignore", "fixed", "remove_rule"]);
+  // `remove_rule` added by T7.w.8, `accept` by T7.w.11.10 (feature ha_urgency_feedback); additive, protocol stays 1.
+  assert.deepEqual([...DEV_ACTIONS], ["add_rule", "ignore", "fixed", "remove_rule", "accept"]);
+  bad({ type: "dev_action", id: "d2", itemId: "h-1", action: "ACCEPT" });
+  bad({ type: "dev_action", id: "d2", itemId: "h-1", action: "kabul" });
   bad({ type: "dev_list" });
   bad({ type: "dev_list", id: "" });
   bad({ type: "dev_list", id: 5 });
@@ -165,7 +168,11 @@ test("notifications_list / notification_action (feature notifications): ids and 
     });
   }
   // `suppress` ("Tekrar gösterme", T7.w.11.7) was added within protocol 1; the old three are unchanged.
-  assert.deepEqual([...NOTIFICATION_ACTIONS], ["read", "unread", "delete", "suppress"]);
+  // `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi", T7.w.11.10, feature ha_urgency_feedback): additive.
+  assert.deepEqual([...NOTIFICATION_ACTIONS], ["read", "unread", "delete", "suppress", "urgent_yes", "urgent_no"]);
+  bad({ type: "notification_action", id: "n2", notificationId: "n-0123456789abcdef", action: "urgent" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-0123456789abcdef", action: "URGENT_YES" });
+  bad({ type: "notification_action", id: "n2", notificationId: "n-0123456789abcdef", action: true });
   bad({ type: "notifications_list" });
   bad({ type: "notifications_list", id: "" });
   bad({ type: "notifications_list", id: 5 });

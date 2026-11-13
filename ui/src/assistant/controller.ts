@@ -33,6 +33,8 @@ import {
   notificationsUnavailable,
   notificationToggleAction,
   notificationsSuppressAvailable,
+  notificationsUrgencyFeedbackAvailable,
+  urgencyFeedbackOffered,
   reducer,
   shouldPlaySpeech,
   type Action,
@@ -642,8 +644,10 @@ export class AssistantController {
    * One action on one listed item; the Core answers with the fresh inbox.
    * `read` only for an unread item, `unread` only for a read one, `delete`
    * ("Gördüm") always, `suppress` ("Tekrar gösterme") only with the Core
-   * feature `notifications_suppress` (the panel asks first for both). Only
-   * ever sent for a user action.
+   * feature `notifications_suppress` (the panel asks first for both),
+   * `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") only on a Home
+   * Assistant item (source `ha`) with the Core feature `ha_urgency_feedback`.
+   * Only ever sent for a user action.
    */
   notificationAction(notificationId: string, action: NotificationAction): boolean {
     const item = this.state.notifications.items?.find((i) => i.id === notificationId);
@@ -651,6 +655,8 @@ export class AssistantController {
     const allowed =
       action === "delete" ||
       (action === "suppress" && notificationsSuppressAvailable(this.state)) ||
+      ((action === "urgent_yes" || action === "urgent_no") &&
+        urgencyFeedbackOffered(item, notificationsUrgencyFeedbackAvailable(this.state))) ||
       action === notificationToggleAction(item);
     if (!allowed) return false;
     return this.sendNotifications((id) => ({ type: "notification_action", id, notificationId, action }), { notificationId, action });

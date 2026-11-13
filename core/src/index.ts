@@ -29,6 +29,7 @@ import { DEFAULT_DIRECT_TIMEOUT_MS, McpDirectClient, type RemoteMcpClient } from
 import { McpGateway, serviceSecrets, type GatewaySource } from "./mcp-gateway.js";
 import { formatQuietHours, NOTIFICATIONS_DIR, NotificationStore } from "./notifications.js";
 import { SuppressionStore } from "./notification-suppressions.js";
+import { HaUrgencyStore, haUrgencyFeedback } from "./ha-urgency.js";
 import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { checkRouterServices } from "./router-config.js";
@@ -314,7 +315,13 @@ export async function main(): Promise<void> {
   for (const d of cfg.devDevices) {
     if (!tokens.digests.has(d)) logger.warn(`[shadow-core] CORE_DEV_DEVICES: '${d}' has no DEVICE_TOKEN_<NAME>; ignored in practice`);
   }
-  devTab = new DevelopmentTab({ rules: learnedRules, toolNotes, turnNotes, managers: cfg.devDevices, logger });
+  // Learned urgency of HA alerts (docs/09, T7.w.11.10): type key, counter, approved level; next to the inbox.
+  const haUrgency = new HaUrgencyStore({
+    dir: join(cfg.dataDir, NOTIFICATIONS_DIR),
+    log: (m) => logger.warn(m),
+    onChange: () => devTab?.changed(),
+  });
+  devTab = new DevelopmentTab({ rules: learnedRules, toolNotes, turnNotes, haUrgency, managers: cfg.devDevices, logger });
   await devTab.view(); // the first badge count, for /health `inbox`
   // The home's notification inbox (docs/08 T7.w.5); producers call notificationCenter.raise()/resolve() (docs/09).
   const notificationStore = new NotificationStore({ dir: join(cfg.dataDir, NOTIFICATIONS_DIR), log: (m) => logger.warn(m) });
@@ -328,6 +335,7 @@ export async function main(): Promise<void> {
     logger,
     quietHours: cfg.quietHours,
     suppressions: notificationSuppressions,
+    urgencyFeedback: haUrgencyFeedback(haUrgency),
   });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
   // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
@@ -380,6 +388,7 @@ export async function main(): Promise<void> {
       suppressed: () => notificationCenter.suppressed(),
     },
     logger,
+    urgency: haUrgency,
   });
 
   const server = createCoreServer({
@@ -416,7 +425,7 @@ export async function main(): Promise<void> {
     // `notificationsUnavailable`: the file could not be read, `notifications` is then not a real count (T7.w.12).
     inbox: () => ({ dev: devTab?.open ?? 0, ...notificationCenter.healthInbox() }),
     devCount: devTab,
-    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications", "notifications_suppress"],
+    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications", "notifications_suppress", "ha_urgency_feedback"],
     serviceHealth: monitor,
     deviceState,
   });
@@ -485,6 +494,7 @@ export async function main(): Promise<void> {
           { name: "turn notes", run: () => turnNotes.flush() },
           // After the inbox changes in flight: coalesced or failed notification writes.
           { name: "notifications", run: () => notificationCenter.flush() },
+          { name: "ha urgency", run: () => haUrgency.flush() },
         ],
       },
       { log: (m) => logger.warn(m), exit: (code) => process.exit(code) },

@@ -25,12 +25,13 @@ import {
   HaAlertsProducer,
   clipText,
   createHaAlerts,
-  haAlertUrgency,
+  haAlertType,
   haAlertsSettings,
   pnKey,
   repairKey,
   repairOf,
   type HaNotificationPort,
+  type HaUrgencyPort,
 } from "../src/ha-producer.js";
 import { MAX_BODY_CHARS, MAX_KEY_CHARS, MAX_TITLE_CHARS, type NotificationItem, type RaiseInput, type RaiseResult } from "../src/notifications.js";
 
@@ -247,7 +248,7 @@ async function settle(producer?: HaAlertsProducer): Promise<void> {
 
 const AUTH_TIMEOUT = 9_999_999;
 
-async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string } = {}) {
+async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string; urgency?: HaUrgencyPort } = {}) {
   const ha = o.ha ?? new FakeHa();
   const base = await ha.ready();
   const center = o.center ?? new FakeCenter();
@@ -256,7 +257,7 @@ async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string } = {
   const producerTimers = new FakeTimers();
   const clientTimers = new FakeTimers();
   const clock = { now: Date.parse("2026-11-13T12:00:00.000Z") };
-  const producer = new HaAlertsProducer({ notifications: center, logger, timers: producerTimers, now: () => clock.now });
+  const producer = new HaAlertsProducer({ notifications: center, logger, timers: producerTimers, now: () => clock.now, urgency: o.urgency });
   const client = new HaClient({
     url: haWebSocketUrl(base)!,
     token: o.token ?? TOKEN,
@@ -350,7 +351,7 @@ test("pnKey: pn:<id> up to the store's key limit, sha256 beyond; clipText cuts l
   assert.notEqual(pnKey(`${long}c`), k);
   assert.equal(clipText("  x  ", 10), "x");
   assert.equal(clipText(`${"a".repeat(4)}\u{1F600}`, 5), "aaaa", "no half surrogate pair");
-  assert.equal(haAlertUrgency({ kind: "pn", id: "http-login" }), "normal");
+  assert.equal(haAlertType({ kind: "pn", id: "http-login" }), "pn:http-login");
   assert.deepEqual([...READ_ONLY_COMMANDS], ["persistent_notification/subscribe", "repairs/list_issues"]);
 });
 
@@ -786,21 +787,22 @@ test("repairKey / repairOf: key limit and hashing, ignored entries, Turkish text
   assert.ok(r && r !== "ignored");
   assert.equal(r.key, "repair:homeassistant:deprecated_yaml_x");
   assert.deepEqual(r.want, {
-    urgency: "normal",
+    type: "repair:homeassistant:deprecated_yaml",
     title: "Home Assistant onarımı: sensor",
     body:
       "Sorun: deprecated_yaml\nÖnem: kritik\nHome Assistant 2027.1.0 sürümünde çalışmayı bırakacak.\nHome Assistant'ta onarma adımı var.\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar.",
   });
   const plain = repairOf(issue("demo", "x1", { translation_key: null, severity: "bogus" }));
   assert.ok(plain && plain !== "ignored");
-  assert.deepEqual(plain.want, { urgency: "normal", title: "Home Assistant onarımı: demo", body: "Sorun: x1\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar." });
+  assert.deepEqual(plain.want, { type: "repair:demo:x1", title: "Home Assistant onarımı: demo", body: "Sorun: x1\nAyrıntılar: Home Assistant > Ayarlar > Onarımlar." });
   assert.equal(repairOf(issue("demo", "x", { ignored: true })), "ignored");
   assert.equal(repairOf(issue("demo", "x", { ignored: undefined, dismissed_version: "2026.10.0" })), "ignored", "no `ignored`: dismissed_version decides");
   assert.notEqual(repairOf(issue("demo", "x", { ignored: false, dismissed_version: "2026.10.0" })), "ignored", "`ignored` wins when present");
   assert.equal(repairOf({ issue_id: "x" }), undefined);
   assert.equal(repairOf(issue("", "x")), undefined);
   assert.equal(repairOf(42), undefined);
-  assert.equal(haAlertUrgency({ kind: "repair", domain: "demo", issueId: "x", severity: "critical" }), "normal");
+  assert.equal(haAlertType({ kind: "repair", domain: "demo", issueId: "x", severity: "critical" }), "repair:demo:x", "no translation key: issue_id");
+  assert.equal(haAlertType({ kind: "repair", domain: "demo", issueId: "x_1", translationKey: "t" }), "repair:demo:t");
 });
 
 test("repairs: listed after the subscription and every 10 min; ignored ones skipped; only read-only commands", async () => {
@@ -1013,5 +1015,106 @@ test("repairs: a list still pending on a dropped connection is ignored (generati
     assert.deepEqual([...t.center.items.keys()], ["repair:demo:x"]);
   } finally {
     await t.close();
+  }
+});
+
+// ------------------------------------------------------------ learned urgency (T7.w.11.10)
+
+/** A fake learned-urgency store: levels by type, every `noteItem` recorded. */
+class FakeUrgency implements HaUrgencyPort {
+  readonly levels = new Map<string, "normal" | "urgent">([
+    ["pn:http-login", "urgent"],
+    ["pn:ip-ban", "urgent"],
+  ]);
+  readonly noted = new Map<string, string>();
+  reads = 0;
+  failing = false;
+  async level(type: string): Promise<"normal" | "urgent"> {
+    this.reads++;
+    if (this.failing) throw new Error("boom");
+    return this.levels.get(type) ?? "normal";
+  }
+  noteItem(itemKey: string, type: string): void {
+    this.noted.set(itemKey, type);
+  }
+}
+
+test("learned urgency: failed-login notifications start urgent, others normal; item keys mapped to type keys", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("http-login", notif("http-login", "Login attempt failed"));
+  ha.notifications.set("ip-ban", notif("ip-ban", "IP banned"));
+  ha.notifications.set("config_entry_discovery", notif("config_entry_discovery", "Yeni cihaz"));
+  ha.notifications.set("backup_failed_12", notif("backup_failed_12", "Yedek"));
+  ha.issues = [issue("demo", "a_1", { translation_key: "deprecated" })];
+  const urgency = new FakeUrgency();
+  const t = await setup({ ha, urgency });
+  try {
+    await waitFor(() => t.center.raises.length >= 4, "four raises");
+    await t.repairsDone();
+    const byKey = new Map(t.center.raises.map((r) => [r.key, r.urgency]));
+    assert.equal(byKey.get("pn:http-login"), "urgent");
+    assert.equal(byKey.get("pn:ip-ban"), "urgent");
+    assert.equal(byKey.get("pn:config_entry_discovery"), "normal");
+    assert.equal(byKey.get("pn:backup_failed_12"), "normal");
+    assert.equal(byKey.get("repair:demo:a_1"), "normal");
+    assert.equal(urgency.noted.get("pn:backup_failed_12"), "pn:backup_failed", "variable suffix stripped");
+    assert.equal(urgency.noted.get("repair:demo:a_1"), "repair:demo:deprecated", "translation key, not issue_id");
+  } finally {
+    await t.close();
+  }
+});
+
+test("learned urgency: read at raise time; an open item keeps its urgency until it is raised again", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("x_1", notif("x_1", "X"));
+  const urgency = new FakeUrgency();
+  const t = await setup({ ha, urgency });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "first raise");
+    assert.equal(t.center.raises[0]!.urgency, "normal");
+    // "Kabul": the type is urgent from now on.
+    urgency.levels.set("pn:x", "urgent");
+    // The same set again (no text change): nothing is raised, the open item stays normal.
+    t.ha.push("updated", notif("x_1", "X"));
+    await t.sync();
+    assert.equal(t.center.raises.length, 1);
+    assert.equal(t.center.items.get("pn:x_1")!.urgency, "normal");
+    // A text change raises it again: now urgent (without renotify, like any update).
+    t.ha.push("updated", notif("x_1", "X2"));
+    await waitFor(() => t.center.raises.length === 2, "re-raised");
+    assert.equal(t.center.raises[1]!.urgency, "urgent");
+    assert.equal(t.center.raises[1]!.renotify, false);
+    // A new occurrence of the same type (new id) is urgent at once.
+    t.ha.push("added", notif("x_2", "X yine"));
+    await waitFor(() => t.center.raises.length === 3, "new occurrence");
+    assert.equal(t.center.raises[2]!.urgency, "urgent");
+    assert.equal(t.center.raises[2]!.renotify, true);
+  } finally {
+    await t.close();
+  }
+});
+
+test("learned urgency: a failing store never blocks the producer (normal); ha:access stays normal", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("http-login", notif("http-login", "Login"));
+  const urgency = new FakeUrgency();
+  urgency.failing = true;
+  const t = await setup({ ha, urgency });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "raised");
+    assert.equal(t.center.raises[0]!.urgency, "normal");
+  } finally {
+    await t.close();
+  }
+  const bad = new FakeHa();
+  bad.acceptToken = false;
+  const u2 = new FakeUrgency();
+  const t2 = await setup({ ha: bad, urgency: u2 });
+  try {
+    await waitFor(() => t2.center.raises.some((r) => r.key === HA_ACCESS_KEY), "ha:access");
+    assert.equal(t2.center.raises.find((r) => r.key === HA_ACCESS_KEY)!.urgency, "normal");
+    assert.equal(u2.reads, 0, "ha:access has no learned type");
+  } finally {
+    await t2.close();
   }
 });

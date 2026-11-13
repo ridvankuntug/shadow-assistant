@@ -11,6 +11,7 @@ import {
   notificationsAvailable,
   notificationsBadgeCount,
   notificationsSuppressAvailable,
+  notificationsUrgencyFeedbackAvailable,
   notificationsUnavailable,
 } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
@@ -456,6 +457,7 @@ export default function App({ adapter, controller }: Props) {
           notifications={state.notifications}
           connected={connected}
           canSuppress={notificationsSuppressAvailable(state)}
+          canFeedback={notificationsUrgencyFeedbackAvailable(state)}
           onRefresh={() => controller.requestNotifications()}
           onAction={(id, action) => controller.notificationAction(id, action)}
           onClose={closePanel}

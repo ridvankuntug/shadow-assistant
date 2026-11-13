@@ -156,6 +156,11 @@ export type NotificationsView = {
   errorMessage: string | null;
   /** Replaced request ids whose late errors are dropped (as `DevView.staleIds`). */
   staleIds: string[];
+  /**
+   * The last urgency signal ("Bu acildi" / "Acil değildi") the Core accepted (its
+   * `notifications` reply arrived); absent / null until then. An error or timeout never sets it.
+   */
+  feedback?: { notificationId: string; action: "urgent_yes" | "urgent_no" } | null;
 };
 
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
@@ -392,6 +397,8 @@ export function devBadgeCount(s: AssistantState): number {
  * statuses get none.
  */
 export function devItemActions(item: DevItem, canManage: boolean): DevAction[] {
+  // An HA urgency suggestion: "Kabul" / "Yok say" (any device).
+  if (item.type === "note" && item.kind === HA_URGENCY_KIND) return item.status === "open" ? ["accept", "ignore"] : [];
   if (item.type === "rule") {
     if (item.status === "candidate" || item.status === "suspended") return canManage ? ["add_rule", "ignore"] : ["ignore"];
     return item.status === "active" && canManage ? ["remove_rule"] : [];
@@ -402,6 +409,21 @@ export function devItemActions(item: DevItem, canManage: boolean): DevAction[] {
 /** The inbox and its badge may be offered: connected to a Core with the `notifications` feature. */
 export function notificationsAvailable(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "notifications");
+}
+
+/** Development note kind of an HA urgency suggestion (Core feature `ha_urgency_feedback`). */
+export const HA_URGENCY_KIND = "ha_urgency";
+/** Inbox source of Home Assistant alerts: the only items with "Bu acildi" / "Acil değildi". */
+export const HA_SOURCE = "ha";
+
+/** "Bu acildi" / "Acil değildi" may be offered: the inbox is available and the Core has `ha_urgency_feedback`. */
+export function notificationsUrgencyFeedbackAvailable(s: AssistantState): boolean {
+  return notificationsAvailable(s) && hasFeature(s, "ha_urgency_feedback");
+}
+
+/** The two urgency signals are offered on this item: an HA alert, with the feature. */
+export function urgencyFeedbackOffered(item: NotificationInfo, available: boolean): boolean {
+  return available && item.source === HA_SOURCE;
 }
 
 /** "Tekrar gösterme" (`suppress`) may be offered: the inbox is available and the Core has `notifications_suppress`. */
@@ -943,20 +965,28 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
       // Only the answer to the latest request (as with dev); it still counts
       // after the local timeout.
       if (msg.id !== s.notifications.requestId) return s;
-      return {
-        ...s,
-        notifications: {
-          status: "ready",
-          requestId: msg.id,
-          acting: null,
-          items: msg.items,
-          unread: msg.unread,
-          unavailable: false,
-          errorCode: null,
-          errorMessage: null,
-          staleIds: s.notifications.staleIds,
-        },
-      };
+      {
+        const acted = s.notifications.acting;
+        const feedback =
+          acted && (acted.action === "urgent_yes" || acted.action === "urgent_no")
+            ? { notificationId: acted.notificationId, action: acted.action }
+            : (s.notifications.feedback ?? null);
+        return {
+          ...s,
+          notifications: {
+            status: "ready",
+            requestId: msg.id,
+            acting: null,
+            items: msg.items,
+            unread: msg.unread,
+            unavailable: false,
+            errorCode: null,
+            errorMessage: null,
+            staleIds: s.notifications.staleIds,
+            feedback,
+          },
+        };
+      }
 
     case "notification":
       return { ...s, notifications: upsertNotification(s.notifications, msg.item) };

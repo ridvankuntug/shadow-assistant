@@ -46,8 +46,11 @@ export type SpeechPrefsMessage = { type: "speech_prefs"; enabled: boolean; mode:
 export type MemoryListMessage = { type: "memory_list"; id: string };
 /** Deletes one memory entry; answered by a fresh `memory` frame. */
 export type MemoryDeleteMessage = { type: "memory_delete"; id: string; entryId: string };
-/** Development-tab actions (Core feature `dev`). */
-export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule";
+/**
+ * Development-tab actions (Core feature `dev`). `accept` ("Kabul") takes an HA
+ * urgency suggestion (`kind: "ha_urgency"`, Core feature `ha_urgency_feedback`).
+ */
+export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule" | "accept";
 /** Asks for the Development items (Core feature `dev`). */
 export type DevListMessage = { type: "dev_list"; id: string };
 /** One action on one Development item; answered by a fresh `dev` frame or `error`. */
@@ -57,8 +60,11 @@ export type DevActionMessage = { type: "dev_action"; id: string; itemId: string;
  * every device. `delete` is "Gördüm"; `suppress` ("Tekrar gösterme") deletes
  * the item too and keeps its condition hidden while it lasts (Core feature
  * `notifications_suppress`; an older Core answers it with `bad_request`).
+ * `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") are one urgency
+ * signal for a Home Assistant alert (source `ha`, Core feature
+ * `ha_urgency_feedback`); they change nothing in the inbox.
  */
-export type NotificationAction = "read" | "unread" | "delete" | "suppress";
+export type NotificationAction = "read" | "unread" | "delete" | "suppress" | "urgent_yes" | "urgent_no";
 /** Asks for the inbox (Core feature `notifications`). */
 export type NotificationsListMessage = { type: "notifications_list"; id: string };
 /** One action on one inbox item; answered by a fresh `notifications` frame or `error`. */
@@ -91,7 +97,14 @@ export type ClientMessage =
 // Core -> Client
 
 /** Optional Core capabilities this client uses (`welcome.features`). */
-export type CoreFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications" | "notifications_suppress";
+export type CoreFeature =
+  | "speech_stream"
+  | "memory"
+  | "usage_limit"
+  | "dev"
+  | "notifications"
+  | "notifications_suppress"
+  | "ha_urgency_feedback";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;

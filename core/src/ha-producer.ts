@@ -42,8 +42,11 @@
  *   resolved only when both are known good: an authenticated connection **and**
  *   a list_issues answer on it that is not `unauthorized` (HA checks admin before
  *   anything else, so any other answer means the permission is there).
- * - Urgency: `haAlertUrgency` (one function; normal for now, learned urgency is
- *   T7.w.11.10).
+ * - Urgency (T7.w.11.10, ha-urgency.ts): every alert carries its type key
+ *   (`haAlertType`); the level is read from the learned-urgency store when the
+ *   item is raised (new, or re-raised for changed text), so an open item keeps
+ *   its urgency until it is raised again. Without a store every alert is normal;
+ *   `ha:access` is always normal.
  *
  * Startup reconcile (docs/09 common rules): existing `ha` items with a `pn:` or
  * `repair:` key and `ha:access` are adopted as open, and keys the user suppressed ("Tekrar
@@ -67,6 +70,7 @@ import {
   type RaiseInput,
   type RaiseResult,
 } from "./notifications.js";
+import { pnTypeKey, repairTypeKey } from "./ha-urgency.js";
 import type { Logger } from "./session.js";
 
 export const HA_SOURCE = "ha";
@@ -102,7 +106,7 @@ const REPAIR_SEVERITY = new Map([
   ["warning", "uyarı"],
 ]);
 
-/** An HA alert as the urgency rule sees it. */
+/** An HA alert as its type key sees it. */
 export type HaAlertRef =
   | {
       kind: "pn";
@@ -119,14 +123,15 @@ export type HaAlertRef =
     };
 
 /**
- * The one place an HA alert's urgency is decided. Every HA alert is normal
- * until learned urgency (T7.w.11.10) replaces this.
+ * The alert type key of an HA alert (T7.w.11.10, docs/09): its urgency is
+ * learned per type, read from the learned-urgency store at raise time.
  */
-export function haAlertUrgency(alert: HaAlertRef): NotificationUrgency {
+export function haAlertType(alert: HaAlertRef): string {
   switch (alert.kind) {
     case "pn":
+      return pnTypeKey(alert.id);
     case "repair":
-      return "normal";
+      return repairTypeKey(alert.domain, alert.translationKey, alert.issueId);
   }
 }
 
@@ -167,22 +172,37 @@ export interface HaNotificationPort {
   suppressed?(): Promise<ReadonlyArray<{ source: string; key: string }>>;
 }
 
+/** What the producer needs from the learned-urgency store (ha-urgency.ts). */
+export interface HaUrgencyPort {
+  /** The level of a type now; never rejects. */
+  level(type: string): Promise<NotificationUrgency>;
+  /** Item key → type key, so feedback on an item finds its type. */
+  noteItem(itemKey: string, type: string): void;
+}
+
 export interface HaProducerOptions {
   notifications: HaNotificationPort;
   logger: Logger;
+  /** Learned urgency (T7.w.11.10); absent = every alert normal. */
+  urgency?: HaUrgencyPort;
   /** Test hooks. */
   now?: () => number;
   timers?: HaTimers;
 }
 
+/** What an item should hold: an HA alert has a `type` (urgency read at raise time), `ha:access` a fixed urgency. */
 interface Want {
-  urgency: NotificationUrgency;
+  urgency?: NotificationUrgency;
+  type?: string;
   title: string;
   body: string;
 }
 
 /** What the producer believes the inbox holds for a key. */
-interface Shown extends Want {
+interface Shown {
+  urgency: NotificationUrgency;
+  title: string;
+  body: string;
   /** "Tekrar gösterme": open, but not shown or updated until it resolves. */
   suppressed: boolean;
 }
@@ -198,8 +218,13 @@ const defaultTimers: HaTimers = {
   },
 };
 
-/** Same urgency, title and body (an unchanged item writes nothing). */
-const sameWant = (a: Want, b: Want): boolean => a.urgency === b.urgency && a.title === b.title && a.body === b.body;
+/**
+ * Same title and body, and for a fixed-urgency item the same urgency (an unchanged item writes
+ * nothing). An alert's learned level is not compared: an open item keeps its urgency until its
+ * text changes and it is raised again (docs/09).
+ */
+const sameWant = (a: Shown, b: Want): boolean =>
+  a.title === b.title && a.body === b.body && (b.type !== undefined || a.urgency === (b.urgency ?? "normal"));
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -211,7 +236,7 @@ function alertOf(mapId: string, entry: unknown): { key: string; want: Want } {
   const body = typeof e.message === "string" ? clipText(e.message, MAX_BODY_CHARS) : "";
   return {
     key: pnKey(id),
-    want: { urgency: haAlertUrgency({ kind: "pn", id }), title: title || DEFAULT_TITLE, body },
+    want: { type: haAlertType({ kind: "pn", id }), title: title || DEFAULT_TITLE, body },
   };
 }
 
@@ -242,7 +267,7 @@ export function repairOf(entry: unknown): { key: string; want: Want } | "ignored
   return {
     key: repairKey(domain, issueId),
     want: {
-      urgency: haAlertUrgency({ kind: "repair", domain, issueId, translationKey, severity }),
+      type: haAlertType({ kind: "repair", domain, issueId, translationKey, severity }),
       title: clipText(`Home Assistant onarımı: ${nonEmpty(entry.issue_domain) ?? domain}`, MAX_TITLE_CHARS),
       body: clipText(lines.join("\n"), MAX_BODY_CHARS),
     },
@@ -432,6 +457,7 @@ export class HaAlertsProducer implements HaClientHandlers {
       }
       if (!complete) this.badRepairsShape();
       this.repairs = next;
+      this.noteTypes(next);
       this.repairsMayResolve = complete && startedAt >= this.connectedAt + HA_RESOLVE_GRACE_MS;
     }
     this.scheduleRepairs(conn, gen);
@@ -470,6 +496,7 @@ export class HaAlertsProducer implements HaClientHandlers {
           next.set(a.key, a.want);
         }
         this.alerts = next;
+        this.noteTypes(next);
         this.loggedSubscribeRefused = false;
         this.resolveAfter = this.now() + HA_RESOLVE_GRACE_MS;
         this.removed.clear();
@@ -482,6 +509,7 @@ export class HaAlertsProducer implements HaClientHandlers {
         for (const [id, entry] of entries) {
           const a = alertOf(id, entry);
           this.alerts.set(a.key, a.want);
+          this.noteTypes(new Map([[a.key, a.want]]));
         }
         break;
       case "removed":
@@ -623,22 +651,48 @@ export class HaAlertsProducer implements HaClientHandlers {
   /** Raises one item; the believed state, or "failed" (retried later). */
   private async raise(key: string, want: Want, opening: boolean): Promise<Shown | "failed"> {
     let r: RaiseResult;
+    // Read now, at raise time: an approval changes the next raise, never an open item by itself.
+    const urgency = want.type !== undefined ? await this.levelOf(want.type) : (want.urgency ?? "normal");
+    const shown: Shown = { urgency, title: want.title, body: want.body, suppressed: false };
     try {
-      r = await this.o.notifications.raise({ source: HA_SOURCE, key, ...want, renotify: opening });
+      r = await this.o.notifications.raise({ source: HA_SOURCE, key, urgency, title: want.title, body: want.body, renotify: opening });
     } catch {
       return "failed";
     }
-    if (r.ok) return { ...want, suppressed: false };
-    if (r.reason === "suppressed") return { ...want, suppressed: true };
+    if (r.ok) return shown;
+    if (r.reason === "suppressed") return { ...shown, suppressed: true };
     if (r.reason === "invalid") {
       // A producer bug, not a passing condition: not retried until the text changes.
       if (!this.loggedInvalid) {
         this.loggedInvalid = true;
         this.o.logger.warn("[shadow-core] ha producer: raise refused (invalid)");
       }
-      return { ...want, suppressed: false };
+      return shown;
     }
     return "failed";
+  }
+
+  /** The learned level of a type (normal without a store or when it fails). */
+  private async levelOf(type: string): Promise<NotificationUrgency> {
+    try {
+      return (await this.o.urgency?.level(type)) ?? "normal";
+    } catch {
+      return "normal";
+    }
+  }
+
+  /** Tells the urgency store which type an item key has (feedback maps an item back to its type). */
+  private noteTypes(listing: Map<string, Want>): void {
+    const u = this.o.urgency;
+    if (!u) return;
+    for (const [key, want] of listing) {
+      if (want.type === undefined) continue;
+      try {
+        u.noteItem(key, want.type);
+      } catch {
+        // never breaks the producer
+      }
+    }
   }
 
   private async resolveKey(key: string): Promise<boolean> {
@@ -732,13 +786,15 @@ export function createHaAlerts(o: {
   env: NodeJS.ProcessEnv;
   notifications: HaNotificationPort;
   logger: Logger;
+  /** Learned urgency (T7.w.11.10); absent = every alert normal. */
+  urgency?: HaUrgencyPort;
 }): HaAlerts | undefined {
   const settings = haAlertsSettings(o.env);
   if ("off" in settings) {
     o.logger.info(`[shadow-core] ha alerts: off (${settings.off})`);
     return undefined;
   }
-  const producer = new HaAlertsProducer({ notifications: o.notifications, logger: o.logger });
+  const producer = new HaAlertsProducer({ notifications: o.notifications, logger: o.logger, urgency: o.urgency });
   const client = new HaClient({ url: settings.url, token: settings.token, logger: o.logger, handlers: producer });
   o.logger.info("[shadow-core] ha alerts: on (persistent notifications and repairs over the HA WebSocket API, read-only)");
   return {

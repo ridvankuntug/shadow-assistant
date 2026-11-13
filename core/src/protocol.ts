@@ -111,9 +111,13 @@ export interface MemoryDeleteFrame {
   entryId: string;
 }
 
-/** Development-tab actions (docs/08-learning-fast-path.md, T7.w.4; `remove_rule` T7.w.8). */
-export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule";
-export const DEV_ACTIONS: readonly DevAction[] = ["add_rule", "ignore", "fixed", "remove_rule"];
+/**
+ * Development-tab actions (docs/08-learning-fast-path.md, T7.w.4; `remove_rule` T7.w.8).
+ * `accept` ("Kabul", T7.w.11.10, feature `ha_urgency_feedback`): takes an HA urgency
+ * suggestion (`kind: "ha_urgency"`); `ignore` on it is "Yok say".
+ */
+export type DevAction = "add_rule" | "ignore" | "fixed" | "remove_rule" | "accept";
+export const DEV_ACTIONS: readonly DevAction[] = ["add_rule", "ignore", "fixed", "remove_rule", "accept"];
 
 /** Asks for the Development items (feature `dev`); answered by `dev` or `error`. */
 export interface DevListFrame {
@@ -134,9 +138,12 @@ export interface DevActionFrame {
  * Inbox actions (docs/08-learning-fast-path.md, T7.w.5). `read` / `unread` are shared across devices.
  * `suppress` ("Tekrar gösterme", T7.w.11.7, feature `notifications_suppress`): deletes the item like
  * `delete` and keeps its producer key from being shown again until the condition ends (docs/09).
+ * `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi", T7.w.11.10, feature
+ * `ha_urgency_feedback`): one urgency signal for the item's HA alert type; changes nothing in
+ * the inbox. Only for source `ha` alert items (else `bad_request`).
  */
-export type NotificationAction = "read" | "unread" | "delete" | "suppress";
-export const NOTIFICATION_ACTIONS: readonly NotificationAction[] = ["read", "unread", "delete", "suppress"];
+export type NotificationAction = "read" | "unread" | "delete" | "suppress" | "urgent_yes" | "urgent_no";
+export const NOTIFICATION_ACTIONS: readonly NotificationAction[] = ["read", "unread", "delete", "suppress", "urgent_yes", "urgent_no"];
 
 /** Asks for the inbox (feature `notifications`); answered by `notifications` or `error`. */
 export interface NotificationsListFrame {
@@ -186,7 +193,10 @@ export type ErrorCode =
   | "usage_limit"
   /** Development: the `itemId` is not (or no longer) listed. Notifications: the `notificationId` is unknown (or deleted). */
   | "unknown_item"
-  /** Development: the action is not valid for the item, or this device may not do it. */
+  /**
+   * Development: the action is not valid for the item, or this device may not do it.
+   * Notifications (`urgent_yes` / `urgent_no`): the item's HA alert type is not known yet.
+   */
   | "not_allowed"
   /** Notifications: the Core cannot read its notifications file; the inbox is not known (never "empty"). */
   | "notifications_unavailable"
@@ -196,7 +206,15 @@ export type ErrorCode =
  * Optional capabilities a Core lists in `welcome.features`. Clients must
  * ignore names they do not know; a missing name means the feature is off.
  */
-export type ProtocolFeature = "speech_stream" | "memory" | "usage_limit" | "dev" | "notifications" | "notifications_suppress";
+export type ProtocolFeature =
+  | "speech_stream"
+  | "memory"
+  | "usage_limit"
+  | "dev"
+  | "notifications"
+  | "notifications_suppress"
+  /** T7.w.11.10: `notification_action` `urgent_yes` / `urgent_no` and Development `ha_urgency` suggestions with `accept`. */
+  | "ha_urgency_feedback";
 
 export interface HistoryItem {
   id: string;
@@ -297,7 +315,11 @@ export interface DevItem {
   /** Opaque id; send it back as `dev_action.itemId`. */
   itemId: string;
   type: DevItemType;
-  /** Note kind (e.g. `new_tool`, `wandering`, `unknown_name`) or, for rules, `learned_rule`. */
+  /**
+   * Note kind (e.g. `new_tool`, `wandering`, `unknown_name`) or, for rules, `learned_rule`.
+   * `ha_urgency` (T7.w.11.10): an HA alert urgency suggestion (`status: "open"`); actions
+   * `accept` ("Kabul") and `ignore` ("Yok say").
+   */
   kind: string;
   /** Rules: `candidate` | `active` | `suspended`; notes: `open` | `ignored` | `fixed`. Clients show unknown values as-is. */
   status: string;
