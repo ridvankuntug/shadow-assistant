@@ -16,6 +16,7 @@ import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDevi
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { BackupProducer, backupStatusPath } from "./backup-producer.js";
 import { ServiceProducer } from "./service-producer.js";
+import { AuthGate } from "./auth-gate.js";
 import { createHaAlerts } from "./ha-producer.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
@@ -357,10 +358,14 @@ export async function main(): Promise<void> {
   for (const w of lexicon.warnings) logger.warn(`[shadow-core] pronunciations.yaml: ${w}`);
   const pronunciations = lexicon.lexicon;
 
+  // One hold-off for a rejected HA_CORE_TOKEN (T20.1), shared by the HA health check and the HA WebSocket
+  // client: HA counts each rejected token as a failed login (ip_ban), so neither retries it every round.
+  const haAuthGate = new AuthGate();
   // Built after the vault check above so a missing vault dir reads as disabled.
   const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, {
       vaultDir: cfg.vaultDir,
       ...(memory ? { memoryDir } : {}),
+      authGates: new Map([["HA_CORE_TOKEN", haAuthGate]]),
     }), {
     intervalMs: cfg.healthIntervalMs,
     timeoutMs: cfg.healthTimeoutMs,
@@ -389,6 +394,7 @@ export async function main(): Promise<void> {
     },
     logger,
     urgency: haUrgency,
+    authGate: haAuthGate,
   });
 
   const server = createCoreServer({

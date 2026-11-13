@@ -60,6 +60,7 @@
  * deleting or suppressing a Shadow item never touches HA.
  */
 import { createHash } from "node:crypto";
+import type { AuthGate } from "./auth-gate.js";
 import { HaClient, HaClosedError, HaCommandError, haWebSocketUrl, type HaClientHandlers, type HaConnection, type HaTimers } from "./ha-client.js";
 import {
   MAX_BODY_CHARS,
@@ -788,6 +789,8 @@ export function createHaAlerts(o: {
   logger: Logger;
   /** Learned urgency (T7.w.11.10); absent = every alert normal. */
   urgency?: HaUrgencyPort;
+  /** Hold-off for a rejected HA_CORE_TOKEN, shared with the HA health check (T20.1). */
+  authGate?: AuthGate;
 }): HaAlerts | undefined {
   const settings = haAlertsSettings(o.env);
   if ("off" in settings) {
@@ -795,7 +798,7 @@ export function createHaAlerts(o: {
     return undefined;
   }
   const producer = new HaAlertsProducer({ notifications: o.notifications, logger: o.logger, urgency: o.urgency });
-  const client = new HaClient({ url: settings.url, token: settings.token, logger: o.logger, handlers: producer });
+  const client = new HaClient({ url: settings.url, token: settings.token, logger: o.logger, handlers: producer, authGate: o.authGate });
   o.logger.info("[shadow-core] ha alerts: on (persistent notifications and repairs over the HA WebSocket API, read-only)");
   return {
     start() {

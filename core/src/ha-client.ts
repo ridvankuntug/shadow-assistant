@@ -17,7 +17,14 @@
  * Reconnect: after any close (refused, lost, auth_invalid, timeout) the next
  * attempt waits 1 → 2 → 4 … → 60 s (± 20 % jitter, injectable timers / random).
  * The delay starts over after the first successful command result on a
- * connection (HA really answered, not only accepted the socket). A dead TCP
+ * connection (HA really answered, not only accepted the socket). With an
+ * `authGate` (T20.1) a rejected token is held off as well: after
+ * `auth_invalid` (or a rejection seen by the health check sharing the gate)
+ * no connection is opened until the gate's hold is over (15 min doubling to
+ * 6 h, one probe for all users of the gate, claimed at `auth_required`, i.e.
+ * only when the token is about to be sent); while held off the handlers get
+ * `onAuthInvalid` once, and a token accepted elsewhere (the health check)
+ * ends the wait at once. A dead TCP
  * link is noticed by protocol-level pings (no HA command): no pong before the
  * next ping → the socket is dropped and reconnected.
  *
@@ -25,6 +32,7 @@
  * error codes and close codes.
  */
 import WebSocket from "ws";
+import type { AuthGate } from "./auth-gate.js";
 import type { Logger } from "./session.js";
 
 /** The only commands this client sends (read-only): the notification subscription (T7.w.11.5) and the repairs list (T7.w.11.6). */
@@ -132,6 +140,12 @@ export interface HaClientOptions {
   /** 0 = no pings (tests). */
   heartbeatMs?: number;
   authTimeoutMs?: number;
+  /**
+   * Shared hold-off for a rejected token (auth-gate.ts, T20.1); the health
+   * check of the same token uses the same gate. Absent = every reconnect sends
+   * the token (backoff only).
+   */
+  authGate?: AuthGate;
 }
 
 interface Pending {
@@ -164,6 +178,9 @@ export class HaClient {
   private loggedFailure = false;
   /** auth_invalid was logged since the last auth_ok. */
   private loggedAuthInvalid = false;
+  /** The handlers know the token is rejected (auth_invalid, or held off by the gate) since the last auth_ok. */
+  private toldRejected = false;
+  private stopGate: (() => void) | undefined;
   private started = false;
   private closed = false;
 
@@ -175,6 +192,7 @@ export class HaClient {
   start(): void {
     if (this.started || this.closed) return;
     this.started = true;
+    this.stopGate = this.o.authGate?.onAccepted(() => this.onGateAccepted());
     this.connect();
   }
 
@@ -182,6 +200,8 @@ export class HaClient {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.stopGate?.();
+    this.stopGate = undefined;
     if (this.retryTimer !== undefined) this.timers.clear(this.retryTimer);
     this.retryTimer = undefined;
     const link = this.link;
@@ -210,6 +230,14 @@ export class HaClient {
 
   private connect(): void {
     if (this.closed) return;
+    const gate = this.o.authGate;
+    // The token is held off after a rejection (here or by the health check): no connection, no auth message.
+    // Only a look, no claim: the probe is claimed at `auth_required`, so a connection that fails before
+    // the token could be sent (refused, proxy error, drop) does not use up the probe for the health check.
+    if (gate && gate.waitMs() > 0) {
+      this.heldOff(gate);
+      return this.scheduleReconnect();
+    }
     let ws: WebSocket;
     try {
       ws = new WebSocket(this.o.url, { handshakeTimeout: HANDSHAKE_TIMEOUT_MS, maxPayload: MAX_PAYLOAD, perMessageDeflate: false });
@@ -281,12 +309,22 @@ export class HaClient {
     const ws = link.ws;
     if (!link.authed) {
       if (m.type === "auth_required" && !link.authSent) {
+        const gate = this.o.authGate;
+        if (gate && !gate.tryAttempt()) {
+          // The health check took the probe meanwhile: no token on this socket.
+          this.clearAuthTimer(link);
+          this.heldOff(gate);
+          ws.close(1000);
+          return;
+        }
         link.authSent = true;
         this.send(link, { type: "auth", access_token: this.o.token });
       } else if (m.type === "auth_ok") {
         link.authed = true;
         this.clearAuthTimer(link);
         this.loggedAuthInvalid = false;
+        this.toldRejected = false;
+        this.o.authGate?.accepted();
         this.o.logger.info("[shadow-core] ha client: connected");
         try {
           this.o.handlers.onConnected(this.connection(link));
@@ -295,9 +333,13 @@ export class HaClient {
         }
       } else if (m.type === "auth_invalid") {
         this.clearAuthTimer(link);
+        this.o.authGate?.rejectedNow();
+        this.toldRejected = true;
         if (!this.loggedAuthInvalid) {
           this.loggedAuthInvalid = true;
-          this.o.logger.warn("[shadow-core] ha client: token rejected (auth_invalid); retried with backoff");
+          this.o.logger.warn(
+            `[shadow-core] ha client: token rejected (auth_invalid); ${this.o.authGate ? "held off, retried sparingly" : "retried with backoff"}`,
+          );
         }
         try {
           this.o.handlers.onAuthInvalid();
@@ -415,12 +457,40 @@ export class HaClient {
 
   private scheduleReconnect(): void {
     if (this.closed || this.retryTimer !== undefined) return;
-    const delay = haBackoffMs(this.failures, this.random);
+    // A held-off token waits for the gate; the backoff still applies after the hold.
+    const gate = this.o.authGate;
+    const gateWait = gate?.waitMs() ?? 0;
+    // The gate closed meanwhile (the health check saw a rejection while this socket failed before
+    // `auth_required`): the wait is the hold, so the handlers hear it now, not a hold later.
+    if (gate && gateWait > 0) this.heldOff(gate);
+    const delay = Math.max(haBackoffMs(this.failures, this.random), gateWait);
     this.failures++;
     this.retryTimer = this.timers.set(() => {
       this.retryTimer = undefined;
       this.connect();
     }, delay);
+  }
+
+  /** Held off by the gate: the handlers hear `onAuthInvalid` (and one warning) once per rejection streak. */
+  private heldOff(gate: AuthGate): void {
+    if (this.toldRejected) return;
+    this.toldRejected = true;
+    this.o.logger.warn(
+      `[shadow-core] ha client: token rejected earlier; held off, next try in about ${Math.ceil(gate.waitMs() / 60_000)} min`,
+    );
+    try {
+      this.o.handlers.onAuthInvalid();
+    } catch {
+      // a handler bug must not stop reconnecting
+    }
+  }
+
+  /** The token was accepted elsewhere (the health check): a reconnect waiting for the hold goes with the normal backoff. */
+  private onGateAccepted(): void {
+    if (this.closed || this.retryTimer === undefined) return;
+    this.timers.clear(this.retryTimer);
+    this.retryTimer = undefined;
+    this.scheduleReconnect();
   }
 
   /** One warning per outage (until the next healthy connection). */

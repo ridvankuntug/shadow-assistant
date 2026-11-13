@@ -14,6 +14,11 @@
  *           headers, before any MCP message is exchanged — no tool is listed
  *           or called. Streamable-HTTP servers may refuse the GET (400/405);
  *           any non-auth answer below 500 counts as reachable there.
+ *           401/403 → `unauthorized`; after that the token is held off
+ *           (auth-gate.ts, T20.1: 15 min doubling to 6 h, one probe per hold
+ *           shared with the HA WebSocket client) and the check reports
+ *           `unauthorized` without a request, so a rejected token does not
+ *           feed HA's failed-login count (`ip_ban`) every round.
  *   vault - the vault folder still exists.
  *   memory - the memory folder exists (created if missing) and is writable.
  * Services that are disabled (in the file or by missing env) are reported as
@@ -36,6 +41,7 @@
  * contain URLs) are never copied into it.
  */
 import { access, constants, mkdir, stat } from "node:fs/promises";
+import { AuthGate } from "./auth-gate.js";
 import type { ServiceHealth, ServiceHealthStatus } from "./protocol.js";
 import type { ServiceDef } from "./services.js";
 
@@ -154,26 +160,40 @@ export function httpHealthCheck(url: string, fetchFn: FetchFn = fetch): HealthCh
   };
 }
 
-/** MCP endpoint handshake (see the module comment); never sends an MCP message. */
+/**
+ * MCP endpoint handshake (see the module comment); never sends an MCP message.
+ * With `gate` (T20.1): a 401/403 tells the gate, and while the gate holds the
+ * token off no request is sent; the check answers `down` / `unauthorized` (the
+ * last thing known about the token) without touching the server. An `ok`
+ * answer (the token went through) tells the gate it was accepted.
+ */
 export function mcpHealthCheck(
   url: string,
   transport: "sse" | "http",
   token: string | undefined,
   fetchFn: FetchFn = fetch,
+  gate?: AuthGate,
 ): HealthCheck {
   return async (signal) => {
+    if (gate && !gate.tryAttempt()) return { status: "down", detail: "unauthorized" };
     const headers: Record<string, string> = { Accept: "text/event-stream" };
     if (token) headers.Authorization = `Bearer ${token}`;
     const res = await fetchFn(url, { method: "GET", headers, signal });
     const type = res.headers.get("content-type") ?? "";
     await discardBody(res);
-    if (res.status === 401 || res.status === 403) return { status: "down", detail: "unauthorized" };
-    if (transport === "sse") {
-      if (res.status !== 200) return { status: "down", detail: `http_${res.status}` };
-      return type.toLowerCase().includes("text/event-stream") ? { status: "ok" } : { status: "down", detail: "bad_response" };
+    if (res.status === 401 || res.status === 403) {
+      gate?.rejectedNow();
+      return { status: "down", detail: "unauthorized" };
     }
-    if (res.status === 404 || res.status >= 500) return { status: "down", detail: `http_${res.status}` };
-    return { status: "ok" };
+    let result: CheckResult;
+    if (transport === "sse") {
+      if (res.status !== 200) result = { status: "down", detail: `http_${res.status}` };
+      else result = type.toLowerCase().includes("text/event-stream") ? { status: "ok" } : { status: "down", detail: "bad_response" };
+    } else if (res.status === 404 || res.status >= 500) result = { status: "down", detail: `http_${res.status}` };
+    else result = { status: "ok" };
+    // Only a good handshake says the token went through (a 404 / 503 can come before HA's auth check).
+    if (result.status === "ok") gate?.accepted();
+    return result;
   };
 }
 
@@ -209,11 +229,14 @@ export function memoryHealthCheck(dir: string): HealthCheck {
  * One target per service, in services.yaml order. `vaultDir` is the resolved
  * SHADOW_VAULT_DIR (index.ts disables the vault service without it);
  * `memoryDir` is `<SHADOW_DATA_DIR>/memory` when memory is enabled.
+ * Every MCP check holds a rejected token off (T20.1): with the gate of
+ * `authGates` for its `token_env` (shared with other users of that token, e.g.
+ * the HA WebSocket client), else with a gate of its own.
  */
 export function buildHealthTargets(
   services: readonly ServiceDef[],
   env: NodeJS.ProcessEnv,
-  opts: { vaultDir?: string; memoryDir?: string; fetchFn?: FetchFn } = {},
+  opts: { vaultDir?: string; memoryDir?: string; fetchFn?: FetchFn; authGates?: ReadonlyMap<string, AuthGate> } = {},
 ): HealthTarget[] {
   const fetchFn = opts.fetchFn ?? fetch;
   return services.map((s): HealthTarget => {
@@ -225,7 +248,8 @@ export function buildHealthTargets(
     }
     if (s.kind === "mcp" && s.url) {
       const token = s.tokenEnv ? env[s.tokenEnv] : undefined;
-      return { name: s.name, check: mcpHealthCheck(s.url, s.transport ?? "sse", token, fetchFn) };
+      const gate = (s.tokenEnv ? opts.authGates?.get(s.tokenEnv) : undefined) ?? new AuthGate();
+      return { name: s.name, check: mcpHealthCheck(s.url, s.transport ?? "sse", token, fetchFn, gate) };
     }
     if (s.kind === "vault" && opts.vaultDir) return { name: s.name, check: vaultHealthCheck(opts.vaultDir) };
     if (s.kind === "memory" && opts.memoryDir) return { name: s.name, check: memoryHealthCheck(opts.memoryDir) };

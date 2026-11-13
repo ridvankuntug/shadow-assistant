@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { WebSocket } from "ws";
 import { loadDeviceTokens } from "../src/auth.js";
+import { AUTH_HOLD_START_MS, AuthGate } from "../src/auth-gate.js";
 import {
   buildHealthTargets,
+  type FetchFn,
   HealthMonitor,
   httpHealthCheck,
   mcpHealthCheck,
@@ -115,6 +117,113 @@ test("mcp sse check: handshake with token ok, wrong token unauthorized, wrong co
   // Streamable HTTP: a refused GET still proves the server is there.
   assert.deepEqual(await mcpHealthCheck(`${base}/html`, "http", HA_TOKEN)(sig()), { status: "ok" });
   assert.deepEqual(await mcpHealthCheck(`${base}/boom/health`, "http", HA_TOKEN)(sig()), { status: "down", detail: "http_500" });
+});
+
+test("mcp check with a gate (T20.1): a rejected token is not sent again until the hold ends; ok accepts it", async () => {
+  const clock = { now: 0 };
+  const gate = new AuthGate(() => clock.now);
+  let calls = 0;
+  let status = 401;
+  const fetchFn: FetchFn = async () => {
+    calls++;
+    return status === 200 ? new Response("", { status, headers: { "Content-Type": "text/event-stream" } }) : new Response(null, { status });
+  };
+  const check = mcpHealthCheck("http://ha.invalid/mcp_server/sse", "sse", "wrong", fetchFn, gate);
+  assert.deepEqual(await check(sig()), { status: "down", detail: "unauthorized" });
+  assert.equal(calls, 1);
+  assert.equal(gate.rejected, true);
+  // Every round during the hold: the same answer, no request.
+  for (let i = 0; i < 5; i++) {
+    clock.now += 30_000;
+    assert.deepEqual(await check(sig()), { status: "down", detail: "unauthorized" });
+  }
+  assert.equal(calls, 1, "no request while held off");
+  // Hold over: one probe; 403 (e.g. HA's ip_ban) counts as a rejection too.
+  clock.now = AUTH_HOLD_START_MS;
+  status = 403;
+  assert.deepEqual(await check(sig()), { status: "down", detail: "unauthorized" });
+  assert.equal(calls, 2);
+  assert.equal(gate.waitMs(), 2 * AUTH_HOLD_START_MS);
+  // A 404 / 503 (before HA's auth check) neither accepts nor rejects.
+  clock.now += 2 * AUTH_HOLD_START_MS;
+  status = 503;
+  assert.deepEqual(await check(sig()), { status: "down", detail: "http_503" });
+  assert.equal(gate.rejected, true);
+  assert.deepEqual(await check(sig()), { status: "down", detail: "unauthorized" }, "held off again after the probe");
+  assert.equal(calls, 3);
+  // Accepted elsewhere (the HA WebSocket client): the next round sends the token; ok keeps it accepted.
+  gate.accepted();
+  status = 200;
+  assert.deepEqual(await check(sig()), { status: "ok" });
+  assert.equal(calls, 4);
+  assert.equal(gate.rejected, false);
+});
+
+test("mcp check: a good handshake ends a hold set by another user of the gate", async () => {
+  const clock = { now: 0 };
+  const g = new AuthGate(() => clock.now);
+  g.rejectedNow(); // e.g. the WebSocket client got auth_invalid
+  clock.now = AUTH_HOLD_START_MS; // the hold is over: this check gets the probe
+  let accepted = 0;
+  g.onAccepted(() => accepted++);
+  assert.deepEqual(await mcpHealthCheck(`${base}/mcp_server/sse`, "sse", HA_TOKEN, fetch, g)(sig()), { status: "ok" });
+  assert.equal(g.rejected, false);
+  assert.equal(accepted, 1, "listeners (the WebSocket client) are told");
+});
+
+test("monitor + gate (T20.1): the HA entry stays down / unauthorized (never unknown) while held off, one request in all", async () => {
+  const clock = { now: 0 };
+  const gate = new AuthGate(() => clock.now);
+  let calls = 0;
+  const fetchFn: FetchFn = async () => {
+    calls++;
+    return new Response(null, { status: 401 });
+  };
+  const cfg = parseServices(
+    `
+services:
+  - name: home-assistant
+    kind: mcp
+    transport: sse
+    url: http://ha.invalid/mcp_server/sse
+    token_env: HA_CORE_TOKEN
+`,
+    { HA_CORE_TOKEN: "wrong" },
+  );
+  const targets = buildHealthTargets(cfg.services, { HA_CORE_TOKEN: "wrong" }, { fetchFn, authGates: new Map([["HA_CORE_TOKEN", gate]]) });
+  const m = new HealthMonitor(targets, { timeoutMs: 1000 });
+  try {
+    for (let i = 0; i < 10; i++) {
+      await m.checkNow();
+      clock.now += 30_000;
+      assert.deepEqual(
+        m.snapshot()?.map((s) => [s.name, s.status, s.detail]),
+        [["home-assistant", "down", "unauthorized"]],
+      );
+    }
+    assert.equal(calls, 1, "10 rounds, one rejected request");
+    assert.deepEqual(publicServiceHealth(cfg.services, m.snapshot()), [
+      { name: "home-assistant", enabled: true, status: "down", detail: "unauthorized" },
+    ]);
+  } finally {
+    await m.close();
+  }
+
+  // Without a shared gate each MCP target still gets one of its own.
+  let own = 0;
+  const ownFetch: FetchFn = async () => {
+    own++;
+    return new Response(null, { status: 401 });
+  };
+  const m2 = new HealthMonitor(buildHealthTargets(cfg.services, { HA_CORE_TOKEN: "wrong" }, { fetchFn: ownFetch }), { timeoutMs: 1000 });
+  try {
+    await m2.checkNow();
+    await m2.checkNow();
+    await m2.checkNow();
+    assert.equal(own, 1);
+  } finally {
+    await m2.close();
+  }
 });
 
 test("buildHealthTargets: disabled services, http/mcp/vault checks, no URL or token in results", async () => {

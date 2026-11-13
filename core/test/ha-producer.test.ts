@@ -33,6 +33,7 @@ import {
   type HaNotificationPort,
   type HaUrgencyPort,
 } from "../src/ha-producer.js";
+import { AUTH_HOLD_START_MS, AuthGate } from "../src/auth-gate.js";
 import { MAX_BODY_CHARS, MAX_KEY_CHARS, MAX_TITLE_CHARS, type NotificationItem, type RaiseInput, type RaiseResult } from "../src/notifications.js";
 
 const TOKEN = "test-token-not-real";
@@ -248,7 +249,7 @@ async function settle(producer?: HaAlertsProducer): Promise<void> {
 
 const AUTH_TIMEOUT = 9_999_999;
 
-async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string; urgency?: HaUrgencyPort } = {}) {
+async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string; urgency?: HaUrgencyPort; authGate?: AuthGate } = {}) {
   const ha = o.ha ?? new FakeHa();
   const base = await ha.ready();
   const center = o.center ?? new FakeCenter();
@@ -267,6 +268,7 @@ async function setup(o: { center?: FakeCenter; ha?: FakeHa; token?: string; urge
     random: () => 0.5,
     heartbeatMs: 0,
     authTimeoutMs: AUTH_TIMEOUT,
+    authGate: o.authGate,
   });
   producer.start();
   client.start();
@@ -472,6 +474,143 @@ test("auth_invalid → one normal ha:access item; resolved on the next good conn
     await waitFor(() => t.center.resolves.includes(HA_ACCESS_KEY) && t.center.items.has("pn:a"), "resolved + listed");
     assert.deepEqual(t.center.resolves, [HA_ACCESS_KEY]);
     assert.ok(t.ha.commandTypes().every((c) => READ_ONLY_COMMANDS.has(c) || c === "auth"));
+  } finally {
+    await t.close();
+  }
+});
+
+test("auth_invalid with a shared gate (T20.1): reconnect waits the hold, one probe per hold, an acceptance elsewhere reconnects at once", async () => {
+  const ha = new FakeHa();
+  ha.acceptToken = false;
+  ha.notifications.set("a", notif("a", "A"));
+  const gclock = { now: 0 };
+  const gate = new AuthGate(() => gclock.now);
+  const t = await setup({ ha, authGate: gate });
+  const all = Number.MAX_SAFE_INTEGER;
+  const lastDelay = () => t.clientTimers.delays.filter((d) => d !== AUTH_TIMEOUT).at(-1);
+  try {
+    await waitFor(() => t.center.raises.length === 1 && t.clientTimers.pending.size === 1, "ha:access + reconnect scheduled");
+    assert.equal(t.center.raises[0]!.key, HA_ACCESS_KEY);
+    assert.equal(gate.rejected, true);
+    assert.equal(lastDelay(), AUTH_HOLD_START_MS, "the next attempt waits the hold, not the 1 s backoff");
+    // The timer fires early (the hold is not over by the gate's clock): no connection, the wait starts again.
+    t.clientTimers.fire(all);
+    await settle(t.producer);
+    assert.equal(t.ha.connections, 1);
+    assert.equal(t.clientTimers.pending.size, 1);
+    assert.equal(lastDelay(), AUTH_HOLD_START_MS);
+    // Hold over: one probe, rejected again → twice the hold.
+    gclock.now += AUTH_HOLD_START_MS;
+    t.clientTimers.fire(all);
+    await waitFor(() => t.ha.connections === 2 && lastDelay() === 2 * AUTH_HOLD_START_MS, "probe rejected, next hold doubled");
+    assert.equal(t.ha.received.filter((m) => m.type === "auth").length, 2, "two tokens sent in all");
+    await settle(t.producer);
+    assert.equal(t.center.raises.length, 1, "ha:access not raised again");
+    // The health check saw the token accepted (HA side fixed): the client reconnects with the normal backoff.
+    t.ha.acceptToken = true;
+    gate.accepted();
+    assert.equal(t.clientTimers.pending.size, 1);
+    assert.ok((lastDelay() ?? all) <= 60_000 * 1.2, "back to the backoff");
+    t.reconnect();
+    await waitFor(() => t.center.resolves.includes(HA_ACCESS_KEY) && t.center.items.has("pn:a"), "resolved + listed");
+    assert.equal(gate.rejected, false);
+  } finally {
+    await t.close();
+  }
+});
+
+test("shared gate (T20.1): a WebSocket attempt that fails before auth_required leaves the probe to the health check", async () => {
+  const probe = new FakeHa();
+  const dead = await probe.ready();
+  await probe.close();
+  const gclock = { now: 0 };
+  const gate = new AuthGate(() => gclock.now);
+  gate.rejectedNow();
+  const timers = new FakeTimers();
+  const client = new HaClient({
+    url: haWebSocketUrl(dead)!,
+    token: TOKEN,
+    logger: { info: () => {}, warn: () => {} },
+    handlers: { onConnected: () => {}, onDisconnected: () => {}, onAuthInvalid: () => {} },
+    timers,
+    random: () => 0.5,
+    heartbeatMs: 0,
+    authTimeoutMs: AUTH_TIMEOUT,
+    authGate: gate,
+  });
+  try {
+    client.start();
+    await waitFor(() => timers.pending.size === 1, "held off");
+    gclock.now += AUTH_HOLD_START_MS;
+    timers.fire(Number.MAX_SAFE_INTEGER);
+    await waitFor(() => timers.delays.filter((d) => d !== AUTH_TIMEOUT).length === 2, "refused, retry scheduled");
+    assert.equal(gate.waitMs(), 0, "the probe was not claimed");
+    assert.equal(gate.tryAttempt(), true, "the health check can still probe");
+  } finally {
+    await client.close();
+  }
+});
+
+test("shared gate (T20.1): the gate closes while a WebSocket attempt fails before auth_required → onAuthInvalid at once, only once", async () => {
+  const probe = new FakeHa();
+  const dead = await probe.ready();
+  await probe.close();
+  const gclock = { now: 0 };
+  const gate = new AuthGate(() => gclock.now);
+  const timers = new FakeTimers();
+  let authInvalid = 0;
+  const warns: string[] = [];
+  const client = new HaClient({
+    url: haWebSocketUrl(dead)!,
+    token: TOKEN,
+    logger: { info: () => {}, warn: (m: string) => warns.push(m) },
+    handlers: { onConnected: () => {}, onDisconnected: () => {}, onAuthInvalid: () => authInvalid++ },
+    timers,
+    random: () => 0.5,
+    heartbeatMs: 0,
+    authTimeoutMs: AUTH_TIMEOUT,
+    authGate: gate,
+  });
+  try {
+    client.start();
+    // The socket is already opening (the gate was open); the health check sees the rejection meanwhile.
+    gate.rejectedNow();
+    await waitFor(() => timers.pending.size === 1, "refused, reconnect scheduled");
+    assert.equal(timers.delays.filter((d) => d !== AUTH_TIMEOUT).at(-1), AUTH_HOLD_START_MS, "the reconnect waits the hold");
+    assert.equal(authInvalid, 1, "handlers told at once, not a hold later");
+    assert.equal(warns.filter((l) => l.includes("held off")).length, 1);
+    // The timer fires before the hold is over: held off again, nothing repeated.
+    timers.fire(Number.MAX_SAFE_INTEGER);
+    await waitFor(() => timers.pending.size === 1, "held off again");
+    assert.equal(authInvalid, 1, "not told twice");
+    assert.equal(warns.filter((l) => l.includes("held off")).length, 1, "logged once");
+  } finally {
+    await client.close();
+  }
+});
+
+test("token rejected by the health check first (shared gate): the client does not connect and reports auth_invalid once", async () => {
+  const ha = new FakeHa();
+  ha.notifications.set("a", notif("a", "A"));
+  const gclock = { now: 0 };
+  const gate = new AuthGate(() => gclock.now);
+  gate.rejectedNow();
+  const t = await setup({ ha, authGate: gate });
+  try {
+    await waitFor(() => t.center.raises.length === 1, "ha:access");
+    assert.equal(t.center.raises[0]!.key, HA_ACCESS_KEY);
+    assert.equal(t.ha.connections, 0, "no connection, no token sent");
+    t.clientTimers.fire(Number.MAX_SAFE_INTEGER);
+    await settle(t.producer);
+    assert.equal(t.ha.connections, 0);
+    assert.equal(t.center.raises.length, 1);
+    assert.equal(t.logs.filter((l) => l.includes("held off")).length, 1, "logged once");
+    assert.ok(t.logs.every((l) => !l.includes(TOKEN) && !l.includes("127.0.0.1")));
+    // Accepted by the health check: the client connects and the item resolves.
+    gate.accepted();
+    t.reconnect();
+    await waitFor(() => t.center.resolves.includes(HA_ACCESS_KEY) && t.center.items.has("pn:a"), "resolved + listed");
+    assert.equal(t.ha.connections, 1);
   } finally {
     await t.close();
   }

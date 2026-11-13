@@ -28,7 +28,9 @@ service the Core depends on going down, and Home Assistant's own alerts.
   `disabled`. Visible in `GET /health` and the `services` frame. Hysteresis
   (T7.w.13): a service is *shown* as `down` only after **2 failed checks in a
   row** (within 60 s at the 30 s interval); one good check shows `ok` again at
-  once. `snapshot()` / `subscribe()` give the shown status.
+  once. `snapshot()` / `subscribe()` give the shown status. A rejected MCP token
+  (401/403) is held off (T20.1): the entry stays `down` / `unauthorized` without
+  a request until the hold ends, see (c) defaults.
 - **HA / "MCP gateway".** The Core reaches HA only over MCP SSE
   (`${HA_URL}/mcp_server/sse`, `HA_CORE_TOKEN`); the gateway
   ([`mcp-gateway.ts`](../core/src/mcp-gateway.ts)) is in-process and its remote
@@ -178,7 +180,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
   successful `list_issues`) is resolved; a lost connection is never an empty list.
   Shadow never dismisses anything in HA (read-only; deleting the Shadow item does
   not touch HA).
-- **Reconnect:** 1 → 2 → 4 … → 60 s with jitter. Not a new health entry: the HA
+- **Reconnect:** 1 → 2 → 4 … → 60 s with jitter; a rejected token is held off
+  longer, shared with the health check (T20.1, see the defaults below). Not a new health entry: the HA
   MCP check already reports HA reachability. Only `auth_invalid` (or a
   missing-permission answer for repairs) raises one normal item `ha:access`
   ("HA uyarıları okunamıyor"), resolved once both causes are known good (an
@@ -219,8 +222,47 @@ service the Core depends on going down, and Home Assistant's own alerts.
   - Jitter ± 20 % of the delay (1 s → 0.8-1.2 s, 60 s → 48-72 s); the delay starts
     over after the first successful command answer on a connection (not at
     `auth_ok`, so an HA that accepts and drops at once still backs off).
-  - `auth_invalid` keeps retrying with the same backoff (up to every ~60 s); the
-    token comes from `.env`, so a fixed token needs a Core restart anyway.
+  - `auth_invalid` no longer retries with the plain backoff (up to every ~60 s,
+    until T20.1): see the shared hold-off below. The token comes from `.env`,
+    so a fixed token needs a Core restart anyway.
+  - **Rejected token hold-off (T20.1):** HA counts every rejected token (HTTP 401
+    on any view, WebSocket `auth_invalid`) as a failed login of the Core's IP;
+    with `ip_ban` and `login_attempts_threshold` set, the old retries (health
+    check every 30 s, WebSocket up to every ~60 s) could ban the Core. Now the HA
+    MCP health check and the WebSocket client share one gate for `HA_CORE_TOKEN`
+    ([`auth-gate.ts`](../core/src/auth-gate.ts), wired in `index.ts`): after a
+    401/403 or `auth_invalid` neither sends the token for **15 min**, doubling
+    per further rejection up to **6 h**; when a hold ends **one** probe goes
+    (whichever asks first), the other waits another hold. The WebSocket client
+    claims the probe only at `auth_required` (when the token is about to be
+    sent), so a connection that fails before that (refused, proxy error) leaves
+    the probe to the health check. A health probe that ends without an answer
+    about the token (timeout, 503) uses up its hold (accepted: a timed-out
+    request may still be counted by HA). A good answer (SSE
+    handshake, `auth_ok`) ends the hold at once; the waiting WebSocket client
+    then reconnects with its normal backoff. While held off the health entry
+    stays `down` / `unauthorized` (no request, never `unknown`), so
+    `service:home-assistant` keeps showing it, and the WebSocket client reports
+    `auth_invalid` to the producer once, so `ha:access` opens even when the
+    health check saw the rejection first. Every other MCP health check gets a
+    gate of its own. About 10 rejected attempts in the first 24 h (two at startup), then 4 a day,
+    instead of ~4300 a day; it delays a ban for a low threshold but does not
+    rule it out (HA keeps the count until it restarts). Sparse probes instead of
+    stopping until a Core restart, so causes on HA's side (user re-activated,
+    backup restored, ban lifted, a proxy that refused for a while) heal by
+    themselves; a fixed `.env` token takes effect with the restart it needs
+    anyway (fresh gate). Tests: `core/test/auth-gate.test.ts`,
+    `health.test.ts`, `ha-producer.test.ts`.
+  - **Health check without a token: not used (T20.1).** HA's ban middleware
+    counts every 401, also a request without a token, so only views that need no
+    auth would be safe (`/`, `/manifest.json`, `/auth/providers`): frontend and
+    login-flow internals, not a stable API, and they say nothing about the token
+    or HA's MCP Server integration, which the handshake checks; under a ban HA
+    answers 403 on every path anyway, and the MCP URL in `services.yaml` would
+    have to be cut back to HA's base. A truly safe reachability signal would be
+    the WebSocket `auth_required` greeting (before any token); not added, the
+    gate already bounds the attempts. HA source details from memory of
+    `homeassistant/components/http/ban.py`; **to be confirmed against a real HA**.
   - A long id is hashed as `pn:sha256:<64 hex>`; an HA notification without a
     title gets "Home Assistant bildirimi"; title/body are trimmed and cut like the
     store (200 / 2000), without leaving half a surrogate pair.
