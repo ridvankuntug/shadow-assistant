@@ -79,7 +79,7 @@ public sealed class TrayApp : ApplicationContext
         if (!_docker.Available) docker.Enabled = false;
         // Checked state comes from the controller (Refresh), never from the click:
         // a failed docker command must leave it where it was.
-        _gameModeItem = new ToolStripMenuItem("Oyun modu (whisper-svc durur, GPU boşalır)", null, async (_, _) => await ToggleGameMode());
+        _gameModeItem = new ToolStripMenuItem(GameModeMenuText(_gameMode.On), null, async (_, _) => await ToggleGameMode());
         _menu.Items.AddRange([
             _statusEnd,
             _uiItem,
@@ -121,7 +121,7 @@ public sealed class TrayApp : ApplicationContext
         {
             // Saved on: say so instead of silently keeping whisper-svc down, and
             // stop it again in case it was started meanwhile (see ReapplyAsync).
-            _notify.ShowBalloonTip(5000, "Shadow Assistant", "Oyun modu açık: whisper-svc kapalı tutuluyor. Kapatmak için menü → Oyun modu.", ToolTipIcon.Info);
+            _notify.ShowBalloonTip(5000, "Shadow Assistant", "Oyun modu açık: whisper-svc kapalı tutuluyor. Kapatmak için menü → Oyun modunu kapat.", ToolTipIcon.Info);
             _ = RunDockerExclusive(() => Task.Run(_gameMode.ReapplyAsync));
         }
 
@@ -157,7 +157,8 @@ public sealed class TrayApp : ApplicationContext
         _stopItem.Enabled = !busy && snap.State is CoreRunState.Running or CoreRunState.WaitingRestart;
         _restartItem.Enabled = !busy && !external;
         _dockerUpItem.Enabled = _dockerDownItem.Enabled = !_dockerBusy && !_exiting;
-        _gameModeItem.Checked = _gameMode.On;
+        // The label names the action the click performs, not the current state.
+        _gameModeItem.Text = GameModeMenuText(_gameMode.On);
         // Turning it off stays possible without docker (it then only clears the flag).
         _gameModeItem.Enabled = !_dockerBusy && !_exiting && (_docker.Available || _gameMode.On);
 
@@ -386,6 +387,11 @@ public sealed class TrayApp : ApplicationContext
         }
         base.Dispose(disposing);
     }
+
+    /// <summary>Menu text for the game mode item: the action a click performs.</summary>
+    internal static string GameModeMenuText(bool on) => on
+        ? "Oyun modunu kapat (whisper-svc yeniden başlar)"
+        : "Oyun modunu aç (whisper-svc durur, GPU boşalır)";
 
     /// <summary>Used when settings are incomplete: StartProblems already reports why.</summary>
     private sealed class MissingLauncher : ICoreLauncher

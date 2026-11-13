@@ -95,7 +95,8 @@ hint). `0` keeps the model loaded. After a failed reload `/health` returns
 
 ### Oyun modu (tray)
 
-Tray menu → *Oyun modu* stops the whisper-svc container
+Tray menu → *Oyun modunu aç* stops the whisper-svc container (the item then
+reads *Oyun modunu kapat*)
 (`docker compose --env-file ..\.env stop whisper-svc` in `deploy\`) to free the
 GPU; unchecking runs `docker compose --env-file ..\.env up -d whisper-svc`.
 While on, the tray icon shows a pause mark, the tooltip starts with

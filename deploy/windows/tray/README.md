@@ -93,7 +93,8 @@ The tooltip has a one-line summary. Menu (right click):
   / `down` in `deploy\` (docker.exe started directly; output goes to
   `core.log`). Disabled when docker.exe is not found (PATH, else Docker
   Desktop's default folder).
-- **Oyun modu** (checkable): frees the GPU for a game. On runs
+- **Oyun modunu aç / Oyun modunu kapat** (the label names the action a click
+  performs): frees the GPU for a game. On runs
   `docker compose --env-file ..\.env stop whisper-svc`, off runs
   `... up -d whisper-svc` (`up -d`, not `start`: it also recreates the
   container if `down` removed it meanwhile, and does nothing to a running
