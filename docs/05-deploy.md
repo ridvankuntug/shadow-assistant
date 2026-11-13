@@ -224,6 +224,51 @@ Check it: the tray icon, `Get-ScheduledTask -TaskPath \ShadowAssistant\` and
 
 Logs are kept; delete `%LOCALAPPDATA%\ShadowAssistant\logs` by hand if wanted.
 
+### Data folder
+
+Everything the Core keeps (conversations, memory, notifications, sessions,
+usage, the backup status) lives in one data folder. One rule decides where;
+the Core defines it (`resolveDataDir` in `core/src/config.ts`) and the backup
+script mirrors it (`Resolve-ShadowDataDir` in
+`deploy/backup/backup-common.ps1`), so `backup\status.json` is written where
+the Core reads it. Change the code on both sides and this section together.
+
+1. `SHADOW_DATA_DIR`, if not blank: an absolute path is used as written; a
+   relative one is resolved against the repo root.
+2. Else `<SHADOW_VAULT_DIR>\.shadow-assistant`, if `SHADOW_VAULT_DIR` names an
+   existing folder when the Core starts.
+3. Else `<repo root>\.shadow-assistant`.
+
+Details:
+
+- A variable set in the real environment wins over `.env`, even when it is
+  blank (blank then means "not set", and `.env` is not read for it). Values
+  are trimmed. `SHADOW_ENV_FILE` picks another `.env`; a relative one is
+  resolved against the repo root. If it names a missing file, the backup
+  scripts stop with an error instead of falling back to the default folder.
+- Relative paths are resolved against the repo root, never the caller's
+  working directory. The Core resolves a relative `SHADOW_VAULT_DIR` against
+  its working directory, which the tray and `run-core.ps1` set to the repo
+  root; started elsewhere (e.g. `npm start` in `core\`), it logs a warning.
+  Prefer absolute paths.
+- No expansion: `~` and `%USERPROFILE%` are taken literally (a relative path
+  under the repo root). A trailing `\` changes nothing. Avoid `\data`
+  (root-relative) and `D:data` (drive-relative): their folder depends on the
+  process's current drive and folder, so both sides log a warning.
+- Write Windows paths unquoted or in single quotes in `.env`: in double quotes
+  Node turns `\n` into a line break (`"C:\new"`).
+- Both sides decide when they run: the Core at startup, the backup at each
+  run. Changing the folder needs a Core restart, and moving the data there is
+  up to you.
+
+Checking it: the Core logs `data folder: <path> (from ...)` at startup
+(`core.log`), and every backup run logs `data folder: <path> (from ...);
+status file: ...` first (`backup.log`, also printed with `-WhatIf`). The two
+paths must match. When the status file is missing, the Core logs its path once
+(`backup producer: no status file at ...`): either backups are not set up or
+the two sides disagree. `backup-data.ps1 -DataDir` overrides the rule; the Core
+then does not see that run's status.
+
 ### Persistent sessions and memory
 
 All optional, set in `.env` (defaults in `.env.example`; details in
@@ -242,10 +287,10 @@ All optional, set in `.env` (defaults in `.env.example`; details in
   urgent notifications are shown but not spoken in this window (docs/09).
 - `SHADOW_PRONUNCIATIONS_FILE`: alternative pronunciation lexicon.
 
-Data lives in `<SHADOW_DATA_DIR>`: `sessions/devices.json`, `memory/brief.md`,
-`memory/notes/*.md`, `memory/index.json`, `memory/state.json`,
-`memory/forget-pending.json`. All of it is inside the encrypted backup (section
-4); nothing extra to configure.
+Data lives in the data folder (see "Data folder" above):
+`sessions/devices.json`, `memory/brief.md`, `memory/notes/*.md`,
+`memory/index.json`, `memory/state.json`, `memory/forget-pending.json`. All of
+it is inside the encrypted backup (section 4); nothing extra to configure.
 
 View or delete memory in the UI (Ayarlar → Hafıza), or by voice/text: "neyi
 hatırlıyorsun" lists it, "bunu unut" deletes an entry.
@@ -255,9 +300,9 @@ Redeploy: `npm run build` in `core/` (rebuilds `core/dist`), restart the Core
 
 ## 4. Backups
 
-`deploy/backup/backup-data.ps1` packs the Core's data folder
-(`SHADOW_DATA_DIR`, default `<SHADOW_VAULT_DIR>\.shadow-assistant`: conversation
-logs and usage records) into
+`deploy/backup/backup-data.ps1` packs the Core's data folder (resolved by the
+Core's rule, section 3 "Data folder": conversation logs, memory, usage
+records, ...) into
 `shadow-assistant-data-YYYYMMDD-HHMMSS.tar.gz`, uploads it to an rclone
 **crypt** remote on top of a Google Drive remote, and prunes:
 

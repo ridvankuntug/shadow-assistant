@@ -29,6 +29,9 @@
  *   deleted ("Gördüm") is not recreated by it. A new failed run or the urgent
  *   escalation raises it again as before.
  * - No file = backup not set up = no notification (open items are resolved).
+ *   Logged once (info, with the path) each time the file is found missing, so
+ *   a script that resolves another data folder (T20.3, docs/05 "Data folder")
+ *   can be told from "not set up" by comparing with backup.log.
  *   An unreadable or invalid file is logged once (until a valid read) and
  *   changes nothing.
  *
@@ -199,6 +202,8 @@ export class BackupProducer {
   private cached: Cached | undefined;
   /** An invalid / unreadable file was logged; cleared by a valid read or a missing file. */
   private loggedBad = false;
+  /** The missing file was logged; cleared once the file exists again. */
+  private loggedMissing = false;
   private loggedAdoptFailure = false;
   /** The suppressed keys were read and adopted (T7.w.11.7); until then re-read every round. */
   private suppressedAdopted = false;
@@ -335,24 +340,17 @@ export class BackupProducer {
       mtimeMs = st.mtimeMs;
       size = st.size;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        this.cached = undefined;
-        this.loggedBad = false;
-        return "missing";
-      }
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return this.missing();
       return this.bad("unreadable");
     }
+    this.loggedMissing = false;
     const c = this.cached;
     if (!c || c.mtimeMs !== mtimeMs || c.size !== size) {
       let text: string;
       try {
         text = await readFile(this.o.statusFile, "utf8");
       } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-          this.cached = undefined;
-          this.loggedBad = false;
-          return "missing";
-        }
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return this.missing();
         return this.bad("unreadable");
       }
       this.cached = { mtimeMs, size, status: parseBackupStatus(text) };
@@ -361,6 +359,19 @@ export class BackupProducer {
     if (!status) return this.bad("invalid");
     this.loggedBad = false;
     return status;
+  }
+
+  private missing(): "missing" {
+    this.cached = undefined;
+    this.loggedBad = false;
+    if (!this.loggedMissing) {
+      this.loggedMissing = true;
+      this.o.logger.info(
+        `[shadow-core] backup producer: no status file at ${this.o.statusFile}; no backup notifications until it appears ` +
+          `(backups not set up, or backup-data.ps1 resolves another data folder: compare the "data folder" line in backup.log, docs/05 "Data folder")`,
+      );
+    }
+    return "missing";
   }
 
   private bad(why: "invalid" | "unreadable" | "not a file"): "bad" {

@@ -3,7 +3,8 @@
     Backs up the Shadow Assistant data folder to an encrypted rclone remote.
 
 .DESCRIPTION
-    1. Packs the data folder (SHADOW_DATA_DIR, else <SHADOW_VAULT_DIR>\.shadow-assistant)
+    1. Packs the Core's data folder (SHADOW_DATA_DIR, else <SHADOW_VAULT_DIR>\.shadow-assistant,
+       else <repo>\.shadow-assistant: the Core's rule, docs/05-deploy.md "Data folder")
        into <LocalDir>\shadow-assistant-data-YYYYMMDD-HHMMSS.tar.gz.
     2. Copies the archive to the rclone crypt remote (file and folder names are
        encrypted too), which sits on a Google Drive remote (scope drive.file).
@@ -28,9 +29,11 @@
     with the stage: setup, archive, upload or prune), together with
     lastSuccessAt. No error text goes into it (see backup.log for that). The
     archive leaves this file out. Not written under -WhatIf, nor when the data
-    folder is missing or unknown (that failure is only logged).
+    folder is missing (that failure is only logged). Every run first logs the
+    data folder it resolved and why ("data folder: ..."), so it can be compared
+    with the Core's "data folder" startup line in core.log.
 
-.PARAMETER DataDir           Folder to back up. Env: SHADOW_DATA_DIR (fallback SHADOW_VAULT_DIR\.shadow-assistant).
+.PARAMETER DataDir           Folder to back up; overrides the Core's rule (the Core then may not see the status). Default: the Core's rule (SHADOW_DATA_DIR, SHADOW_VAULT_DIR, repo root; docs/05 "Data folder").
 .PARAMETER LocalDir          Where archives are written. Env: SHADOW_BACKUP_LOCAL_DIR. Default %LOCALAPPDATA%\ShadowAssistant\backups.
 .PARAMETER LocalKeep         Archives kept locally. Env: SHADOW_BACKUP_LOCAL_KEEP. Default 3.
 .PARAMETER RemoteDays        Days archives are kept on the remote; 0 = never delete. Env: SHADOW_BACKUP_REMOTE_DAYS. Default 60.
@@ -86,7 +89,9 @@ try {
     $LogDir = Get-ShadowSetting $LogDir 'SHADOW_BACKUP_LOG_DIR' $dot (Join-Path $env:LOCALAPPDATA 'ShadowAssistant\logs')
     $logFile = Join-Path ([IO.Path]::GetFullPath($LogDir)) 'backup.log'
 
-    $DataDir = Resolve-ShadowDataDir $DataDir $dot $RepoRoot
+    $resolved = Resolve-ShadowDataDir $DataDir $dot $RepoRoot
+    $DataDir = $resolved.Path
+    Write-ShadowBackupLog $logFile ("data folder: {0} (from {1}); status file: {2}" -f $DataDir, $resolved.Source, [IO.Path]::Combine($DataDir, 'backup\status.json'))
     # Checked before anything else: the status file lives inside the data folder.
     if (-not (Test-Path -LiteralPath $DataDir -PathType Container)) { throw "Data folder does not exist: $DataDir (backup status not written)" }
     if (-not $WhatIfPreference) {

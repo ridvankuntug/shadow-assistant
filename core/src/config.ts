@@ -35,7 +35,12 @@ export interface CoreConfig {
   healthIntervalMs: number;
   healthTimeoutMs: number;
   vaultDir?: string;
+  /** The data folder, resolved by `resolveDataDir` (the rule in docs/05, "Data folder"). */
   dataDir: string;
+  /** Which rule step chose `dataDir` (logged at startup). */
+  dataDirSource: DataDirSource;
+  /** Set when the backup script may resolve another folder (see `resolveDataDir`); logged at startup. */
+  dataDirWarning?: string;
   services: ServicesConfig;
   whisper?: ServiceDef;
   tts?: ServiceDef;
@@ -141,21 +146,93 @@ function positiveInt(name: string, v: string | undefined, def: number): number {
   return n;
 }
 
+export type DataDirSource = "SHADOW_DATA_DIR" | "SHADOW_VAULT_DIR" | "default";
+
+export interface DataDirResolution {
+  /** SHADOW_VAULT_DIR when it names an existing folder (also the vault tool's root). */
+  vaultDir: string | undefined;
+  dataDir: string;
+  dataDirSource: DataDirSource;
+  dataDirWarning?: string;
+}
+
+/**
+ * The data folder rule (T20.3). It is the one definition: `backup-data.ps1`
+ * (`Resolve-ShadowDataDir` in deploy/backup/backup-common.ps1) mirrors it, so
+ * that the script writes `backup/status.json` where the Core reads it; docs/05,
+ * "Data folder", describes it. Change both and the doc together.
+ *
+ * `env` is the process environment after `loadDotEnv` (a variable that exists
+ * in the real environment, even blank, wins over `.env`). Values are trimmed.
+ * 1. SHADOW_DATA_DIR not blank: absolute → used as written; relative →
+ *    against the repo root.
+ * 2. Else `<SHADOW_VAULT_DIR>/.shadow-assistant` when SHADOW_VAULT_DIR names an
+ *    existing folder at startup (a relative vault path is resolved against the
+ *    working directory, which the tray and run-core.ps1 set to the repo root).
+ * 3. Else `<repo root>/.shadow-assistant`.
+ * No `~` or `%VAR%` expansion: such a value is a relative path.
+ *
+ * `dataDirWarning`: a value whose folder depends on the process rather than
+ * on the repo root, so the script may resolve another folder and write the
+ * status where the Core does not read it: a relative SHADOW_VAULT_DIR while the
+ * working directory is not the repo root (step 2), or on Windows a
+ * drive-relative (`D:data`) or root-relative (`\data`) path in the step used.
+ *
+ * `cwd` is for tests; by default the vault path is resolved exactly as before
+ * T20.3 (`resolve(value)`, which also honours Windows' per-drive directories).
+ */
+export function resolveDataDir(env: NodeJS.ProcessEnv, repoRoot: string = REPO_ROOT, cwd?: string): DataDirResolution {
+  let vaultDir: string | undefined;
+  const vaultRaw = env.SHADOW_VAULT_DIR?.trim();
+  if (vaultRaw) {
+    const v = cwd === undefined ? resolve(vaultRaw) : resolve(cwd, vaultRaw);
+    if (existsSync(v) && statSync(v).isDirectory()) vaultDir = v;
+  }
+  const dataRaw = env.SHADOW_DATA_DIR?.trim();
+  if (dataRaw) {
+    const warning = driveDependent(dataRaw) ? ambiguousWarning("SHADOW_DATA_DIR") : undefined;
+    return {
+      vaultDir,
+      dataDir: isAbsolute(dataRaw) ? dataRaw : resolve(repoRoot, dataRaw),
+      dataDirSource: "SHADOW_DATA_DIR",
+      ...(warning ? { dataDirWarning: warning } : {}),
+    };
+  }
+  let warning: string | undefined;
+  if (vaultRaw && driveDependent(vaultRaw)) warning = ambiguousWarning("SHADOW_VAULT_DIR");
+  else if (vaultRaw && !isAbsolute(vaultRaw) && !samePath(cwd ?? process.cwd(), repoRoot)) {
+    warning =
+      'SHADOW_VAULT_DIR is a relative path and the working directory is not the repo root: the backup script resolves it against the repo root and may back up another folder; use an absolute path (docs/05, "Data folder")';
+  }
+  return {
+    vaultDir,
+    dataDir: join(vaultDir ?? repoRoot, ".shadow-assistant"),
+    dataDirSource: vaultDir ? "SHADOW_VAULT_DIR" : "default",
+    ...(warning ? { dataDirWarning: warning } : {}),
+  };
+}
+
+/** Windows only: `D:data` (drive-relative) or `\data` (root-relative, not UNC). */
+function driveDependent(p: string): boolean {
+  return process.platform === "win32" && /^(?:[A-Za-z]:(?![\\/])|[\\/](?![\\/]))/.test(p);
+}
+
+function ambiguousWarning(name: string): string {
+  return `${name} is a drive-relative or root-relative path: its folder depends on the process's drive, so the backup script may resolve another folder; use an absolute path (docs/05, "Data folder")`;
+}
+
+/** Same folder after resolving; case-insensitive on Windows. */
+function samePath(a: string, b: string): boolean {
+  const x = resolve(a);
+  const y = resolve(b);
+  return process.platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
   const port = positiveInt("CORE_PORT", env.CORE_PORT, 8700);
   if (port > 65535) throw new Error("CORE_PORT must be <= 65535");
 
-  let vaultDir: string | undefined;
-  if (env.SHADOW_VAULT_DIR && env.SHADOW_VAULT_DIR.trim() !== "") {
-    const v = resolve(env.SHADOW_VAULT_DIR.trim());
-    if (existsSync(v) && statSync(v).isDirectory()) vaultDir = v;
-  }
-  const dataRaw = env.SHADOW_DATA_DIR?.trim();
-  const dataDir = dataRaw
-    ? isAbsolute(dataRaw)
-      ? dataRaw
-      : resolve(REPO_ROOT, dataRaw)
-    : join(vaultDir ?? REPO_ROOT, ".shadow-assistant");
+  const { vaultDir, dataDir, dataDirSource, dataDirWarning } = resolveDataDir(env);
 
   const servicesFile = env.SHADOW_SERVICES_FILE || join(REPO_ROOT, "services.yaml");
   const services = loadServicesFile(servicesFile, env);
@@ -185,6 +262,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     healthTimeoutMs: positiveInt("CORE_HEALTH_TIMEOUT_MS", env.CORE_HEALTH_TIMEOUT_MS, DEFAULT_HEALTH_TIMEOUT_MS),
     vaultDir,
     dataDir,
+    dataDirSource,
+    ...(dataDirWarning ? { dataDirWarning } : {}),
     services,
     whisper: findService(services, "whisper-svc"),
     tts: findService(services, "tts-svc"),

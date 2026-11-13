@@ -24,8 +24,16 @@ $script:ShadowBackupEnvSaved = @{}
 function Read-ShadowDotEnv([string] $RepoRoot) {
     $values = @{}
     $file = $env:SHADOW_ENV_FILE
-    if (-not $file) { $file = Join-Path $RepoRoot '.env' }
-    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $values }
+    if (-not $file) { $file = '.env' }
+    # Relative SHADOW_ENV_FILE: to the repo root, the Core's working directory
+    # (not the caller's; Test-Path and .NET would even disagree on that).
+    if (-not [IO.Path]::IsPathRooted($file)) { $file = [IO.Path]::Combine($RepoRoot, $file) }
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+        # A missing file that was named explicitly is an error: going on without
+        # it would back up the default folder (or miss the crypt passwords).
+        if ($env:SHADOW_ENV_FILE) { throw "SHADOW_ENV_FILE names a file that does not exist: $file" }
+        return $values
+    }
     # -cmatch: a case-insensitive match uses the current culture, and under
     # tr-TR [A-Za-z] does not match 'I' (keys like SHADOW_DATA_DIR were lost).
     foreach ($line in [IO.File]::ReadAllLines($file)) {
@@ -57,21 +65,90 @@ function Get-ShadowSetting([string] $Value, [string] $Name, [hashtable] $DotEnv,
     return $Default
 }
 
-# Relative paths are resolved against the repo root, like the Core does (it
-# runs with the repo root as working directory), never against the caller's
-# working directory (System32 for a scheduled task).
-function Resolve-ShadowDataDir([string] $DataDir, [hashtable] $DotEnv, [string] $RepoRoot) {
-    $dir = Get-ShadowSetting $DataDir 'SHADOW_DATA_DIR' $DotEnv $null
-    if (-not $dir) {
-        $vault = Get-ShadowSetting $null 'SHADOW_VAULT_DIR' $DotEnv $null
-        if ($vault) {
-            if (-not [IO.Path]::IsPathRooted($vault)) { $vault = Join-Path $RepoRoot $vault }
-            $dir = Join-Path $vault '.shadow-assistant'
+# --- Data folder: the Core's rule (T20.3) -------------------------------------
+# One rule, defined by the Core (resolveDataDir in core/src/config.ts) and
+# described in docs/05-deploy.md, section "Data folder"; mirrored here so the
+# status file lands where the Core reads it. Change all three together.
+# The working directory the Core resolves against is taken to be the repo root
+# (the tray and run-core.ps1 start it there); the caller's working directory is
+# never used.
+
+# SHADOW_DATA_DIR / SHADOW_VAULT_DIR as the Core sees them: a variable that
+# exists in the process environment wins over .env even when it is blank (Node's
+# .env loader keeps every existing variable); the value is trimmed.
+function Get-ShadowCoreSetting([string] $Name, [hashtable] $DotEnv) {
+    $fromEnv = [Environment]::GetEnvironmentVariable($Name)
+    # Windows PowerShell 5.1 returns $null for a variable that exists with an
+    # empty value; the Env: drive still lists it (and Node keeps it).
+    if ($null -eq $fromEnv -and (Test-Path -LiteralPath "Env:$Name")) { $fromEnv = '' }
+    if ($null -ne $fromEnv) { return @{ Value = $fromEnv.Trim(); From = "$Name (environment)" } }
+    if ($DotEnv.ContainsKey($Name)) { return @{ Value = ([string]$DotEnv[$Name]).Trim(); From = "$Name (.env)" } }
+    return @{ Value = ''; From = $Name }
+}
+
+# Node's path.win32.resolve(Base, Path) with the working directory = Base.
+# Absolute means \x, /x or X:\x (UNC included); .NET's IsPathRooted also counts
+# the drive-relative X:x, Node does not. A root-relative \x takes Base's drive;
+# a drive-relative X:x is under Base on Base's drive, else under the drive's
+# current folder from the hidden =X: variable (as Node does), else X:\.
+# The last two depend on the process: Get-ShadowDriveWarning flags them.
+function Resolve-ShadowNodePath([string] $Path, [string] $Base) {
+    if ($Path -cmatch '^[\\/](?![\\/])') {
+        $Path = [IO.Path]::GetPathRoot($Base).TrimEnd('\', '/') + $Path
+    }
+    elseif ($Path -cmatch '^([A-Za-z]):(?![\\/])') {
+        $rest = $Path.Substring(2)
+        if ([string]::Equals($Matches[1] + ':', $Base.Substring(0, [Math]::Min(2, $Base.Length)), [StringComparison]::OrdinalIgnoreCase)) {
+            $Path = [IO.Path]::Combine($Base, $rest)
+        }
+        else {
+            $drive = $Matches[1] + ':'
+            $current = [Environment]::GetEnvironmentVariable('=' + $drive)
+            if ($current -and $current.StartsWith($drive, [StringComparison]::OrdinalIgnoreCase)) { $Path = [IO.Path]::Combine($current, $rest) }
+            else { $Path = $drive + '\' + $rest }
         }
     }
-    if (-not $dir) { throw 'Data folder unknown: set SHADOW_DATA_DIR (or SHADOW_VAULT_DIR) in .env or pass -DataDir.' }
-    if (-not [IO.Path]::IsPathRooted($dir)) { $dir = Join-Path $RepoRoot $dir }
-    return [IO.Path]::GetFullPath($dir).TrimEnd('\')
+    elseif ($Path -cnotmatch '^([\\/]|[A-Za-z]:[\\/])') {
+        $Path = [IO.Path]::Combine($Base, $Path)
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    # Drop a trailing separator, but keep a drive root (D:\) intact.
+    if ($full.Length -gt [IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\', '/') }
+    return $full
+}
+
+# The Core warns about these too (resolveDataDir): D:data or \data resolve
+# against the process's drive state, which the two processes need not share.
+function Get-ShadowDriveWarning([string] $Path) {
+    if ($Path -cmatch '^(?:[A-Za-z]:(?![\\/])|[\\/](?![\\/]))') { return '; WARNING: drive- or root-relative path, use an absolute one (docs/05 "Data folder")' }
+    return ''
+}
+
+# Returns @{ Path; Source }. -DataDir (parameter) overrides the rule, relative
+# to the repo root; then:
+# 1. SHADOW_DATA_DIR not blank: absolute, or relative to the repo root.
+# 2. <SHADOW_VAULT_DIR>\.shadow-assistant if SHADOW_VAULT_DIR is an existing
+#    folder (relative: to the repo root).
+# 3. <repo root>\.shadow-assistant.
+# No ~ or %VAR% expansion (the Core does none either).
+function Resolve-ShadowDataDir([string] $DataDir, [hashtable] $DotEnv, [string] $RepoRoot) {
+    if ($DataDir -and $DataDir.Trim()) {
+        return @{ Path = (Resolve-ShadowNodePath $DataDir.Trim() $RepoRoot); Source = 'parameter -DataDir (not the Core''s rule)' }
+    }
+    $data = Get-ShadowCoreSetting 'SHADOW_DATA_DIR' $DotEnv
+    if ($data.Value) { return @{ Path = (Resolve-ShadowNodePath $data.Value $RepoRoot); Source = ($data.From + (Get-ShadowDriveWarning $data.Value)) } }
+    $base = $RepoRoot
+    $source = 'the default <repo>\.shadow-assistant'
+    $vault = Get-ShadowCoreSetting 'SHADOW_VAULT_DIR' $DotEnv
+    if ($vault.Value) {
+        $vaultDir = Resolve-ShadowNodePath $vault.Value $RepoRoot
+        if (Test-Path -LiteralPath $vaultDir -PathType Container) {
+            $base = $vaultDir
+            $source = $vault.From + (Get-ShadowDriveWarning $vault.Value)
+        }
+        else { $source = "the default <repo>\.shadow-assistant: $($vault.From) is not an existing folder" }
+    }
+    return @{ Path = (Resolve-ShadowNodePath ([IO.Path]::Combine($base, '.shadow-assistant')) $RepoRoot); Source = $source }
 }
 
 function Find-ShadowRclone([string] $Explicit) {

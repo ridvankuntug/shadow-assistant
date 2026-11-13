@@ -438,6 +438,9 @@ export async function main(): Promise<void> {
   const { port } = await server.listen(cfg.port, cfg.host);
 
   logger.info(`[shadow-core] env file: ${envFile ? "loaded" : "not found (using process environment)"}`);
+  // The backup script must resolve the same folder (docs/05, "Data folder"); backup.log shows its side.
+  logger.info(`[shadow-core] data folder: ${cfg.dataDir} (${cfg.dataDirSource === "default" ? "default <repo>/.shadow-assistant" : `from ${cfg.dataDirSource}`})`);
+  if (cfg.dataDirWarning) logger.warn(`[shadow-core] ${cfg.dataDirWarning}`);
   for (const s of cfg.services.services) {
     logger.info(`[shadow-core] service ${s.name} (${s.kind}): ${s.enabled ? "enabled" : `disabled${s.disabledReason ? ` — ${s.disabledReason}` : ""}`}`);
   }

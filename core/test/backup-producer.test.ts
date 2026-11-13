@@ -452,3 +452,32 @@ test("parseBackupStatus: BOM, ok without lastSuccessAt, bad timestamps", () => {
   assert.equal(parseBackupStatus(JSON.stringify({ version: 1, runId: "a", startedAt: iso(T0), result: "done" })), undefined);
   assert.equal(parseBackupStatus("[]"), undefined);
 });
+
+test("missing file: its path is logged once (info) until the file exists again (T20.3)", async () => {
+  const dataDir = join(base, `d${++n}`);
+  const file = backupStatusPath(dataDir);
+  const infos: string[] = [];
+  const warns: string[] = [];
+  const producer = new BackupProducer({
+    statusFile: file,
+    notifications: new FakeCenter(() => T0),
+    logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
+    now: () => T0,
+  });
+  const missingLines = () => infos.filter((m) => m.includes("no status file"));
+  await producer.checkNow();
+  await producer.checkNow();
+  assert.equal(missingLines().length, 1);
+  assert.ok(missingLines()[0]?.includes(file));
+  // The file appears: no new line; it disappears again: logged once more.
+  mkdirSync(join(dataDir, "backup"), { recursive: true });
+  writeFileSync(file, JSON.stringify({ version: 1, ...ok("r1", T0) }));
+  await producer.checkNow();
+  assert.equal(missingLines().length, 1);
+  unlinkSync(file);
+  await producer.checkNow();
+  await producer.checkNow();
+  assert.equal(missingLines().length, 2);
+  assert.deepEqual(warns, []);
+  await producer.close();
+});
