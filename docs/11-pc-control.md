@@ -617,6 +617,8 @@ Kept 90 days (pruned at startup). The Core log gets one short line per action
 Each has a recommended default; the implementation uses the default until the
 user decides.
 
+**Onaylandı 2026-11-13:** the user approved Q1–Q13 with the defaults below.
+
 | # | Question | Default |
 |---|---|---|
 | Q1 | Does **sleep** also ask every time? (Your risky list names shut down, restart, force-close; a warning without a confirmation cannot be acted on.) | Yes, sleep asks too; the confirm text carries "Shadow da kapanacak". |
@@ -674,7 +676,7 @@ task may touch. Tasks sharing a file are not run in parallel (**After**).
 | T17.10 | `router.yaml`, `core/src/router-config.ts`, `core/src/router.ts`, `core/src/pc/direct.ts` (new), `docs/04-router.md`, router tests | T17.5 | – |
 | T17.11 | `core/src/learn/*`, `router-config.ts` ceilings, `docs/08` | T17.10 | `fast-path/rules.json` |
 
-- [ ] **T17.2 — Permission list without execution.** Store, protocol frames,
+- [x] **T17.2 — Permission list without execution.** Store, protocol frames,
   `CORE_PC_PERMISSION_DEVICES`, İzinler page under ⋮, badge, tray inbox
   number. Acceptance: list / set / seen / count work; `not_allowed` outside the
   list and when unset; corrupt file → unavailable, nothing written; D3 negative
@@ -714,3 +716,12 @@ task may touch. Tasks sharing a file are not run in parallel (**After**).
 - 2026-11-13: updated for the user decision that the Core will run without a
   sign-in (T21.4): `pc-svc` dials the Core over a loopback `/pc` WebSocket with a
   per-start token file; no link = "oturum açık değil", no row.
+- 2026-11-13: T17.2 started (Q1–Q13 approved with the defaults): permission
+  store `core/src/pc/permissions.ts`, protocol frames (feature `pc_permissions`),
+  `CORE_PC_PERMISSION_DEVICES`, `/health` `inbox.pc`, İzinler page under ⋮ with
+  the count; no PC action runs. The tray menu entry "İzinler (N)" and the
+  `#permissions` hash need tray / `ui/src/ui/trayHash.ts` changes outside the
+  T17.2 file list (left for a follow-up).
+- 2026-11-13: T17.2 done: review 2 rounds (round 1: a restart after a
+  quarantine no longer opens an empty list; site ids made idempotent), core
+  1486/1486 and ui 446/446 tests green.

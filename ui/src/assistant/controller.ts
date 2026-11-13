@@ -34,6 +34,7 @@ import {
   notificationToggleAction,
   notificationsSuppressAvailable,
   notificationsUrgencyFeedbackAvailable,
+  pcPermissionsAvailable,
   urgencyFeedbackOffered,
   reducer,
   shouldPlaySpeech,
@@ -69,6 +70,8 @@ export const MEMORY_TIMEOUT_MS = 8_000;
 export const DEV_TIMEOUT_MS = 8_000;
 /** Same for `notifications_list` / `notification_action` in the inbox. */
 export const NOTIFICATIONS_TIMEOUT_MS = 8_000;
+/** Same for `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` on the İzinler page. */
+export const PC_PERMISSIONS_TIMEOUT_MS = 8_000;
 /**
  * While the Core cannot read its notifications file ("!" badge), the inbox is
  * asked for again this often, so the badge recovers without a reconnect once
@@ -199,6 +202,9 @@ export class AssistantController {
   private voicesTimer: ReturnType<typeof setTimeout> | null = null;
   private memoryTimer: ReturnType<typeof setTimeout> | null = null;
   private devTimer: ReturnType<typeof setTimeout> | null = null;
+  private pcPermissionsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The İzinler page is open: a list that arrives with new rows is answered with `pc_permissions_seen`. */
+  private pcPermissionsOpen = false;
   private notificationsTimer: ReturnType<typeof setTimeout> | null = null;
   /** Next inbox request while the inbox is unavailable (NOTIFICATIONS_RETRY_MS). */
   private notificationsRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -327,6 +333,7 @@ export class AssistantController {
     // A memory or Development request in flight is failed by the reducer ("connection").
     this.clearMemoryTimer();
     this.clearDevTimer();
+    this.clearPcPermissionsTimer();
     this.clearNotificationsTimer();
     // The Core picked this socket to speak them; a new connection never speaks them again.
     this.announcements.length = 0;
@@ -350,6 +357,7 @@ export class AssistantController {
     this.clearVoicesTimer();
     this.clearMemoryTimer();
     this.clearDevTimer();
+    this.clearPcPermissionsTimer();
     this.clearNotificationsTimer();
     this.clearNotificationsRetryTimer();
     this.stopLocalAudio();
@@ -632,6 +640,59 @@ export class AssistantController {
   }
 
   /**
+   * Asks the Core for the PC permission list (`pc_permissions_list`). Only with
+   * the `pc_permissions` feature, while connected and no request of the page is
+   * in flight. Also sent after `welcome`, for the İzinler count.
+   */
+  requestPcPermissions(): boolean {
+    return this.sendPcPermissions((id) => ({ type: "pc_permissions_list", id }));
+  }
+
+  /**
+   * The İzinler page opened: lists the rows; once a list arrives with rows not
+   * yet seen, `pc_permissions_seen` follows (the count goes to 0). No sound,
+   * vibration or notification, ever (docs/11 D3 UI).
+   */
+  openPcPermissions(): void {
+    this.pcPermissionsOpen = true;
+    this.requestPcPermissions();
+  }
+
+  /** The İzinler page closed: later lists no longer mark anything seen. */
+  closePcPermissions(): void {
+    this.pcPermissionsOpen = false;
+  }
+
+  /**
+   * One switch, tapped on the page: sets the row to `enabled` (an explicit
+   * value). Only sent for a listed row whose value differs, while the list is
+   * available and this device may switch (`canManage`); the Core checks the
+   * device again and may still answer `not_allowed`. Never called for a turn.
+   */
+  setPcPermission(rowId: string, enabled: boolean): boolean {
+    const p = this.state.pcPermissions;
+    const row = p.rows?.find((r) => r.rowId === rowId);
+    if (!row || row.enabled === enabled || !p.canManage || p.available !== true) return false;
+    return this.sendPcPermissions((id) => ({ type: "pc_permission_set", id, rowId, enabled }), { rowId, enabled });
+  }
+
+  private sendPcPermissions(
+    frame: (id: string) => Extract<ClientMessage, { type: "pc_permissions_list" | "pc_permission_set" | "pc_permissions_seen" }>,
+    acting?: { rowId: string; enabled: boolean } | "seen",
+  ): boolean {
+    if (!pcPermissionsAvailable(this.state) || this.state.pcPermissions.status === "loading") return false;
+    const id = this.newId();
+    if (!this.client?.send(frame(id))) return false;
+    this.dispatch(acting ? { type: "pc_permissions_requested", id, acting } : { type: "pc_permissions_requested", id });
+    this.clearPcPermissionsTimer();
+    this.pcPermissionsTimer = setTimeout(() => {
+      this.pcPermissionsTimer = null;
+      this.dispatch({ type: "pc_permissions_timeout", id });
+    }, PC_PERMISSIONS_TIMEOUT_MS);
+    return true;
+  }
+
+  /**
    * Asks the Core for the inbox (`notifications_list`). Only with the
    * `notifications` feature, while connected and no inbox request is in
    * flight. Also sent after `welcome`, for the badge and the catch-up.
@@ -774,6 +835,11 @@ export class AssistantController {
     this.devTimer = null;
   }
 
+  private clearPcPermissionsTimer(): void {
+    if (this.pcPermissionsTimer !== null) clearTimeout(this.pcPermissionsTimer);
+    this.pcPermissionsTimer = null;
+  }
+
   private clearNotificationsTimer(): void {
     if (this.notificationsTimer !== null) clearTimeout(this.notificationsTimer);
     this.notificationsTimer = null;
@@ -792,12 +858,16 @@ export class AssistantController {
   private handleServer(msg: ServerMessage): void {
     // Read before the reducer clears `awaitingSpeech` for the error.
     const failedSpeak = msg.type === "error" ? this.failedSpeakReply(msg.id) : null;
+    // Read before the reducer clears `acting`: only a list (not a switch or a seen) leads to `pc_permissions_seen`.
+    const pcListAnswer =
+      msg.type === "pc_permissions" && msg.id === this.state.pcPermissions.requestId && this.state.pcPermissions.acting === null;
     this.dispatch({ type: "server", msg });
     switch (msg.type) {
       case "welcome":
         this.clearVoicesTimer(); // the reducer reset the voice list
         this.clearMemoryTimer(); // and the memory view
         this.clearDevTimer(); // and the Development view
+        this.clearPcPermissionsTimer(); // and the İzinler page
         this.clearNotificationsTimer(); // and the inbox
         this.catchUpPending = true;
         this.sentPrefs = null; // a new Core session: opt in again
@@ -807,6 +877,8 @@ export class AssistantController {
         this.requestDev();
         // The inbox badge and the catch-up of unread items not yet shown here.
         this.requestNotifications();
+        // The İzinler count: the Core sends `pc_permissions_count` only when it changes.
+        this.requestPcPermissions();
         break;
       case "voices":
         if (msg.id === this.state.voices.requestId) this.clearVoicesTimer();
@@ -817,6 +889,15 @@ export class AssistantController {
       // Development frames are silent: no notify, vibration or sound (docs/08 §T7.w.4).
       case "dev":
         if (msg.id === this.state.dev.requestId) this.clearDevTimer();
+        break;
+      // PC permission frames are silent too: no notify, vibration or sound (docs/11 D3 UI).
+      case "pc_permissions":
+        if (msg.id !== this.state.pcPermissions.requestId) break;
+        this.clearPcPermissionsTimer();
+        // The page is open and shows rows not yet seen: the user sees them now.
+        if (pcListAnswer && this.pcPermissionsOpen && msg.available && msg.rows.some((r) => !r.seen)) {
+          this.sendPcPermissions((id) => ({ type: "pc_permissions_seen", id }), "seen");
+        }
         break;
       case "notifications":
         if (msg.id !== this.state.notifications.requestId) break;
@@ -858,6 +939,12 @@ export class AssistantController {
         }
         // A late error for an earlier Development request: not about a turn.
         if (msg.id !== undefined && this.state.dev.staleIds.includes(msg.id)) break;
+        // Same for the İzinler page.
+        if (msg.id !== undefined && msg.id === this.state.pcPermissions.requestId) {
+          this.clearPcPermissionsTimer();
+          break;
+        }
+        if (msg.id !== undefined && this.state.pcPermissions.staleIds.includes(msg.id)) break;
         // Same for the inbox.
         if (msg.id !== undefined && msg.id === this.state.notifications.requestId) {
           this.clearNotificationsTimer();

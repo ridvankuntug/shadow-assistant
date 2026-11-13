@@ -56,6 +56,11 @@ export interface CoreConfig {
    * that may use "Kuralı ekle" in the Development tab. Empty = nobody.
    */
   devDevices: string[];
+  /**
+   * CORE_PC_PERMISSION_DEVICES: device names (lower case, as from DEVICE_TOKEN_<NAME>)
+   * that may switch rows on the İzinler page (docs/11 D3). Empty = nobody (fail closed).
+   */
+  pcPermissionDevices: string[];
   /** CORE_QUIET_HOURS (default 00:00-09:00; `off` = none): no urgent speech in this window (docs/09). */
   quietHours: QuietHours | null;
   /** Set when CORE_QUIET_HOURS was invalid and the default is used; the Core logs it at startup. */
@@ -287,6 +292,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
         : positiveInt("CORE_COMPACT_AT_TOKENS", env.CORE_COMPACT_AT_TOKENS, 50_000),
     },
     devDevices: parseDeviceList(env.CORE_DEV_DEVICES),
+    pcPermissionDevices: parseDeviceList(env.CORE_PC_PERMISSION_DEVICES),
     ...quiet,
   };
 }

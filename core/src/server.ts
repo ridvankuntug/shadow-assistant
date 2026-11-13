@@ -44,13 +44,15 @@ export interface CoreServerOptions {
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
-   * Counts for GET /health `inbox` (e.g. `{ dev: 3, notifications: 1, notificationsUnavailable: false }`),
+   * Counts for GET /health `inbox` (e.g. `{ dev: 3, notifications: 1, notificationsUnavailable: false, pc: 2 }`),
    * sent **only** to loopback requests (the tray on the same machine): numbers and flags, no titles.
    * Remote callers get the body without `inbox`.
    */
   inbox?: () => Record<string, number | boolean>;
   /** Development badge count (T7.w.4): every change goes to every authenticated socket as `dev_count`. */
   devCount?: DevCountSource;
+  /** PC permission badge count (T17.2): every change goes to every authenticated socket as `pc_permissions_count`. */
+  pcPermissionsCount?: DevCountSource;
   /**
    * Service health source (HealthMonitor). Authenticated clients get the
    * current list right after `welcome` + `state` and every change as a
@@ -281,6 +283,10 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
   const unsubscribeDev = opts.devCount?.subscribe((open) => {
     for (const send of authed) send({ type: "dev_count", open });
   });
+  // Same for the PC permission badge (docs/02 §PC permissions); no sound, no notification.
+  const unsubscribePc = opts.pcPermissionsCount?.subscribe((unseen) => {
+    for (const send of authed) send({ type: "pc_permissions_count", unseen });
+  });
 
   http.on("upgrade", (req: IncomingMessage, socket, head) => {
     const path = (req.url ?? "/").split("?")[0];
@@ -414,6 +420,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
       shuttingDown = true;
       unsubscribeHealth?.();
       unsubscribeDev?.();
+      unsubscribePc?.();
       authed.clear();
       for (const client of wss.clients) client.close(1001, "server shutting down");
       await Promise.all([...sessions].map((s) => s.close("server_shutdown").catch(() => {})));

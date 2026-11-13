@@ -15,6 +15,7 @@ import type {
   MemoryMessage,
   NotificationAction,
   NotificationInfo,
+  PcPermissionRow,
   ServerMessage,
   ServerState,
   ServiceHealth,
@@ -163,6 +164,29 @@ export type NotificationsView = {
   feedback?: { notificationId: string; action: "urgent_yes" | "urgent_no" } | null;
 };
 
+/**
+ * The PC permission page "İzinler" (Core feature `pc_permissions`, docs/11 D3).
+ * Same request model as the Development panel: one `pc_permissions_list` /
+ * `pc_permission_set` / `pc_permissions_seen` at a time (`acting` = the switch
+ * being sent, or `seen`), `error` keeps the last rows. `unseen` is the badge
+ * count, null until the Core told one. `available` false: the Core could not
+ * load its list (null until a list arrived). `canManage`: this device may
+ * switch rows (from the last answer; false until then).
+ */
+export type PcPermissionsView = {
+  status: "idle" | "loading" | "ready" | "error";
+  requestId: string | null;
+  acting: { rowId: string; enabled: boolean } | "seen" | null;
+  rows: PcPermissionRow[] | null;
+  unseen: number | null;
+  canManage: boolean;
+  available: boolean | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /** Replaced request ids whose late errors are dropped (as `DevView.staleIds`). */
+  staleIds: string[];
+};
+
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
 export type VoicePreview = { id: string; failed: boolean };
 
@@ -210,6 +234,7 @@ export type AssistantState = {
   memory: MemoryView;
   dev: DevView;
   notifications: NotificationsView;
+  pcPermissions: PcPermissionsView;
 };
 
 export type Action =
@@ -238,13 +263,16 @@ export type Action =
   | { type: "dev_requested"; id: string; acting?: { itemId: string; action: DevAction } }
   | { type: "dev_timeout"; id: string }
   | { type: "notifications_requested"; id: string; acting?: { notificationId: string; action: NotificationAction } }
-  | { type: "notifications_timeout"; id: string };
+  | { type: "notifications_timeout"; id: string }
+  | { type: "pc_permissions_requested"; id: string; acting?: { rowId: string; enabled: boolean } | "seen" }
+  | { type: "pc_permissions_timeout"; id: string };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
 const MAX_STALE_MEMORY = 8;
 const MAX_STALE_DEV = 8;
 const MAX_STALE_NOTIFICATIONS = 8;
+const MAX_STALE_PC_PERMISSIONS = 8;
 
 export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
@@ -286,6 +314,18 @@ export const initialState: AssistantState = {
     items: null,
     unread: null,
     unavailable: false,
+    errorCode: null,
+    errorMessage: null,
+    staleIds: [],
+  },
+  pcPermissions: {
+    status: "idle",
+    requestId: null,
+    acting: null,
+    rows: null,
+    unseen: null,
+    canManage: false,
+    available: null,
     errorCode: null,
     errorMessage: null,
     staleIds: [],
@@ -441,6 +481,42 @@ export function notificationsUnavailable(s: AssistantState): boolean {
   return notificationsAvailable(s) && s.notifications.unavailable;
 }
 
+/** The İzinler page and its count may be offered: connected to a Core with the `pc_permissions` feature. */
+export function pcPermissionsAvailable(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "pc_permissions");
+}
+
+/** The İzinler count (0 = no count): rows not yet seen, only while the page is available. */
+export function pcPermissionsBadgeCount(s: AssistantState): number {
+  return pcPermissionsAvailable(s) ? (s.pcPermissions.unseen ?? 0) : 0;
+}
+
+/** Actions that ask every time even with the switch on (docs/11 decision 5). */
+export const RISKY_PC_ACTIONS: readonly string[] = ["force_close_app", "sleep", "shutdown", "restart"];
+
+export function isRiskyPcAction(action: string): boolean {
+  return RISKY_PC_ACTIONS.includes(action);
+}
+
+/**
+ * The page's groups (docs/11 D3 UI): "Yeni" first, then "Açık", then "Kapalı",
+ * each in the Core's order (most recently requested first). A row is new while
+ * the Core reports it unseen or while it is in `freshIds` (the rows that were
+ * new when the page opened: they stay under "Yeni" after `pc_permissions_seen`
+ * until the page is closed).
+ */
+export function pcPermissionGroups(
+  rows: readonly PcPermissionRow[],
+  freshIds: ReadonlySet<string> = new Set(),
+): { fresh: PcPermissionRow[]; on: PcPermissionRow[]; off: PcPermissionRow[] } {
+  const isFresh = (r: PcPermissionRow) => !r.seen || freshIds.has(r.rowId);
+  return {
+    fresh: rows.filter(isFresh),
+    on: rows.filter((r) => !isFresh(r) && r.enabled),
+    off: rows.filter((r) => !isFresh(r) && !r.enabled),
+  };
+}
+
 /** The action that toggles an item: `read` while unread, `unread` once read. */
 export function notificationToggleAction(item: NotificationInfo): "read" | "unread" {
   return item.readAt === null ? "read" : "unread";
@@ -484,6 +560,11 @@ function notificationsFailed(n: NotificationsView, code: string, message?: strin
     errorCode: code,
     errorMessage: message ?? null,
   };
+}
+
+/** A failed or unanswered PC permission request (keeps the shown rows). */
+function pcPermissionsFailed(p: PcPermissionsView, code: string, message?: string): PcPermissionsView {
+  return { ...p, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
 }
 
 /** A failed or unanswered Development request (keeps the shown items). */
@@ -565,6 +646,7 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         memory: s.memory.status === "loading" ? memoryFailed(s.memory, "connection") : s.memory,
         dev: s.dev.status === "loading" ? devFailed(s.dev, "connection") : s.dev,
         notifications: s.notifications.status === "loading" ? notificationsFailed(s.notifications, "connection") : s.notifications,
+        pcPermissions: s.pcPermissions.status === "loading" ? pcPermissionsFailed(s.pcPermissions, "connection") : s.pcPermissions,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -719,6 +801,21 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         ? { ...s, notifications: notificationsFailed(s.notifications, "timeout") }
         : s;
 
+    case "pc_permissions_requested": {
+      const p = s.pcPermissions;
+      const prev = p.requestId;
+      const staleIds = prev && prev !== a.id ? [...p.staleIds, prev].slice(-MAX_STALE_PC_PERMISSIONS) : p.staleIds;
+      return {
+        ...s,
+        pcPermissions: { ...p, status: "loading", requestId: a.id, acting: a.acting ?? null, errorCode: null, errorMessage: null, staleIds },
+      };
+    }
+
+    case "pc_permissions_timeout":
+      return s.pcPermissions.status === "loading" && s.pcPermissions.requestId === a.id
+        ? { ...s, pcPermissions: pcPermissionsFailed(s.pcPermissions, "timeout") }
+        : s;
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -748,6 +845,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         dev: initialState.dev,
         // And the inbox (the controller asks again, also for the phone catch-up).
         notifications: initialState.notifications,
+        // And the PC permission list and its count (the controller asks again).
+        pcPermissions: initialState.pcPermissions,
       };
 
     case "state": {
@@ -888,6 +987,11 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         return { ...s, notifications: gone ? { ...n, status: "ready", acting: null } : notificationsFailed(n, msg.code, msg.message) };
       }
       if (msg.id !== undefined && s.notifications.staleIds.includes(msg.id)) return s;
+      // And errors of the İzinler page (not_allowed, unknown_item, pc_permissions_unavailable, …).
+      if (msg.id !== undefined && msg.id === s.pcPermissions.requestId) {
+        return s.pcPermissions.status === "loading" ? { ...s, pcPermissions: pcPermissionsFailed(s.pcPermissions, msg.code, msg.message) } : s;
+      }
+      if (msg.id !== undefined && s.pcPermissions.staleIds.includes(msg.id)) return s;
       if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
         return {
           ...s,
@@ -993,5 +1097,28 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
 
     case "notification_removed":
       return { ...s, notifications: removeNotification(s.notifications, msg.notificationId) };
+
+    case "pc_permissions":
+      // Only the answer to the latest request (as with dev); it still counts after the local timeout.
+      if (msg.id !== s.pcPermissions.requestId) return s;
+      return {
+        ...s,
+        pcPermissions: {
+          status: "ready",
+          requestId: msg.id,
+          acting: null,
+          rows: msg.rows,
+          unseen: msg.unseen,
+          canManage: msg.canManage,
+          available: msg.available,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: s.pcPermissions.staleIds,
+        },
+      };
+
+    case "pc_permissions_count":
+      // Count only; the rows are refreshed when the page opens (or "Yenile").
+      return msg.unseen === s.pcPermissions.unseen ? s : { ...s, pcPermissions: { ...s.pcPermissions, unseen: msg.unseen } };
   }
 }

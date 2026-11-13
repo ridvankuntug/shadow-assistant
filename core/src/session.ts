@@ -19,6 +19,7 @@ import {
   type TurnNotes,
 } from "./dev-notes.js";
 import type { DeviceRegistry } from "./device-registry.js";
+import type { PcPermissionStore } from "./pc/permissions.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
 import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
 import type { LearnedRuleRecord, LearnedRuleStore } from "./learn/store.js";
@@ -117,6 +118,14 @@ export const TAIL_WAIT_MS = 3_000;
 
 const LEVEL_RANK: Record<PermissionLevel, number> = { read: 0, write: 1, confirm: 2 };
 
+/** Error messages of a refused `pc_permission_set` (never names a device or a target). */
+const PC_SET_MESSAGES: Record<"not_allowed" | "unknown_item" | "pc_permissions_unavailable" | "internal", string> = {
+  not_allowed: "this device may not switch pc permissions (CORE_PC_PERMISSION_DEVICES)",
+  unknown_item: "unknown pc permission row",
+  pc_permissions_unavailable: "the pc permission list could not be read",
+  internal: "the pc permission list could not be stored",
+};
+
 /** What the model is told when the gate denies one of its tool calls. */
 const DENY_MESSAGES: Record<GateDeny, string> = {
   tier_service: "This tool is not available in this mode.",
@@ -188,6 +197,13 @@ export interface SessionDeps {
    * `notification_action`; absent = `bad_request`.
    */
   notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "speechOn" | "list" | "act">;
+  /**
+   * The PC permission list (T17.2, feature `pc_permissions`, docs/11 D3):
+   * `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`; absent = `bad_request`.
+   * Only handlePcPermissions() uses it: no turn, router rule, tool or learned
+   * rule reaches `setEnabled` (pinned by test/pc-permissions-separation.test.ts).
+   */
+  pcPermissions?: Pick<PcPermissionStore, "list" | "setEnabled" | "markAllSeen" | "canManage">;
 }
 
 /** What a session needs for pattern learning. */
@@ -395,6 +411,52 @@ export class Session {
       case "notification_action":
         await this.handleNotifications(frame.id, { notificationId: frame.notificationId, action: frame.action });
         return;
+      case "pc_permissions_list":
+        await this.handlePcPermissions(frame.id, "list");
+        return;
+      case "pc_permission_set":
+        await this.handlePcPermissions(frame.id, { rowId: frame.rowId, enabled: frame.enabled });
+        return;
+      case "pc_permissions_seen":
+        await this.handlePcPermissions(frame.id, "seen");
+        return;
+    }
+  }
+
+  // ------------------------------------------------------------ PC permission list (T17.2)
+
+  /**
+   * `pc_permissions_list`, `pc_permission_set` and `pc_permissions_seen`:
+   * answered with a fresh `pc_permissions` frame to this socket only, or an
+   * `error` with the request id. The device is the one from the token
+   * (`info.device`), never `hello.client`; the store checks it against
+   * CORE_PC_PERMISSION_DEVICES itself. This is the only caller of `setEnabled`.
+   */
+  private async handlePcPermissions(id: string, op: "list" | "seen" | { rowId: string; enabled: boolean }): Promise<void> {
+    const store = this.deps.pcPermissions;
+    if (!store) {
+      this.error("bad_request", "pc permissions are disabled", id);
+      return;
+    }
+    try {
+      if (op === "seen") {
+        const r = await store.markAllSeen();
+        if (!r.ok) {
+          this.error(r.code, r.code === "internal" ? "the pc permission list could not be stored" : "the pc permission list could not be read", id);
+          return;
+        }
+      } else if (op !== "list") {
+        const r = await store.setEnabled(this.info.device, op.rowId, op.enabled);
+        if (!r.ok) {
+          this.error(r.code, PC_SET_MESSAGES[r.code], id);
+          return;
+        }
+      }
+      const v = await store.list();
+      this.emit({ type: "pc_permissions", id, rows: v.rows, unseen: v.unseen, canManage: store.canManage(this.info.device), available: v.available });
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] pc permissions request failed: ${(err as Error)?.name ?? "error"}`);
+      this.error("internal", "the pc permission list is unavailable", id);
     }
   }
 

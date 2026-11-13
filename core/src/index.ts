@@ -33,6 +33,7 @@ import { SuppressionStore } from "./notification-suppressions.js";
 import { HaUrgencyStore, haUrgencyFeedback } from "./ha-urgency.js";
 import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
+import { PC_DIR, PcPermissionStore } from "./pc/permissions.js";
 import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
@@ -339,6 +340,18 @@ export async function main(): Promise<void> {
     urgencyFeedback: haUrgencyFeedback(haUrgency),
   });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
+  // The PC permission list (docs/11 D3, T17.2): read once; a corrupt or unreadable file leaves it
+  // unavailable (fail closed, nothing written) until a restart. Switching only for
+  // CORE_PC_PERMISSION_DEVICES; unset = nobody. No PC action runs yet (T17.4+).
+  for (const d of cfg.pcPermissionDevices) {
+    if (!tokens.digests.has(d)) logger.warn(`[shadow-core] CORE_PC_PERMISSION_DEVICES: '${d}' has no DEVICE_TOKEN_<NAME>; ignored in practice`);
+  }
+  const pcPermissions = new PcPermissionStore({
+    dir: join(cfg.dataDir, PC_DIR),
+    managers: cfg.pcPermissionDevices,
+    log: (m) => logger.warn(m),
+  });
+  await pcPermissions.load(); // the first badge count, for /health `inbox`
   // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
   // Startup adoption reads the store directly (the center's list drops the dedupe key).
   const backupProducer = new BackupProducer({
@@ -421,6 +434,7 @@ export async function main(): Promise<void> {
           turnNotes: recordTurnNote,
           dev: devTab,
           notifications: notificationCenter,
+          pcPermissions,
         },
         info,
         send,
@@ -429,9 +443,20 @@ export async function main(): Promise<void> {
     health: () => ({ services: publicServiceHealth(cfg.services.services, monitor.snapshot()) }),
     // Loopback requests only (the tray): the Development badge count and unread notifications, no titles.
     // `notificationsUnavailable`: the file could not be read, `notifications` is then not a real count (T7.w.12).
-    inbox: () => ({ dev: devTab?.open ?? 0, ...notificationCenter.healthInbox() }),
+    // `pc`: PC permission rows not yet seen on the İzinler page (T17.2).
+    inbox: () => ({ dev: devTab?.open ?? 0, ...notificationCenter.healthInbox(), pc: pcPermissions.unseen }),
     devCount: devTab,
-    features: ["speech_stream", "usage_limit", ...(memory ? (["memory"] as ProtocolFeature[]) : []), "dev", "notifications", "notifications_suppress", "ha_urgency_feedback"],
+    pcPermissionsCount: pcPermissions,
+    features: [
+      "speech_stream",
+      "usage_limit",
+      ...(memory ? (["memory"] as ProtocolFeature[]) : []),
+      "dev",
+      "notifications",
+      "notifications_suppress",
+      "ha_urgency_feedback",
+      "pc_permissions",
+    ],
     serviceHealth: monitor,
     deviceState,
   });
@@ -460,6 +485,9 @@ export async function main(): Promise<void> {
   logger.info(`[shadow-core] learning: ${learnedRules ? `on (${learnedRules.snapshot().length} active learned rules)` : "off"}`);
   logger.info(
     `[shadow-core] development tab: ${devTab.open ?? 0} open; "Kuralı ekle" ${cfg.devDevices.length > 0 ? `for ${cfg.devDevices.join(",")}` : "off (CORE_DEV_DEVICES not set)"}`,
+  );
+  logger.info(
+    `[shadow-core] pc permission list: ${pcPermissions.available ? `${pcPermissions.unseen} new` : "unavailable (PC commands refused)"}; switching ${cfg.pcPermissionDevices.length > 0 ? `for ${cfg.pcPermissionDevices.join(",")}` : "off (CORE_PC_PERMISSION_DEVICES not set)"}`,
   );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
@@ -493,6 +521,7 @@ export async function main(): Promise<void> {
           { name: "mcp gateway", run: () => gateway.close() },
           { name: "mcp client", run: () => mcpClient.close() },
           { name: "development tab", run: () => devTab?.close() },
+          { name: "pc permissions", run: () => pcPermissions.close() },
           // The retry read of an unreadable notifications file (T7.w.13); the flush below still runs.
           { name: "notification center", run: () => notificationCenter.close() },
         ],
@@ -504,6 +533,8 @@ export async function main(): Promise<void> {
           // After the inbox changes in flight: coalesced or failed notification writes.
           { name: "notifications", run: () => notificationCenter.flush() },
           { name: "ha urgency", run: () => haUrgency.flush() },
+          // Writes are immediate; this waits for a switch still being written.
+          { name: "pc permissions", run: () => pcPermissions.flush() },
         ],
       },
       { log: (m) => logger.warn(m), exit: (code) => process.exit(code) },

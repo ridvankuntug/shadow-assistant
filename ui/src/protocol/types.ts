@@ -75,6 +75,16 @@ export type NotificationActionMessage = {
   action: NotificationAction;
 };
 
+/** Asks for the PC permission list (Core feature `pc_permissions`, docs/02 §PC permissions). */
+export type PcPermissionsListMessage = { type: "pc_permissions_list"; id: string };
+/**
+ * Switches one PC permission row to an explicit value (never a toggle); only a
+ * device in the Core's CORE_PC_PERMISSION_DEVICES may (else `not_allowed`).
+ */
+export type PcPermissionSetMessage = { type: "pc_permission_set"; id: string; rowId: string; enabled: boolean };
+/** Marks every PC permission row seen (the page was opened). */
+export type PcPermissionsSeenMessage = { type: "pc_permissions_seen"; id: string };
+
 export type ClientMessage =
   | HelloMessage
   | UserTextMessage
@@ -91,7 +101,10 @@ export type ClientMessage =
   | DevListMessage
   | DevActionMessage
   | NotificationsListMessage
-  | NotificationActionMessage;
+  | NotificationActionMessage
+  | PcPermissionsListMessage
+  | PcPermissionSetMessage
+  | PcPermissionsSeenMessage;
 
 // ---------------------------------------------------------------------------
 // Core -> Client
@@ -104,7 +117,8 @@ export type CoreFeature =
   | "dev"
   | "notifications"
   | "notifications_suppress"
-  | "ha_urgency_feedback";
+  | "ha_urgency_feedback"
+  | "pc_permissions";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;
@@ -242,6 +256,37 @@ export type NotificationsMessage = { type: "notifications"; id: string; items: N
 export type NotificationMessage = { type: "notification"; item: NotificationInfo; speak?: true };
 /** An item was deleted or resolved; broadcast to every authenticated socket. */
 export type NotificationRemovedMessage = { type: "notification_removed"; notificationId: string };
+/**
+ * One PC permission row (display only). `label` is the target's name; the UI
+ * adds the verb of `action` ("Steam · aç"). Unknown `action` / `kind` values
+ * are shown as-is. Times are ISO 8601 strings; `changedAt` only after a switch.
+ */
+export type PcPermissionRow = {
+  rowId: string;
+  action: string;
+  kind: string;
+  label: string;
+  enabled: boolean;
+  seen: boolean;
+  requests: number;
+  createdAt: string;
+  lastRequestedAt: string;
+  changedAt?: string;
+};
+/**
+ * Answer to `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`.
+ * `available: false`: the Core could not load its list (every PC command refused).
+ */
+export type PcPermissionsMessage = {
+  type: "pc_permissions";
+  id: string;
+  rows: PcPermissionRow[];
+  unseen: number;
+  canManage: boolean;
+  available: boolean;
+};
+/** PC permission badge count change, broadcast to every authenticated socket. */
+export type PcPermissionsCountMessage = { type: "pc_permissions_count"; unseen: number };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -264,6 +309,8 @@ export type ServerMessage =
   | NotificationsMessage
   | NotificationMessage
   | NotificationRemovedMessage
+  | PcPermissionsMessage
+  | PcPermissionsCountMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -495,6 +542,41 @@ function toNotifications(o: Obj): NotificationsMessage | null {
   };
 }
 
+/**
+ * A valid PC permission row with only the known fields, or null. Strings are
+ * cut so a bad row cannot flood the page; a malformed `changedAt` is dropped.
+ */
+function toPcPermissionRow(v: unknown): PcPermissionRow | null {
+  if (!isObj(v) || !str(v, "rowId") || !v.rowId) return null;
+  for (const k of ["action", "kind", "label", "createdAt", "lastRequestedAt"]) if (!str(v, k)) return null;
+  if (!bool(v, "enabled") || !bool(v, "seen") || !isCount(v.requests)) return null;
+  const row: PcPermissionRow = {
+    rowId: (v.rowId as string).slice(0, 128),
+    action: (v.action as string).slice(0, 64),
+    kind: (v.kind as string).slice(0, 32),
+    label: (v.label as string).slice(0, 200),
+    enabled: v.enabled as boolean,
+    seen: v.seen as boolean,
+    requests: v.requests,
+    createdAt: v.createdAt as string,
+    lastRequestedAt: v.lastRequestedAt as string,
+  };
+  if (str(v, "changedAt")) row.changedAt = v.changedAt as string;
+  return row;
+}
+
+function toPcPermissions(o: Obj): PcPermissionsMessage | null {
+  if (!str(o, "id") || !isCount(o.unseen) || !bool(o, "canManage") || !bool(o, "available") || !Array.isArray(o.rows)) return null;
+  return {
+    type: "pc_permissions",
+    id: o.id as string,
+    rows: o.rows.map(toPcPermissionRow).filter((r): r is PcPermissionRow => r !== null),
+    unseen: o.unseen,
+    canManage: o.canManage as boolean,
+    available: o.available as boolean,
+  };
+}
+
 /** `speak` is kept only when it is exactly `true`. */
 function toNotification(o: Obj): NotificationMessage | null {
   const item = toNotificationInfo(o.item);
@@ -585,6 +667,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       return str(o, "notificationId") && o.notificationId
         ? { type: "notification_removed", notificationId: o.notificationId as string }
         : null;
+    case "pc_permissions":
+      return toPcPermissions(o);
+    case "pc_permissions_count":
+      return isCount(o.unseen) ? { type: "pc_permissions_count", unseen: o.unseen } : null;
     case "pong":
       return { type: "pong" };
     default:

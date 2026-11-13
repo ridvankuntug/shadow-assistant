@@ -13,6 +13,8 @@ import {
   notificationsSuppressAvailable,
   notificationsUrgencyFeedbackAvailable,
   notificationsUnavailable,
+  pcPermissionsAvailable,
+  pcPermissionsBadgeCount,
 } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
@@ -27,19 +29,29 @@ import { DevPanel } from "./ui/DevPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
 import { NotificationsPanel } from "./ui/NotificationsPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
+import { PermissionsPanel } from "./ui/PermissionsPanel.tsx";
 import { ServiceIndicator } from "./ui/ServiceIndicator.tsx";
 import { serviceIssues, sttStatus } from "./ui/serviceHealth.ts";
 import { watchGemini } from "./ui/gemini.ts";
-import { topbarCrowded } from "./ui/topbar.ts";
+import { CROWDED_FROM, topbarIconCount } from "./ui/topbar.ts";
 import { VersionPanel } from "./ui/VersionPanel.tsx";
 import { clearTrayHash, trayTarget, watchTrayHash } from "./ui/trayHash.ts";
 import { VoicePicker } from "./ui/VoicePicker.tsx";
 import { Stage } from "./ui/Stage.tsx";
-import { CONNECTION_LABEL, devOpenText, noticeMessage, noticeText, notificationsUnreadText, resolvedText } from "./ui/strings.ts";
+import {
+  CONNECTION_LABEL,
+  devOpenText,
+  noticeMessage,
+  noticeText,
+  notificationsUnreadText,
+  PC_PERMISSIONS_TITLE,
+  pcPermissionsUnseenText,
+  resolvedText,
+} from "./ui/strings.ts";
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect" | "version";
+type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect" | "version" | "permissions";
 
 /** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5; ui/trayHash.ts). */
 const atHash = (panel: "dev" | "notifications") => typeof window !== "undefined" && trayTarget(window.location.hash) === panel;
@@ -125,6 +137,16 @@ export default function App({ adapter, controller }: Props) {
   useEffect(() => {
     if (panel === "notifications" && notificationsOn) controller.requestNotifications();
   }, [controller, panel, notificationsOn]);
+
+  // The İzinler page lists its rows each time it opens (and again after a
+  // reconnect); a list with new rows is answered with `pc_permissions_seen` by
+  // the controller while the page is open. Closing it stops that.
+  const pcPermissionsOn = pcPermissionsAvailable(state);
+  useEffect(() => {
+    if (panel !== "permissions" || !pcPermissionsOn) return;
+    controller.openPcPermissions();
+    return () => controller.closePcPermissions();
+  }, [controller, panel, pcPermissionsOn]);
 
   // The open panel for the hash listener (a hash for the open panel is dropped there).
   const panelRef = useRef<Panel>(panel);
@@ -221,6 +243,7 @@ export default function App({ adapter, controller }: Props) {
   const devCount = devBadgeCount(state);
   const unreadCount = notificationsBadgeCount(state);
   const inboxUnreadable = notificationsUnavailable(state);
+  const pcUnseen = pcPermissionsBadgeCount(state);
 
   const status = state.connection.status;
   const unauthorized = status === "unauthorized";
@@ -241,12 +264,16 @@ export default function App({ adapter, controller }: Props) {
   const notice = state.notice;
   const accent = PHASE_COLOR[phase];
   // Too many icons for a phone-wide bar: the brand text gives way (T16.3, ui/topbar.ts).
-  const crowded = topbarCrowded({
-    services: connected && serviceIssues(state.services) !== null,
-    dev: devCount > 0,
-    notifications: notificationsOn,
-    gemini: gemini !== undefined && geminiOn,
-  });
+  // A count on the "⋮" button (new İzinler rows) widens it like a badge: counted as one more icon.
+  const crowded =
+    topbarIconCount({
+      services: connected && serviceIssues(state.services) !== null,
+      dev: devCount > 0,
+      notifications: notificationsOn,
+      gemini: gemini !== undefined && geminiOn,
+    }) +
+      (pcUnseen > 0 ? 1 : 0) >=
+    CROWDED_FROM;
 
   return (
     <div className={`app phase-${phase}`} style={{ "--accent": accent } as CSSProperties}>
@@ -342,7 +369,23 @@ export default function App({ adapter, controller }: Props) {
             </button>
           )}
           {/* Rightmost, in the corner (T16.2); more entries will join later. */}
-          <AppMenu items={[{ id: "version", label: "Güncelleme ve sürüm", onSelect: () => setPanel("version") }]} />
+          <AppMenu
+            items={[
+              // Only with the Core feature `pc_permissions`; the count is the rows not yet seen (no sound, ever).
+              ...(pcPermissionsOn
+                ? [
+                    {
+                      id: "permissions",
+                      label: PC_PERMISSIONS_TITLE,
+                      onSelect: () => setPanel("permissions"),
+                      count: pcUnseen,
+                      countLabel: pcPermissionsUnseenText(pcUnseen),
+                    },
+                  ]
+                : []),
+              { id: "version", label: "Güncelleme ve sürüm", onSelect: () => setPanel("version") },
+            ]}
+          />
         </nav>
       </header>
 
@@ -448,6 +491,16 @@ export default function App({ adapter, controller }: Props) {
           onRefresh={() => controller.requestDev()}
           onAction={(itemId, action) => controller.devAction(itemId, action)}
           onClose={closeDev}
+        />
+      )}
+      {/* Hidden without the Core feature `pc_permissions` (e.g. after reconnecting to an older Core). */}
+      {panel === "permissions" && hasFeature(state, "pc_permissions") && (
+        <PermissionsPanel
+          permissions={state.pcPermissions}
+          connected={connected}
+          onRefresh={() => controller.requestPcPermissions()}
+          onSwitch={(rowId, enabled) => controller.setPcPermission(rowId, enabled)}
+          onClose={closePanel}
         />
       )}
       {panel === "version" && <VersionPanel app={adapter.app} onCheckUpdates={handOff} onClose={closePanel} />}

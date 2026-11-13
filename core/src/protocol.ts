@@ -160,6 +160,31 @@ export interface NotificationActionFrame {
   action: NotificationAction;
 }
 
+/** Asks for the PC permission list (feature `pc_permissions`, docs/11 D3); answered by `pc_permissions` or `error`. */
+export interface PcPermissionsListFrame {
+  type: "pc_permissions_list";
+  id: string;
+}
+
+/**
+ * Switches one PC permission row; answered by a fresh `pc_permissions` frame or `error`.
+ * Only from a device in CORE_PC_PERMISSION_DEVICES (else `not_allowed`). `enabled` is an
+ * explicit value, never a toggle, so a repeat is harmless.
+ */
+export interface PcPermissionSetFrame {
+  type: "pc_permission_set";
+  id: string;
+  /** `rows[].rowId` of a `pc_permissions` frame (`p-` + 16 hex digits). */
+  rowId: string;
+  enabled: boolean;
+}
+
+/** Marks every PC permission row seen (the page was opened; the badge goes to 0); answered by `pc_permissions` or `error`. */
+export interface PcPermissionsSeenFrame {
+  type: "pc_permissions_seen";
+  id: string;
+}
+
 export type ClientFrame =
   | HelloFrame
   | UserTextFrame
@@ -176,7 +201,10 @@ export type ClientFrame =
   | DevListFrame
   | DevActionFrame
   | NotificationsListFrame
-  | NotificationActionFrame;
+  | NotificationActionFrame
+  | PcPermissionsListFrame
+  | PcPermissionSetFrame
+  | PcPermissionsSeenFrame;
 
 // ---------------------------------------------------------------- core → client
 
@@ -200,6 +228,8 @@ export type ErrorCode =
   | "not_allowed"
   /** Notifications: the Core cannot read its notifications file; the inbox is not known (never "empty"). */
   | "notifications_unavailable"
+  /** PC permissions: the list could not be loaded at startup; nothing is changed (docs/11 D3 "Store"). */
+  | "pc_permissions_unavailable"
   | "internal";
 
 /**
@@ -214,7 +244,9 @@ export type ProtocolFeature =
   | "notifications"
   | "notifications_suppress"
   /** T7.w.11.10: `notification_action` `urgent_yes` / `urgent_no` and Development `ha_urgency` suggestions with `accept`. */
-  | "ha_urgency_feedback";
+  | "ha_urgency_feedback"
+  /** T17.2: the PC permission list (`pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`, `pc_permissions_count`). */
+  | "pc_permissions";
 
 export interface HistoryItem {
   id: string;
@@ -407,6 +439,50 @@ export interface NotificationRemovedFrame {
   notificationId: string;
 }
 
+/**
+ * One PC permission row as clients see it (docs/11 D3): display fields only,
+ * never the target id, aliases, search texts or device names. `label` is the
+ * target's display name ("Steam", "youtube.com", "Ses düzeyi"); clients add the
+ * verb of `action` ("Steam · aç"). Clients show unknown `action` / `kind` values as-is.
+ */
+export interface PcPermissionInfo {
+  /** `p-` + 16 hex digits; send it back as `pc_permission_set.rowId`. */
+  rowId: string;
+  action: string;
+  kind: string;
+  label: string;
+  enabled: boolean;
+  /** False while the row was added by a refused request and not yet seen on the page. */
+  seen: boolean;
+  /** How many requests were refused or ran for this row. */
+  requests: number;
+  /** ISO 8601. */
+  createdAt: string;
+  lastRequestedAt: string;
+  /** ISO 8601 of the last switch; absent while never switched. */
+  changedAt?: string;
+}
+
+export interface PcPermissionsFrame {
+  type: "pc_permissions";
+  /** The `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` request id. */
+  id: string;
+  /** Most recently requested first; empty while `available` is false. */
+  rows: PcPermissionInfo[];
+  /** Badge count: rows not yet seen. */
+  unseen: number;
+  /** Whether this device may send `pc_permission_set` (CORE_PC_PERMISSION_DEVICES). */
+  canManage: boolean;
+  /** False when the Core could not load its permission list: every PC command is refused, nothing is written. */
+  available: boolean;
+}
+
+/** The PC permission badge count changed; to every authenticated socket (feature `pc_permissions`). */
+export interface PcPermissionsCountFrame {
+  type: "pc_permissions_count";
+  unseen: number;
+}
+
 export type ServerFrame =
   | {
       type: "welcome";
@@ -439,6 +515,8 @@ export type ServerFrame =
   | NotificationsFrame
   | NotificationFrame
   | NotificationRemovedFrame
+  | PcPermissionsFrame
+  | PcPermissionsCountFrame
   /** `retryAt` (epoch ms): only on `usage_limit`, when the reset time is known. */
   | { type: "error"; id?: string; code: ErrorCode; message: string; retryAt?: number }
   | { type: "services"; items: ServiceHealth[] }
@@ -450,6 +528,9 @@ export type ServerFrame =
 export type ParseResult =
   | { ok: true; frame: ClientFrame }
   | { ok: false; message: string; id?: string };
+
+/** `pc_permission_set.rowId`: `p-` + 16 lower-case hex digits (core/src/pc/permissions.ts pcRowId). */
+const PC_ROW_ID_RE = /^p-[0-9a-f]{16}$/;
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -590,6 +671,17 @@ export function parseClientFrame(raw: string): ParseResult {
         frame: { type: "notification_action", id: data.id, notificationId: data.notificationId, action: action as NotificationAction },
       };
     }
+    case "pc_permissions_list":
+      if (!isId(data.id)) return bad("pc_permissions_list.id must be a non-empty string");
+      return { ok: true, frame: { type: "pc_permissions_list", id: data.id } };
+    case "pc_permission_set":
+      if (!isId(data.id)) return bad("pc_permission_set.id must be a non-empty string");
+      if (typeof data.rowId !== "string" || !PC_ROW_ID_RE.test(data.rowId)) return bad("pc_permission_set.rowId must be p- and 16 hex digits");
+      if (typeof data.enabled !== "boolean") return bad("pc_permission_set.enabled must be a boolean");
+      return { ok: true, frame: { type: "pc_permission_set", id: data.id, rowId: data.rowId, enabled: data.enabled } };
+    case "pc_permissions_seen":
+      if (!isId(data.id)) return bad("pc_permissions_seen.id must be a non-empty string");
+      return { ok: true, frame: { type: "pc_permissions_seen", id: data.id } };
     default:
       return bad(`unknown frame type`);
   }

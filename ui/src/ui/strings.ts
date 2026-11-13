@@ -384,3 +384,75 @@ export function notificationsErrorText(code: string, message?: string | null): s
       return noticeText(code, message ?? undefined);
   }
 }
+
+// ------------------------------------------------------- PC permission page ("İzinler", docs/11 D3)
+
+export const PC_PERMISSIONS_TITLE = "İzinler";
+
+/** The verb shown after the target ("Steam · aç"). The Core sends only the target name, so no case suffix is ever built. */
+const PC_ACTION_VERB: Record<string, string> = {
+  open_app: "aç",
+  close_app: "kapat",
+  force_close_app: "zorla kapat",
+  open_site: "aç",
+  web_search: "ara",
+  media_search: "ara",
+  volume: "değiştir",
+  media: "oynat / duraklat",
+  lock: "kilitle",
+  sleep: "uyut",
+  shutdown: "kapat",
+  restart: "yeniden başlat",
+  play_game: "başlat",
+};
+
+/** Row label: "‹target› · ‹verb›"; an unknown action shows the target with the action as-is. */
+export function pcPermissionLabel(label: string, action: string): string {
+  return `${label} · ${PC_ACTION_VERB[action] ?? action}`;
+}
+
+/** "3 kez istendi" */
+export function pcPermissionRequestsText(requests: number): string {
+  return `${requests} kez istendi`;
+}
+
+/** The İzinler count in words, for screen readers: "2 yeni izin satırı". */
+export function pcPermissionsUnseenText(unseen: number): string {
+  return `${unseen} yeni izin satırı`;
+}
+
+export const PC_PERMISSIONS_GROUP = { fresh: "Yeni", on: "Açık", off: "Kapalı" } as const;
+
+export const PC_PERMISSIONS_INTRO =
+  "Shadow'un bilgisayarda yapabilecekleri. Her şey kapalı başlar; izinli olmayan bir komut istendiğinde satır kapalı olarak buraya eklenir. Anahtarları yalnız buradan sen değiştirirsin; ses ya da model değiştiremez.";
+
+export const PC_PERMISSIONS_EMPTY = "Henüz izin satırı yok.";
+
+export const PC_PERMISSIONS_CANNOT_MANAGE =
+  "Bu cihaz izinleri değiştiremez. Çekirdekte CORE_PC_PERMISSION_DEVICES ayarına bu cihazın adı eklenmeli.";
+
+export const PC_PERMISSIONS_UNAVAILABLE =
+  "İzin listesi okunamadı; bilgisayar komutları kapalı. Dosya elle geri yüklenip Çekirdek yeniden başlatılmalı.";
+
+/** Shown under a risky row that is on (shut down, restart, sleep, force-close). */
+export const PC_PERMISSION_RISKY_NOTE = "Açık olsa da her seferinde onay sorulur.";
+
+/** Why the last request of the page failed (`timeout` / `connection` are local codes). */
+export function pcPermissionsErrorText(code: string, message?: string | null): string {
+  switch (code) {
+    case "timeout":
+      return "Çekirdek izin isteğine yanıt vermedi.";
+    case "connection":
+      return "Bağlantı koptu; izin listesi alınamadı.";
+    case "unknown_item":
+      return "Bu satır artık listede yok. Listeyi yenile.";
+    case "not_allowed":
+      return "Bu cihaz izinleri değiştiremez.";
+    case "pc_permissions_unavailable":
+      return PC_PERMISSIONS_UNAVAILABLE;
+    case "bad_request":
+      return "Çekirdek isteği reddetti. Listeyi yenile.";
+    default:
+      return noticeText(code, message ?? undefined);
+  }
+}

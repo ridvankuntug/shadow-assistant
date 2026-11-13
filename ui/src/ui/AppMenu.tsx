@@ -1,7 +1,12 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
-import { menuKey } from "./menu.ts";
+import { badgeText, menuBadgeCount, menuKey } from "./menu.ts";
 
-export type AppMenuItem = { id: string; label: string; onSelect: () => void };
+/**
+ * One entry. `count` (e.g. new İzinler rows) is drawn next to the label and
+ * added up on the "⋮" button, like the Development badge: a number only,
+ * never a sound or a notification. `countLabel` says it in words for screen readers.
+ */
+export type AppMenuItem = { id: string; label: string; onSelect: () => void; count?: number; countLabel?: string };
 
 /**
  * The top bar's "⋮" menu (T16.2): a button and a small list of entries. Opens
@@ -15,6 +20,9 @@ export function AppMenu({ items }: { items: readonly AppMenuItem[] }) {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const listId = useId();
+  const total = menuBadgeCount(items);
+  const counted = items.filter((i) => (i.count ?? 0) > 0 && i.countLabel).map((i) => i.countLabel);
+  const buttonLabel = total > 0 && counted.length > 0 ? `Menü: ${counted.join(", ")}` : "Menü";
 
   useEffect(() => {
     if (!open) return;
@@ -49,9 +57,9 @@ export function AppMenu({ items }: { items: readonly AppMenuItem[] }) {
       <button
         ref={buttonRef}
         type="button"
-        className="btn btn-icon menu-btn"
-        aria-label="Menü"
-        title="Menü"
+        className={total > 0 ? "btn btn-icon menu-btn dev-badge" : "btn btn-icon menu-btn"}
+        aria-label={buttonLabel}
+        title={buttonLabel}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
@@ -60,6 +68,11 @@ export function AppMenu({ items }: { items: readonly AppMenuItem[] }) {
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
         </svg>
+        {total > 0 && (
+          <span className="dev-count" aria-hidden="true">
+            {badgeText(total)}
+          </span>
+        )}
       </button>
       {open && (
         <ul id={listId} className="app-menu-list" role="menu" aria-label="Menü" onKeyDown={onKeyDown}>
@@ -78,6 +91,15 @@ export function AppMenu({ items }: { items: readonly AppMenuItem[] }) {
                 }}
               >
                 {item.label}
+                {(item.count ?? 0) > 0 && (
+                  <>
+                    {" "}
+                    <span className="dev-count" aria-hidden="true">
+                      {badgeText(item.count ?? 0)}
+                    </span>
+                    {item.countLabel && <span className="visually-hidden">, {item.countLabel}</span>}
+                  </>
+                )}
               </button>
             </li>
           ))}

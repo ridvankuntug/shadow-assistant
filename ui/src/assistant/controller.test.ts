@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CoreClientOptions, StatusEvent } from "../protocol/client.ts";
-import type { ClientMessage, DevItem, NotificationInfo, ServerMessage } from "../protocol/types.ts";
+import type { ClientMessage, DevItem, NotificationInfo, PcPermissionRow, ServerMessage } from "../protocol/types.ts";
 import { PlatformError, type PlatformAdapter, type TtsCapability, type Utterance } from "../platform/types.ts";
 import {
   AssistantController,
@@ -11,6 +11,7 @@ import {
   MEMORY_TIMEOUT_MS,
   NOTIFICATIONS_RETRY_MS,
   NOTIFICATIONS_TIMEOUT_MS,
+  PC_PERMISSIONS_TIMEOUT_MS,
   SPEECH_FINAL_TIMEOUT_MS,
   VOICES_TIMEOUT_MS,
   VOICE_SAMPLE_TEXT,
@@ -25,6 +26,7 @@ import {
   notificationsSuppressAvailable,
   notificationsUnavailable,
   notificationsUrgencyFeedbackAvailable,
+  pcPermissionsBadgeCount,
 } from "./state.ts";
 import { noticeMessage } from "../ui/strings.ts";
 
@@ -2125,5 +2127,146 @@ describe("clipForSpeech", () => {
     const clipped = clipForSpeech(long, 2000);
     expect(clipped.length).toBeLessThanOrEqual(2000);
     expect(clipped.endsWith(".")).toBe(true);
+  });
+});
+
+describe("İzinler page (T17.2, feature pc_permissions)", () => {
+  const row = (o: Partial<PcPermissionRow> = {}): PcPermissionRow => ({
+    rowId: "p-0123456789abcdef",
+    action: "open_app",
+    kind: "app",
+    label: "Steam",
+    enabled: false,
+    seen: false,
+    requests: 2,
+    createdAt: "2026-11-14T18:00:00.000Z",
+    lastRequestedAt: "2026-11-14T18:05:00.000Z",
+    ...o,
+  });
+  const frame = (id: string, o: { rows?: PcPermissionRow[]; canManage?: boolean; available?: boolean } = {}): ServerMessage => {
+    const rows = o.rows ?? [row()];
+    return { type: "pc_permissions", id, rows, unseen: rows.filter((r) => !r.seen).length, canManage: o.canManage ?? true, available: o.available ?? true };
+  };
+  /** Connected to a Core with `pc_permissions`; the list sent on welcome ("t1") answered with `answer`. */
+  const ready = (answer = frame("t1")) => {
+    const t = setup(undefined, ["pc_permissions"]);
+    t.receive(answer);
+    t.sent.length = 0;
+    return t;
+  };
+
+  it("without the feature: no list on welcome, nothing sent, no count", () => {
+    const t = setup(undefined, ["dev"]);
+    expect(t.sentTypes()).not.toContain("pc_permissions_list");
+    expect(t.controller.requestPcPermissions()).toBe(false);
+    t.controller.openPcPermissions();
+    expect(t.controller.setPcPermission("p-0123456789abcdef", true)).toBe(false);
+    expect(t.sentTypes().filter((x) => x.startsWith("pc_"))).toEqual([]);
+    t.receive({ type: "pc_permissions_count", unseen: 3 });
+    expect(pcPermissionsBadgeCount(t.controller.getState())).toBe(0);
+  });
+
+  it("list after welcome for the count (without marking anything seen); pc_permissions_count changes it; gone while disconnected", () => {
+    const t = setup(undefined, ["pc_permissions"]);
+    expect(t.controller.getState().pcPermissions.requestId).toBe("t1");
+    t.receive(frame("t1"));
+    expect(pcPermissionsBadgeCount(t.controller.getState())).toBe(1);
+    expect(t.sentTypes()).not.toContain("pc_permissions_seen"); // the page is not open
+    t.receive({ type: "pc_permissions_count", unseen: 4 });
+    expect(pcPermissionsBadgeCount(t.controller.getState())).toBe(4);
+    t.drop();
+    expect(pcPermissionsBadgeCount(t.controller.getState())).toBe(0);
+  });
+
+  it("opening the page lists the rows, then sends pc_permissions_seen once the list with new rows arrived", () => {
+    const t = ready();
+    t.controller.openPcPermissions();
+    expect(t.sent).toEqual([{ type: "pc_permissions_list", id: "t2" }]);
+    t.receive(frame("t2"));
+    expect(t.sent.at(-1)).toEqual({ type: "pc_permissions_seen", id: "t3" });
+    expect(t.controller.getState().pcPermissions.acting).toBe("seen");
+    t.receive(frame("t3", { rows: [row({ seen: true })] }));
+    expect(pcPermissionsBadgeCount(t.controller.getState())).toBe(0);
+    // A refresh with nothing new sends no second seen.
+    t.controller.requestPcPermissions();
+    t.receive(frame("t4", { rows: [row({ seen: true })] }));
+    expect(t.sentTypes().filter((x) => x === "pc_permissions_seen")).toHaveLength(1);
+  });
+
+  it("the list sent on welcome marks the rows seen when the page is already open (reconnect with the page open)", () => {
+    const t = setup(undefined, ["pc_permissions"]);
+    t.controller.openPcPermissions(); // refused: the welcome list is in flight
+    t.receive(frame("t1"));
+    expect(t.sent.at(-1)).toMatchObject({ type: "pc_permissions_seen" });
+  });
+
+  it("after the page closed, a new list marks nothing seen; an unavailable list never does", () => {
+    const t = ready();
+    t.controller.openPcPermissions();
+    t.controller.closePcPermissions();
+    t.receive(frame("t2"));
+    expect(t.sentTypes()).not.toContain("pc_permissions_seen");
+    t.controller.openPcPermissions();
+    t.receive(frame("t3", { rows: [], available: false }));
+    expect(t.sentTypes()).not.toContain("pc_permissions_seen");
+  });
+
+  it("switch: pc_permission_set with an explicit value; only for a listed row, a changed value, canManage and an available list", () => {
+    const t = ready();
+    expect(t.controller.setPcPermission("p-0123456789abcdef", false)).toBe(false); // already off
+    expect(t.controller.setPcPermission("p-ffffffffffffffff", true)).toBe(false); // not listed
+    expect(t.controller.setPcPermission("p-0123456789abcdef", true)).toBe(true);
+    expect(t.sent).toEqual([{ type: "pc_permission_set", id: "t2", rowId: "p-0123456789abcdef", enabled: true }]);
+    expect(t.controller.getState().pcPermissions.acting).toEqual({ rowId: "p-0123456789abcdef", enabled: true });
+    expect(t.controller.setPcPermission("p-0123456789abcdef", true)).toBe(false); // one request at a time
+    t.receive(frame("t2", { rows: [row({ enabled: true, seen: true })] }));
+    expect(t.controller.getState().pcPermissions.rows?.[0]?.enabled).toBe(true);
+    expect(t.sentTypes()).not.toContain("pc_permissions_seen"); // a switch answer is not a list
+
+    const viewer = ready(frame("t1", { canManage: false }));
+    expect(viewer.controller.setPcPermission("p-0123456789abcdef", true)).toBe(false);
+    const broken = ready(frame("t1", { rows: [], available: false }));
+    expect(broken.controller.setPcPermission("p-0123456789abcdef", true)).toBe(false);
+    expect([...viewer.sent, ...broken.sent]).toEqual([]);
+  });
+
+  it("errors stay on the page (not_allowed, pc_permissions_unavailable), never a chat notice; a timeout fails the request", () => {
+    const t = ready();
+    t.controller.setPcPermission("p-0123456789abcdef", true);
+    t.receive({ type: "error", id: "t2", code: "not_allowed", message: "x" });
+    expect(t.controller.getState().pcPermissions).toMatchObject({ status: "error", errorCode: "not_allowed", acting: null });
+    expect(t.controller.getState().notice).toBeNull();
+    expect(t.controller.getState().pcPermissions.rows?.[0]?.enabled).toBe(false);
+    vi.useFakeTimers();
+    try {
+      t.controller.requestPcPermissions();
+      vi.advanceTimersByTime(PC_PERMISSIONS_TIMEOUT_MS);
+      expect(t.controller.getState().pcPermissions.errorCode).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("PC permission frames never notify, vibrate or play a sound (also in the background)", () => {
+    const t = setup(undefined, ["pc_permissions"]);
+    t.adapter.isVisible = () => false;
+    t.controller.openPcPermissions();
+    t.receive(frame("t1"));
+    t.receive({ type: "pc_permissions_count", unseen: 9 });
+    t.receive(frame("t2", { rows: [row({ seen: true })] }));
+    expect(t.adapter.notify).not.toHaveBeenCalled();
+    expect(t.adapter.vibrate).not.toHaveBeenCalled();
+    expect(t.adapter.playback.play).not.toHaveBeenCalled();
+    expect(t.calls).toEqual([]);
+  });
+
+  it("typed text and voice never send a switch: 'Steam iznini aç' is a turn, not pc_permission_set", async () => {
+    const t = ready();
+    t.controller.sendText("Steam iznini aç");
+    await t.controller.startTalk();
+    await t.controller.stopTalk();
+    await flush();
+    expect(t.sentTypes()).toContain("user_text");
+    expect(t.sentTypes().filter((x) => x.startsWith("pc_"))).toEqual([]);
   });
 });

@@ -18,8 +18,10 @@ shell) uses. TypeScript types for all frames live in a single module:
   `true`, `notifications` is the last count read (0 if none since startup), not a real count:
   show the inbox as unreadable ("!"), not as empty. It turns `false` again with the next call
   that reads the file (a `notifications_list`, an action, a producer's call). Older Cores omit the field;
-  treat a missing field as `false`. Numbers and a flag only, no titles. Remote callers get the
-  body without `inbox`.
+  treat a missing field as `false`. With the feature `pc_permissions` the object also has
+  `"pc":<unseen>`: the PC permission rows not yet seen on the İzinler page (see *PC
+  permissions*; added in protocol 1 without a version bump, T17.2; 0 while the list is
+  unavailable). Numbers and a flag only, no titles. Remote callers get the body without `inbox`.
 - Device state: `POST http://<core-host>:<CORE_PORT>/device/state` (bearer token; see *Device state*).
 - Every frame is a JSON **text** frame with a `type` field. Binary frames are rejected.
 - `id` is a client-generated turn id (string, 1–128 chars). The Core echoes it on
@@ -62,12 +64,15 @@ refuses to start.
 | `{"type":"dev_action","id":"d2","itemId":"…","action":"add_rule"\|"ignore"\|"fixed"\|"remove_rule"\|"accept"}` | One action on one Development item (feature `dev`; `accept` only with `ha_urgency_feedback`). See *Development*. |
 | `{"type":"notifications_list","id":"q1"}` | Ask for the notification inbox (feature `notifications`). See *Notifications*. |
 | `{"type":"notification_action","id":"q2","notificationId":"n-…","action":"read"\|"unread"\|"delete"\|"suppress"\|"urgent_yes"\|"urgent_no"}` | One action on one notification (feature `notifications`; `suppress` only with `notifications_suppress`; `urgent_yes` / `urgent_no` only with `ha_urgency_feedback`). See *Notifications*. |
+| `{"type":"pc_permissions_list","id":"p1"}` | Ask for the PC permission list (feature `pc_permissions`). See *PC permissions*. |
+| `{"type":"pc_permission_set","id":"p2","rowId":"p-3f9a1c2e5b7d0a11","enabled":true}` | Switch one PC permission row (feature `pc_permissions`; only devices in `CORE_PC_PERMISSION_DEVICES`). See *PC permissions*. |
+| `{"type":"pc_permissions_seen","id":"p3"}` | Mark every PC permission row seen (feature `pc_permissions`). See *PC permissions*. |
 
 ## Core → Client
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -83,6 +88,8 @@ refuses to start.
 | `{"type":"notifications","id":"q1","items":[…],"unread":1}` | Reply to `notifications_list` / `notification_action`. See *Notifications*. |
 | `{"type":"notification","item":{…},"speak"?:true}` | A notification was raised or changed (every authenticated socket; `speak` on at most one). See *Notifications*. |
 | `{"type":"notification_removed","notificationId":"n-…"}` | A notification was deleted or resolved (every authenticated socket). See *Notifications*. |
+| `{"type":"pc_permissions","id":"p1","rows":[…],"unseen":1,"canManage":true,"available":true}` | Reply to `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`. See *PC permissions*. |
+| `{"type":"pc_permissions_count","unseen":1}` | The PC permission badge count changed (every authenticated socket; feature `pc_permissions`). See *PC permissions*. |
 | `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…","retryAt"?:<epoch ms>}` | See *Errors*. `retryAt` only with `usage_limit`. |
@@ -108,6 +115,7 @@ The protocol number stays 1.
 | `notifications` | The notification inbox is available: `notifications_list` / `notification_action` are answered and `notification` / `notification_removed` are sent. Without it clients hide the inbox and its badge. |
 | `notifications_suppress` | `notification_action` also accepts `action:"suppress"` ("Tekrar gösterme", see *Notifications*). Without it clients offer only `delete` (an older Core answers `suppress` with `bad_request`). |
 | `ha_urgency_feedback` | Learned urgency of Home Assistant alerts (T7.w.11.10): `notification_action` also accepts `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") on `source:"ha"` items, and the Development tab may list `kind:"ha_urgency"` suggestions that take `dev_action` `accept` ("Kabul") or `ignore` ("Yok say"). Without it clients offer neither (an older Core answers both actions with `bad_request`). |
+| `pc_permissions` | The PC permission list (T17.2, docs/11 D3): `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` are answered and `pc_permissions_count` is sent. Without it clients hide the İzinler page and its count. |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -127,9 +135,10 @@ Agent SDK's `mcp__<service>__` prefix.
 | `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
-| `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted). |
-| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). `notification_action` `urgent_yes` / `urgent_no`: the item's Home Assistant alert type is not known yet (a repair the Core has not listed from HA since it started; try again later). |
+| `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted); `pc_permission_set` names a `rowId` that is not in the list. |
+| `not_allowed` | `dev_action`: the action is not valid for the item (e.g. `fixed` on a rule), or this device may not do it (`add_rule` / `remove_rule` outside `CORE_DEV_DEVICES`). `notification_action` `urgent_yes` / `urgent_no`: the item's Home Assistant alert type is not known yet (a repair the Core has not listed from HA since it started; try again later). `pc_permission_set` from a device not in `CORE_PC_PERMISSION_DEVICES` (unset = nobody). |
 | `notifications_unavailable` | `notifications_list` / `notification_action` while the Core cannot read its notifications file (see *Notifications*): the inbox is unknown, not empty. |
+| `pc_permissions_unavailable` | `pc_permission_set` / `pc_permissions_seen` while the PC permission list could not be loaded (see *PC permissions*); nothing is changed. Added in protocol 1 (T17.2). |
 | `internal` | Unexpected server error. |
 
 Clients must treat unknown `code` values as generic errors.
@@ -379,6 +388,73 @@ them or the producer resolves them.
   error. An invalid file that could be moved aside is kept as
   `notifications.json.corrupt-<ts>` and the inbox starts empty (one warning in
   the Core log).
+
+## PC permissions
+
+With the feature `pc_permissions` (T17.2). Design:
+[`docs/11-pc-control.md` §D3](11-pc-control.md#d3-permission-list-store-row-identity-protocol-who-may-switch).
+One row per PC action + target with a switch; everything is off by default. A
+row is added (off) only by a refused PC request (from T17.4 on); the page never
+adds rows, and there is no delete in v1. Display plus one switch, never a push
+or a sound. Nothing in T17.2 runs a PC action.
+
+```json
+{"type":"pc_permissions","id":"p1","unseen":1,"canManage":true,"available":true,
+ "rows":[{"rowId":"p-3f9a1c2e5b7d0a11","action":"open_app","kind":"app","label":"Steam",
+          "enabled":false,"seen":false,"requests":2,
+          "createdAt":"2026-11-14T18:00:00.000Z","lastRequestedAt":"2026-11-14T18:05:00.000Z",
+          "changedAt"?:"…"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `rowId` | `p-` + 16 hex digits (deterministic for action + target); send it back as `pc_permission_set.rowId`. |
+| `action` | `open_app`, `close_app`, `force_close_app`, `open_site`, `web_search`, `media_search`, `volume`, `media`, `lock`, `sleep`, `shutdown`, `restart`, `play_game`. Clients show unknown values as-is. |
+| `kind` | Target kind: `app`, `steam`, `epic`, `battlenet`, `site`, `search`, `system`. |
+| `label` | The target's display name (`Steam`, `youtube.com`, `Ses düzeyi`); the client adds the verb of `action` ("Steam · aç"). |
+| `enabled`, `seen` | The switch; `seen: false` = added by a refused request and not yet seen on the page. |
+| `requests`, `createdAt`, `lastRequestedAt`, `changedAt` | How often it was asked for, ISO 8601 times; `changedAt` only after a switch. |
+| `unseen` | Badge count: rows with `seen: false`. |
+| `canManage` | Whether this device may send `pc_permission_set`. |
+| `available` | `false` when the Core could not load its list (then `rows` is empty and `unseen` 0). |
+
+Rows never carry the target id, spoken aliases, search texts or device names.
+Rows are sorted most recently requested first.
+
+- `pc_permissions_list` is answered with `pc_permissions` (same `id`), also
+  while the list is unavailable (`available: false`).
+- `pc_permission_set` sets `enabled` to the given value (explicit, never a
+  toggle: a repeat changes nothing and answers the fresh list) and marks the
+  row seen; answered with a fresh `pc_permissions`. Every change is logged with
+  the device.
+- `pc_permissions_seen` marks every row seen (the UI sends it after the list
+  arrived on the open page); answered with a fresh `pc_permissions`.
+- Errors (with `id`): `pc_permission_set` from a device not listed in
+  `CORE_PC_PERMISSION_DEVICES` (unset or empty = nobody) → `not_allowed`, checked
+  first; list unavailable → `pc_permissions_unavailable`; unknown `rowId` →
+  `unknown_item`; the file could not be written → `internal` (nothing changed);
+  malformed frame (`rowId` not `p-` + 16 hex digits, `enabled` not a boolean) →
+  `bad_request`. `pc_permissions_seen` while unavailable →
+  `pc_permissions_unavailable`.
+- `pc_permissions_list` and `pc_permissions_seen` are open to every authenticated
+  device (they do not change what the PC does).
+- The device is the one from the token, never `hello.client`.
+- **Only this frame switches a row.** `user_text` and `audio` only start turns;
+  no router rule, model tool or learned rule produces `pc_permission_set` or
+  reaches the store's switch (docs/11 D3 "Structural separation", pinned by
+  core tests). A stolen token of a listed device can still send it: keep the
+  list short.
+- `pc_permissions_count` is sent to every authenticated socket when the unseen
+  count changes, only by a Core with the feature `pc_permissions`.
+  `pc_permissions` frames go only to the requesting socket.
+- Store: `<SHADOW_DATA_DIR>/pc/permissions.json`, read once at startup, written
+  atomically on every change. A corrupt file is moved aside
+  (`permissions.json.corrupt-<ts>`); a corrupt or unreadable file leaves the
+  list **unavailable** until the Core restarts: nothing is written (the
+  quarantined copy keeps the grants), every PC command is refused. It stays
+  unavailable after a restart while the file is missing and a `.corrupt-<ts>`
+  copy is next to it. Recovery is by hand (restore the quarantined copy or a
+  backup; delete the copies to start empty on purpose) and a restart.
 
 ## Voices
 

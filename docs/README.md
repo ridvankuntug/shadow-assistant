@@ -6,3 +6,4 @@ Project documentation and plans.
 - [`08-learning-fast-path.md`](08-learning-fast-path.md): learning fast path, Development tab, notification store (T7.w design).
 - [`09-notification-producers.md`](09-notification-producers.md): notification producers for backup, services and HA alerts (T7.w.11 design).
 - [`10-android-updates.md`](10-android-updates.md): signed GitHub Releases and in-app update for the Android app (T14).
+- [`11-pc-control.md`](11-pc-control.md): PC control (`pc-svc`) and the switched permission list (T17 design; T17.2 permission list implemented).
