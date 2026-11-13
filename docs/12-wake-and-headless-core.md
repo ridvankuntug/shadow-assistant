@@ -510,6 +510,8 @@ login checks; OneDrive "Always keep on this device" (or Q6).
 Each has a recommended default; the implementation uses the default until the
 user decides.
 
+**Onaylandı 2026-11-13:** the user approved Q1–Q9 with the defaults below.
+
 | # | Question | Default |
 |---|---|---|
 | Q1 | The box's LAN address goes into the public repo's NSC (like the PC's address already does). OK, or HTTPS through Tailscale instead (then at home the phone needs Tailscale on too)? | Cleartext LAN address in the NSC, same as the Core. |
@@ -562,3 +564,8 @@ user decides.
   systemd over Docker for a stdlib daemon, separate Android store for the wake
   token, `/health` polling instead of TCP, give-up exit code for the task
   restart, `tray.log`, `not_connected` instead of `no_session`).
+- 2026-11-13: T21.3.1 done: `services/wake-svc/` (stdlib-only server, pytest
+  suite without network beyond loopback, README). Additions to D1 found in
+  review: a 10 s whole-connection deadline (the 5 s timeout is per read) and
+  a bounded lingering close; `retryAfterS` reports the longer wait when both
+  wake limits apply; a failed send gives the attempt back. Default port 8704.

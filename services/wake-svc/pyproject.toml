@@ -1,0 +1,11 @@
+[project]
+name = "wake-svc"
+version = "0.1.0"
+description = "Wake-on-LAN HTTP endpoint for Shadow Assistant (one fixed MAC, standard library only)"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,2 @@
+# Test dependencies only. The service itself uses the Python standard library (no requirements.txt).
+pytest>=8
