@@ -33,15 +33,21 @@ type Stored = Pick<NotificationItem, "source" | "key" | "urgency" | "title" | "b
 /** Records every call; keeps keyed items like the store does. */
 class FakeCenter implements BackupNotificationPort {
   readonly raises: RaiseInput[] = [];
+  /** `onlyIfExists` raises that found no item (T20.2): nothing created. */
+  readonly missed: RaiseInput[] = [];
   readonly resolves: string[] = [];
   readonly items = new Map<string, Stored>();
   unavailable = false;
   constructor(private readonly clock: () => number) {}
   async raise(input: RaiseInput): Promise<RaiseResult> {
     if (this.unavailable) return { ok: false, reason: "unavailable" };
-    this.raises.push(input);
     const k = `${input.source}|${input.key}`;
     const prev = this.items.get(k);
+    if (input.onlyIfExists && !prev) {
+      this.missed.push(input);
+      return { ok: false, reason: "missing" };
+    }
+    this.raises.push(input);
     const stamp = iso(this.clock());
     const item = {
       source: input.source,
@@ -201,6 +207,59 @@ test("running older than 2 h 15 min: backup:failed 'takıldı'; later failed for
   assert.equal(h.center.raises.length, 2);
   assert.equal(h.center.raises[1]!.renotify, false);
   assert.match(h.center.raises[1]!.body ?? "", /arşivleme/);
+  // T20.2: the text update only updates an existing item; the first raise creates.
+  assert.equal(h.center.raises[0]!.onlyIfExists, undefined);
+  assert.equal(h.center.raises[1]!.onlyIfExists, true);
+});
+
+test("T20.2: an item deleted before a text update is not recreated; a new failed run raises it again", async () => {
+  const h = setup();
+  h.write(running("r1", T0, T0 - 24 * H));
+  h.set(T0 + BACKUP_STUCK_MS + 1);
+  await h.check();
+  assert.equal(h.center.items.size, 1);
+  // The user deletes the item ("Gördüm") before the same run's failure updates the text.
+  h.center.items.clear();
+  h.write(failed("r1", T0 + BACKUP_STUCK_MS + 2 * 60_000, T0 - 24 * H, "archive"));
+  h.set(T0 + BACKUP_STUCK_MS + 3 * 60_000);
+  await h.check();
+  assert.equal(h.center.items.size, 0);
+  assert.equal(h.center.raises.length, 1);
+  assert.equal(h.center.missed.length, 1);
+  // The same text is not tried again on the next round.
+  h.set(T0 + BACKUP_STUCK_MS + 4 * 60_000);
+  await h.check();
+  assert.equal(h.center.missed.length, 1);
+  assert.equal(h.center.raises.length, 1);
+  // A new failed run is a new condition: created again with renotify.
+  h.write(failed("r2", T0 + 24 * H, T0 - 24 * H));
+  h.set(T0 + 24 * H + 60_000);
+  await h.check();
+  assert.equal(h.center.items.size, 1);
+  assert.equal(h.center.raises.at(-1)!.renotify, true);
+  assert.equal(h.center.raises.at(-1)!.onlyIfExists, undefined);
+  // The key stayed open meanwhile: ok resolves it.
+  h.write(ok("r3", T0 + 25 * H));
+  h.set(T0 + 25 * H);
+  await h.check();
+  assert.deepEqual(h.center.resolves, [BACKUP_KEY_FAILED]);
+  assert.equal(h.center.items.size, 0);
+});
+
+test("T20.2: the 72 h urgent escalation still raises over an item the user deleted", async () => {
+  const h = setup();
+  h.write(ok("r1", T0));
+  h.set(T0 + 30 * H);
+  await h.check();
+  assert.equal(h.center.raises[0]!.key, BACKUP_KEY_STALE);
+  h.center.items.clear();
+  h.set(T0 + BACKUP_URGENT_MS + 1);
+  await h.check();
+  assert.equal(h.center.items.size, 1);
+  const r = h.center.raises.at(-1)!;
+  assert.equal(r.urgency, "urgent");
+  assert.equal(r.renotify, true);
+  assert.equal(r.onlyIfExists, undefined);
 });
 
 test("stale: 26 h boundary, ok after resolves", async () => {

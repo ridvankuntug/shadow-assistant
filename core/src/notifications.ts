@@ -14,7 +14,9 @@
  * - `key` (optional, unique per `source`) dedupes a recurring condition: a
  *   raise on an existing key replaces title / body / urgency and bumps
  *   `updatedAt` and `raised`; it becomes unread again only with
- *   `renotify: true`. Without a key every raise is a new item.
+ *   `renotify: true`. Without a key every raise is a new item. A keyed raise
+ *   with `onlyIfExists` (T20.2) never creates: it answers `missing` when the
+ *   item is gone (deleted by the user), checked in the same store step.
  * - Items are kept until deleted or resolved; nothing is pruned. The hard limit
  *   (MAX_ITEMS) only refuses new keyless raises (logged).
  * - `readAt` is shared across devices.
@@ -71,6 +73,13 @@ export interface RaiseInput {
   body?: string;
   /** On an existing key: make the item unread again. */
   renotify?: boolean;
+  /**
+   * Keyed raise only (T20.2): update the item only if it still exists; never
+   * create it (`missing` instead). The check and the update are one step of
+   * the store, so an item the user deletes after a producer last saw it is
+   * not recreated (nor spoken) by a text update. Keyless + this is `invalid`.
+   */
+  onlyIfExists?: boolean;
 }
 
 export type RaiseResult =
@@ -80,9 +89,11 @@ export type RaiseResult =
    * limit; `unavailable`: the file could not be read; `suppressed` (NotificationCenter only, never the
    * store, T7.w.11.7): the user chose "Tekrar gösterme" for this source + key and the condition has not
    * resolved yet, so nothing was created, changed, broadcast or spoken. A producer counts the key as open
-   * (it must still `resolve` it when the condition ends: that removes the suppression).
+   * (it must still `resolve` it when the condition ends: that removes the suppression). `missing`
+   * (T20.2): an `onlyIfExists` raise found no item of the key (the user deleted it); nothing was
+   * created, changed, broadcast or spoken.
    */
-  | { ok: false; reason: "invalid" | "full" | "unavailable" | "suppressed" };
+  | { ok: false; reason: "invalid" | "full" | "unavailable" | "suppressed" | "missing" };
 
 /**
  * Quiet hours for urgent speech (T7.w.11.9, docs/09): a daily window
@@ -232,6 +243,7 @@ export class NotificationStore {
             if (clean.renotify) existing.readAt = null;
             return { result: { ok: true, item: copy(existing), created: false }, changed: true };
           }
+          if (clean.onlyIfExists) return { result: { ok: false, reason: "missing" }, changed: false };
         } else if (inbox.items.size >= this.maxItems) {
           this.o.log?.(`[shadow-core] notifications: limit of ${this.maxItems} items reached; keyless raise from "${clean.source}" refused`);
           return { result: { ok: false, reason: "full" }, changed: false };
@@ -480,12 +492,14 @@ function newId(items: ReadonlyMap<string, NotificationItem>): string {
 
 function normalizeInput(input: RaiseInput): Required<Omit<RaiseInput, "key">> & { key?: string } | undefined {
   if (typeof input !== "object" || input === null) return undefined;
-  const { source, key, urgency = "normal", title, body = "", renotify = false } = input;
+  const { source, key, urgency = "normal", title, body = "", renotify = false, onlyIfExists = false } = input;
   if (typeof source !== "string" || !SOURCE_RE.test(source)) return undefined;
   if (key !== undefined && (typeof key !== "string" || key.length === 0 || key.length > MAX_KEY_CHARS)) return undefined;
   if (typeof urgency !== "string" || !URGENCIES.has(urgency)) return undefined;
   if (typeof title !== "string" || title.trim().length === 0) return undefined;
   if (typeof body !== "string" || typeof renotify !== "boolean") return undefined;
+  // A keyless raise always creates: "only if it exists" has no item to find (a producer bug).
+  if (typeof onlyIfExists !== "boolean" || (onlyIfExists && key === undefined)) return undefined;
   return {
     source,
     ...(key !== undefined ? { key } : {}),
@@ -493,6 +507,7 @@ function normalizeInput(input: RaiseInput): Required<Omit<RaiseInput, "key">> & 
     title: title.trim().slice(0, MAX_TITLE_CHARS),
     body: body.trim().slice(0, MAX_BODY_CHARS),
     renotify,
+    onlyIfExists,
   };
 }
 

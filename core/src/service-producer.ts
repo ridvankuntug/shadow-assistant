@@ -414,9 +414,10 @@ export class ServiceProducer {
   /**
    * Raises or updates the item. New item: renotify (it opens the key);
    * escalation to urgent: renotify (spoken once); otherwise only a changed
-   * text is written, without renotify, and only while the item still exists:
-   * an item the user deleted is not recreated (a raise would create it, and
-   * an urgent new item would be spoken). Returns a retry deadline on failure.
+   * text is written, without renotify, and only while the item still exists
+   * (`onlyIfExists`, atomic in the store, T20.2): an item the user deleted is
+   * not recreated (a plain raise would create it, and an urgent new item would
+   * be spoken). Returns a retry deadline on failure.
    */
   private async show(t: Track, now: number, want: Want): Promise<number | undefined> {
     const cur = t.open;
@@ -427,21 +428,10 @@ export class ServiceProducer {
       return undefined;
     }
     const renotify = opening || escalating;
-    if (cur && !renotify) {
-      if (t.deleted) return undefined;
-      let exists: boolean;
-      try {
-        exists = (await this.o.notifications.list()).some((i) => i.source === SERVICE_SOURCE && i.key === t.def.key);
-      } catch {
-        t.failed = true;
-        return now + RETRY_MS;
-      }
-      if (!exists) {
-        t.deleted = true;
-        this.o.logger.info(`[shadow-core] service producer: ${t.def.key} deleted by the user; not updated until it resolves`);
-        return undefined;
-      }
-    }
+    // A text update: only while the item still exists, checked by the store in the same step as
+    // the write (T20.2), so a delete between our last look and this raise cannot recreate it.
+    const update = !!cur && !renotify;
+    if (update && t.deleted) return undefined;
     let r: RaiseResult;
     try {
       r = await this.o.notifications.raise({
@@ -451,10 +441,16 @@ export class ServiceProducer {
         title: want.title,
         body: want.body,
         renotify,
+        ...(update ? { onlyIfExists: true } : {}),
       });
     } catch {
       t.failed = true;
       return now + RETRY_MS;
+    }
+    if (!r.ok && r.reason === "missing") {
+      t.deleted = true;
+      this.o.logger.info(`[shadow-core] service producer: ${t.def.key} deleted by the user; not updated until it resolves`);
+      return undefined;
     }
     if (!r.ok && r.reason !== "suppressed") {
       if (r.reason !== "unavailable") this.o.logger.warn(`[shadow-core] service producer: ${t.def.key} raise refused (${r.reason})`);

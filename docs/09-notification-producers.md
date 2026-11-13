@@ -64,6 +64,16 @@ service the Core depends on going down, and Home Assistant's own alerts.
 - **Startup reconcile:** existing items of the producer's `source` are adopted as
   "raised", so a condition that ended while the Core was down is resolved by the
   normal recovery rule instead of staying forever.
+- **Text updates only touch an existing item (T20.2):** the service and backup
+  producers raise a text-only update of an open item (no renotify) with
+  `onlyIfExists: true`. The store checks for the item and writes in the same
+  step and answers `missing` when it is gone, so an item the user deleted after
+  the producer last saw it is not recreated (nor spoken when urgent); the
+  producer keeps the key open (its end still resolves it) and does not retry the
+  text. A new condition (first raise, a new failed backup run, the urgent
+  escalation) raises without it and creates the item as before. Fixes the delete
+  race of the earlier "list, then raise" check. The HA producer does not use it
+  (an HA update of a deleted item recreates it by decision, see (c)).
 
 ### (a) Backup failure
 
@@ -94,7 +104,9 @@ service the Core depends on going down, and Home Assistant's own alerts.
   items wait for its result); a failure resolves `backup:stale` (it explains it); an
   invalid file keeps the open items, a removed file resolves them; an adopted
   `backup:failed` is renotified only if the run in the file ended after the item's
-  last update.
+  last update. An item the user deleted is not recreated by a text update of the
+  same run (T20.2, see *Common rules*); a new failed run or the 72 h escalation
+  raises it again.
 - **Varsayılan — kullanıcı onayı bekliyor:** with `lastSuccessAt: null` (no run ever
   succeeded) the 72 h urgency counts from the earliest known start: the earliest
   `startedAt` seen since the Core started, or the `createdAt` of an open backup item
@@ -158,7 +170,8 @@ service the Core depends on going down, and Home Assistant's own alerts.
     resolves like `disabled`; `loading` counts as "more than 180 s" (strict).
   - An open item the user deleted is not recreated by a text update (detail
     change, new outage in the back window) until the condition resolves; the HA
-    30 min urgent re-raise still recreates it (spoken once).
+    30 min urgent re-raise still recreates it (spoken once). Since T20.2 the
+    "still exists" check is the store's (`onlyIfExists`), not a separate list.
 
 ### (c) Home Assistant's own alerts
 

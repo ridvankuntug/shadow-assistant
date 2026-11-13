@@ -24,6 +24,10 @@
  *   last success is recent again (a fresh `ok` always is).
  * - A run in progress (`running`, not stuck) changes nothing: the open items
  *   wait for its result.
+ * - A text-only update of an open item (same run, no escalation) is written
+ *   only while the item still exists (`onlyIfExists`, T20.2): an item the user
+ *   deleted ("Gördüm") is not recreated by it. A new failed run or the urgent
+ *   escalation raises it again as before.
  * - No file = backup not set up = no notification (open items are resolved).
  *   An unreadable or invalid file is logged once (until a valid read) and
  *   changes nothing.
@@ -439,6 +443,7 @@ export class BackupProducer {
       return;
     }
     let renotify: boolean;
+    let update = false;
     if (!cur) {
       renotify = true;
     } else {
@@ -453,6 +458,10 @@ export class BackupProducer {
         cur.updatedAt = undefined;
         return;
       }
+      // A text update (same run, same urgency): only while the item still exists, checked by the
+      // store in the same step as the write (T20.2). A new failed run or the urgent escalation
+      // raises as before, also over an item the user deleted.
+      update = !renotify;
     }
     const r = await this.o.notifications.raise({
       source: BACKUP_SOURCE,
@@ -461,7 +470,15 @@ export class BackupProducer {
       title: want.title,
       body: want.body,
       renotify,
+      ...(update ? { onlyIfExists: true } : {}),
     });
+    if (!r.ok && r.reason === "missing") {
+      // Deleted by the user ("Gördüm"): the key stays open (its end resolves it) with the new text,
+      // so the same text is not tried again; a new run or the escalation raises it again.
+      this.open.set(key, { urgency: want.urgency, title: want.title, body: want.body, runId: want.runId, updatedAt: undefined });
+      this.o.logger.info(`[shadow-core] backup producer: ${key} deleted by the user; not updated until it resolves`);
+      return;
+    }
     if (!r.ok && r.reason !== "suppressed") {
       if (r.reason !== "unavailable") this.o.logger.warn(`[shadow-core] backup producer: ${key} raise refused (${r.reason})`);
       return;

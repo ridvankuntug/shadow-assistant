@@ -160,6 +160,64 @@ test("keys are per source; keyless raises are always new items; urgency default 
   );
 });
 
+test("onlyIfExists (T20.2): updates an existing keyed item, never creates one (missing, nothing written)", async () => {
+  const dir = freshDir();
+  const c = clock("2026-11-07T10:00:00Z");
+  const store = new NotificationStore({ coalesceMs: 0, dir, now: c.now });
+  const KEY = { source: "service", key: "service:tts-svc" } as const;
+
+  // Never raised: missing, no file written.
+  assert.deepEqual(await store.raise({ ...KEY, title: "x", onlyIfExists: true }), { ok: false, reason: "missing" });
+  assert.equal(existsSync(join(dir, NOTIFICATIONS_FILE)), false);
+
+  const first = await store.raise({ ...KEY, title: "Ses servisi yanıt vermiyor", body: "a" });
+  assert.ok(first.ok && first.created);
+  await store.markRead(first.item.id);
+  c.set("2026-11-07T10:02:00Z");
+  const upd = await store.raise({ ...KEY, title: "Ses servisi yanıt vermiyor", body: "b", urgency: "urgent", onlyIfExists: true });
+  assert.ok(upd.ok);
+  assert.equal(upd.created, false);
+  assert.equal(upd.item.id, first.item.id);
+  assert.equal(upd.item.body, "b");
+  assert.equal(upd.item.urgency, "urgent");
+  assert.equal(upd.item.raised, 2);
+  assert.notEqual(upd.item.readAt, null, "no renotify: stays read");
+  assert.equal(upd.item.updatedAt, iso(c.now()));
+
+  // Deleted by the user: missing; the inbox stays empty on disk.
+  assert.equal(await store.delete(first.item.id), true);
+  assert.deepEqual(await store.raise({ ...KEY, title: "x", urgency: "urgent", renotify: true, onlyIfExists: true }), { ok: false, reason: "missing" });
+  assert.deepEqual(await store.list(), []);
+  assert.deepEqual(disk(dir).items, []);
+
+  // Resolved: missing too. Another source's same key is not the item.
+  assert.ok((await store.raise({ ...KEY, title: "x" })).ok);
+  await store.resolve(KEY.source, KEY.key);
+  assert.deepEqual(await store.raise({ ...KEY, title: "x", onlyIfExists: true }), { ok: false, reason: "missing" });
+  assert.ok((await store.raise({ source: "backup", key: KEY.key, title: "y" })).ok);
+  assert.deepEqual(await store.raise({ ...KEY, title: "x", onlyIfExists: true }), { ok: false, reason: "missing" });
+
+  // Without onlyIfExists a raise of a deleted key still creates (a new condition).
+  const again = await store.raise({ ...KEY, title: "x" });
+  assert.ok(again.ok && again.created);
+});
+
+test("onlyIfExists (T20.2): a delete queued before the update wins; the check and the write are one step", async () => {
+  const dir = freshDir();
+  const store = new NotificationStore({ coalesceMs: 0, dir });
+  const r = await store.raise({ source: "backup", key: "backup:failed", title: "Yedekleme başarısız" });
+  assert.ok(r.ok);
+  // The producer saw the item; the user's delete and the producer's update are then issued back to back.
+  const [deleted, update] = await Promise.all([
+    store.delete(r.item.id),
+    store.raise({ source: "backup", key: "backup:failed", title: "Yedekleme takıldı", onlyIfExists: true }),
+  ]);
+  assert.equal(deleted, true);
+  assert.deepEqual(update, { ok: false, reason: "missing" });
+  assert.deepEqual(await store.list(), []);
+  assert.deepEqual(disk(dir).items, []);
+});
+
 test("markRead / markUnread / delete; unknown ids; readAt is shared (one inbox)", async () => {
   const dir = freshDir();
   const c = clock("2026-11-07T10:00:00Z");
@@ -194,6 +252,9 @@ test("invalid raises are refused and logged; title/body are trimmed and cut", as
     { source: "test", title: "x", urgency: "loud" },
     { source: "test", title: "x", body: 7 },
     { source: "test", title: "x", renotify: "yes" },
+    { source: "test", title: "x", key: "k", onlyIfExists: "yes" },
+    // T20.2: a keyless raise always creates, so "only if it exists" is a producer bug.
+    { source: "test", title: "x", onlyIfExists: true },
   ]) {
     assert.deepEqual(await store.raise(bad as never), { ok: false, reason: "invalid" }, JSON.stringify(bad));
   }

@@ -27,6 +27,8 @@ type Stored = Pick<NotificationItem, "source" | "key" | "urgency" | "title" | "b
 
 class FakeCenter implements ServiceNotificationPort {
   readonly raises: RaiseInput[] = [];
+  /** `onlyIfExists` raises that found no item (T20.2): nothing created. */
+  readonly missed: RaiseInput[] = [];
   readonly resolves: string[] = [];
   lists = 0;
   attempts = 0;
@@ -36,8 +38,12 @@ class FakeCenter implements ServiceNotificationPort {
   async raise(input: RaiseInput): Promise<RaiseResult> {
     this.attempts++;
     if (this.unavailable) return { ok: false, reason: "unavailable" };
-    this.raises.push(input);
     const prev = this.items.get(input.key ?? "");
+    if (input.onlyIfExists && !prev) {
+      this.missed.push(input);
+      return { ok: false, reason: "missing" };
+    }
+    this.raises.push(input);
     const item = {
       source: input.source,
       key: input.key,
@@ -490,6 +496,10 @@ test("an item the user deleted is not recreated by a detail change (no new urgen
   await h.shown(32 * M, { "home-assistant": ["down", "timeout"] });
   assert.equal(h.center.raises.length, before);
   assert.equal(h.center.items.size, 0);
+  // T20.2: one update was tried with onlyIfExists (the store answered `missing`); no further tries.
+  assert.equal(h.center.missed.length, 1);
+  assert.equal(h.center.missed[0]!.onlyIfExists, true);
+  assert.equal(h.center.missed[0]!.renotify, false);
   // Recovery resolves (nothing to delete), a new outage raises a new item again.
   await h.shown(33 * M, { "home-assistant": "ok" });
   await h.to(34 * M);
@@ -498,6 +508,55 @@ test("an item the user deleted is not recreated by a detail change (no new urgen
   assert.equal(h.center.raises.length, before + 1);
   assert.equal(h.center.raises.at(-1)!.renotify, true);
   assert.equal(h.center.raises.at(-1)!.urgency, "normal");
+  await h.producer.close();
+});
+
+test("T20.2: only a text update is raised with onlyIfExists; a new item and the urgent re-raise create as before", async () => {
+  const h = await setup();
+  await h.shown(0, { "home-assistant": ["down", "timeout"] });
+  await h.to(90 * S);
+  await h.shown(2 * M, { "home-assistant": ["down", "unreachable"] });
+  await h.to(30 * M);
+  const [opening, update, escalation] = h.center.raises;
+  assert.equal(h.center.raises.length, 3);
+  assert.equal(opening!.renotify, true);
+  assert.equal(opening!.onlyIfExists, undefined);
+  assert.equal(update!.renotify, false);
+  assert.equal(update!.onlyIfExists, true);
+  assert.equal(escalation!.urgency, "urgent");
+  assert.equal(escalation!.renotify, true);
+  assert.equal(escalation!.onlyIfExists, undefined);
+  // The update path no longer reads the whole inbox first (the store checks in the same step).
+  assert.equal(h.center.lists, 1); // startup adoption only
+  await h.producer.close();
+});
+
+test("T20.2: an item deleted between the producer's last look and the update is not recreated", async () => {
+  const h = await setup();
+  await h.shown(0, { "tts-svc": ["down", "timeout"] });
+  await h.to(90 * S);
+  assert.equal(h.center.items.size, 1);
+  // The user deletes the item right before the update reaches the store.
+  const orig = h.center.raise.bind(h.center);
+  h.center.raise = async (input) => {
+    h.center.items.delete("service:tts-svc");
+    return orig(input);
+  };
+  await h.shown(2 * M, { "tts-svc": ["down", "unreachable"] });
+  assert.equal(h.center.items.size, 0);
+  assert.equal(h.center.raises.length, 1);
+  assert.equal(h.center.missed.length, 1);
+  assert.ok(h.logs.some((l) => l.includes("service:tts-svc deleted by the user")));
+  h.center.raise = orig;
+  // Still open: recovery resolves it; the next outage is a new item again.
+  await h.shown(3 * M, { "tts-svc": "ok" });
+  await h.to(4 * M);
+  assert.deepEqual(h.center.resolves, ["service:tts-svc"]);
+  await h.shown(10 * M, { "tts-svc": "down" });
+  await h.to(10 * M + 90 * S);
+  assert.equal(h.center.items.size, 1);
+  assert.equal(h.center.raises.at(-1)!.renotify, true);
+  assert.equal(h.center.raises.at(-1)!.onlyIfExists, undefined);
   await h.producer.close();
 });
 
