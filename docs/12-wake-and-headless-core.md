@@ -612,3 +612,15 @@ user decides.
   decision): both stay `429` + `Retry-After`, the body's `error` is
   `auth_locked` for the lockout and `rate_limited` for the wake limit;
   response contract table in D1, D2 flow: neither `429` enters WAKING.
+- 2026-11-16: T21.3.3 done (Android): `WakeAddress`, `WakeStore` (own
+  Keystore alias `shadow.wakeToken.v1`, own file `shadow_wake`), `WakeFlow`
+  (pure Kotlin, fake clock/scheduler/HTTP in `WakeFlowTest`), `WakeNet`
+  (`HttpURLConnection`, no redirects), `WakeDialog`, the third button on the
+  Core panel and the waking panel. Deviation from D2 "Network rules" / Q1:
+  the wake host is **not** committed; the network security config is
+  generated at build time from `android/app/src/main/nsc/` with the Gradle
+  property `shadowWakeHost` / environment `SHADOW_WAKE_HOST` (also
+  `BuildConfig.WAKE_CLEARTEXT_HOST`); without it only an `https://` wake
+  address is accepted. The CI workflow still has to pass `SHADOW_WAKE_HOST`
+  (not part of this step). An answer outside the contract (another status,
+  a `503` without `send_failed`) shows "beklenmeyen yanıt (HTTP n)".

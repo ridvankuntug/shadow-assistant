@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools" tools:locale="tr">
     <string name="app_name">Shadow</string>
     <string name="notification_channel">Onay istekleri</string>
     <string name="notification_channel_items">Bildirimler</string>
@@ -23,6 +23,41 @@
 
     <string name="error_local_network_title">Yerel ağ izni gerekli</string>
     <string name="error_local_network_message">Çekirdek yerel ağ adresinde (evde Wi-Fi, dışarıda Tailscale üzerinden) çalışıyor; Android bu adrese bağlanmak için \"Yerel ağ\" izni istiyor. İzin verilmeden çekirdeğe bağlanılamaz. Tekrar dene ile izni yeniden iste ya da Ayarları aç → İzinler bölümünden \"Yerel ağ\" iznini aç.</string>
+
+    <!-- Waking the PC from the Core error panel (docs/12 D2). -->
+    <string name="wake_button">Bilgisayarı uyandır</string>
+    <string name="wake_settings_button">Uyandırma ayarı</string>
+    <string name="wake_cancel">İptal</string>
+    <string name="wake_close">Kapat</string>
+    <string name="wake_again">Tekrar uyandır</string>
+    <string name="wake_title">Bilgisayar uyandırılıyor</string>
+    <string name="wake_sending">Uyandırma isteği gönderiliyor…</string>
+    <string name="wake_waking">Uyandırma isteği gönderildi, bilgisayar açılıyor… %1$s</string>
+    <string name="wake_rate_limited">Az önce bir uyandırma isteği gönderildi; biraz bekle.</string>
+    <string name="wake_rate_limited_wait">Az önce bir uyandırma isteği gönderildi; biraz bekle (yaklaşık %1$s).</string>
+    <string name="wake_wait_seconds">%1$d sn</string>
+    <string name="wake_wait_minutes">%1$d dk</string>
+    <string name="wake_auth_locked">Uyandırma anahtarı yanlış ya da geçici kilit var.</string>
+    <string name="wake_unauthorized">Uyandırma anahtarı kabul edilmedi.</string>
+    <string name="wake_send_failed">Uyandırma cihazı paketi gönderemedi.</string>
+    <string name="wake_unreachable">Uyandırma cihazına ulaşılamadı. Evde değilsen Tailscale açık mı?</string>
+    <string name="wake_unexpected">Uyandırma cihazından beklenmeyen bir yanıt geldi (HTTP %1$d). Uyandırma adresini kontrol et.</string>
+    <string name="wake_timed_out">Uyandırma paketi gönderildi ama bilgisayar yanıt vermedi. Bilgisayar kapalıysa uyandırma ayarlarını kontrol et (docs/12, C); açıksa Shadow çekirdeği başlamamış olabilir.</string>
+
+    <string name="wake_dialog_title">Uyandırma ayarı</string>
+    <string name="wake_dialog_message">Her zaman açık kutudaki uyandırma servisinin adresi ve anahtarı. Anahtar yalnız bu telefonda, şifreli saklanır; arayüz onu göremez.</string>
+    <string name="wake_dialog_address_hint">Adres, ör. http://adres:8704</string>
+    <string name="wake_dialog_token_hint">Uyandırma anahtarı (yapıştır)</string>
+    <string name="wake_dialog_token_keep_hint">Kayıtlı anahtar korunur; değiştirmek için yenisini yapıştır</string>
+    <string name="wake_dialog_save">Kaydet</string>
+    <string name="wake_dialog_delete">Sil</string>
+    <string name="wake_dialog_cancel">Vazgeç</string>
+    <string name="wake_dialog_address_invalid">Geçerli bir adres gir: http://adres:port (yol, sorgu yok).</string>
+    <string name="wake_dialog_address_cleartext">Şifresiz (http://) yalnız %1$s adresine izinli; başka bir adres için https:// kullan.</string>
+    <string name="wake_dialog_address_no_cleartext">Bu derlemede şifresiz uyandırma adresi tanımlı değil; yalnız https:// adres kullanılabilir.</string>
+    <string name="wake_dialog_token_missing">Uyandırma anahtarını yapıştır.</string>
+    <string name="wake_dialog_token_invalid">Anahtar boşluk ya da özel karakter içeremez.</string>
+    <string name="wake_dialog_save_failed">Anahtar güvenli biçimde saklanamadı; hiçbir şey kaydedilmedi.</string>
 
     <!-- In-app update (docs/10): launcher shortcut and UpdateActivity. -->
     <string name="update_shortcut_short">Güncelle</string>

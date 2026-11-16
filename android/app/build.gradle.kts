@@ -39,6 +39,69 @@ val copyUiBundle = tasks.register<CopyUiBundle>("copyUiBundle") {
     uiDist.set(rootProject.layout.projectDirectory.dir("../ui/dist"))
 }
 
+/**
+ * docs/12 D2: the wake endpoint (wake-svc on the always-on box) is plain HTTP
+ * on the LAN like the Core, so its host needs a cleartext entry in the network
+ * security config. The address must not be committed to this public repository,
+ * so it comes from the build: Gradle property `shadowWakeHost` (`-P…`,
+ * `~/.gradle/gradle.properties`) or the environment variable SHADOW_WAKE_HOST
+ * (CI). Unset means no cleartext wake host: the app then accepts only an
+ * `https://` wake address. An IPv4 address or a plain DNS name only (it goes
+ * into XML and Kotlin source, so nothing else is let through).
+ */
+val shadowWakeHost: String = (
+    providers.gradleProperty("shadowWakeHost").orNull
+        ?: providers.environmentVariable("SHADOW_WAKE_HOST").orNull
+    )?.trim().orEmpty().also { host ->
+    val ipv4 = Regex("""^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$""")
+    val dnsName = Regex("""^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$""")
+    val numeric = host.all { it.isDigit() || it == '.' }
+    if (host.isNotEmpty() && !(if (numeric) ipv4.matches(host) else dnsName.matches(host))) {
+        throw GradleException("shadowWakeHost / SHADOW_WAKE_HOST must be an IPv4 address or a DNS name")
+    }
+}
+
+/**
+ * Writes res/xml/network_security_config.xml from the template in
+ * src/main/nsc/, replacing the `<!-- WAKE_HOST -->` marker with the wake host's
+ * `<domain>` (or dropping it when there is none). The output is a generated
+ * resource folder of every variant; the unit tests read it back.
+ */
+abstract class GenerateNetworkSecurityConfig : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val template: RegularFileProperty
+
+    @get:Input
+    abstract val wakeHost: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val text = template.get().asFile.readText()
+        val marker = "<!-- WAKE_HOST -->"
+        if (text.split(marker).size != 2) throw GradleException("NSC template must contain $marker exactly once")
+        val host = wakeHost.get()
+        val entry = if (host.isEmpty()) "" else """<domain includeSubdomains="false">$host</domain>"""
+        val out = outputDir.get().asFile.resolve("xml")
+        out.deleteRecursively()
+        out.mkdirs()
+        out.resolve("network_security_config.xml").writeText(text.replace(marker, entry))
+    }
+}
+
+val generateNetworkSecurityConfig = tasks.register<GenerateNetworkSecurityConfig>("generateNetworkSecurityConfig") {
+    template.set(layout.projectDirectory.file("src/main/nsc/network_security_config.xml"))
+    wakeHost.set(shadowWakeHost)
+}
+
+/** Tells the unit tests where the generated NSC is (checked against Core/WakeAddress). */
+class GeneratedNscArgument(@get:Internal val dir: Provider<Directory>) : CommandLineArgumentProvider {
+    override fun asArguments() = listOf("-Dshadow.generatedNscDir=${dir.get().asFile.absolutePath}")
+}
+
 // Release signing is configured only when the keystore is provided through the
 // environment (CI decodes it from a secret at build time; see README). Nothing
 // signing-related lives in the repository.
@@ -66,6 +129,8 @@ android {
         }
         versionCode = ciVersionCode ?: 1
         versionName = "$versionBase.${ciVersionCode ?: 0}"
+        // docs/12 D2: WakeAddress.CLEARTEXT_HOST; "" when no wake host is configured (see shadowWakeHost).
+        buildConfigField("String", "WAKE_CLEARTEXT_HOST", "\"$shadowWakeHost\"")
     }
 
     signingConfigs {
@@ -99,7 +164,16 @@ android {
 androidComponents {
     onVariants { variant ->
         variant.sources.assets?.addGeneratedSourceDirectory(copyUiBundle, CopyUiBundle::outputDir)
+        variant.sources.res?.addGeneratedSourceDirectory(generateNetworkSecurityConfig, GenerateNetworkSecurityConfig::outputDir)
     }
+}
+
+tasks.withType<Test>().configureEach {
+    // An input (not only an ordering): a changed NSC re-runs the allowlist test.
+    inputs.dir(generateNetworkSecurityConfig.flatMap { it.outputDir })
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+        .withPropertyName("generatedNsc")
+    jvmArgumentProviders.add(GeneratedNscArgument(generateNetworkSecurityConfig.flatMap { it.outputDir }))
 }
 
 dependencies {

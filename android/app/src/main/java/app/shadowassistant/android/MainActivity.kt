@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -27,6 +28,7 @@ import android.webkit.WebView
 import android.widget.Button
 import android.widget.TextView
 import androidx.core.view.ViewCompat
+import androidx.core.view.isVisible
 import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.WebResourceErrorCompat
 import androidx.webkit.WebViewAssetLoader
@@ -67,6 +69,8 @@ class MainActivity : Activity() {
     private lateinit var errorMessage: TextView
     private lateinit var retryButton: Button
     private lateinit var secondaryButton: Button
+    private lateinit var wakeButton: Button
+    private lateinit var wakeSettingsButton: Button
 
     private lateinit var storage: BridgeStorage
     private lateinit var focus: AudioFocus
@@ -77,6 +81,14 @@ class MainActivity : Activity() {
     private lateinit var notifier: Notifier
     private lateinit var probe: CoreProbe
     private lateinit var gemini: GeminiLauncher
+    private lateinit var wakeStore: WakeStore
+    private lateinit var wakeScheduler: ExecutorWakeScheduler
+    private lateinit var wake: WakeFlow
+    private lateinit var wakeDialog: WakeDialog
+
+    /** The last "Core unreachable" result while its panel is shown: the only place the wake button appears. */
+    private var unreachable: CoreStatus.Unreachable? = null
+    private val wakeTicker = Runnable { renderCorePanel() }
 
     @Volatile
     private var trustedPage = false
@@ -99,6 +111,8 @@ class MainActivity : Activity() {
         errorMessage = findViewById(R.id.error_message)
         retryButton = findViewById(R.id.error_retry)
         secondaryButton = findViewById(R.id.error_secondary)
+        wakeButton = findViewById(R.id.error_wake)
+        wakeSettingsButton = findViewById(R.id.error_wake_settings)
         applyInsets()
 
         storage = AppStorage.bridge(this) { Log.w(TAG, it) }
@@ -121,6 +135,13 @@ class MainActivity : Activity() {
         notifier = Notifier(this)
         probe = CoreProbe(main)
         gemini = GeminiLauncher(this)
+        wakeStore = AppStorage.wake(this) { Log.w(TAG, it) }
+        wakeScheduler = ExecutorWakeScheduler()
+        // States arrive on the wake thread; the panel always renders the flow's current state.
+        wake = WakeFlow(UrlConnectionWakeHttp(), wakeScheduler, SystemClock::elapsedRealtime) {
+            main.post { if (!destroyed) onWakeState() }
+        }
+        wakeDialog = WakeDialog(this, wakeStore)
 
         configureWebView()
 
@@ -245,6 +266,8 @@ class MainActivity : Activity() {
             notify = notifier::notify,
             notifyItem = notifier::notifyItem,
             onStorageChanged = { key ->
+                // A waking flow waits for one Core; another address stops it (docs/12 D2).
+                if (key == BridgeStorage.CORE_URL_KEY) wake.coreAddressChanged(storage.get(BridgeStorage.CORE_URL_KEY))
                 if (key == BridgeStorage.CORE_URL_KEY || key == BridgeStorage.TOKEN_KEY) checkCore()
                 // Connecting: the UI writes the address first and the token last, so trigger on the
                 // token only (the job then finds a matching address/token pair).
@@ -296,11 +319,15 @@ class MainActivity : Activity() {
         probe.check(storage.get(BridgeStorage.CORE_URL_KEY)) { status ->
             if (destroyed) return@check
             when (status) {
-                CoreStatus.Fine -> if (shownError == ErrorKind.CORE) hideError()
-                is CoreStatus.Unreachable -> showCoreError(
-                    getString(R.string.error_core_title),
-                    getString(R.string.error_core_message, status.endpoint.toString()),
-                )
+                // While waking, only the flow's /health poll decides (docs/12 D2: an open TCP port is not
+                // a usable Core yet); the flow closes the panel itself once the Core answers.
+                CoreStatus.Fine -> if (shownError == ErrorKind.CORE && !wake.active) hideError()
+                is CoreStatus.Unreachable -> {
+                    // A finished wake result is replaced by the fresh check; a running one keeps its panel.
+                    if (wake.state is WakeState.Stopped) wake.cancel()
+                    unreachable = status
+                    renderCorePanel()
+                }
                 is CoreStatus.CleartextBlocked -> showCoreError(
                     getString(R.string.error_cleartext_title),
                     getString(R.string.error_cleartext_message, status.endpoint.host, CoreAddress.CLEARTEXT_HOST),
@@ -330,30 +357,186 @@ class MainActivity : Activity() {
 
     /** [secondary] is the label of the second button (null: hidden); its action depends on [kind]. */
     private fun showPanel(kind: ErrorKind, title: String, message: String, secondary: String?) {
+        // Another panel replaces the Core-unreachable one: a running wake flow ends with it.
+        unreachable = null
+        main.removeCallbacks(wakeTicker)
+        wake.cancel()
+        setPanel(
+            kind,
+            title,
+            message,
+            primary = getString(R.string.error_retry) to {
+                when (kind) {
+                    ErrorKind.CORE -> checkCore()
+                    // Asks again; once permanently denied Android answers at once without a dialog.
+                    ErrorKind.LOCAL_NETWORK -> requestPermissions(arrayOf(LocalNetworkPermission.PERMISSION), REQ_LOCAL_NETWORK)
+                    else -> loadUi()
+                }
+            },
+            // Settings → Permissions; onResume re-checks when the user comes back.
+            secondary = secondary?.let { label -> label to { if (kind == ErrorKind.LOCAL_NETWORK) openAppSettings() else hideError() } },
+        )
+    }
+
+    /** Fills the panel; [wake] / [wakeSettings] show the wake buttons (Core-unreachable panel only). */
+    private fun setPanel(
+        kind: ErrorKind,
+        title: String,
+        message: String,
+        primary: Pair<String, () -> Unit>,
+        secondary: Pair<String, () -> Unit>?,
+        wake: Boolean = false,
+        wakeSettings: Boolean = false,
+    ) {
+        val wasShown = errorPanel.isVisible && shownError == kind
         shownError = kind
         errorTitle.text = title
         errorMessage.text = message
-        retryButton.setOnClickListener {
-            when (kind) {
-                ErrorKind.CORE -> checkCore()
-                // Asks again; once permanently denied Android answers at once without a dialog.
-                ErrorKind.LOCAL_NETWORK -> requestPermissions(arrayOf(LocalNetworkPermission.PERMISSION), REQ_LOCAL_NETWORK)
-                else -> loadUi()
-            }
-        }
+        retryButton.text = primary.first
+        retryButton.setOnClickListener { primary.second() }
         secondaryButton.visibility = if (secondary != null) View.VISIBLE else View.GONE
-        secondaryButton.text = secondary.orEmpty()
-        secondaryButton.setOnClickListener {
-            // Settings → Permissions; onResume re-checks when the user comes back.
-            if (kind == ErrorKind.LOCAL_NETWORK) openAppSettings() else hideError()
-        }
+        secondaryButton.text = secondary?.first.orEmpty()
+        secondaryButton.setOnClickListener { secondary?.second?.invoke() }
+        wakeButton.visibility = if (wake) View.VISIBLE else View.GONE
+        wakeButton.setOnClickListener { onWakePressed() }
+        wakeSettingsButton.visibility = if (wakeSettings) View.VISIBLE else View.GONE
+        wakeSettingsButton.setOnClickListener { wakeDialog.show() }
         errorPanel.visibility = View.VISIBLE
-        retryButton.requestFocus()
+        // Not on every tick of the waking timer: focus only moves when a panel first appears.
+        if (!wasShown) retryButton.requestFocus()
     }
 
     private fun hideError() {
         shownError = null
+        unreachable = null
         errorPanel.visibility = View.GONE
+        main.removeCallbacks(wakeTicker)
+        // Closing the panel ends a running wake flow (docs/12 D2).
+        wake.cancel()
+    }
+
+    // --- waking the PC (docs/12 D2) ---------------------------------------------------
+
+    /**
+     * The "Çekirdeğe ulaşılamıyor" panel in its current wake state. The wake
+     * button is offered only here (not for a blocked cleartext address, not on
+     * the local network permission panel).
+     */
+    private fun renderCorePanel() {
+        main.removeCallbacks(wakeTicker)
+        // Set only while this panel is meant to be up (cleared by showPanel / hideError).
+        val status = unreachable ?: return
+        if (destroyed) return
+        val coreTitle = getString(R.string.error_core_title)
+        val backToCore: () -> Unit = {
+            wake.cancel()
+            renderCorePanel()
+        }
+        val close = getString(R.string.wake_close) to backToCore
+        when (val state = wake.state) {
+            WakeState.Idle, WakeState.Done -> setPanel(
+                ErrorKind.CORE,
+                coreTitle,
+                getString(R.string.error_core_message, status.endpoint.toString()),
+                primary = getString(R.string.error_retry) to { checkCore() },
+                // "Adresi değiştir": back to the UI, whose settings/connect screen edits the address.
+                secondary = getString(R.string.error_change_address) to { hideError() },
+                wake = true,
+            )
+            WakeState.Sending -> setPanel(
+                ErrorKind.CORE,
+                getString(R.string.wake_title),
+                getString(R.string.wake_sending),
+                primary = getString(R.string.wake_cancel) to backToCore,
+                secondary = null,
+            )
+            is WakeState.Waking -> {
+                setPanel(
+                    ErrorKind.CORE,
+                    getString(R.string.wake_title),
+                    getString(R.string.wake_waking, WakeTime.elapsed(SystemClock.elapsedRealtime() - state.sinceMs)),
+                    primary = getString(R.string.wake_cancel) to backToCore,
+                    secondary = null,
+                    wakeSettings = true,
+                )
+                main.postDelayed(wakeTicker, 1_000)
+            }
+            is WakeState.Stopped -> renderWakeStop(state.reason, coreTitle, close)
+        }
+    }
+
+    private fun renderWakeStop(reason: WakeStop, title: String, close: Pair<String, () -> Unit>) {
+        val wakeAgain: () -> Unit = { onWakePressed() }
+        when (reason) {
+            WakeStop.Unauthorized, is WakeStop.AuthLocked -> setPanel(
+                ErrorKind.CORE,
+                title,
+                getString(if (reason == WakeStop.Unauthorized) R.string.wake_unauthorized else R.string.wake_auth_locked),
+                primary = getString(R.string.wake_settings_button) to { wakeDialog.show() },
+                secondary = close,
+            )
+            // A new press would only be limited again: the primary button checks whether the Core is up.
+            is WakeStop.RateLimited -> setPanel(
+                ErrorKind.CORE,
+                title,
+                reason.retryAfterS?.let { getString(R.string.wake_rate_limited_wait, waitText(it)) }
+                    ?: getString(R.string.wake_rate_limited),
+                primary = getString(R.string.error_retry) to { checkCore() },
+                secondary = close,
+                wakeSettings = true,
+            )
+            WakeStop.SendFailed, WakeStop.Unreachable, is WakeStop.Unexpected -> setPanel(
+                ErrorKind.CORE,
+                title,
+                when (reason) {
+                    WakeStop.SendFailed -> getString(R.string.wake_send_failed)
+                    is WakeStop.Unexpected -> getString(R.string.wake_unexpected, reason.status)
+                    else -> getString(R.string.wake_unreachable)
+                },
+                primary = getString(R.string.error_retry) to wakeAgain,
+                secondary = close,
+                wakeSettings = true,
+            )
+            WakeStop.TimedOut -> setPanel(
+                ErrorKind.CORE,
+                title,
+                getString(R.string.wake_timed_out),
+                primary = getString(R.string.wake_again) to wakeAgain,
+                secondary = close,
+                wakeSettings = true,
+            )
+        }
+    }
+
+    private fun waitText(seconds: Int): String {
+        val (value, minutes) = WakeTime.waitParts(seconds)
+        return getString(if (minutes) R.string.wake_wait_minutes else R.string.wake_wait_seconds, value)
+    }
+
+    /** First press without settings opens the dialog, which sends right after saving. */
+    private fun onWakePressed() {
+        if (destroyed || unreachable == null) return
+        val config = wakeStore.config()
+        val endpoint = config?.let { (WakeAddress.check(it.address) as? WakeAddress.Check.Ok)?.endpoint }
+        // No settings, an unreadable token, or an address this build does not allow: ask (again).
+        if (config == null || endpoint == null) {
+            wakeDialog.show(onSaved = ::onWakePressed)
+            return
+        }
+        val health = WakeAddress.coreHealthUrl(storage.get(BridgeStorage.CORE_URL_KEY)) ?: return
+        wake.start(WakeTarget(endpoint.wakeUrl, config.token, health))
+        renderCorePanel()
+    }
+
+    private fun onWakeState() {
+        if (wake.state == WakeState.Done) {
+            // The Core answers /health: do what a return to the foreground does, so the UI reconnects now.
+            hideError()
+            sendEvent("visibility", BridgeJs.visibility(true))
+            checkCore()
+            return
+        }
+        renderCorePanel()
     }
 
     /** Answers a bridge request exactly as docs/03 §4.2 shows. */
@@ -451,6 +634,10 @@ class MainActivity : Activity() {
         speaker.shutdown()
         recorder.shutdown()
         probe.shutdown()
+        main.removeCallbacks(wakeTicker)
+        wake.cancel()
+        wakeScheduler.shutdown()
+        wakeDialog.dismiss()
         focus.releaseAll()
         webView.removeJavascriptInterface("ShadowAndroid")
         webView.destroy()

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Template of res/xml/network_security_config.xml: the build (task
+  generateNetworkSecurityConfig, app/build.gradle.kts) copies it into a
+  generated resource folder and replaces the WAKE_HOST marker below with the
+  wake endpoint's host (docs/12 D2), or drops the marker when no wake host is
+  configured. The real wake host is never committed: it comes from the Gradle
+  property `shadowWakeHost` or the environment variable SHADOW_WAKE_HOST.
+
+  Cleartext (ws:// / http://) only to the Core's home address, which is the same
+  at home (LAN) and outside (Tailscale subnet router, WireGuard-encrypted), and
+  to the wake host (same reasoning, docs/12 D6).
+  Everything else must use TLS with a system CA (no user-installed CAs).
+  Keep the addresses in sync with CoreAddress.CLEARTEXT_HOST and
+  WakeAddress.CLEARTEXT_HOST (unit-tested against the generated file).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.2</domain>
+        <!-- WAKE_HOST -->
+    </domain-config>
+</network-security-config>

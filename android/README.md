@@ -30,7 +30,7 @@ role (opens from the assist gesture / power key).
 
 | Path | What |
 |---|---|
-| `app/build.gradle.kts` | App module; task `copyUiBundle` copies `../ui/dist` into the APK assets (`assets/ui/`) |
+| `app/build.gradle.kts` | App module; task `copyUiBundle` copies `../ui/dist` into the APK assets (`assets/ui/`); task `generateNetworkSecurityConfig` writes the network security config (see "Waking the PC") |
 | `MainActivity.kt` | WebView host, hardening, lifecycle (`visibility` events), native error screen |
 | `ShadowBridge.kt` | The `@JavascriptInterface` methods of `ShadowAndroid` |
 | `CaptureController.kt` | Microphone state machine of the contract (permission, background cut, cancel) |
@@ -39,11 +39,12 @@ role (opens from the assist gesture / power key).
 | `TokenCipher.kt`, `BridgeStorage.kt` | Keystore-encrypted device token, plain other keys |
 | `CoreAddress.kt`, `CoreProbe.kt` | Default Core address, cleartext allowlist, reachability check |
 | `LocalNetworkPermission.kt` | When the Android 17 local network permission is needed / asked at startup |
+| `WakeAddress.kt`, `WakeStore.kt`, `WakeFlow.kt`, `WakeNet.kt`, `WakeDialog.kt` | "Bilgisayarı uyandır" (docs/12 D2): wake address checks, encrypted wake token store, waking state machine, HTTP + scheduler, settings dialog |
 | `CaseBattery.kt`, `CaseBatterySync.kt` | Buds case battery: validation, Core request, receiver + WorkManager job |
 | `AppStorage.kt` | Opens the stores (shared by the activity and the background job) |
 | `Updater.kt`, `UpdateActivity.kt` | In-app update from GitHub Releases: checks (`UpdateRules`), download, `PackageInstaller`; shortcut dialog |
 | `assist/AssistServices.kt` | `VoiceInteractionService` + session + recognition stub |
-| `res/xml/network_security_config.xml` | Cleartext only to `192.168.1.2` |
+| `src/main/nsc/network_security_config.xml` | Template of the network security config: cleartext only to `192.168.1.2` (+ the wake host from the build) |
 
 ## Build
 
@@ -121,6 +122,46 @@ the app shows a native error screen with **Tekrar dene** and **Adresi
 değiştir** (back to the UI's settings to edit the address). The check is a
 plain TCP connect to the Core's host/port, run when the page has loaded, on
 every return to the foreground and after the address or token changes.
+
+**Waking the PC (docs/12 D2).** On the "Çekirdeğe ulaşılamıyor" panel (and
+only there: not for a blocked cleartext address, not for the local network
+panel) a third button **Bilgisayarı uyandır** sends `POST /wake` to wake-svc
+on the always-on box (docs/12 D1), which sends the Wake-on-LAN packet. The
+first press opens **Uyandırma ayarı**: the box's address (prefilled
+`http://<wake host>:8704` when the build has a wake host) and the wake token
+(password field, paste; never shown again, empty = keep the stored one;
+**Sil** deletes both). After `202` the panel shows "bilgisayar açılıyor…"
+with the elapsed time and polls the Core's `/health` every 5 s (3 s timeout)
+for at most 4 min; when the Core answers, the panel closes and the UI
+reconnects. `401` / `429 auth_locked` / `429 rate_limited` (also any other
+`429`) / `503 send_failed` / no answer each show their own text and never
+start the waiting (the `429`s are told apart by the body's `error`, as the
+docs/12 D1 contract says). **İptal**, closing the panel, leaving the app for
+good or changing the Core address stops the flow.
+
+- The wake token is AES-GCM under its **own** Keystore key
+  (`shadow.wakeToken.v1`) in its **own** SharedPreferences file
+  (`shadow_wake`), never a bridge key, so the page can never read it. If
+  encryption fails nothing is stored; an undecryptable token is deleted and
+  the dialog asks again. The token is never logged.
+- Plain `http://` is allowed only to the build's wake host; `https://` to any
+  host. The CSP does not change (the WebView never talks to the box).
+- **The wake host comes from the build, not from the repository.** The
+  network security config is generated from `app/src/main/nsc/` by the task
+  `generateNetworkSecurityConfig`, which adds a `<domain>` for the Gradle
+  property `shadowWakeHost` (or the environment variable `SHADOW_WAKE_HOST`);
+  the same value becomes `BuildConfig.WAKE_CLEARTEXT_HOST`
+  (`WakeAddress.CLEARTEXT_HOST`). Only an IPv4 address or a DNS name is
+  accepted. Local build: `./gradlew assembleDebug -PshadowWakeHost=<wake-host>`
+  or put `shadowWakeHost=<wake-host>` into `~/.gradle/gradle.properties`
+  (outside the repository). Without it the app accepts only an `https://` wake
+  address and the dialog says so. CI builds need the value too (see "CI and
+  signing").
+- Phone setup (once): install a build that has the wake host, open the app
+  while the PC is off, press **Bilgisayarı uyandır**, enter
+  `http://<wake-host>:<wake-port>` and paste the token from the box's
+  `/etc/credstore/wake-svc.token` (docs/05 section 5), **Kaydet**. The wake goes out right
+  after saving.
 
 **Local network permission (Android 17+).** With `targetSdk` 37, Android 17
 blocks connections to LAN addresses such as `192.168.1.2` — on Wi-Fi and
@@ -268,9 +309,14 @@ Local signed build (optional): set the same values as environment variables
 `SHADOW_KEY_ALIAS`, `SHADOW_KEY_PASSWORD` and run `./gradlew assembleRelease`.
 Without them `assembleRelease` produces an unsigned APK.
 
+**Wake host in CI.** The release APK needs the wake host in its network
+security config (see "Waking the PC"). The workflow must pass it to Gradle as
+`SHADOW_WAKE_HOST` (e.g. from a repository variable); without it the CI APK is
+built without a cleartext wake host and only an `https://` wake address works.
+
 The repository is public, so workflow artifacts can be downloaded by other
 GitHub users. The APK contains no token or address beyond the documented
-`192.168.1.2` default.
+`192.168.1.2` default and, if configured, the wake host (a LAN address).
 
 Signing keys (`*.jks`, `*.keystore`) and `local.properties` are git-ignored and
 must never be committed.

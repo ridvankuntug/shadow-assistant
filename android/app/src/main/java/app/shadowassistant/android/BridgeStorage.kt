@@ -8,6 +8,9 @@ interface KeyValueStore {
     fun get(key: String): String?
     fun put(key: String, value: String)
     fun remove(key: String)
+
+    /** Writes all [values] together; stores that can do it atomically override this. */
+    fun putAll(values: Map<String, String>) = values.forEach { (k, v) -> put(k, v) }
 }
 
 class SharedPrefsStore(private val prefs: SharedPreferences) : KeyValueStore {
@@ -18,6 +21,10 @@ class SharedPrefsStore(private val prefs: SharedPreferences) : KeyValueStore {
     override fun put(key: String, value: String) = prefs.edit(commit = true) { putString(key, value) }
 
     override fun remove(key: String) = prefs.edit(commit = true) { remove(key) }
+
+    // One editor, one commit: either every value reaches the disk or none does.
+    override fun putAll(values: Map<String, String>) =
+        prefs.edit(commit = true) { values.forEach { (k, v) -> putString(k, v) } }
 }
 
 /**

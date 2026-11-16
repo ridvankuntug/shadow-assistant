@@ -12,7 +12,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Native error screen: missing UI bundle, load failure, Core unreachable. -->
+    <!-- Native error screen: missing UI bundle, load failure, Core unreachable (+ waking the PC). -->
     <LinearLayout
         android:id="@+id/error_panel"
         android:layout_width="match_parent"
@@ -50,6 +50,15 @@
             android:layout_marginTop="28dp"
             android:text="@string/error_retry" />
 
+        <!-- Only on the "Çekirdeğe ulaşılamıyor" panel (docs/12 D2). -->
+        <Button
+            android:id="@+id/error_wake"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/wake_button"
+            android:visibility="gone" />
+
         <Button
             android:id="@+id/error_secondary"
             style="?android:attr/borderlessButtonStyle"
@@ -58,6 +67,16 @@
             android:layout_marginTop="8dp"
             android:text="@string/error_change_address"
             android:textColor="@color/shadow_accent"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/error_wake_settings"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/wake_settings_button"
+            android:textColor="@color/shadow_muted"
+            android:textSize="13sp"
             android:visibility="gone" />
     </LinearLayout>
 </FrameLayout>

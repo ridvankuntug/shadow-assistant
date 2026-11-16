@@ -38,8 +38,11 @@ class AddressAndOriginTest {
 
     @Test
     fun networkSecurityConfigMatchesTheAllowlist() {
-        val xml = File("src/main/res/xml/network_security_config.xml")
-        assertTrue("run from the app module directory", xml.isFile)
+        // The build generates the NSC from src/main/nsc/ (wake host from the build, docs/12 D2).
+        val dir = System.getProperty("shadow.generatedNscDir")
+        assertTrue("run through Gradle (generateNetworkSecurityConfig)", !dir.isNullOrEmpty())
+        val xml = File(dir, "xml/network_security_config.xml")
+        assertTrue("generated network security config missing: $xml", xml.isFile)
         val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(xml)
         val base = doc.getElementsByTagName("base-config").item(0)
         assertEquals("false", base.attributes.getNamedItem("cleartextTrafficPermitted").nodeValue)
@@ -47,9 +50,22 @@ class AddressAndOriginTest {
         assertEquals(1, configs.length)
         assertEquals("true", configs.item(0).attributes.getNamedItem("cleartextTrafficPermitted").nodeValue)
         val domains = doc.getElementsByTagName("domain")
-        assertEquals(1, domains.length)
-        assertEquals(CoreAddress.CLEARTEXT_HOST, domains.item(0).textContent.trim())
-        assertEquals("false", domains.item(0).attributes.getNamedItem("includeSubdomains").nodeValue)
+        val hosts = (0 until domains.length).map { domains.item(it).textContent.trim() }
+        val expected = listOfNotNull(CoreAddress.CLEARTEXT_HOST, WakeAddress.CLEARTEXT_HOST.takeIf { it.isNotEmpty() })
+        assertEquals(expected, hosts)
+        for (i in 0 until domains.length) {
+            assertEquals("false", domains.item(i).attributes.getNamedItem("includeSubdomains").nodeValue)
+        }
+    }
+
+    @Test
+    fun networkSecurityConfigTemplateHasTheWakeMarkerOnce() {
+        val text = File("src/main/nsc/network_security_config.xml").readText()
+        assertEquals(2, text.split("<!-- WAKE_HOST -->").size)
+        // The template itself holds only the Core's address; the wake host never enters the repository.
+        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(File("src/main/nsc/network_security_config.xml"))
+        assertEquals(1, doc.getElementsByTagName("domain").length)
+        assertFalse(File("src/main/res/xml/network_security_config.xml").exists())
     }
 
     @Test
