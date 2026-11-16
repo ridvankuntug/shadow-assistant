@@ -24,7 +24,8 @@ empty; every answer has `Cache-Control: no-store` and `Connection: close`.
 | `GET /health` | `200` | `{"status":"ok","service":"wake-svc","version":"0.1.0"}` (no MAC, no target, no counters) |
 | `POST /wake` + `Authorization: Bearer <wake token>` | `202` | `{"sent":true}`: the packets were handed to the network stack. **Not** proof that the PC woke. |
 | `POST /wake`, token missing / wrong / malformed | `401` | `{"error":"unauthorized"}` (+ `WWW-Authenticate: Bearer`) |
-| `POST /wake`, a rate limit hit | `429` | `{"error":"rate_limited","retryAfterS":N}` (+ `Retry-After: N`, whole seconds, at least 1) |
+| `POST /wake`, a wake was accepted moments ago (10 s / hourly limit) | `429` | `{"error":"rate_limited","retryAfterS":N}` (+ `Retry-After: N`, whole seconds, at least 1) |
+| `POST /wake`, the caller's address is locked after failed tokens | `429` | `{"error":"auth_locked","retryAfterS":N}` (+ `Retry-After: N`, whole seconds, at least 1) |
 | `POST /wake`, the packet could not be sent (socket error) | `503` | `{"error":"send_failed"}` |
 | known path, other method | `405` | empty (+ `Allow: GET` / `Allow: POST`) |
 | any other path | `404` | empty |
@@ -33,9 +34,13 @@ empty; every answer has `Cache-Control: no-store` and `Connection: close`.
 - The query string is ignored on both paths (`/wake?x=…` is `/wake`).
 - `Authorization` scheme is case-insensitive (`Bearer`, `bearer`); exactly one
   `Authorization` header, otherwise `401`.
-- `429` means either a wake was accepted moments ago (10 s / hourly limit) or
-  the caller's address is locked after failed tokens (see below); the body is
-  the same in both cases.
+- Both limits answer `429` ("too many requests, retry after N s"); the
+  `error` field tells them apart, so a client must branch on `error`, not on
+  the status alone: `rate_limited` = a wake was accepted recently (10 s / hourly limit),
+  `auth_locked` = this address sent too many wrong tokens (see below). During
+  a lockout the token is not checked, so `auth_locked` says nothing about the
+  token sent with that request. The failure that triggers the lockout is
+  itself still answered `401`. Client behaviour: docs/12, D2.
 - The `Server` header is just `wake-svc` (no versions).
 
 Example (placeholders; never paste a real token into a shell history you share):
@@ -101,16 +106,16 @@ WAKE_TOKEN_FILE=/path/to/wake-token python3 -m wake_svc.server
 
 **Deploy on the box:** the hardened systemd unit (`DynamicUser=yes`,
 `LoadCredential=`, sandboxing), the environment file example and the
-**[USER ACTION]** steps come with T21.3.2 (`deploy/linux/wake-svc.service`,
-`deploy/linux/wake-svc.env.example`, `docs/05-deploy.md`). Until then, run it
-by hand as above for a test.
+**[USER ACTION]** install steps are in `deploy/linux/wake-svc.service`,
+`deploy/linux/wake-svc.env.example` and `docs/05-deploy.md` section 5. Running
+it by hand as above is for a quick test only.
 
 ## Limits and hardening
 
 - Accepted wakes: at most **1 per 10 s** and **20 per hour** (global; there
   is one target).
 - Failed authentications: **5 per minute per source address**, then that
-  address gets `429` for **5 minutes** (even with the right token). The table
+  address gets `429` `auth_locked` for **5 minutes** (even with the right token). The table
   of addresses holds at most 1024 entries (least recently failed dropped).
   Failed attempts never use up the wake budget.
 - All limits live in memory: a restart resets them.

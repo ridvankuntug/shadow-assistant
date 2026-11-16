@@ -99,10 +99,39 @@ question Q2); the code is the same.
 |---|---|
 | `GET /health` | `200 {"status":"ok","service":"wake-svc","version":"…"}` (no MAC, no target, no counters) |
 | `POST /wake`, `Authorization: Bearer <wake token>` | `202 {"sent":true}`: the packets were handed to the network stack. **Not** proof that the PC woke. |
-| no / wrong token | `401 {"error":"unauthorized"}` |
-| rate limit hit | `429 {"error":"rate_limited","retryAfterS":N}` + `Retry-After` |
+| no / wrong token | `401 {"error":"unauthorized"}` + `WWW-Authenticate: Bearer` |
+| wake limit hit (a wake was accepted < 10 s ago, or 20 in the last hour) | `429 {"error":"rate_limited","retryAfterS":N}` + `Retry-After: N` |
+| caller's address locked after failed tokens | `429 {"error":"auth_locked","retryAfterS":N}` + `Retry-After: N` |
 | send failed (socket error) | `503 {"error":"send_failed"}` |
 | anything else (path, method) | `404` / `405`, empty body |
+
+**Response contract for clients (user decision 2026-11-16).** The lockout
+and the wake limit must be distinguishable. Both keep `429`: each is "too
+many requests from you, retry after N s" (RFC 6585), the answer carries the
+same `Retry-After`, and neither is a statement about the token (`401` would
+read as "wrong token", `403` as "this token is not allowed"). They differ
+only in the machine-readable `error` field, so **a client branches on
+`error`, never on the status alone**:
+
+| Status | `error` | Meaning | Phone (D2) |
+|---|---|---|---|
+| `202` | – (`{"sent":true}`) | packets handed to the network stack | WAKING |
+| `401` | `unauthorized` | the token sent with **this** request is missing, malformed or wrong | "key not accepted", no WAKING |
+| `429` | `auth_locked` | this source address sent 5 wrong tokens within a minute and is locked for 5 min; the token of this request was **not checked** (even the right one gets this) | "key wrong or temporary lockout", no WAKING |
+| `429` | `rate_limited` | a wake was accepted recently (10 s / hourly limit); not proof that a packet left (a send that failed at the same moment is given back) | "a wake was just sent, wait", no WAKING |
+| `429` | anything else / unreadable body | – (not produced by the service) | treat like `rate_limited`'s message without a wait, no WAKING |
+| `503` | `send_failed` | the packet could not be sent | "could not send", Tekrar dene |
+
+- Body fields: `error` (string), `retryAfterS` (integer seconds, ≥ 1) on
+  both `429`s; the `Retry-After` header carries the same number. The service
+  never puts the token, MAC or target into a body.
+- Order of checks: lockout → token → wake limit → send. So the failure that
+  triggers the lockout is still answered `401`; only later requests from
+  that address get `auth_locked`. A locked address gets `auth_locked` even
+  when the wake limit also applies.
+- The lockout is per source address: at home the box sees the phone's LAN
+  address, away (Tailscale) its tailnet address, so a lockout from one place
+  need not apply at the other.
 
 **Packet:** 6 × `0xFF` + 16 × MAC, UDP to port 9, sent **3 times 100 ms
 apart** to each configured broadcast address (default: the LAN's
@@ -129,8 +158,8 @@ static files, `Server` header without version.
 **Rate limits** (in memory, one lock, atomic check-and-set):
 - accepted wakes: at most 1 per 10 s and 20 per hour (global; there is one
   target);
-- failed authentications: 5 per minute per source address, then `429` for
-  that address for 5 min; the table is capped (oldest entries dropped), and
+- failed authentications: 5 per minute per source address, then `429`
+  `auth_locked` for that address for 5 min (even with the right token); the table is capped (oldest entries dropped), and
   failed attempts never consume the accepted-wake budget.
 
 **Logging:** one JSON line per request to stdout (journald): `ts`, `event`
@@ -182,7 +211,9 @@ unit-testable without Android):**
 ```
 press ─ POST /wake (timeout 5 s, no redirects)
   ├─ 202 ────────────── WAKING: "Uyandırma isteği gönderildi, bilgisayar açılıyor…"  (elapsed m:ss, İptal)
-  ├─ 429 ────────────── WAKING (a packet went out moments ago): "Az önce gönderildi; bekleniyor…"
+  ├─ 429 rate_limited ─ no WAKING: "Az önce bir uyandırma isteği gönderildi; biraz bekle." (+ wait from retryAfterS)
+  ├─ 429 auth_locked ── no WAKING: "Uyandırma anahtarı yanlış ya da geçici kilit var." + Uyandırma ayarı
+  ├─ 429 other ──────── no WAKING: same text as rate_limited, without a wait
   ├─ 401 ────────────── "Uyandırma anahtarı kabul edilmedi." + Uyandırma ayarı
   ├─ 503 ────────────── "Uyandırma cihazı paketi gönderemedi." + Tekrar dene
   └─ no connection ──── "Uyandırma cihazına ulaşılamadı. Evde değilsen Tailscale açık mı?" + Tekrar dene
@@ -194,6 +225,11 @@ WAKING: every 5 s GET http(s)://<core>/health (timeout 3 s), max 4 min
                          açıksa Shadow çekirdeği başlamamış olabilir." + Tekrar uyandır / Kapat
 ```
 
+- Neither `429` enters WAKING (user decision 2026-11-16): `rate_limited`
+  means an earlier press already sent (that flow, if still open, keeps
+  waiting; a new press only shows the hint), `auth_locked` means nothing was
+  sent. The branch is on the body's `error` (see the response contract in
+  D1), not on the status.
 - Polling uses `/health`, not a bare TCP connect: a half-booted machine can
   accept TCP before the Core is usable. Any `200` with `"service":"core"` is
   success; service problems are shown by the UI afterwards.
@@ -460,19 +496,22 @@ an `error`/answer text). Decide after the test (Q4).
   parsing (`:`/`-`, case) and rejection; body and query ignored (a MAC in the
   body changes nothing); token compare (missing, wrong, prefix, right); rate
   limits with a fake clock (10 s, hourly, auth lockout, failures not eating the
-  wake budget, table cap); responses and status codes; log lines contain no
+  wake budget, table cap); responses and status codes (`auth_locked` vs
+  `rate_limited`, lockout before the token and before the wake limit); log lines contain no
   token/MAC; startup refuses short token / bad MAC / wildcard bind. The socket
   sender is injected; one test sends to `127.0.0.1` and reads the datagram.
 - **wake-svc (manual, on the box):** `curl` with and without token;
   `journalctl -u wake-svc`; packet seen in Wireshark on the PC (D3 step 6).
-- **Android (JVM unit):** `WakeFlow` transitions for every answer and the
+- **Android (JVM unit):** `WakeFlow` transitions for every answer (both
+  `429` bodies and an unknown one) and the
   timeout with a fake clock and fake HTTP; cancellation on address change;
   `WakeAddress.CLEARTEXT_HOST` vs NSC XML; the dialog's host validation;
   `WakeStore` (encrypted, own alias, own file, never readable through
   `BridgeStorage`, failed encryption ⇒ not stored), following
   `TokenStorageTest`.
 - **Android (manual):** PC off at home → wake → UI connects; away on Tailscale;
-  wrong token; two presses within 10 s (429 path); box off.
+  wrong token; six wrong-token presses (`401`, then `429 auth_locked`, no
+  WAKING); two presses within 10 s (`429 rate_limited`, no WAKING); box off.
 - **Tray (xUnit):** headless exits 1 on give-up, 0 on clean Core exit; task
   mode never starts a Core after missed checks; restart actions call the task
   API (fake); `tray.log` vs `core.log` paths.
@@ -569,3 +608,7 @@ user decides.
   review: a 10 s whole-connection deadline (the 5 s timeout is per read) and
   a bounded lingering close; `retryAfterS` reports the longer wait when both
   wake limits apply; a failed send gives the attempt back. Default port 8704.
+- 2026-11-16: wake-svc lockout answer separated from the wake limit (user
+  decision): both stay `429` + `Retry-After`, the body's `error` is
+  `auth_locked` for the lockout and `rate_limited` for the wake limit;
+  response contract table in D1, D2 flow: neither `429` enters WAKING.

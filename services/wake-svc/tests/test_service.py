@@ -123,10 +123,10 @@ def test_five_failures_per_minute_lock_the_address_for_5_minutes(service, clock,
     for _ in range(AUTH_FAIL_MAX):
         assert service.handle_wake(SRC, ["Bearer nope"])[0] == 401
         clock.advance(1)
-    # locked: even the right token gets 429 from that address
+    # locked: even the right token gets 429 from that address, with its own error code
     status, body, headers = service.handle_wake(SRC, bearer())
     assert status == 429
-    assert body == {"error": "rate_limited", "retryAfterS": 299}  # locked at t+4 for 300 s, now t+5
+    assert body == {"error": "auth_locked", "retryAfterS": 299}  # locked at t+4 for 300 s, now t+5
     assert ("Retry-After", "299") in headers
     assert sender.payloads == []
     # another address is not affected
@@ -134,6 +134,27 @@ def test_five_failures_per_minute_lock_the_address_for_5_minutes(service, clock,
     clock.advance(AUTH_LOCKOUT_S)
     clock.advance(10)
     assert service.handle_wake(SRC, bearer())[0] == 202
+
+
+def test_lockout_answer_is_the_same_for_right_wrong_and_missing_token(service, clock) -> None:
+    for _ in range(AUTH_FAIL_MAX - 1):
+        assert service.handle_wake(SRC, ["Bearer nope"])[0] == 401
+    # the failure that locks the address is still answered 401 (the token was wrong)
+    assert service.handle_wake(SRC, ["Bearer nope"])[:2] == (401, {"error": "unauthorized"})
+    answers = [service.handle_wake(SRC, auth) for auth in (bearer(), ["Bearer nope"], [])]
+    for status, body, headers in answers:
+        assert (status, body) == (429, {"error": "auth_locked", "retryAfterS": 300})
+        assert ("Retry-After", "300") in headers
+
+
+def test_lockout_wins_over_the_wake_limit(service, clock) -> None:
+    assert service.handle_wake(OTHER, bearer())[0] == 202  # the wake interval now applies to everyone
+    for _ in range(AUTH_FAIL_MAX):
+        service.handle_wake(SRC, ["Bearer nope"])
+    status, body, _ = service.handle_wake(SRC, bearer())
+    assert (status, body["error"]) == (429, "auth_locked")
+    status, body, _ = service.handle_wake(OTHER, bearer())
+    assert (status, body["error"]) == (429, "rate_limited")
 
 
 def test_failures_older_than_a_minute_do_not_count(service, clock) -> None:

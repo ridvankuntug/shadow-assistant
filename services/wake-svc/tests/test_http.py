@@ -10,6 +10,8 @@ import pytest
 
 from conftest import MAC, TOKEN, FakeSender
 from wake_svc.server import (
+    AUTH_FAIL_MAX,
+    AUTH_LOCKOUT_S,
     MAX_BODY_BYTES,
     SOCKET_TIMEOUT_S,
     VERSION,
@@ -132,6 +134,18 @@ def test_wake_twice_429_with_retry_after(http_server) -> None:
     assert body["error"] == "rate_limited"
     assert isinstance(body["retryAfterS"], int) and 1 <= body["retryAfterS"] <= 10
     assert headers["Retry-After"] == str(body["retryAfterS"])
+
+
+def test_wake_lockout_429_auth_locked_with_retry_after(http_server, sender: FakeSender) -> None:
+    for _ in range(AUTH_FAIL_MAX):
+        assert request(http_server, "POST", "/wake", headers=auth(b"wrong"))[0] == 401
+    status, headers, data = request(http_server, "POST", "/wake", headers=auth())
+    assert status == 429
+    body = json.loads(data)
+    assert body["error"] == "auth_locked"
+    assert isinstance(body["retryAfterS"], int) and 1 <= body["retryAfterS"] <= AUTH_LOCKOUT_S
+    assert headers["Retry-After"] == str(body["retryAfterS"])
+    assert sender.payloads == []
 
 
 def test_wake_send_failure_503(http_server, sender: FakeSender) -> None:

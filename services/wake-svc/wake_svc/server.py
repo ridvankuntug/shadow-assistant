@@ -452,7 +452,8 @@ class WakeService:
 
         locked_for = self.limiter.auth_lockout(src, now)
         if locked_for is not None:
-            return self._rate_limited(src, locked_for, "auth_lockout")
+            # Checked before the token, so this answer says nothing about the token sent now.
+            return self._rate_limited(src, locked_for, "auth_lockout", error="auth_locked")
 
         if not self.token_ok(authorization):
             locked = self.limiter.auth_failed(src, now)
@@ -474,10 +475,17 @@ class WakeService:
         self.log({"event": "wake_sent", "src": src, "status": 202, "datagrams": sent})
         return 202, {"sent": True}, []
 
-    def _rate_limited(self, src: str, seconds: float, reason: str) -> Response:
+    def _rate_limited(self, src: str, seconds: float, reason: str, error: str = "rate_limited") -> Response:
+        """``429`` + ``Retry-After``; ``error`` tells the client which limit applies.
+
+        ``"rate_limited"``: a wake went out moments ago (``interval`` / ``hourly``).
+        ``"auth_locked"``: this address is locked after failed tokens (``auth_lockout``).
+        Both are "too many requests, retry after N s" (RFC 6585), so both keep
+        ``429``; clients must branch on ``error``, not on the status alone.
+        """
         retry = _retry_seconds(seconds)
         self.log({"event": "rate_limited", "src": src, "status": 429, "reason": reason, "retryAfterS": retry})
-        return 429, {"error": "rate_limited", "retryAfterS": retry}, [("Retry-After", str(retry))]
+        return 429, {"error": error, "retryAfterS": retry}, [("Retry-After", str(retry))]
 
 
 # --------------------------------------------------------------------------- HTTP
