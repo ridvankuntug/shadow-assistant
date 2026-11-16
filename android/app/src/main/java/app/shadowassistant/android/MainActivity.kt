@@ -50,16 +50,18 @@ import java.io.ByteArrayInputStream
  * - Every bundle response carries a strict Content-Security-Policy
  *   ([UiOrigin.CONTENT_SECURITY_POLICY]): scripts only from the bundle (no
  *   inline/eval, so no injected or `srcdoc` script can reach the bridge), no
- *   frames, and `connect-src` limited to the bundle, `ws://192.168.1.2` and
- *   `wss:`. WebSocket handshakes bypass shouldInterceptRequest, so the CSP is
- *   what actually keeps a plain `ws://` (and the token in `hello`) from going
- *   to any other host.
- * - Mixed content: the Core speaks plain `ws://` on the LAN/Tailscale address,
- *   and Chromium only lets an https page open `ws://` with
- *   MIXED_CONTENT_ALWAYS_ALLOW. Since all non-asset HTTP(S) requests are
- *   refused above, in practice that setting only admits WebSockets, which the
- *   CSP limits to 192.168.1.2 (plain) or TLS; the network security config
- *   limits cleartext to 192.168.1.2 as well.
+ *   frames, and `connect-src` limited to the bundle and `wss:` (plus
+ *   `ws://<host>` only for a development build's Core host,
+ *   [CoreAddress.CLEARTEXT_HOST]). WebSocket handshakes bypass
+ *   shouldInterceptRequest, so the CSP is what actually keeps a plain `ws://`
+ *   (and the token in `hello`) from going to any host.
+ * - Mixed content: the Core is reached through `wss://` (T21.3.3), so mixed
+ *   content stays forbidden (MIXED_CONTENT_NEVER_ALLOW). Only a development
+ *   build with a cleartext Core host needs MIXED_CONTENT_ALWAYS_ALLOW, because
+ *   Chromium lets an https page open `ws://` only with it; all non-asset
+ *   HTTP(S) requests are refused above, so in practice it then admits only
+ *   WebSockets, which the CSP and the network security config limit to that
+ *   one host (plain) or TLS.
  */
 class MainActivity : Activity() {
     private lateinit var main: Handler
@@ -117,7 +119,8 @@ class MainActivity : Activity() {
 
         storage = AppStorage.bridge(this) { Log.w(TAG, it) }
         val flags = AppStorage.flags(this)
-        storage.seedDefaults(flags)
+        // No built-in Core address (T21.3.3); an old plain ws:// one is dropped so the UI asks again.
+        storage.forgetUnusableCoreUrl()
 
         focus = AudioFocus(getSystemService(AudioManager::class.java), main)
         recorder = AudioRecordRecorder(main, focus)
@@ -199,7 +202,12 @@ class MainActivity : Activity() {
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
             mediaPlaybackRequiresUserGesture = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW // see class comment
+            // See class comment: plain ws:// exists only in a development build with a Core host.
+            mixedContentMode = if (CoreAddress.CLEARTEXT_HOST.isEmpty()) {
+                WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            } else {
+                WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            }
         }
         val assets = WebViewAssetLoader.Builder()
             .setDomain(UiOrigin.HOST)
@@ -330,7 +338,11 @@ class MainActivity : Activity() {
                 }
                 is CoreStatus.CleartextBlocked -> showCoreError(
                     getString(R.string.error_cleartext_title),
-                    getString(R.string.error_cleartext_message, status.endpoint.host, CoreAddress.CLEARTEXT_HOST),
+                    if (CoreAddress.CLEARTEXT_HOST.isEmpty()) {
+                        getString(R.string.error_cleartext_message_none, status.endpoint.host)
+                    } else {
+                        getString(R.string.error_cleartext_message, status.endpoint.host, CoreAddress.CLEARTEXT_HOST)
+                    },
                 )
             }
         }

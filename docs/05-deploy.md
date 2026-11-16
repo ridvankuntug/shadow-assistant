@@ -440,8 +440,9 @@ Python 3.10+ file using only the standard library: nothing to install besides
 Rules that do not change:
 
 - It listens on the box's **LAN address only**. It is **never** added to the
-  Cloudflare tunnel or any other public route. Away from home the phone
-  reaches it through the Tailscale subnet route, like the Core.
+  Cloudflare tunnel or any other public route. The phone reaches it, like the
+  Core, only through the box's tailnet-only HTTPS address ("HTTPS addresses
+  through Tailscale" below), at home and away.
 - The wake token is **separate** from every Core device token and only allows
   "send the magic packet". It lives in one root-only file and reaches the
   service through systemd `LoadCredential=`, never through the environment, a
@@ -572,42 +573,72 @@ journalctl -u wake-svc -n 5 --no-pager      # a "wake_sent" line, no token, no M
 with the PC shut down (docs/12, D3). Optional: `systemd-analyze security
 wake-svc` rates the unit's sandbox.
 
-### Optional: an HTTPS address through Tailscale
+### HTTPS addresses through Tailscale (recommended; required by the Android app)
 
-The Android app allows plain `http://` only to a wake host compiled into the
-build; an `https://` address works in every build (android/README.md, "Waking
-the PC"). If the box is on your tailnet, Tailscale can give wake-svc an HTTPS
-address with a valid certificate, so no address has to go into the build.
+The Android app talks to the Core only over `wss://` and to wake-svc only
+over `https://`; a released APK allows no cleartext and has no built-in
+address (android/README.md, "Network: home and away"). Tailscale `serve` on
+the box gives both a tailnet-only HTTPS address with a valid certificate, on
+the box's one ts.net name:
 
-Trade-offs: the phone needs **Tailscale connected** to wake the PC, at home
-too (the name resolves only on the tailnet). The box's machine name and your
-tailnet name appear in the public certificate transparency log. All requests
-then reach wake-svc from the box itself, so the wrong-token lockout is shared
-by every caller.
+| Address (tailnet only) | Proxied to | Entered in the phone as |
+| --- | --- | --- |
+| `https://<box>.<tailnet>.ts.net` (port 443) | the Core, `http://<pc-lan-ip>:8700` (incl. the WebSocket) | Core address `wss://<box>.<tailnet>.ts.net/ws` |
+| `https://<box>.<tailnet>.ts.net:8443` | wake-svc, `http://<box-lan-ip>:8704` | wake address `https://<box>.<tailnet>.ts.net:8443` |
+
+Costs of this path:
+
+- The phone needs **Tailscale connected at home too**: the name resolves
+  only on the tailnet.
+- **If the box is off** (or loses the LAN), the phone cannot reach the Core
+  at all, and cannot wake the PC either.
+- The box's machine name and your tailnet name appear in the public
+  **certificate transparency** logs.
+- Every request reaches wake-svc from the box itself, so the **wrong-token
+  lockout is shared by all callers**: a few wrong tokens from any tailnet
+  device lock out the phone too until the lockout ends.
+- The Core sees every phone connection as coming from the box's LAN address.
+  That is fine: the device token still decides, the `/health` `inbox` stays
+  loopback-only (the box is not loopback), and the Core never reads
+  `X-Forwarded-For`.
 
 1. **[USER ACTION]** In the Tailscale admin console, DNS page: enable
    **MagicDNS** and **HTTPS Certificates** (once per tailnet).
 
-2. **[USER ACTION]** On the box, proxy tailnet HTTPS to wake-svc. Use `serve`
-   (tailnet only), never `funnel` (public internet):
+2. **[USER ACTION]** On the PC, let the Core accept connections from the box:
+   `CORE_HOST=0.0.0.0` (or `<pc-lan-ip>`) in `.env`, and allow inbound TCP
+   8700 in the Windows firewall from `<box-lan-ip>` (android/README.md, "Core
+   setup"). Restart the Core.
+
+3. **[USER ACTION]** On the box, proxy tailnet HTTPS to the Core and to
+   wake-svc. Use `serve` (tailnet only), never `funnel` (public internet):
 
    ```sh
-   sudo tailscale serve --bg --https=443 http://<box-lan-ip>:8704
-   tailscale serve status      # shows https://<box>.<tailnet>.ts.net
+   sudo tailscale serve --bg --https=443 http://<pc-lan-ip>:8700
+   sudo tailscale serve --bg --https=8443 http://<box-lan-ip>:8704
+   tailscale serve status      # shows both https://<box>.<tailnet>.ts.net entries
    ```
 
-   `--bg` keeps the setting across reboots. If port 443 is already used by
-   another `serve` entry, pick another one (e.g. `--https=8443`) and add it
-   to the address. Undo: `sudo tailscale serve --https=443 off`.
+   `--bg` keeps the settings across reboots. Undo:
+   `sudo tailscale serve --https=443 off` and
+   `sudo tailscale serve --https=8443 off`.
 
-3. **[USER ACTION]** Check from a device on the tailnet (the first request
-   may take a few seconds while the certificate is issued), then enter that
-   `https://` address as the wake address in the phone:
+4. **[USER ACTION]** Check from a device on the tailnet (the first request
+   may take a few seconds while the certificate is issued):
 
    ```sh
    curl -i https://<box>.<tailnet>.ts.net/health
+   # 200 {"status":"ok","service":"core",...}   (no "inbox": the Core sees the box, not loopback)
+   curl -i https://<box>.<tailnet>.ts.net:8443/health
    # 200 {"status":"ok","service":"wake-svc","version":"0.1.0"}
    ```
+
+   While the PC is off the first answers `502` (the box is up, the Core is
+   not); the app then shows "Çekirdeğe ulaşılamıyor" with the wake button.
+
+5. **[USER ACTION]** In the phone: Core address
+   `wss://<box>.<tailnet>.ts.net/ws` (connect screen), wake address
+   `https://<box>.<tailnet>.ts.net:8443` (**Uyandırma ayarı**).
 
 ### Rotate the token
 

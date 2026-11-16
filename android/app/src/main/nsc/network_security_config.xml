@@ -1,18 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Template of res/xml/network_security_config.xml: the build (task
-  generateNetworkSecurityConfig, app/build.gradle.kts) copies it into a
-  generated resource folder and replaces the WAKE_HOST marker below with the
-  wake endpoint's host (docs/12 D2), or drops the marker when no wake host is
-  configured. The real wake host is never committed: it comes from the Gradle
-  property `shadowWakeHost` or the environment variable SHADOW_WAKE_HOST.
+  Template of res/xml/network_security_config.xml: the build (tasks
+  generateNetworkSecurityConfigDebug / Release, app/build.gradle.kts) copies it
+  into a generated resource folder per build type and replaces the
+  CLEARTEXT_HOSTS marker below with a cleartext domain-config for a debug
+  build's development hosts, or drops the marker when there are none (the
+  default, and always for release).
 
-  Cleartext (ws:// / http://) only to the Core's home address, which is the same
-  at home (LAN) and outside (Tailscale subnet router, WireGuard-encrypted), and
-  to the wake host (same reasoning, docs/12 D6).
+  The Core is reached only through `wss://` and the wake endpoint only through
+  `https://` (T21.3.3), so a released APK allows no cleartext at all. The
+  optional development hosts come from the Gradle properties `shadowCoreHost` /
+  `shadowWakeHost` or the environment variables SHADOW_CORE_HOST /
+  SHADOW_WAKE_HOST and are never committed.
   Everything else must use TLS with a system CA (no user-installed CAs).
-  Keep the addresses in sync with CoreAddress.CLEARTEXT_HOST and
-  WakeAddress.CLEARTEXT_HOST (unit-tested against the generated file).
+  The generated file is unit-tested against CoreAddress.CLEARTEXT_HOST and
+  WakeAddress.CLEARTEXT_HOST.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false">
@@ -20,8 +22,5 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">192.168.1.2</domain>
-        <!-- WAKE_HOST -->
-    </domain-config>
+    <!-- CLEARTEXT_HOSTS -->
 </network-security-config>

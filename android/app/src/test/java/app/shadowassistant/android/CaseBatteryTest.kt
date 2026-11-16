@@ -78,7 +78,6 @@ class CaseBatteryTest {
 
     @Test
     fun deviceStateUrlFromTheStoredWebSocketUrl() {
-        assertEquals("http://192.168.1.2:8700/device/state", CaseBattery.deviceStateUrl(CoreAddress.DEFAULT_URL))
         assertEquals("https://core.example:443/device/state", CaseBattery.deviceStateUrl("wss://core.example/ws"))
         assertEquals("https://core.example:9443/device/state", CaseBattery.deviceStateUrl("WSS://core.example:9443/ws?x=1"))
         assertEquals("https://[::1]:8700/device/state", CaseBattery.deviceStateUrl("wss://[::1]:8700/ws"))
@@ -88,11 +87,14 @@ class CaseBatteryTest {
     fun deviceStateUrlRefusesUnusableOrNonAllowlistedCleartext() {
         assertNull(CaseBattery.deviceStateUrl(null))
         assertNull(CaseBattery.deviceStateUrl(""))
-        assertNull(CaseBattery.deviceStateUrl("http://192.168.1.2:8700/ws"))
+        assertNull(CaseBattery.deviceStateUrl("http://192.0.2.10:8700/ws"))
         assertNull(CaseBattery.deviceStateUrl("not a url"))
-        // Plain HTTP only to the network security config's host.
-        assertNull(CaseBattery.deviceStateUrl("ws://192.0.2.10:8700/ws"))
-        assertNull(CaseBattery.deviceStateUrl("ws://localhost:8700/ws"))
+        // No plain HTTP without a development host (every CI/release build)…
+        assertNull(CaseBattery.deviceStateUrl("ws://192.0.2.10:8700/ws", cleartextHost = ""))
+        assertNull(CaseBattery.deviceStateUrl("ws://localhost:8700/ws", cleartextHost = ""))
+        // …and with one, only to that host.
+        assertNull(CaseBattery.deviceStateUrl("ws://192.0.2.11:8700/ws", cleartextHost = "192.0.2.10"))
+        assertEquals("http://192.0.2.10:8700/device/state", CaseBattery.deviceStateUrl("ws://192.0.2.10:8700/ws", cleartextHost = "192.0.2.10"))
     }
 
     // --- HTTP status → decision ----------------------------------------------------

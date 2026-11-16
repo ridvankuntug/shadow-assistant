@@ -344,13 +344,13 @@ test("returned errors: a protocol error is generic for the model (detail in the 
   assert.ok(logs.some((l) => l.includes("-32602") && l.includes(SECRET_HOST)));
 
   ha.callResult = {
-    text: `Error calling tool: no entity named 'light.salon' (via ${SECRET_HOST}, homeassistant.local, 192.168.1.20:8123, Bearer abc.def)`,
+    text: `Error calling tool: no entity named 'light.salon' (via ${SECRET_HOST}, homeassistant.local, 192.0.2.20:8123, Bearer abc.def)`,
     isError: true,
   };
   const t = await gw.call(HA, "intent__HassTurnOn", {}, allowAll, ctx());
   assert.equal(t.isError, true);
   assert.match(textOf(t), /^Error calling tool: no entity named 'light\.salon'/, "the useful part reaches the model");
-  for (const leak of ["secret", "8123", "homeassistant.local", "192.168", "abc.def", "http"]) {
+  for (const leak of ["secret", "8123", "homeassistant.local", "192.0.2", "abc.def", "http"]) {
     assert.ok(!textOf(t).includes(leak), `no '${leak}' in the model text`);
   }
   // A successful result is passed through unchanged.

@@ -4,17 +4,19 @@ import java.net.URI
 import java.net.URISyntaxException
 
 /**
- * The Core's address. At home and outside it is the same LAN address: away
- * from home the phone reaches 192.168.1.2 through the Tailscale subnet router
- * (decision #15), so there is no second URL to switch to.
+ * The Core's address, as the user enters it in the UI's connect screen. There
+ * is no built-in default (T21.3.3): the Core is reached through a `wss://`
+ * address (e.g. the always-on box's Tailscale HTTPS name, docs/05 §5), which
+ * the app asks for on first launch.
  *
- * [CLEARTEXT_HOST] must match res/xml/network_security_config.xml (a unit
- * test checks this).
+ * [CLEARTEXT_HOST] is a development-only host for plain `ws://`, set by the
+ * build (Gradle property `shadowCoreHost` / environment SHADOW_CORE_HOST, see
+ * app/build.gradle.kts) and never committed; it is "" otherwise, and then
+ * every `ws://` address is refused. It must match the generated network
+ * security config (a unit test checks this).
  */
 object CoreAddress {
-    const val CLEARTEXT_HOST = "192.168.1.2"
-    const val DEFAULT_PORT = 8700 // core/src/config.ts CORE_PORT default
-    const val DEFAULT_URL = "ws://$CLEARTEXT_HOST:$DEFAULT_PORT/ws"
+    val CLEARTEXT_HOST: String = BuildConfig.CORE_CLEARTEXT_HOST
 
     data class Endpoint(val secure: Boolean, val host: String, val port: Int) {
         override fun toString() = "$host:$port"
@@ -38,8 +40,19 @@ object CoreAddress {
         return Endpoint(secure, host, port)
     }
 
-    /** Mirrors the network security config: plain `ws://` only to [CLEARTEXT_HOST]. */
-    fun cleartextAllowed(endpoint: Endpoint): Boolean = endpoint.secure || endpoint.host == CLEARTEXT_HOST
+    /** Mirrors the network security config: plain `ws://` only to the build's [cleartextHost], if any. */
+    fun cleartextAllowed(endpoint: Endpoint, cleartextHost: String = CLEARTEXT_HOST): Boolean =
+        endpoint.secure || (cleartextHost.isNotEmpty() && endpoint.host.equals(cleartextHost, ignoreCase = true))
+
+    /**
+     * A stored address this build can never use: a `ws://` one the network
+     * security config refuses (e.g. the LAN default that older versions seeded).
+     * Unparsable values are left to the UI's connect screen.
+     */
+    fun unusable(url: String?, cleartextHost: String = CLEARTEXT_HOST): Boolean {
+        val endpoint = parse(url) ?: return false
+        return !cleartextAllowed(endpoint, cleartextHost)
+    }
 }
 
 /** Only the bundled UI may use the bridge or be navigated to. */
@@ -52,13 +65,18 @@ object UiOrigin {
     /**
      * Sent with every bundle response. `style-src 'unsafe-inline'` is needed for
      * React style attributes; no inline/eval scripts, no frames, no plugins.
-     * Plain WebSockets only to the Core's home address (any port), TLS ones anywhere.
+     * WebSockets over TLS only; a plain `ws://` source is added only for the
+     * build's development Core host ([CoreAddress.CLEARTEXT_HOST], any port).
      */
-    const val CONTENT_SECURITY_POLICY =
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+    val CONTENT_SECURITY_POLICY: String = contentSecurityPolicy(CoreAddress.CLEARTEXT_HOST)
+
+    fun contentSecurityPolicy(cleartextHost: String): String {
+        val plain = if (cleartextHost.isEmpty()) "" else "ws://$cleartextHost:* "
+        return "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
             "img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; " +
-            "connect-src 'self' ws://${CoreAddress.CLEARTEXT_HOST}:* wss:; " +
+            "connect-src 'self' ${plain}wss:; " +
             "frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    }
 
     fun isTrusted(scheme: String?, host: String?): Boolean =
         scheme.equals("https", ignoreCase = true) && host.equals(HOST, ignoreCase = true)

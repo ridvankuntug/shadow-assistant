@@ -7,11 +7,13 @@ import java.net.URISyntaxException
  * Address of the wake endpoint (wake-svc on the always-on box, docs/12 D1/D2)
  * and the Core's `/health` URL that the waking flow polls.
  *
- * [CLEARTEXT_HOST] comes from the build (Gradle property `shadowWakeHost` /
+ * The wake endpoint is reached through `https://` (e.g. the box's Tailscale
+ * HTTPS name on port 8443, docs/05 §5). [CLEARTEXT_HOST] is a development-only
+ * host for plain `http://`, from the build (Gradle property `shadowWakeHost` /
  * environment SHADOW_WAKE_HOST, see app/build.gradle.kts), never from the
- * repository; it is "" when the build has none. It must match the generated
- * network security config (a unit test checks this). Plain `http://` is
- * accepted only to that host; `https://` to any host (a later TLS setup).
+ * repository; it is "" when the build has none (every CI/release build). It
+ * must match the generated network security config (a unit test checks this).
+ * Plain `http://` is accepted only to that host; `https://` to any host.
  */
 object WakeAddress {
     val CLEARTEXT_HOST: String = BuildConfig.WAKE_CLEARTEXT_HOST
@@ -67,7 +69,7 @@ object WakeAddress {
         return Check.Ok(Endpoint(secure, host.lowercase(), port))
     }
 
-    /** `ws://host:port/ws` → `http://host:port/health` (`wss` → `https`); null for an unusable Core address. */
+    /** `wss://host:port/ws` → `https://host:port/health` (`ws` → `http`); null for an unusable Core address. */
     fun coreHealthUrl(coreUrl: String?): String? {
         val core = CoreAddress.parse(coreUrl) ?: return null
         val scheme = if (core.secure) "https" else "http"

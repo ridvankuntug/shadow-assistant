@@ -2,10 +2,18 @@ package app.shadowassistant.android
 
 /**
  * Android 17 (API 37) local network protection: an app targeting 37 cannot
- * open connections to LAN addresses (the Core at `192.168.1.2`, reached on
- * Wi-Fi at home and through the Tailscale subnet route outside) unless it
- * holds the runtime permission `ACCESS_LOCAL_NETWORK`. Below API 37 the
- * permission does not exist and nothing is required.
+ * open connections to local network addresses unless it holds the runtime
+ * permission `ACCESS_LOCAL_NETWORK`. Below API 37 the permission does not
+ * exist and nothing is required.
+ *
+ * Still asked after T21.3.3 (Core only through `wss://`): the Core's address
+ * is the always-on box's Tailscale HTTPS name, which resolves to a tailnet
+ * address in the shared 100.64.0.0/10 range reached through the Tailscale VPN,
+ * and a development build may add a cleartext LAN host (CoreAddress /
+ * WakeAddress.CLEARTEXT_HOST). Whether Android counts the tailnet range as
+ * local has not been verified on a device; dropping the permission would risk
+ * cutting the only path to the Core, so it stays until a phone test shows it is
+ * not needed.
  *
  * Pure decisions only; MainActivity does the platform calls. Nothing here
  * looks at the network type: the same permission covers Wi-Fi and VPN routes.

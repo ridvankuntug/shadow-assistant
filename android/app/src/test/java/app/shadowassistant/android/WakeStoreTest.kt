@@ -150,7 +150,7 @@ class WakeStoreTest {
         )
         assertEquals(WakeAddress.Check.Ok(WakeAddress.Endpoint(false, home, 80)), WakeAddress.check(" http://192.0.2.10/ ", home))
         assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.11:8704", home))
-        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.168.1.2:8704", home))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.12:8704", home))
         assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.10:8704", ""))
         assertEquals(
             WakeAddress.Check.Ok(WakeAddress.Endpoint(true, "wake.example.test", 443)),
@@ -181,10 +181,10 @@ class WakeStoreTest {
 
     @Test
     fun coreHealthUrlFollowsTheCoreAddress() {
-        assertEquals("http://192.168.1.2:8700/health", WakeAddress.coreHealthUrl(CoreAddress.DEFAULT_URL))
+        assertEquals("http://192.0.2.10:8700/health", WakeAddress.coreHealthUrl("ws://192.0.2.10:8700/ws"))
         assertEquals("https://core.example.test:443/health", WakeAddress.coreHealthUrl("wss://core.example.test/ws"))
         assertEquals("http://[::1]:8700/health", WakeAddress.coreHealthUrl("ws://[::1]:8700/ws"))
-        assertNull(WakeAddress.coreHealthUrl("http://192.168.1.2:8700"))
+        assertNull(WakeAddress.coreHealthUrl("http://192.0.2.10:8700"))
         assertNull(WakeAddress.coreHealthUrl(null))
     }
 

@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * [WakeHttp] over [HttpURLConnection]. Bound by the network security config:
- * plain HTTP only to the Core's and the wake host's addresses. No redirects,
+ * TLS only, except a development build's cleartext Core / wake host. No redirects,
  * no caches, bodies read up to [MAX_BODY_BYTES]. The token goes only into the
  * `Authorization` header; nothing here logs.
  */

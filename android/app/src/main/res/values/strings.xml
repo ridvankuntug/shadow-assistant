@@ -16,13 +16,14 @@
     <string name="error_load_message">Arayüz yüklenirken bir hata oluştu.</string>
 
     <string name="error_core_title">Çekirdeğe ulaşılamıyor</string>
-    <string name="error_core_message">%1$s adresine bağlanılamadı. Evdeysen Wi-Fi\'ye, dışarıdaysan Tailscale\'e bağlı olduğundan ve bilgisayarda Shadow çekirdeğinin çalıştığından emin ol.</string>
+    <string name="error_core_message">%1$s adresine bağlanılamadı. Telefonda Tailscale\'in bağlı olduğundan (evde de), her zaman açık kutunun ve bilgisayarda Shadow çekirdeğinin çalıştığından emin ol.</string>
 
     <string name="error_cleartext_title">Şifresiz bağlantıya izin yok</string>
     <string name="error_cleartext_message">%1$s adresine şifresiz (ws://) bağlanılamaz; yalnız %2$s izinli. Adresi düzelt ya da wss:// kullan.</string>
+    <string name="error_cleartext_message_none">%1$s adresine şifresiz (ws://) bağlanılamaz. Adresi değiştir ve wss:// ile başlayan adresi kullan.</string>
 
     <string name="error_local_network_title">Yerel ağ izni gerekli</string>
-    <string name="error_local_network_message">Çekirdek yerel ağ adresinde (evde Wi-Fi, dışarıda Tailscale üzerinden) çalışıyor; Android bu adrese bağlanmak için \"Yerel ağ\" izni istiyor. İzin verilmeden çekirdeğe bağlanılamaz. Tekrar dene ile izni yeniden iste ya da Ayarları aç → İzinler bölümünden \"Yerel ağ\" iznini aç.</string>
+    <string name="error_local_network_message">Çekirdeğe Tailscale ağındaki adres üzerinden bağlanılıyor; Android bu adrese bağlanmak için \"Yerel ağ\" izni istiyor. İzin verilmeden çekirdeğe bağlanılamaz. Tekrar dene ile izni yeniden iste ya da Ayarları aç → İzinler bölümünden \"Yerel ağ\" iznini aç.</string>
 
     <!-- Waking the PC from the Core error panel (docs/12 D2). -->
     <string name="wake_button">Bilgisayarı uyandır</string>
@@ -46,13 +47,13 @@
 
     <string name="wake_dialog_title">Uyandırma ayarı</string>
     <string name="wake_dialog_message">Her zaman açık kutudaki uyandırma servisinin adresi ve anahtarı. Anahtar yalnız bu telefonda, şifreli saklanır; arayüz onu göremez.</string>
-    <string name="wake_dialog_address_hint">Adres, ör. http://adres:8704</string>
+    <string name="wake_dialog_address_hint">Adres, ör. https://adres:8443</string>
     <string name="wake_dialog_token_hint">Uyandırma anahtarı (yapıştır)</string>
     <string name="wake_dialog_token_keep_hint">Kayıtlı anahtar korunur; değiştirmek için yenisini yapıştır</string>
     <string name="wake_dialog_save">Kaydet</string>
     <string name="wake_dialog_delete">Sil</string>
     <string name="wake_dialog_cancel">Vazgeç</string>
-    <string name="wake_dialog_address_invalid">Geçerli bir adres gir: http://adres:port (yol, sorgu yok).</string>
+    <string name="wake_dialog_address_invalid">Geçerli bir adres gir: https://adres:port (yol, sorgu yok).</string>
     <string name="wake_dialog_address_cleartext">Şifresiz (http://) yalnız %1$s adresine izinli; başka bir adres için https:// kullan.</string>
     <string name="wake_dialog_address_no_cleartext">Bu derlemede şifresiz uyandırma adresi tanımlı değil; yalnız https:// adres kullanılabilir.</string>
     <string name="wake_dialog_token_missing">Uyandırma anahtarını yapıştır.</string>

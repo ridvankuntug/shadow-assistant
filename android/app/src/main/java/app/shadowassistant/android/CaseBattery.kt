@@ -69,11 +69,12 @@ object CaseBattery {
     /**
      * The Core's HTTP address for [DEVICE_STATE_PATH], derived from the stored WebSocket
      * URL (same host and port: ws→http, wss→https). Null when the URL is unusable or
-     * plain HTTP would go to a host the network security config does not allow.
+     * plain HTTP would go to a host the network security config does not allow
+     * (every host unless the build has a development [cleartextHost]).
      */
-    fun deviceStateUrl(coreUrl: String?): String? {
+    fun deviceStateUrl(coreUrl: String?, cleartextHost: String = CoreAddress.CLEARTEXT_HOST): String? {
         val endpoint = CoreAddress.parse(coreUrl) ?: return null
-        if (!CoreAddress.cleartextAllowed(endpoint)) return null
+        if (!CoreAddress.cleartextAllowed(endpoint, cleartextHost)) return null
         val scheme = if (endpoint.secure) "https" else "http"
         return try {
             // The multi-argument constructor adds the brackets around an IPv6 literal.

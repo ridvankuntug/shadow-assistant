@@ -28,7 +28,9 @@ addresses, MACs, tokens or account names.
    router) is built as a **fallback**. The cause of the HA failures is looked
    for separately.
 2. The phone reaches the same LAN addresses at home (Wi-Fi) and away
-   (Tailscale subnet route).
+   (Tailscale subnet route). *Superseded 2026-11-16 (user decision, T21.3.3):
+   the phone reaches the Core and wake-svc only through the box's
+   tailnet-only HTTPS addresses; see Q1 and the progress log.*
 3. **No automatic sign-in.** The Core becomes a scheduled task that runs
    "whether the user is signed in or not". The user creates the task's stored
    credential (password) themselves.
@@ -198,7 +200,9 @@ fields: address (prefilled `http://<wake-host>:<wake-port>`) and token
 - **Uyandırma ayarı** (small text button on the waking panel) reopens the
   dialog to change or delete both.
 
-**Network rules:** the wake host is cleartext HTTP on the LAN like the Core,
+**Network rules** (*superseded 2026-11-16: HTTPS only, no cleartext host in
+the release build; see Q1 and the progress log*): the wake host is cleartext
+HTTP on the LAN like the Core,
 so the NSC gets a second `<domain>` and a constant
 `WakeAddress.CLEARTEXT_HOST`, checked against the XML by the existing unit
 test pattern. The address dialog refuses any host other than that constant
@@ -553,7 +557,7 @@ user decides.
 
 | # | Question | Default |
 |---|---|---|
-| Q1 | The box's LAN address goes into the public repo's NSC (like the PC's address already does). OK, or HTTPS through Tailscale instead (then at home the phone needs Tailscale on too)? | Cleartext LAN address in the NSC, same as the Core. |
+| Q1 | The box's LAN address goes into the public repo's NSC (like the PC's address already does). OK, or HTTPS through Tailscale instead (then at home the phone needs Tailscale on too)? | ~~Cleartext LAN address in the NSC, same as the Core.~~ **Changed 2026-11-16 (user decision):** HTTPS through Tailscale for both the Core and wake-svc (`tailscale serve` on the box); no LAN address in the NSC or anywhere in the repository; the phone keeps Tailscale on at home too. See the progress log. |
 | Q2 | wake-svc as a systemd unit or a Docker container (host network)? | systemd unit (`DynamicUser`). |
 | Q3 | Connect the always-on box by cable? (Both it and the HA box send from Wi-Fi today.) | Yes, if D3 points at Wi-Fi; otherwise optional. |
 | Q4 | If Claude login fails before sign-in: long-lived `setup-token` in `.env`, or model-less until sign-in? | Decide after the test; lean: model-less (no new long-lived secret). |
@@ -624,3 +628,24 @@ user decides.
   address is accepted. The CI workflow still has to pass `SHADOW_WAKE_HOST`
   (not part of this step). An answer outside the contract (another status,
   a `503` without `send_failed`) shows "beklenmeyen yanıt (HTTP n)".
+- 2026-11-16: T21.3.3, HTTPS only (user decision 2026-11-16; resolves Q1 the
+  other way and supersedes fixed decision 2 and D2 "Network rules"). The
+  phone reaches the Core and wake-svc only through the box's tailnet-only
+  Tailscale `serve` addresses: `wss://<box>.<tailnet>.ts.net/ws` (443 → Core)
+  and `https://<box>.<tailnet>.ts.net:8443` (→ wake-svc); docs/05 section 5
+  lists the steps and costs. Android: no built-in Core address (the connect
+  screen asks on first launch; a stored plain `ws://` address from an older
+  version is dropped at start, the token kept); the NSC template holds no
+  address and a release APK allows no cleartext; plain `ws://` / `http://`
+  only to a development host from the build (`shadowCoreHost` /
+  `SHADOW_CORE_HOST`, `shadowWakeHost` / `SHADOW_WAKE_HOST`, both empty by
+  default), so CI no longer needs `SHADOW_WAKE_HOST`. CSP `connect-src` is
+  `'self' wss:` (plus a development Core host); mixed content is off without
+  one. `CoreProbe` now asks the Core's `/health` instead of a TCP connect:
+  the box's proxy accepts TCP while the PC is off (`502`), so the wake button
+  would never appear. The local network permission stays (the ts.net name
+  resolves to a tailnet `100.64.0.0/10` address; whether Android 17 counts it
+  as local is not verified on a device). Core: no change needed (no
+  Host/Origin checks on HTTP or the WebSocket upgrade; loopback only from the
+  socket address, `X-Forwarded-For` never read). No home LAN address is
+  left in the repository.

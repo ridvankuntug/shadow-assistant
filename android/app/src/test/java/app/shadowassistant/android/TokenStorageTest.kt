@@ -130,23 +130,49 @@ class TokenStorageTest {
     }
 
     @Test
-    fun seedsCoreUrlOnceOnly() {
+    fun noAddressIsSeeded() {
+        // T21.3.3: no built-in Core address; the UI's connect screen asks on first launch.
         val plain = MapStore()
-        val flags = MapStore()
         val s = BridgeStorage(plain, MapStore(), cipher) {}
-        s.seedDefaults(flags)
-        assertEquals(CoreAddress.DEFAULT_URL, s.get(BridgeStorage.CORE_URL_KEY))
-        s.remove(BridgeStorage.CORE_URL_KEY)
-        s.seedDefaults(flags)
+        assertFalse(s.forgetUnusableCoreUrl(cleartextHost = ""))
         assertNull(s.get(BridgeStorage.CORE_URL_KEY))
+        assertTrue(plain.map.isEmpty())
     }
 
     @Test
-    fun seedingKeepsAUserValue() {
+    fun anOldPlainAddressIsForgottenButTheTokenKept() {
+        // An install upgraded from a version that seeded / stored a plain ws:// LAN address.
         val plain = MapStore()
-        plain.put(BridgeStorage.CORE_URL_KEY, "wss://example.test/ws")
-        BridgeStorage(plain, MapStore(), cipher) {}.seedDefaults(MapStore())
-        assertEquals("wss://example.test/ws", plain.map[BridgeStorage.CORE_URL_KEY])
+        val secret = MapStore()
+        val logs = mutableListOf<String>()
+        val s = BridgeStorage(plain, secret, cipher) { logs += it }
+        s.set(BridgeStorage.CORE_URL_KEY, "ws://192.0.2.10:8700/ws")
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        assertTrue(s.forgetUnusableCoreUrl(cleartextHost = ""))
+        assertNull(s.get(BridgeStorage.CORE_URL_KEY))
+        assertEquals(token, s.get(BridgeStorage.TOKEN_KEY))
+        assertNull(s.connection())
+        assertFalse(logs.any { it.contains("192.0.2.10") || it.contains(token) })
+        // Entering the new address and saving the token again makes a clean pair.
+        s.set(BridgeStorage.CORE_URL_KEY, "wss://box.example.ts.net/ws")
+        assertNull(s.connection())
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        assertEquals("wss://box.example.ts.net/ws", s.connection()?.coreUrl)
+    }
+
+    @Test
+    fun usableAddressesAreKept() {
+        val plain = MapStore()
+        val s = BridgeStorage(plain, MapStore(), cipher) {}
+        for (url in listOf("wss://box.example.ts.net/ws", "not a url")) {
+            plain.put(BridgeStorage.CORE_URL_KEY, url)
+            assertFalse(s.forgetUnusableCoreUrl(cleartextHost = ""))
+            assertEquals(url, plain.map[BridgeStorage.CORE_URL_KEY])
+        }
+        // A development build's own cleartext host stays.
+        plain.put(BridgeStorage.CORE_URL_KEY, "ws://192.0.2.10:8700/ws")
+        assertFalse(s.forgetUnusableCoreUrl(cleartextHost = "192.0.2.10"))
+        assertEquals("ws://192.0.2.10:8700/ws", plain.map[BridgeStorage.CORE_URL_KEY])
     }
 
     // --- connection pair (address + token as one snapshot) ---------------------

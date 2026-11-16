@@ -117,21 +117,24 @@ class BridgeStorage(
     fun hasToken(): Boolean = secret.get(TOKEN_KEY) != null
 
     /**
-     * First run only: prefill the Core address with the home address so the
-     * UI's connect screen shows it ([CoreAddress.DEFAULT_URL]). [flags] is a
-     * store the page cannot read, so removing the key later stays removed.
+     * At every start: forget a stored Core address this build can never use
+     * ([CoreAddress.unusable], e.g. the plain `ws://` LAN address that versions
+     * before T21.3.3 seeded), so the UI's connect screen asks for a new one
+     * instead of a page that keeps failing. There is no default address any
+     * more; the token stays, so only the address has to be entered again.
+     * Without an address [connection] is null, and the next address write marks
+     * the pair dirty as usual. Returns true if an address was removed.
      */
-    fun seedDefaults(flags: KeyValueStore) {
-        if (flags.get(SEEDED_FLAG) != null) return
-        // Through set(): an address change, so the pair is dirty until a token is saved with it.
-        if (plain.get(CORE_URL_KEY) == null) set(CORE_URL_KEY, CoreAddress.DEFAULT_URL)
-        flags.put(SEEDED_FLAG, "1")
+    fun forgetUnusableCoreUrl(cleartextHost: String = CoreAddress.CLEARTEXT_HOST): Boolean = synchronized(PAIR_LOCK) {
+        if (!CoreAddress.unusable(plain.get(CORE_URL_KEY), cleartextHost)) return@synchronized false
+        plain.remove(CORE_URL_KEY)
+        log("stored Core address is not allowed by this build (plain ws://); it was cleared")
+        true
     }
 
     companion object {
         const val TOKEN_KEY = "shadow.deviceToken"
         const val CORE_URL_KEY = "shadow.coreUrl"
-        const val SEEDED_FLAG = "coreUrlSeeded"
 
         /** In the secret store, never readable by the page; present = address written, matching token not yet. */
         const val PAIR_DIRTY_KEY = "connectionPairDirty"
