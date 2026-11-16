@@ -572,6 +572,43 @@ journalctl -u wake-svc -n 5 --no-pager      # a "wake_sent" line, no token, no M
 with the PC shut down (docs/12, D3). Optional: `systemd-analyze security
 wake-svc` rates the unit's sandbox.
 
+### Optional: an HTTPS address through Tailscale
+
+The Android app allows plain `http://` only to a wake host compiled into the
+build; an `https://` address works in every build (android/README.md, "Waking
+the PC"). If the box is on your tailnet, Tailscale can give wake-svc an HTTPS
+address with a valid certificate, so no address has to go into the build.
+
+Trade-offs: the phone needs **Tailscale connected** to wake the PC, at home
+too (the name resolves only on the tailnet). The box's machine name and your
+tailnet name appear in the public certificate transparency log. All requests
+then reach wake-svc from the box itself, so the wrong-token lockout is shared
+by every caller.
+
+1. **[USER ACTION]** In the Tailscale admin console, DNS page: enable
+   **MagicDNS** and **HTTPS Certificates** (once per tailnet).
+
+2. **[USER ACTION]** On the box, proxy tailnet HTTPS to wake-svc. Use `serve`
+   (tailnet only), never `funnel` (public internet):
+
+   ```sh
+   sudo tailscale serve --bg --https=443 http://<box-lan-ip>:8704
+   tailscale serve status      # shows https://<box>.<tailnet>.ts.net
+   ```
+
+   `--bg` keeps the setting across reboots. If port 443 is already used by
+   another `serve` entry, pick another one (e.g. `--https=8443`) and add it
+   to the address. Undo: `sudo tailscale serve --https=443 off`.
+
+3. **[USER ACTION]** Check from a device on the tailnet (the first request
+   may take a few seconds while the certificate is issued), then enter that
+   `https://` address as the wake address in the phone:
+
+   ```sh
+   curl -i https://<box>.<tailnet>.ts.net/health
+   # 200 {"status":"ok","service":"wake-svc","version":"0.1.0"}
+   ```
+
 ### Rotate the token
 
 When the phone is lost, the token was shown somewhere it should not be, or
