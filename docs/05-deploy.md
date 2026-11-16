@@ -2,7 +2,8 @@
 
 How to run the pieces on a Windows PC: the speech services in Docker, the Core
 as a scheduled task in your own session, and an encrypted daily backup of the
-Core's data folder to Google Drive.
+Core's data folder to Google Drive. One piece runs on the always-on Linux box: the
+Wake-on-LAN endpoint (section 5).
 
 Steps you have to do or approve yourself are marked **[USER ACTION]**. Nothing
 in this repo registers tasks, creates rclone remotes or starts containers on
@@ -13,6 +14,7 @@ its own.
 | whisper-svc, tts-svc | Docker containers, ports on 127.0.0.1 only | `deploy/docker-compose.yml` |
 | Core | Tray app started by a scheduled task at sign-in, your user, not elevated | `deploy/windows/` |
 | Backup | Script (optionally a daily scheduled task), your user | `deploy/backup/` |
+| wake-svc | systemd unit on the always-on Linux box, throw-away user (`DynamicUser`), LAN address only | `deploy/linux/` |
 
 ## 1. Prerequisites
 
@@ -426,7 +428,174 @@ Without the scripts, the same remote can be defined in plain rclone:
 `rclone config create shadowcrypt crypt remote=gdrive:shadow-assistant-backup password=<first> password2=<second> filename_encryption=standard directory_name_encryption=true`
 (rclone obscures the values; this stores them in rclone.conf).
 
-## 5. Troubleshooting
+## 5. Wake endpoint on the always-on Linux box
+
+`wake-svc` ([services/wake-svc](../services/wake-svc/README.md), design:
+[docs/12](12-wake-and-headless-core.md) D1/D6) runs on the always-on Linux box
+(systemd, e.g. a Raspberry Pi) and sends a Wake-on-LAN packet to the PC's
+**one** configured MAC when the phone asks with the wake token. It is a single
+Python 3.10+ file using only the standard library: nothing to install besides
+`python3` (and `curl` for the checks).
+
+Rules that do not change:
+
+- It listens on the box's **LAN address only**. It is **never** added to the
+  Cloudflare tunnel or any other public route. Away from home the phone
+  reaches it through the Tailscale subnet route, like the Core.
+- The wake token is **separate** from every Core device token and only allows
+  "send the magic packet". It lives in one root-only file and reaches the
+  service through systemd `LoadCredential=`, never through the environment, a
+  command line or a tracked file.
+- The MAC, the addresses and the token are set only on the box. The tracked
+  files (`deploy/linux/`) hold placeholders and paths only.
+
+| Path on the box | What | Owner, mode |
+| --- | --- | --- |
+| `/opt/shadow-assistant/wake-svc/server.py` | The code (`services/wake-svc/wake_svc/server.py`) | `root:root 0644` (folders `0755`) |
+| `/etc/systemd/system/wake-svc.service` | The unit (`deploy/linux/wake-svc.service`) | `root:root 0644` |
+| `/etc/shadow-assistant/wake-svc.env` | Settings: MAC, LAN address, broadcast (from `deploy/linux/wake-svc.env.example`) | `root:root 0600` |
+| `/etc/credstore/wake-svc.token` | The wake token | `root:root 0600` (folder `0700`) |
+
+The unit runs the service as a throw-away user (`DynamicUser=yes`) with no
+capabilities, a read-only system, no home and a system-call filter; only root
+and the service itself can read the token. If you change any of these paths,
+change them in the unit too.
+
+Placeholders below: `<user>@<box>` is your SSH login on the box,
+`<box-lan-ip>` its LAN address (the same value as `WAKE_BIND`), `<lan-cidr>`
+the home LAN range.
+
+### Install
+
+1. **[USER ACTION]** Check that the box has Python 3.10 or newer and systemd:
+
+   ```sh
+   python3 --version
+   systemctl --version | head -1
+   ```
+
+2. **[USER ACTION]** Copy the three files to a private folder in your home
+   on the box (not `/tmp`, where other local users could swap them before root
+   installs them). From the repo root on the PC (PowerShell or Git Bash):
+
+   ```sh
+   ssh <user>@<box> "mkdir -p -m 0700 wake-svc-install"
+   scp services/wake-svc/wake_svc/server.py deploy/linux/wake-svc.service deploy/linux/wake-svc.env.example <user>@<box>:wake-svc-install/
+   ```
+
+   (Or `git pull` a clone on the box and use the same files from there.)
+
+3. **[USER ACTION]** On the box, install the code and the unit:
+
+   ```sh
+   sudo install -d -m 0755 -o root -g root /opt/shadow-assistant /opt/shadow-assistant/wake-svc
+   sudo install -m 0644 -o root -g root ~/wake-svc-install/server.py /opt/shadow-assistant/wake-svc/server.py
+   sudo install -m 0644 -o root -g root ~/wake-svc-install/wake-svc.service /etc/systemd/system/wake-svc.service
+   ```
+
+4. **[USER ACTION]** Create the env file and fill it in. `WAKE_MAC` is the
+   PC's **wired** adapter MAC (`Get-NetAdapter` on the PC, `MacAddress` of the
+   Ethernet adapter), `WAKE_BIND` the box's LAN IPv4 address (`ip -4 addr` on
+   the box), `WAKE_BROADCASTS` the LAN's broadcast address (the `brd` value in
+   the same output). Give the box a fixed LAN address (a DHCP reservation in
+   the router, or a static address on the box): if it changes, wake-svc can no
+   longer listen.
+
+   ```sh
+   sudo install -d -m 0755 -o root -g root /etc/shadow-assistant
+   sudo install -m 0600 -o root -g root ~/wake-svc-install/wake-svc.env.example /etc/shadow-assistant/wake-svc.env
+   sudoedit /etc/shadow-assistant/wake-svc.env
+   ```
+
+   Do not add `WAKE_TOKEN` (refused at startup) or `WAKE_TOKEN_FILE` (it would
+   bypass the credential).
+
+5. **[USER ACTION]** Generate the wake token **on the box**. It goes straight
+   into a root-only file and never appears on a command line:
+
+   ```sh
+   sudo install -d -m 0700 -o root -g root /etc/credstore
+   sudo sh -c 'umask 077; python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" > /etc/credstore/wake-svc.token.new && mv /etc/credstore/wake-svc.token.new /etc/credstore/wake-svc.token'
+   sudo ls -l /etc/credstore/wake-svc.token      # -rw------- root root
+   ```
+
+   You need the value once, to enter it in the phone (docs/12, D2):
+   `sudo cat /etc/credstore/wake-svc.token`. Copy it from the terminal into
+   your password manager or straight into the phone; never paste it into
+   chats, issues, files in the repo or a command line.
+
+6. **[USER ACTION]** Remove the copies and start the service:
+
+   ```sh
+   rm -r ~/wake-svc-install
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now wake-svc
+   systemctl status wake-svc --no-pager
+   ```
+
+   A configuration error (bad MAC, short token, wildcard address, ...)
+   stops it with exit code 1; `journalctl -u wake-svc -n 20` names the setting
+   (never its value). A missing token file stops it before it runs, with
+   `status=243/CREDENTIALS`. The unit keeps retrying every 15 s; fix the
+   cause, then `sudo systemctl restart wake-svc`.
+
+7. **[USER ACTION]** If a firewall is active on the box, open the port
+   (default `8704/tcp`) for the LAN and the tailnet only, e.g. with ufw:
+
+   ```sh
+   sudo ufw allow from <lan-cidr> to any port 8704 proto tcp
+   sudo ufw allow in on tailscale0 to any port 8704 proto tcp
+   ```
+
+### Verify
+
+From the box and from the PC (or a browser on the phone, on the home Wi-Fi):
+
+```sh
+curl -i http://<box-lan-ip>:8704/health
+# 200 {"status":"ok","service":"wake-svc","version":"0.1.0"}
+curl -i -X POST http://<box-lan-ip>:8704/wake
+# 401 {"error":"unauthorized"}   (no token)
+```
+
+A full wake test, on the box, with the token passed through a pipe so it is
+not on a command line (if the PC is on, the packet does nothing):
+
+```sh
+sudo sh -c 'printf "Authorization: Bearer %s\n" "$(cat /etc/credstore/wake-svc.token)"' \
+  | curl -i -X POST -H @- http://<box-lan-ip>:8704/wake
+# 202 {"sent":true}; a second call within 10 s gives 429
+journalctl -u wake-svc -n 5 --no-pager      # a "wake_sent" line, no token, no MAC
+```
+
+`202` means the packets left the box, not that the PC woke: test a real wake
+with the PC shut down (docs/12, D3). Optional: `systemd-analyze security
+wake-svc` rates the unit's sandbox.
+
+### Rotate the token
+
+When the phone is lost, the token was shown somewhere it should not be, or
+just from time to time:
+
+```sh
+sudo sh -c 'umask 077; python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" > /etc/credstore/wake-svc.token.new && mv /etc/credstore/wake-svc.token.new /etc/credstore/wake-svc.token'
+sudo systemctl restart wake-svc
+```
+
+The old token stops working with the restart (the service reads the token only
+at start); the restart also clears the in-memory rate limits. Then enter the
+new token in the phone (`sudo cat /etc/credstore/wake-svc.token`).
+
+### Update or remove
+
+- Update: copy the new `server.py` (step 2), install it (the second line of
+  step 3), `sudo systemctl restart wake-svc`, then `rm -r ~/wake-svc-install`.
+  If the unit changed, install it again and run `sudo systemctl daemon-reload`
+  before the restart.
+- Remove: `sudo systemctl disable --now wake-svc`, delete the four paths in
+  the table above, `sudo systemctl daemon-reload`.
+
+## 6. Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
@@ -444,3 +613,7 @@ Without the scripts, the same remote can be defined in plain rclone:
 | Backup: "SHADOW_BACKUP_CRYPT_PASSWORD is not set" | Step 3. The scheduled task reads the repo-root `.env`; user environment variables only reach new processes after signing in again. |
 | Restore: "could not be decrypted" warning | The two secrets differ from the ones used when the backup was made. |
 | Drive OAuth token expired | `rclone config reconnect gdrive:` **[USER ACTION]** |
+| wake-svc: `/health` answers on the box but times out from the PC | The box's firewall (section 5, step 7), or `WAKE_BIND` is not the address you are calling. |
+| wake-svc does not start, journal: "cannot listen on ..." | `WAKE_BIND` is not an address of the box, or the port is in use (`ss -ltnp`). At boot the LAN address may come up late; the unit retries every 15 s. Give the box a fixed address (section 5, step 4). |
+| wake-svc fails with `status=243/CREDENTIALS` | `/etc/credstore/wake-svc.token` is missing or not at the path in the unit's `LoadCredential=` (section 5, step 5). |
+| wake-svc answers `202` but the PC stays off | Wake-on-LAN enabled in the PC's BIOS/UEFI and on the wired adapter, the wired MAC in `WAKE_MAC`, packet seen on the PC (docs/12, D3 checklist). |

@@ -1,6 +1,7 @@
 # deploy
 
-Files for running Shadow Assistant at home on Windows. Full guide:
+Files for running Shadow Assistant at home on Windows, plus the wake endpoint
+on the always-on Linux box. Full guide:
 [docs/05-deploy.md](../docs/05-deploy.md).
 
 | Path | What |
@@ -11,6 +12,7 @@ Files for running Shadow Assistant at home on Windows. Full guide:
 | `windows/run-core.ps1` | Manual fallback supervisor in PowerShell (`-DryRun` to check); no longer used by the task |
 | `backup/backup-data.ps1`, `restore-data.ps1` | Encrypted backup of the data folder to Google Drive via rclone crypt, and restore; the data folder is resolved by the Core's rule ([docs/05 "Data folder"](../docs/05-deploy.md#data-folder)) |
 | `backup/install-backup-task.ps1` | Optional daily backup task |
+| `linux/wake-svc.service`, `linux/wake-svc.env.example` | Hardened systemd unit (`DynamicUser`, token via `LoadCredential=`) and settings template for wake-svc on the always-on Linux box; LAN only, never behind the tunnel ([docs/05 section 5](../docs/05-deploy.md#5-wake-endpoint-on-the-always-on-linux-box)) |
 
 The Core is not containerised: the Claude Agent SDK uses the Claude Code login
 in the user's Windows profile.
