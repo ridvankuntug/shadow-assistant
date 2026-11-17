@@ -649,3 +649,17 @@ user decides.
   Host/Origin checks on HTTP or the WebSocket upgrade; loopback only from the
   socket address, `X-Forwarded-For` never read). No home LAN address is
   left in the repository.
+- 2026-11-17: T21.3.3, home and away addresses (user decision 2026-11-17:
+  no Tailscale needed at home). Core and wake each get an optional home
+  address next to the away one; the app asks the Core's home `/health`
+  first (1.5 s) and falls back to away, on every Core check; wake tries home
+  first, away only without an answer, and waits for the Core at both
+  addresses. Plain `ws://` / `http://` only to a private IPv4 literal
+  (`CoreAddress.isPrivateIpv4Literal`, strict unit tests); the NSC permits
+  cleartext in base-config (no ranges possible), the CSP admits plain `ws://`
+  only to the exact configured Core `host:port`, mixed content only then.
+  UI: no change; the Core's home address and both wake addresses are in the
+  native **Adresler** dialog (formerly "Uyandırma ayarı"), the page reads the
+  address in use through `shadow.coreUrl` and is reloaded when it changes.
+  Migration: a stored `wss://` Core address stays the away address; an old
+  `http://` wake address moves to the home slot if private, else is dropped.

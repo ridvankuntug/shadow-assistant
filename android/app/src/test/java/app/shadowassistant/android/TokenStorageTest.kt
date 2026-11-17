@@ -175,6 +175,103 @@ class TokenStorageTest {
         assertEquals("ws://192.0.2.10:8700/ws", plain.map[BridgeStorage.CORE_URL_KEY])
     }
 
+    // --- home / away Core address (T21.3.3) ---------------------------------------
+
+    private val away = "wss://box.example.ts.net/ws"
+    private val home = "ws://10.0.0.2:8700/ws"
+
+    @Test
+    fun pageReadsTheSelectedAddressAndHomeStaysNativeOnly() {
+        val plain = MapStore()
+        val secret = MapStore()
+        val s = BridgeStorage(plain, secret, cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, away)
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        s.setHomeCoreUrl(home)
+        // Not selected yet: the away address.
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+        s.selectHome(true)
+        assertEquals(home, s.get(BridgeStorage.CORE_URL_KEY))
+        assertEquals(BridgeStorage.Connection(home, token), s.connection())
+        // The page cannot read or write the native keys.
+        assertNull(s.get(BridgeStorage.CORE_HOME_KEY))
+        assertNull(s.get(BridgeStorage.USE_HOME_KEY))
+        assertFalse(plain.map.values.contains(home))
+        s.selectHome(false)
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+    }
+
+    @Test
+    fun onlyAHomeAddressIsUsedWithoutSelection() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.setHomeCoreUrl(home)
+        assertEquals(home, s.get(BridgeStorage.CORE_URL_KEY))
+    }
+
+    @Test
+    fun aHomeAddressTheGateRefusesIsNeverHandedOut() {
+        val secret = MapStore()
+        val s = BridgeStorage(MapStore(), secret, cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, away)
+        // Written behind the dialog's back (or by an older build): still refused.
+        secret.put(BridgeStorage.CORE_HOME_KEY, "ws://box.example.test:8700/ws")
+        s.selectHome(true)
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+        secret.put(BridgeStorage.CORE_HOME_KEY, "ws://10.0.0.2@evil.example:8700/ws")
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+    }
+
+    @Test
+    fun savingBackTheShownHomeAddressKeepsTheAwayAddress() {
+        val plain = MapStore()
+        val s = BridgeStorage(plain, MapStore(), cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, away)
+        s.setHomeCoreUrl(home)
+        s.selectHome(true)
+        // The connect screen shows the address in use (home) and saves it again with a new token.
+        s.set(BridgeStorage.CORE_URL_KEY, home)
+        assertNull(s.connection())
+        s.set(BridgeStorage.TOKEN_KEY, token)
+        assertEquals(away, plain.map[BridgeStorage.CORE_URL_KEY])
+        assertEquals(BridgeStorage.Connection(home, token), s.connection())
+        // Same host and port, another path: a new address, not the home one written back.
+        s.set(BridgeStorage.CORE_URL_KEY, "ws://10.0.0.2:8700/other")
+        assertEquals("ws://10.0.0.2:8700/other", plain.map[BridgeStorage.CORE_URL_KEY])
+        s.setHomeCoreUrl("ws://10.0.0.9:8700/ws")
+        s.setHomeCoreUrl(home)
+        s.selectHome(true)
+        // A really new address replaces the away one and is used until the next check picks home.
+        s.set(BridgeStorage.CORE_URL_KEY, newUrl)
+        assertEquals(newUrl, plain.map[BridgeStorage.CORE_URL_KEY])
+        assertEquals(newUrl, s.get(BridgeStorage.CORE_URL_KEY))
+    }
+
+    @Test
+    fun changingTheHomeAddressResetsTheSelection() {
+        val s = BridgeStorage(MapStore(), MapStore(), cipher) {}
+        s.set(BridgeStorage.CORE_URL_KEY, away)
+        s.setHomeCoreUrl(home)
+        s.selectHome(true)
+        s.setHomeCoreUrl(" $home ") // unchanged: selection kept
+        assertEquals(home, s.get(BridgeStorage.CORE_URL_KEY))
+        s.setHomeCoreUrl("ws://10.0.0.3:8700/ws")
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+        s.setHomeCoreUrl(null)
+        assertNull(s.homeCoreUrl())
+        assertEquals(away, s.get(BridgeStorage.CORE_URL_KEY))
+    }
+
+    @Test
+    fun anExistingWssAddressStaysTheAwayAddress() {
+        // Upgrade from a version with one address: nothing to migrate, it is the away address.
+        val plain = MapStore()
+        plain.put(BridgeStorage.CORE_URL_KEY, away)
+        val s = BridgeStorage(plain, MapStore(), cipher) {}
+        assertFalse(s.forgetUnusableCoreUrl(cleartextHost = ""))
+        assertEquals(away, s.awayCoreUrl())
+        assertNull(s.homeCoreUrl())
+    }
+
     // --- connection pair (address + token as one snapshot) ---------------------
 
     private val newUrl = "wss://new.example.test/ws"

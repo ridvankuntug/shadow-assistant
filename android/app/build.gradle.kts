@@ -40,15 +40,16 @@ val copyUiBundle = tasks.register<CopyUiBundle>("copyUiBundle") {
 }
 
 /**
- * docs/12 D2 / T21.3.3: the app reaches the Core (`wss://`) and the wake
- * endpoint (`https://`) only over TLS; a released APK allows no cleartext.
- * For local development a build may add one plain-text host per endpoint:
+ * docs/12 D2 / T21.3.3: the app reaches the Core and the wake endpoint over TLS,
+ * or in plain text only to a private IPv4 address the user enters on the phone
+ * (enforced in code, CoreAddress / WakeAddress; see src/main/nsc/). For local
+ * development a build may add one more plain-text host per endpoint:
  *
  * - `shadowCoreHost` (Gradle property, `-P…` or `~/.gradle/gradle.properties`)
  *   or the environment variable SHADOW_CORE_HOST: the Core's host for `ws://`.
  * - `shadowWakeHost` / SHADOW_WAKE_HOST: wake-svc's host for `http://`.
  *
- * Both default to empty (no cleartext at all); no address lives in this public
+ * Both default to empty (no extra host); no address lives in this public
  * repository and CI sets neither. An IPv4 address or a plain DNS name only (it
  * goes into XML and Kotlin source, so nothing else is let through).
  */

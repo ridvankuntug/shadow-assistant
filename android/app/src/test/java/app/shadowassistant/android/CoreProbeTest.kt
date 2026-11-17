@@ -15,6 +15,10 @@ class CoreProbeTest {
     }
 
     private val box = "wss://box.example.ts.net/ws"
+    private val lan = "ws://10.0.0.2:8700/ws"
+    private val lanEndpoint = CoreAddress.Endpoint(false, "10.0.0.2", 8700)
+    private val coreUp = { HttpAnswer(200, """{"status":"ok","service":"core","version":"0.1.0"}""") }
+    private val down: () -> HttpAnswer = { throw IOException("timeout") }
     private val boxEndpoint = CoreAddress.Endpoint(true, "box.example.ts.net", 443)
 
     @Test
@@ -38,6 +42,47 @@ class CoreProbeTest {
     @Test
     fun asksTheCoresHealthOnTheSameHostAndPort() {
         assertEquals(CoreProbe.Precheck.Ask(boxEndpoint, "https://box.example.ts.net:443/health"), CoreProbe.precheck(box, ""))
+    }
+
+    @Test
+    fun homeIsAskedFirstWithItsOwnClientAndWins() {
+        val home = FakeHttp(coreUp)
+        val away = FakeHttp { throw AssertionError("away must not be asked") }
+        assertEquals(CoreSelection(true, CoreStatus.Fine), CoreProbe.select(lan, box, away, home, ""))
+        assertEquals(listOf("http://10.0.0.2:8700/health"), home.asked)
+    }
+
+    @Test
+    fun awayIsUsedWhenHomeDoesNotAnswer() {
+        val home = FakeHttp(down)
+        val away = FakeHttp(coreUp)
+        assertEquals(CoreSelection(false, CoreStatus.Fine), CoreProbe.select(lan, box, away, home, ""))
+        assertEquals(listOf("https://box.example.ts.net:443/health"), away.asked)
+        // Neither answers: keep the current choice, report the away address.
+        assertEquals(
+            CoreSelection(null, CoreStatus.Unreachable(boxEndpoint)),
+            CoreProbe.select(lan, box, FakeHttp(down), FakeHttp(down), ""),
+        )
+    }
+
+    @Test
+    fun eitherAddressMayBeMissing() {
+        assertEquals(CoreSelection(null, CoreStatus.Fine), CoreProbe.select(null, box, FakeHttp(coreUp), FakeHttp(down), ""))
+        assertEquals(CoreSelection(true, CoreStatus.Fine), CoreProbe.select(lan, null, FakeHttp(down), FakeHttp(coreUp), ""))
+        assertEquals(
+            CoreSelection(null, CoreStatus.Unreachable(lanEndpoint)),
+            CoreProbe.select(lan, "", FakeHttp(down), FakeHttp(down), ""),
+        )
+        // Nothing configured: nothing asked, the UI's connect screen takes over.
+        assertEquals(CoreSelection(null, CoreStatus.Fine), CoreProbe.select(null, null, FakeHttp(down), FakeHttp(down), ""))
+    }
+
+    @Test
+    fun aRefusedHomeAddressIsNeverAsked() {
+        val home = FakeHttp(coreUp)
+        val selection = CoreProbe.select("ws://box.example.test:8700/ws", box, FakeHttp(coreUp), home, "")
+        assertEquals(CoreSelection(false, CoreStatus.Fine), selection)
+        assertEquals(emptyList<String>(), home.asked)
     }
 
     @Test

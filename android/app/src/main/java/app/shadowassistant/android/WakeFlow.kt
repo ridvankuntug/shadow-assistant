@@ -57,9 +57,15 @@ sealed interface WakeState {
     data class Stopped(val reason: WakeStop) : WakeState
 }
 
-/** What one press needs: where to send, the token, and which Core to wait for. */
-data class WakeTarget(val wakeUrl: String, val token: String, val coreHealthUrl: String) {
-    override fun toString() = "WakeTarget(wakeUrl=$wakeUrl, token=<redacted>, coreHealthUrl=$coreHealthUrl)"
+/**
+ * What one press needs: where to send (home first, then away: the next URL is
+ * tried only when there is no answer at all), the token, and the Core's
+ * `/health` URLs to wait for (any of them answering counts).
+ */
+data class WakeTarget(val wakeUrls: List<String>, val token: String, val coreHealthUrls: List<String>) {
+    constructor(wakeUrl: String, token: String, coreHealthUrl: String) : this(listOf(wakeUrl), token, listOf(coreHealthUrl))
+
+    override fun toString() = "WakeTarget(wakeUrls=$wakeUrls, token=<redacted>, coreHealthUrls=$coreHealthUrls)"
 }
 
 /**
@@ -128,18 +134,26 @@ class WakeFlow(
 
     /** The Core address changed (docs/12 D2): a running flow would wait for the wrong Core, so it stops. */
     fun coreAddressChanged(newCoreUrl: String?) {
-        val waitingFor = synchronized(lock) { target?.coreHealthUrl } ?: return
-        if (WakeAddress.coreHealthUrl(newCoreUrl) != waitingFor) cancel()
+        val waitingFor = synchronized(lock) { target?.coreHealthUrls } ?: return
+        if (WakeAddress.coreHealthUrl(newCoreUrl) !in waitingFor) cancel()
     }
 
     private fun send(gen: Int) {
         val t = targetFor(gen) ?: return
-        val next = try {
-            interpretWake(http.postWake(t.wakeUrl, t.token))
-        } catch (_: Exception) {
-            // IOException: no answer / timeout / refused by the network security config; anything
-            // else (e.g. a malformed URL that slipped through) must not leave the flow in Sending.
-            WakeState.Stopped(WakeStop.Unreachable)
+        // The first address that answers decides; IOException (no answer / timeout / refused) or
+        // anything else (e.g. a malformed URL that slipped through) moves on to the next one and
+        // never leaves the flow in Sending.
+        var next: WakeState = WakeState.Stopped(WakeStop.Unreachable)
+        for ((i, url) in t.wakeUrls.withIndex()) {
+            // Cancelled while the previous address timed out: send nothing more.
+            if (i > 0 && targetFor(gen) == null) return
+            val answer = try {
+                http.postWake(url, t.token)
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            next = interpretWake(answer)
+            break
         }
         if (next is WakeState.Waking) {
             val since = clock()
@@ -156,10 +170,12 @@ class WakeFlow(
             set(gen, WakeState.Stopped(WakeStop.TimedOut))
             return
         }
-        val up = try {
-            coreAnswered(http.getHealth(t.coreHealthUrl))
-        } catch (_: Exception) {
-            false
+        val up = t.coreHealthUrls.any { url ->
+            try {
+                coreAnswered(http.getHealth(url))
+            } catch (_: Exception) {
+                false
+            }
         }
         when {
             up -> set(gen, WakeState.Done)

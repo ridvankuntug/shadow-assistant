@@ -48,20 +48,23 @@ import java.io.ByteArrayInputStream
  *   refused, so no foreign page can ever run next to the bridge, and the
  *   bridge itself answers only while the main frame is the bundle.
  * - Every bundle response carries a strict Content-Security-Policy
- *   ([UiOrigin.CONTENT_SECURITY_POLICY]): scripts only from the bundle (no
- *   inline/eval, so no injected or `srcdoc` script can reach the bridge), no
- *   frames, and `connect-src` limited to the bundle and `wss:` (plus
- *   `ws://<host>` only for a development build's Core host,
- *   [CoreAddress.CLEARTEXT_HOST]). WebSocket handshakes bypass
- *   shouldInterceptRequest, so the CSP is what actually keeps a plain `ws://`
- *   (and the token in `hello`) from going to any host.
- * - Mixed content: the Core is reached through `wss://` (T21.3.3), so mixed
- *   content stays forbidden (MIXED_CONTENT_NEVER_ALLOW). Only a development
- *   build with a cleartext Core host needs MIXED_CONTENT_ALWAYS_ALLOW, because
- *   Chromium lets an https page open `ws://` only with it; all non-asset
- *   HTTP(S) requests are refused above, so in practice it then admits only
- *   WebSockets, which the CSP and the network security config limit to that
- *   one host (plain) or TLS.
+ *   ([UiOrigin.pagePolicy], fixed per page load): scripts only from the bundle
+ *   (no inline/eval, so no injected or `srcdoc` script can reach the bridge),
+ *   no frames, and `connect-src` limited to the bundle, `wss:` and plain
+ *   `ws://` only to the exact `host:port` of a configured Core address that
+ *   passes the cleartext gate (a private IPv4 address, T21.3.3; plus a
+ *   development build's Core host, [CoreAddress.CLEARTEXT_HOST]). WebSocket
+ *   handshakes bypass shouldInterceptRequest, so the CSP is what actually keeps
+ *   a plain `ws://` (and the token in `hello`) from going to any other host.
+ * - Mixed content: forbidden (MIXED_CONTENT_NEVER_ALLOW) unless a Core address
+ *   is a plain `ws://` one that passes the gate; only then
+ *   MIXED_CONTENT_ALWAYS_ALLOW, because Chromium lets an https page open
+ *   `ws://` only with it. All non-asset HTTP(S) requests are refused above, so
+ *   in practice it admits only WebSockets, which the CSP limits as described.
+ * - Home / away (T21.3.3): [checkCore] asks the Core's home address first
+ *   ([CoreProbe]) and records the choice ([BridgeStorage.selectHome]); the page
+ *   reads the address in use once, at load, so a different address or policy
+ *   reloads it ([reloadIfStale]).
  */
 class MainActivity : Activity() {
     private lateinit var main: Handler
@@ -98,6 +101,14 @@ class MainActivity : Activity() {
     private var pageLoaded = false
     private var shownError: ErrorKind? = null
 
+    /** What the current page load was given: the Core address it reads and its policy. */
+    private var loadedCoreUrl: String? = null
+    private var loadedPolicy: UiOrigin.PagePolicy? = null
+
+    /** The CSP sent with bundle responses (read on WebView threads). */
+    @Volatile
+    private var pageCsp: String = UiOrigin.CONTENT_SECURITY_POLICY
+
     /** The UI was not loaded because the local network permission is missing (API 37+). */
     private var uiDeferred = false
 
@@ -119,7 +130,7 @@ class MainActivity : Activity() {
 
         storage = AppStorage.bridge(this) { Log.w(TAG, it) }
         val flags = AppStorage.flags(this)
-        // No built-in Core address (T21.3.3); an old plain ws:// one is dropped so the UI asks again.
+        // No built-in Core address (T21.3.3); a plain ws:// one the gate refuses is dropped so the UI asks again.
         storage.forgetUnusableCoreUrl()
 
         focus = AudioFocus(getSystemService(AudioManager::class.java), main)
@@ -139,12 +150,18 @@ class MainActivity : Activity() {
         probe = CoreProbe(main)
         gemini = GeminiLauncher(this)
         wakeStore = AppStorage.wake(this) { Log.w(TAG, it) }
+        wakeStore.migrate()
         wakeScheduler = ExecutorWakeScheduler()
         // States arrive on the wake thread; the panel always renders the flow's current state.
         wake = WakeFlow(UrlConnectionWakeHttp(), wakeScheduler, SystemClock::elapsedRealtime) {
             main.post { if (!destroyed) onWakeState() }
         }
-        wakeDialog = WakeDialog(this, wakeStore)
+        // Changed addresses: a running wake waits for the old ones, so it stops (the first-press
+        // flow starts its wake only after this); then check and pick again.
+        wakeDialog = WakeDialog(this, wakeStore, storage) {
+            wake.cancel()
+            checkCore()
+        }
 
         configureWebView()
 
@@ -202,12 +219,8 @@ class MainActivity : Activity() {
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
             mediaPlaybackRequiresUserGesture = false
-            // See class comment: plain ws:// exists only in a development build with a Core host.
-            mixedContentMode = if (CoreAddress.CLEARTEXT_HOST.isEmpty()) {
-                WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            } else {
-                WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            }
+            // Set per load in loadUi (see class comment); forbidden until then.
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
         val assets = WebViewAssetLoader.Builder()
             .setDomain(UiOrigin.HOST)
@@ -274,8 +287,13 @@ class MainActivity : Activity() {
             notify = notifier::notify,
             notifyItem = notifier::notifyItem,
             onStorageChanged = { key ->
-                // A waking flow waits for one Core; another address stops it (docs/12 D2).
-                if (key == BridgeStorage.CORE_URL_KEY) wake.coreAddressChanged(storage.get(BridgeStorage.CORE_URL_KEY))
+                if (key == BridgeStorage.CORE_URL_KEY) {
+                    val url = storage.get(BridgeStorage.CORE_URL_KEY)
+                    // The page already uses the address it just saved: no reload just for that.
+                    loadedCoreUrl = url
+                    // A waking flow waits for one Core; another address stops it (docs/12 D2).
+                    wake.coreAddressChanged(url)
+                }
                 if (key == BridgeStorage.CORE_URL_KEY || key == BridgeStorage.TOKEN_KEY) checkCore()
                 // Connecting: the UI writes the address first and the token last, so trigger on the
                 // token only (the job then finds a matching address/token pair).
@@ -291,11 +309,14 @@ class MainActivity : Activity() {
         webView.addJavascriptInterface(bridge, "ShadowAndroid")
     }
 
-    /** Adds [UiOrigin.CONTENT_SECURITY_POLICY] to a bundle response (see class comment). */
+    /** Adds the current load's CSP ([pageCsp]) to a bundle response (see class comment). */
     private fun withCsp(response: WebResourceResponse): WebResourceResponse {
-        response.responseHeaders = (response.responseHeaders.orEmpty()) + ("Content-Security-Policy" to UiOrigin.CONTENT_SECURITY_POLICY)
+        response.responseHeaders = (response.responseHeaders.orEmpty()) + ("Content-Security-Policy" to pageCsp)
         return response
     }
+
+    /** The policy for the stored Core addresses (home and away). */
+    private fun currentPolicy() = UiOrigin.pagePolicy(listOf(storage.homeCoreUrl(), storage.awayCoreUrl()))
 
     private fun blocked(status: Int, reason: String) =
         WebResourceResponse("text/plain", "utf-8", status, reason, emptyMap(), ByteArrayInputStream(ByteArray(0)))
@@ -314,7 +335,25 @@ class MainActivity : Activity() {
             return
         }
         pageLoaded = false
+        val policy = currentPolicy()
+        loadedPolicy = policy
+        loadedCoreUrl = storage.get(BridgeStorage.CORE_URL_KEY)
+        pageCsp = policy.csp
+        webView.settings.mixedContentMode =
+            if (policy.mixedContent) WebSettings.MIXED_CONTENT_ALWAYS_ALLOW else WebSettings.MIXED_CONTENT_NEVER_ALLOW
         webView.loadUrl(UiOrigin.START_URL)
+    }
+
+    /**
+     * Reloads the page if the Core address it uses or its policy is out of date
+     * (another address was selected, or the addresses changed). Not while a wake
+     * is running: its Done state checks again and reloads then. True if reloaded.
+     */
+    private fun reloadIfStale(): Boolean {
+        if (wake.active) return false
+        if (storage.get(BridgeStorage.CORE_URL_KEY) == loadedCoreUrl && currentPolicy() == loadedPolicy) return false
+        loadUi()
+        return true
     }
 
     /** Shows a native error when the configured Core cannot be reached (only once a token is set). */
@@ -324,9 +363,11 @@ class MainActivity : Activity() {
             if (shownError == ErrorKind.CORE) hideError()
             return
         }
-        probe.check(storage.get(BridgeStorage.CORE_URL_KEY)) { status ->
+        probe.check(storage.homeCoreUrl(), storage.awayCoreUrl()) { selection ->
             if (destroyed) return@check
-            when (status) {
+            selection.useHome?.let(storage::selectHome)
+            if (reloadIfStale()) return@check // onPageFinished checks again with the new page
+            when (val status = selection.status) {
                 // While waking, only the flow's /health poll decides (docs/12 D2: an open TCP port is not
                 // a usable Core yet); the flow closes the panel itself once the Core answers.
                 CoreStatus.Fine -> if (shownError == ErrorKind.CORE && !wake.active) hideError()
@@ -338,11 +379,7 @@ class MainActivity : Activity() {
                 }
                 is CoreStatus.CleartextBlocked -> showCoreError(
                     getString(R.string.error_cleartext_title),
-                    if (CoreAddress.CLEARTEXT_HOST.isEmpty()) {
-                        getString(R.string.error_cleartext_message_none, status.endpoint.host)
-                    } else {
-                        getString(R.string.error_cleartext_message, status.endpoint.host, CoreAddress.CLEARTEXT_HOST)
-                    },
+                    getString(R.string.error_cleartext_message, status.endpoint.host),
                 )
             }
         }
@@ -454,6 +491,8 @@ class MainActivity : Activity() {
                 // "Adresi değiştir": back to the UI, whose settings/connect screen edits the address.
                 secondary = getString(R.string.error_change_address) to { hideError() },
                 wake = true,
+                // "Adresler": where the home address (and the wake settings) are entered.
+                wakeSettings = true,
             )
             WakeState.Sending -> setPanel(
                 ErrorKind.CORE,
@@ -529,18 +568,28 @@ class MainActivity : Activity() {
     private fun onWakePressed() {
         if (destroyed || unreachable == null) return
         val config = wakeStore.config()
-        val endpoint = config?.let { (WakeAddress.check(it.address) as? WakeAddress.Check.Ok)?.endpoint }
-        // No settings, an unreadable token, or an address this build does not allow: ask (again).
-        if (config == null || endpoint == null) {
+        // Home first, then away; only addresses the gate allows.
+        val wakeUrls = config?.let { c ->
+            listOf(c.home, c.away).mapNotNull { (WakeAddress.check(it) as? WakeAddress.Check.Ok)?.endpoint?.wakeUrl }
+        }.orEmpty()
+        // No settings, an unreadable token, or no address this build allows: ask (again).
+        if (config == null || wakeUrls.isEmpty()) {
             wakeDialog.show(onSaved = ::onWakePressed)
             return
         }
-        val health = WakeAddress.coreHealthUrl(storage.get(BridgeStorage.CORE_URL_KEY)) ?: return
-        wake.start(WakeTarget(endpoint.wakeUrl, config.token, health))
+        // Wait for the Core at either address: the network may change while the PC boots.
+        val health = listOf(storage.homeCoreUrl(), storage.awayCoreUrl())
+            .filter { CoreAddress.usable(it) }
+            .mapNotNull { WakeAddress.coreHealthUrl(it) }
+            .distinct()
+        if (health.isEmpty()) return
+        wake.start(WakeTarget(wakeUrls, config.token, health))
         renderCorePanel()
     }
 
     private fun onWakeState() {
+        // A reload held back while the wake ran (reloadIfStale) happens as soon as it ends.
+        if (wake.state != WakeState.Done && !wake.active && reloadIfStale()) return
         if (wake.state == WakeState.Done) {
             // The Core answers /health: do what a return to the foreground does, so the UI reconnects now.
             hideError()

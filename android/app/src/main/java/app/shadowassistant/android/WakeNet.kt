@@ -10,12 +10,14 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /**
- * [WakeHttp] over [HttpURLConnection]. Bound by the network security config:
- * TLS only, except a development build's cleartext Core / wake host. No redirects,
+ * [WakeHttp] over [HttpURLConnection]. Callers pass only URLs that passed the
+ * cleartext gate ([CoreAddress.cleartextAllowed] / [WakeAddress.check]: TLS, or
+ * plain HTTP to a private IPv4 address). [healthTimeoutMs] is shorter for the
+ * Core's home address probe ([CoreProbe]). No redirects,
  * no caches, bodies read up to [MAX_BODY_BYTES]. The token goes only into the
  * `Authorization` header; nothing here logs.
  */
-class UrlConnectionWakeHttp : WakeHttp {
+class UrlConnectionWakeHttp(private val healthTimeoutMs: Int = HEALTH_TIMEOUT_MS) : WakeHttp {
     override fun postWake(wakeUrl: String, token: String): HttpAnswer =
         request(wakeUrl, "POST", WAKE_TIMEOUT_MS) { conn ->
             conn.setRequestProperty("Authorization", "Bearer $token")
@@ -23,7 +25,7 @@ class UrlConnectionWakeHttp : WakeHttp {
             conn.setFixedLengthStreamingMode(0)
         }
 
-    override fun getHealth(healthUrl: String): HttpAnswer = request(healthUrl, "GET", HEALTH_TIMEOUT_MS) {}
+    override fun getHealth(healthUrl: String): HttpAnswer = request(healthUrl, "GET", healthTimeoutMs) {}
 
     private fun request(url: String, method: String, timeoutMs: Int, setup: (HttpURLConnection) -> Unit): HttpAnswer {
         val conn = URL(url).openConnection() as? HttpURLConnection ?: throw IOException("not an HTTP URL")

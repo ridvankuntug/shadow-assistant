@@ -46,9 +46,58 @@ class AddressAndOriginTest {
     }
 
     @Test
+    fun privateIpv4LiteralsOnly() {
+        // The 192.168/16 literals are built from a prefix: the repository holds no LAN address (docs/12).
+        val p192 = "192.168"
+        for (ok in listOf(
+            "10.0.0.1", "10.255.255.255", "10.0.0.0", "172.16.0.1", "172.31.255.255", "$p192.0.1", "$p192.255.254",
+        )) {
+            assertTrue(ok, CoreAddress.isPrivateIpv4Literal(ok))
+        }
+        for (bad in listOf(
+            // Outside the ranges (incl. the neighbours of 172.16/12 and 192.168/16, CGNAT, loopback).
+            "11.0.0.1", "9.255.255.255", "172.15.0.1", "172.32.0.1", "192.167.0.1", "192.169.0.1", "100.64.0.1",
+            "127.0.0.1", "0.0.0.0", "255.255.255.255", "192.0.2.10", "8.8.8.8",
+            // Not a plain dotted quad.
+            "10.1", "10.0.1", "10.0.0.1.5", "010.0.0.1", "10.00.0.1", "10.0.0.01", "0x0a.0.0.1", "10.0.0.256",
+            "10.0.0.1000", "10.0.0.-1", "10.0.0.1.", ".10.0.0.1", "10..0.1", " 10.0.0.1", "10.0.0.1 ", "1e1.0.0.1",
+            "\uFF11\uFF10.0.0.1", "",
+            // Hostnames that look like one, IPv6 forms.
+            "10.0.0.1.evil.example", "evil.example.10.0.0.1x", "localhost", "::1", "[::ffff:10.0.0.1]", "::ffff:10.0.0.1",
+            "fd00::1",
+        )) {
+            assertFalse(bad, CoreAddress.isPrivateIpv4Literal(bad))
+        }
+    }
+
+    @Test
+    fun plainWebSocketsOnlyToPrivateIpv4() {
+        fun allowed(url: String) = CoreAddress.parse(url)?.let { CoreAddress.cleartextAllowed(it, "") } ?: false
+        assertTrue(allowed("ws://10.0.0.2:8700/ws"))
+        assertTrue(allowed("WS://172.20.1.2:8700/ws"))
+        assertTrue(allowed("ws://10.0.0.2/ws"))
+        for (bad in listOf(
+            "ws://172.15.0.2:8700/ws", "ws://172.32.0.2:8700/ws", "ws://11.0.0.2:8700/ws", "ws://198.51.100.7:8700/ws",
+            "ws://10.0.0.1.evil.example:8700/ws", "ws://box.example.test:8700/ws", "ws://localhost:8700/ws",
+            // User info: the host is evil.example (refused), and even a private host with user info is refused.
+            "ws://10.0.0.2@evil.example:8700/ws", "ws://user:pw@10.0.0.2:8700/ws", "ws://10.0.0.2:8700@evil.example/ws",
+            "ws://[::1]:8700/ws", "ws://[::ffff:10.0.0.2]:8700/ws", "ws://[fd00::1]:8700/ws",
+            "ws://010.0.0.2:8700/ws", "ws://10.2:8700/ws", "ws://0x0a.0.0.2:8700/ws", "ws://10.0.0.2.:8700/ws",
+        )) {
+            assertFalse(bad, allowed(bad))
+        }
+        // Unparsable tricks never reach the gate as allowed.
+        assertFalse(CoreAddress.usable("ws://10.0.0.2\\@evil.example/ws", ""))
+        assertFalse(CoreAddress.usable("ws://10.0.0.2%2eevil.example/ws", ""))
+        assertTrue(CoreAddress.usable("wss://box.example.ts.net/ws", ""))
+    }
+
+    @Test
     fun unusableMeansAPlainAddressThisBuildRefuses() {
-        // The address versions before T21.3.3 seeded (a plain LAN ws://) is unusable without a dev host.
+        // A plain ws:// to a non-private address is unusable without a dev host; a private one is fine.
         assertTrue(CoreAddress.unusable("ws://192.0.2.10:8700/ws", ""))
+        assertTrue(CoreAddress.unusable("ws://box.example.test:8700/ws", ""))
+        assertFalse(CoreAddress.unusable("ws://10.0.0.2:8700/ws", ""))
         assertFalse(CoreAddress.unusable("ws://192.0.2.10:8700/ws", "192.0.2.10"))
         assertFalse(CoreAddress.unusable("wss://box.example.ts.net/ws", ""))
         // Missing or unparsable values are left to the UI's connect screen.
@@ -66,7 +115,9 @@ class AddressAndOriginTest {
         assertTrue("generated network security config missing: $xml", xml.isFile)
         val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(xml)
         val base = doc.getElementsByTagName("base-config").item(0)
-        assertEquals("false", base.attributes.getNamedItem("cleartextTrafficPermitted").nodeValue)
+        // T21.3.3: LAN addresses are not known at build time and NSC has no ranges, so cleartext is
+        // open here and the gate is CoreAddress / WakeAddress / the page CSP (tested below).
+        assertEquals("true", base.attributes.getNamedItem("cleartextTrafficPermitted").nodeValue)
         val configs = doc.getElementsByTagName("domain-config")
         for (i in 0 until configs.length) {
             assertEquals("true", configs.item(i).attributes.getNamedItem("cleartextTrafficPermitted").nodeValue)
@@ -114,6 +165,29 @@ class AddressAndOriginTest {
             setOf("'self'", "ws://192.0.2.10:*", "wss:"),
             cspDirectives(UiOrigin.contentSecurityPolicy("192.0.2.10"))["connect-src"],
         )
+    }
+
+    @Test
+    fun pagePolicyAddsOnlyTheConfiguredPrivateAddressesAndMixedContentOnlyThen() {
+        val tls = UiOrigin.pagePolicy(listOf(null, "wss://box.example.ts.net/ws"), "")
+        assertFalse(tls.mixedContent)
+        assertEquals(setOf("'self'", "wss:"), cspDirectives(tls.csp)["connect-src"])
+        assertEquals(UiOrigin.contentSecurityPolicy(""), tls.csp)
+
+        val home = UiOrigin.pagePolicy(listOf("ws://10.0.0.2:8700/ws", "wss://box.example.ts.net/ws"), "")
+        assertTrue(home.mixedContent)
+        assertEquals(setOf("'self'", "ws://10.0.0.2:8700", "wss:"), cspDirectives(home.csp)["connect-src"])
+        // Default port spelled out; duplicates collapse.
+        assertEquals(
+            setOf("'self'", "ws://10.0.0.2:80", "wss:"),
+            cspDirectives(UiOrigin.pagePolicy(listOf("ws://10.0.0.2/ws", "ws://10.0.0.2:80/ws"), "").csp)["connect-src"],
+        )
+        // Refused addresses never become a source, and then mixed content stays off.
+        for (bad in listOf("ws://box.example.test:8700/ws", "ws://198.51.100.7:8700/ws", "ws://10.0.0.2@evil.example/ws", "not a url")) {
+            val p = UiOrigin.pagePolicy(listOf(bad, null), "")
+            assertFalse(bad, p.mixedContent)
+            assertEquals(bad, setOf("'self'", "wss:"), cspDirectives(p.csp)["connect-src"])
+        }
     }
 
     @Test

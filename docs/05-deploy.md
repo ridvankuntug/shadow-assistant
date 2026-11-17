@@ -575,9 +575,10 @@ wake-svc` rates the unit's sandbox.
 
 ### HTTPS addresses through Tailscale (recommended; required by the Android app)
 
-The Android app talks to the Core only over `wss://` and to wake-svc only
-over `https://`; a released APK allows no cleartext and has no built-in
-address (android/README.md, "Network: home and away"). Tailscale `serve` on
+Away from home the Android app talks to the Core over `wss://` and to
+wake-svc over `https://`; it has no built-in address (android/README.md,
+"Network: home and away"). At home it can use plain LAN addresses instead
+(see "Home addresses" below). Tailscale `serve` on
 the box gives both a tailnet-only HTTPS address with a valid certificate, on
 the box's one ts.net name:
 
@@ -588,8 +589,9 @@ the box's one ts.net name:
 
 Costs of this path:
 
-- The phone needs **Tailscale connected at home too**: the name resolves
-  only on the tailnet.
+- The name resolves only on the tailnet, so **away** the phone needs
+  Tailscale connected (at home not, if the home addresses are entered, see
+  below).
 - **If the box is off** (or loses the LAN), the phone cannot reach the Core
   at all, and cannot wake the PC either.
 - The box's machine name and your tailnet name appear in the public
@@ -637,8 +639,28 @@ Costs of this path:
    not); the app then shows "Çekirdeğe ulaşılamıyor" with the wake button.
 
 5. **[USER ACTION]** In the phone: Core address
-   `wss://<box>.<tailnet>.ts.net/ws` (connect screen), wake address
-   `https://<box>.<tailnet>.ts.net:8443` (**Uyandırma ayarı**).
+   `wss://<box>.<tailnet>.ts.net/ws` (connect screen), wake away address
+   `https://<box>.<tailnet>.ts.net:8443` (**Adresler**).
+
+### Home addresses (no Tailscale at home)
+
+The app tries a **home** address first (Core: `/health` with a 1.5 s
+timeout; wake: first `POST`) and falls back to the away address above
+(T21.3.3). Plain `ws://` / `http://` is accepted only to a private IPv4
+address (10.0.0.0/8, 172.16.0.0/12, 192.168/16), never to a name.
+
+1. **[USER ACTION]** Give the PC and the box fixed LAN addresses (DHCP
+   reservation on the router), so the entered addresses stay valid.
+2. **[USER ACTION]** The Core already listens on the LAN (step 2 above); allow
+   inbound TCP 8700 in the Windows firewall from the phone's Wi-Fi subnet as
+   well, not only from `<box-lan-ip>`. wake-svc listens on `<box-lan-ip>:8704`
+   (section "Install").
+3. **[USER ACTION]** In the phone, **Adresler**: Core home address
+   `ws://<pc-lan-ip>:8700/ws`, wake home address `http://<box-lan-ip>:8704`.
+
+On the home Wi-Fi this traffic (including the device token in `hello` and
+the wake token) is not encrypted; anyone on that network can read it. Use it
+only on a network you trust.
 
 ### Rotate the token
 

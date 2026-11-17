@@ -41,11 +41,11 @@ class WakeStoreTest {
         val store = MapStore()
         val logs = mutableListOf<String>()
         val s = WakeStore(store, cipher) { logs += it }
-        assertTrue(s.save(address, token))
+        assertTrue(s.save(null, address, token))
         assertFalse(store.map.values.any { it.contains(token) })
         assertTrue(store.map.getValue(WakeStore.TOKEN_KEY).startsWith("v1:"))
         assertEquals(address, store.map[WakeStore.ADDRESS_KEY])
-        assertEquals(WakeStore.Config(address, token), s.config())
+        assertEquals(WakeStore.Config(null, address, token), s.config())
         assertFalse(s.config().toString().contains(token))
         assertTrue(logs.isEmpty())
     }
@@ -54,17 +54,18 @@ class WakeStoreTest {
     fun addressAndTokenAreOneWrite() {
         val store = MapStore()
         val s = WakeStore(store, cipher) {}
-        s.save(address, token)
-        s.save(address, null)
-        assertEquals(listOf(setOf(WakeStore.TOKEN_KEY, WakeStore.ADDRESS_KEY), setOf(WakeStore.ADDRESS_KEY)), store.writes)
+        s.save(null, address, token)
+        s.save(null, address, null)
+        val addresses = setOf(WakeStore.HOME_KEY, WakeStore.ADDRESS_KEY)
+        assertEquals(listOf(addresses + WakeStore.TOKEN_KEY, addresses), store.writes)
     }
 
     @Test
     fun emptyTokenFieldKeepsTheStoredToken() {
         val s = WakeStore(MapStore(), cipher) {}
-        s.save(address, token)
-        assertTrue(s.save("https://wake.example.test:8443", null))
-        assertEquals(WakeStore.Config("https://wake.example.test:8443", token), s.config())
+        s.save(null, address, token)
+        assertTrue(s.save(null, "https://wake.example.test:8443", null))
+        assertEquals(WakeStore.Config(null, "https://wake.example.test:8443", token), s.config())
     }
 
     @Test
@@ -76,7 +77,7 @@ class WakeStoreTest {
             override fun decrypt(blob: String): String? = null
         }
         val s = WakeStore(store, failing) { logs += it }
-        assertFalse(s.save(address, token))
+        assertFalse(s.save(null, address, token))
         assertTrue(store.map.isEmpty())
         assertFalse(logs.any { it.contains(token) })
         assertNull(s.config())
@@ -86,11 +87,11 @@ class WakeStoreTest {
     fun undecryptableTokenIsClearedAndNotLogged() {
         val store = MapStore()
         val logs = mutableListOf<String>()
-        WakeStore(store, cipher) {}.save(address, token)
+        WakeStore(store, cipher) {}.save(null, address, token)
         val other = WakeStore(store, AesGcmTokenCipher({ newKey() }, WakeStore.TOKEN_AAD)) { logs += it }
         assertNull(other.config())
         assertFalse(other.hasToken())
-        assertEquals(address, other.address())
+        assertEquals(address, other.away())
         assertEquals(1, logs.size)
         assertFalse(logs.any { it.contains(token) })
     }
@@ -108,7 +109,7 @@ class WakeStoreTest {
         val store = MapStore()
         val s = WakeStore(store, cipher) {}
         for (bad in listOf("", "with space", "line\nbreak", "tab\t", "ünicode", "x".repeat(513))) {
-            assertFalse(bad, s.save(address, bad))
+            assertFalse(bad, s.save(null, address, bad))
         }
         assertTrue(store.map.isEmpty())
     }
@@ -117,7 +118,7 @@ class WakeStoreTest {
     fun clearRemovesBoth() {
         val store = MapStore()
         val s = WakeStore(store, cipher) {}
-        s.save(address, token)
+        s.save(null, address, token)
         s.clear()
         assertTrue(store.map.isEmpty())
         assertNull(s.config())
@@ -133,7 +134,7 @@ class WakeStoreTest {
         // The page reads BridgeStorage only; the wake keys mean nothing there.
         val bridge = BridgeStorage(MapStore(), MapStore(), cipher) {}
         val wakeFile = MapStore()
-        WakeStore(wakeFile, cipher) {}.save(address, token)
+        WakeStore(wakeFile, cipher) {}.save(null, address, token)
         assertNull(bridge.get(WakeStore.TOKEN_KEY))
         assertNull(bridge.get(WakeStore.ADDRESS_KEY))
     }
@@ -143,15 +144,24 @@ class WakeStoreTest {
     private val home = "192.0.2.10"
 
     @Test
-    fun cleartextOnlyToTheBuildsWakeHost() {
+    fun cleartextOnlyToPrivateIpv4OrTheBuildsWakeHost() {
+        // Private IPv4 literals: always (T21.3.3), with or without a build host.
+        assertEquals(WakeAddress.Check.Ok(WakeAddress.Endpoint(false, "10.0.0.5", 8704)), WakeAddress.check("http://10.0.0.5:8704", ""))
+        assertEquals(WakeAddress.Check.Ok(WakeAddress.Endpoint(false, "172.16.0.5", 80)), WakeAddress.check(" http://172.16.0.5/ ", ""))
+        // Public / documentation addresses and hostnames: only the build's development host.
         assertEquals(
             WakeAddress.Check.Ok(WakeAddress.Endpoint(false, home, 8704)),
             WakeAddress.check("http://192.0.2.10:8704", home),
         )
-        assertEquals(WakeAddress.Check.Ok(WakeAddress.Endpoint(false, home, 80)), WakeAddress.check(" http://192.0.2.10/ ", home))
         assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.11:8704", home))
-        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.12:8704", home))
         assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://192.0.2.10:8704", ""))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://box.example.test:8704", ""))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://10.0.0.5.example.test:8704", ""))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://172.32.0.5:8704", ""))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://010.0.0.5:8704", ""))
+        assertEquals(WakeAddress.Check.CleartextNotAllowed, WakeAddress.check("http://[fd00::1]:8704", ""))
+        // User info is refused outright (it could hide the real host).
+        assertEquals(WakeAddress.Check.Invalid, WakeAddress.check("http://10.0.0.5@box.example.test:8704", ""))
         assertEquals(
             WakeAddress.Check.Ok(WakeAddress.Endpoint(true, "wake.example.test", 443)),
             WakeAddress.check("HTTPS://Wake.Example.Test", home),
@@ -188,35 +198,83 @@ class WakeStoreTest {
         assertNull(WakeAddress.coreHealthUrl(null))
     }
 
+    private fun form(
+        coreHome: String? = null,
+        wakeHome: String? = null,
+        wakeAway: String? = null,
+        token: String? = null,
+        hasStoredToken: Boolean = false,
+    ) = WakeSettingsForm.validate(coreHome, wakeHome, wakeAway, token, hasStoredToken, coreCleartextHost = "", wakeCleartextHost = "")
+
+    private fun invalid(field: WakeSettingsForm.Field, problem: WakeSettingsForm.Problem) = WakeSettingsForm.Result.Invalid(field, problem)
+
     @Test
     fun dialogValidation() {
-        val ok = WakeSettingsForm.validate("http://192.0.2.10:8704/", " $token ", hasStoredToken = false, cleartextHost = home)
-        assertEquals(WakeSettingsForm.Result.Ok("http://192.0.2.10:8704", token), ok)
+        val ok = form("ws://10.0.0.2:8700/ws", "http://10.0.0.5:8704/", "https://wake.example.test:8443", " $token ")
+        assertEquals(
+            WakeSettingsForm.Result.Ok("ws://10.0.0.2:8700/ws", "http://10.0.0.5:8704", "https://wake.example.test:8443", token),
+            ok,
+        )
         assertFalse(ok.toString().contains(token))
+        // Everything is optional: no addresses, no token is "nothing configured".
+        assertEquals(WakeSettingsForm.Result.Ok(null, null, null, null), form())
+        assertEquals(WakeSettingsForm.Result.Ok("wss://core.example.test/ws", null, null, null), form("wss://core.example.test/ws"))
+        // One wake address is enough; an empty token field keeps a stored token.
         assertEquals(
-            WakeSettingsForm.Result.Ok("http://192.0.2.10:8704", null),
-            WakeSettingsForm.validate("http://192.0.2.10:8704", "", hasStoredToken = true, cleartextHost = home),
+            WakeSettingsForm.Result.Ok(null, "http://10.0.0.5:8704", null, null),
+            form(wakeHome = "http://10.0.0.5:8704", token = "", hasStoredToken = true),
         )
+        assertEquals(invalid(WakeSettingsForm.Field.TOKEN, WakeSettingsForm.Problem.TOKEN_MISSING), form(wakeAway = "https://wake.example.test", token = "  "))
         assertEquals(
-            WakeSettingsForm.Result.Invalid(WakeSettingsForm.Problem.TOKEN_MISSING),
-            WakeSettingsForm.validate("http://192.0.2.10:8704", "  ", hasStoredToken = false, cleartextHost = home),
+            invalid(WakeSettingsForm.Field.TOKEN, WakeSettingsForm.Problem.TOKEN_INVALID),
+            form(wakeAway = "https://wake.example.test", token = "two words", hasStoredToken = true),
         )
-        assertEquals(
-            WakeSettingsForm.Result.Invalid(WakeSettingsForm.Problem.TOKEN_INVALID),
-            WakeSettingsForm.validate("http://192.0.2.10:8704", "two words", hasStoredToken = true, cleartextHost = home),
-        )
-        assertEquals(
-            WakeSettingsForm.Result.Invalid(WakeSettingsForm.Problem.ADDRESS_CLEARTEXT),
-            WakeSettingsForm.validate("http://198.51.100.7:8704", token, hasStoredToken = false, cleartextHost = home),
-        )
-        assertEquals(
-            WakeSettingsForm.Result.Invalid(WakeSettingsForm.Problem.ADDRESS_NO_CLEARTEXT_HOST),
-            WakeSettingsForm.validate("http://192.0.2.10:8704", token, hasStoredToken = false, cleartextHost = ""),
-        )
-        assertEquals(
-            WakeSettingsForm.Result.Invalid(WakeSettingsForm.Problem.ADDRESS_INVALID),
-            WakeSettingsForm.validate("http://192.0.2.10:8704/wake", token, hasStoredToken = false, cleartextHost = home),
-        )
+        assertEquals(invalid(WakeSettingsForm.Field.WAKE_AWAY, WakeSettingsForm.Problem.ADDRESS_MISSING), form(token = token))
+        // The cleartext gate on every address field.
+        assertEquals(invalid(WakeSettingsForm.Field.CORE_HOME, WakeSettingsForm.Problem.ADDRESS_CLEARTEXT), form("ws://core.example.test:8700/ws"))
+        assertEquals(invalid(WakeSettingsForm.Field.CORE_HOME, WakeSettingsForm.Problem.ADDRESS_CLEARTEXT), form("ws://198.51.100.7:8700/ws"))
+        assertEquals(invalid(WakeSettingsForm.Field.CORE_HOME, WakeSettingsForm.Problem.ADDRESS_CLEARTEXT), form("ws://user@10.0.0.2:8700/ws"))
+        assertEquals(invalid(WakeSettingsForm.Field.CORE_HOME, WakeSettingsForm.Problem.ADDRESS_INVALID), form("http://10.0.0.2:8700"))
+        // The Core's home address is stored as the page will use it.
+        assertEquals(WakeSettingsForm.Result.Ok("ws://10.0.0.2:8700/ws", null, null, null), form(" WS://10.0.0.2:8700 "))
+        assertEquals(WakeSettingsForm.Result.Ok("ws://10.0.0.2:8700/ws", null, null, null), form("ws://10.0.0.2:8700/"))
+        for (bad in listOf("ws://10.0.0.2:8700/ws#x", "ws://10.0.0.2:8700/ws?x=1", "ws://10.0.0.2:99999/ws")) {
+            assertEquals(bad, invalid(WakeSettingsForm.Field.CORE_HOME, WakeSettingsForm.Problem.ADDRESS_INVALID), form(bad))
+        }
+        assertEquals(invalid(WakeSettingsForm.Field.WAKE_HOME, WakeSettingsForm.Problem.ADDRESS_CLEARTEXT), form(wakeHome = "http://198.51.100.7:8704", token = token))
+        assertEquals(invalid(WakeSettingsForm.Field.WAKE_AWAY, WakeSettingsForm.Problem.ADDRESS_CLEARTEXT), form(wakeAway = "http://wake.example.test", token = token))
+        assertEquals(invalid(WakeSettingsForm.Field.WAKE_HOME, WakeSettingsForm.Problem.ADDRESS_INVALID), form(wakeHome = "http://10.0.0.5:8704/wake", token = token))
+    }
+
+    @Test
+    fun migrationKeepsHttpsAwayAndMovesAPrivateHttpAddressHome() {
+        fun migrated(old: String, homeBefore: String? = null): Pair<String?, String?> {
+            val store = MapStore()
+            store.put(WakeStore.ADDRESS_KEY, old)
+            homeBefore?.let { store.put(WakeStore.HOME_KEY, it) }
+            val s = WakeStore(store, cipher) {}
+            s.migrate(cleartextHost = "")
+            return s.home() to s.away()
+        }
+        assertEquals(null to "https://wake.example.test:8443", migrated("https://wake.example.test:8443"))
+        assertEquals("http://10.0.0.5:8704" to null, migrated("http://10.0.0.5:8704"))
+        // Not allowed any more (a hostname / public address): dropped, the dialog asks again.
+        assertEquals(null to null, migrated("http://wake.example.test:8704"))
+        assertEquals(null to null, migrated("http://198.51.100.7:8704"))
+        // A home address already set is not replaced.
+        assertEquals("http://10.0.0.6:8704" to null, migrated("http://10.0.0.5:8704", "http://10.0.0.6:8704"))
+    }
+
+    @Test
+    fun migrationRunsOnceAndLeavesLaterAddressesAlone() {
+        val store = MapStore()
+        val s = WakeStore(store, cipher) {}
+        s.migrate(cleartextHost = "")
+        // Saved by the dialog afterwards: a private http:// away address is valid and stays.
+        assertTrue(s.save("http://10.0.0.5:8704", "http://10.0.0.6:8704", token))
+        s.migrate(cleartextHost = "")
+        assertEquals("http://10.0.0.5:8704", s.home())
+        assertEquals("http://10.0.0.6:8704", s.away())
     }
 
     @Test

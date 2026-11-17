@@ -7,17 +7,26 @@
   build's development hosts, or drops the marker when there are none (the
   default, and always for release).
 
-  The Core is reached only through `wss://` and the wake endpoint only through
-  `https://` (T21.3.3), so a released APK allows no cleartext at all. The
-  optional development hosts come from the Gradle properties `shadowCoreHost` /
-  `shadowWakeHost` or the environment variables SHADOW_CORE_HOST /
-  SHADOW_WAKE_HOST and are never committed.
-  Everything else must use TLS with a system CA (no user-installed CAs).
+  Cleartext (T21.3.3): at home the app reaches the Core (`ws://`) and the wake
+  endpoint (`http://`) on the user's own LAN addresses, which are entered on the
+  phone and never known at build time. A network security config can only name
+  domains/addresses, not address ranges, so cleartext has to be permitted in
+  base-config. The real gate is in code and unit-tested: CoreAddress /
+  WakeAddress allow plain traffic only to a private IPv4 literal (10/8,
+  172.16/12, 192.168/16) and refuse it for every hostname and public address;
+  the WebView's CSP admits plain `ws://` only to the exact configured
+  host:port (MainActivity, UiOrigin.pagePolicy). Nothing else in the app makes
+  plain requests (the updater accepts https only).
+
+  The optional development hosts come from the Gradle properties
+  `shadowCoreHost` / `shadowWakeHost` or the environment variables
+  SHADOW_CORE_HOST / SHADOW_WAKE_HOST and are never committed.
+  TLS always uses a system CA (no user-installed CAs).
   The generated file is unit-tested against CoreAddress.CLEARTEXT_HOST and
   WakeAddress.CLEARTEXT_HOST.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>

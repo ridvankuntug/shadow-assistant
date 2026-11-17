@@ -81,7 +81,7 @@ class WakeFlowTest {
     fun accepted202EntersWakingAndSendsTheToken() {
         val s = pressWith(202, """{"sent":true}""")
         assertEquals(WakeState.Waking(sched.now), s)
-        assertEquals(listOf(target.wakeUrl to target.token), http.wakeCalls)
+        assertEquals(listOf(target.wakeUrls.single() to target.token), http.wakeCalls)
         assertEquals(listOf(WakeState.Sending, s), states)
         assertTrue(flow.active)
     }
@@ -289,6 +289,45 @@ class WakeFlowTest {
         pressWith(401)
         flow.coreAddressChanged("ws://third.test:8700/ws")
         assertEquals(WakeState.Stopped(WakeStop.Unauthorized), flow.state)
+    }
+
+    @Test
+    fun homeAddressFirstThenAwayOnlyWithoutAnAnswer() {
+        val both = WakeTarget(
+            listOf("http://10.0.0.5:8704/wake", "https://wake.example.test:8443/wake"),
+            "secret-wake-token",
+            listOf("http://10.0.0.2:8700/health", "https://core.example.test:443/health"),
+        )
+        http.wakeAnswers += { throw IOException("no route") }
+        http.wakeAnswers += answer(202)
+        assertTrue(flow.start(both))
+        sched.advance(0)
+        assertTrue(flow.state is WakeState.Waking)
+        assertEquals(listOf("http://10.0.0.5:8704/wake", "https://wake.example.test:8443/wake"), http.wakeCalls.map { it.first })
+        // Any of the Core's addresses answering ends the wait.
+        var asked = 0
+        http.health = { if (asked++ % 2 == 0) throw IOException("no route") else coreUp }
+        sched.advance(WakeFlow.POLL_INTERVAL_MS)
+        assertEquals(WakeState.Done, flow.state)
+        // Same Core at the other address: a running flow keeps going.
+        flow.cancel()
+        http.wakeAnswers += answer(202)
+        assertTrue(flow.start(both))
+        sched.advance(0)
+        flow.coreAddressChanged("wss://core.example.test/ws")
+        assertTrue(flow.state is WakeState.Waking)
+        flow.coreAddressChanged("wss://other.example.test/ws")
+        assertEquals(WakeState.Idle, flow.state)
+    }
+
+    @Test
+    fun anAnswerFromHomeIsFinal() {
+        val both = WakeTarget(listOf("http://10.0.0.5:8704/wake", "https://wake.example.test:8443/wake"), "t", listOf("http://10.0.0.2:8700/health"))
+        http.wakeAnswers += answer(401)
+        assertTrue(flow.start(both))
+        sched.advance(0)
+        assertEquals(WakeState.Stopped(WakeStop.Unauthorized), flow.state)
+        assertEquals(1, http.wakeCalls.size)
     }
 
     @Test

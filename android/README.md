@@ -11,7 +11,8 @@ role (opens from the assist gesture / power key).
   [docs/03-platform-adapter.md §4](../docs/03-platform-adapter.md#4-android-bridge-contract-windowshadowandroid)
   (`bridgeVersion` 1).
 - The app talks **only to the Core** (over `wss://`, e.g.
-  `wss://<box>.<tailnet>.ts.net/ws` through the always-on box, see "Network"),
+  `wss://<box>.<tailnet>.ts.net/ws` through the always-on box, or at home over
+  `ws://` to the PC's private LAN address, see "Network"),
   never to Home Assistant or a model. The WebSocket and `hello`/token flow are the UI's own,
   identical to the browser (`client: "android"`).
 - No wake word, nothing listens in the background. The microphone is only open
@@ -38,14 +39,14 @@ role (opens from the assist gesture / power key).
 | `AudioRecordRecorder.kt` | 16 kHz mono PCM capture → `audio/wav` |
 | `AudioPlayer.kt` / `Speaker.kt` | `playAudio` (Core voice) / `speak` (TextToSpeech fallback) |
 | `TokenCipher.kt`, `BridgeStorage.kt` | Keystore-encrypted device token, plain other keys |
-| `CoreAddress.kt`, `CoreProbe.kt` | Core address parsing, development cleartext host, reachability check (`/health`) |
+| `CoreAddress.kt`, `CoreProbe.kt` | Core address parsing, cleartext gate (private IPv4 only), page CSP, home/away selection and reachability check (`/health`) |
 | `LocalNetworkPermission.kt` | When the Android 17 local network permission is needed / asked at startup |
 | `WakeAddress.kt`, `WakeStore.kt`, `WakeFlow.kt`, `WakeNet.kt`, `WakeDialog.kt` | "Bilgisayarı uyandır" (docs/12 D2): wake address checks, encrypted wake token store, waking state machine, HTTP + scheduler, settings dialog |
 | `CaseBattery.kt`, `CaseBatterySync.kt` | Buds case battery: validation, Core request, receiver + WorkManager job |
 | `AppStorage.kt` | Opens the stores (shared by the activity and the background job) |
 | `Updater.kt`, `UpdateActivity.kt` | In-app update from GitHub Releases: checks (`UpdateRules`), download, `PackageInstaller`; shortcut dialog |
 | `assist/AssistServices.kt` | `VoiceInteractionService` + session + recognition stub |
-| `src/main/nsc/network_security_config.xml` | Template of the network security config: no cleartext (only a development build adds its Core / wake host) |
+| `src/main/nsc/network_security_config.xml` | Template of the network security config: cleartext permitted in base-config (no ranges in NSC); the gate is in code |
 
 ## Build
 
@@ -115,20 +116,47 @@ settings). Pick one; for daily use the signed release APK from CI.
 
 ## Network: home and away
 
-The app reaches the Core and wake-svc **only over TLS** (T21.3.3): the Core at
-`wss://<box>.<tailnet>.ts.net/ws` and wake-svc at
-`https://<box>.<tailnet>.ts.net:8443`, both tailnet-only HTTPS addresses that
-Tailscale `serve` on the always-on box proxies to the PC and to wake-svc
-([docs/05 section 5](../docs/05-deploy.md#5-wake-endpoint-on-the-always-on-linux-box)).
-The address is the same everywhere, but the phone needs **Tailscale connected
-at home too**, and nothing works while the box is off. A released APK allows
-no cleartext at all.
+The Core and wake-svc each have an **away** and an optional **home**
+address (T21.3.3). Away: the tailnet-only HTTPS addresses that Tailscale
+`serve` on the always-on box proxies to the PC and to wake-svc
+(`wss://<box>.<tailnet>.ts.net/ws`, `https://<box>.<tailnet>.ts.net:8443`,
+[docs/05 section 5](../docs/05-deploy.md#5-wake-endpoint-on-the-always-on-linux-box)).
+Home: plain LAN addresses, so the phone needs no Tailscale at home
+(`ws://<pc-lan-ip>:8700/ws`, `http://<box-lan-ip>:8704`).
+
+- **Where they are entered.** The Core's away address is the UI's connect
+  screen (`shadow.coreUrl`). The Core's home address and both wake addresses
+  are in the native **Adresler** dialog (button on the "Çekirdeğe
+  ulaşılamıyor" panel; also opened by the first wake press). Every address
+  may be empty: one address alone works.
+- **Selection.** On every Core check (page loaded, return to the
+  foreground, **Tekrar dene**, address/token change, a finished wake) the app
+  asks the home address's `/health` first with a 1.5 s timeout and uses it if
+  the Core answers; otherwise it asks the away address. The page reads the
+  address in use through the bridge key `shadow.coreUrl` (the home address
+  while it is selected); a change reloads the page. If neither answers, the
+  current choice is kept. The UI's reconnect logic is unchanged. Wake: the
+  home address is tried first; the away address only when the home one gives
+  no answer at all; the waiting polls the Core at both addresses.
+- **Cleartext gate.** Plain `ws://` / `http://` is accepted only to a private
+  IPv4 address written as a plain dotted quad (10.0.0.0/8, 172.16.0.0/12,
+  192.168/16; `CoreAddress.isPrivateIpv4Literal`); hostnames, public
+  addresses, IPv6, user info and forms like `10.1` or `010.0.0.1` are
+  refused. Android's network security config cannot express address ranges,
+  so it permits cleartext in base-config; the gate is in code (dialog
+  validation, storage, probe, wake) and in the page's CSP, which admits plain
+  `ws://` only to the exact configured `host:port` (see "Security").
+- **Upgrade.** A stored `wss://` Core address stays the away address. A
+  stored `http://` wake address moves to the home slot if it is a private
+  IPv4 address, otherwise it is dropped (`WakeStore.migrate`); `https://`
+  stays the away address.
 
 There is no built-in Core address: on first launch the UI's connect screen
 asks for it (its form shows the UI's generic `ws://localhost:8700/ws` example,
-which the app refuses; replace it with the `wss://` address). An install upgraded from a version that stored a plain `ws://`
-LAN address drops that address at start (`BridgeStorage.forgetUnusableCoreUrl`),
-keeps the token and shows the connect screen again.
+which the app refuses; replace it with the `wss://` address). A stored plain
+`ws://` address the gate refuses (e.g. a hostname) is dropped at start
+(`BridgeStorage.forgetUnusableCoreUrl`); the token is kept and the connect
+screen asks again.
 
 When the Core cannot be reached (or the address is not allowed, see below),
 the app shows a native error screen with **Tekrar dene** and **Adresi
@@ -143,11 +171,11 @@ while the PC is off (and answers `502`).
 only there: not for a blocked cleartext address, not for the local network
 panel) a third button **Bilgisayarı uyandır** sends `POST /wake` to wake-svc
 on the always-on box (docs/12 D1), which sends the Wake-on-LAN packet. The
-first press opens **Uyandırma ayarı**: the box's address
-(`https://<box>.<tailnet>.ts.net:8443`; prefilled `http://<wake host>:8704`
-only in a development build with a wake host) and the wake token
-(password field, paste; never shown again, empty = keep the stored one;
-**Sil** deletes both). After `202` the panel shows "bilgisayar açılıyor…"
+first press opens **Adresler**: the box's home and away addresses
+(`http://<box-lan-ip>:8704`, `https://<box>.<tailnet>.ts.net:8443`) and the
+wake token (password field, paste; never shown again, empty = keep the
+stored one; **Sil** deletes the addresses, the token and the Core's home
+address). After `202` the panel shows "bilgisayar açılıyor…"
 with the elapsed time and polls the Core's `/health` every 5 s (3 s timeout)
 for at most 4 min; when the Core answers, the panel closes and the UI
 reconnects. `401` / `429 auth_locked` / `429 rate_limited` (also any other
@@ -161,8 +189,9 @@ good or changing the Core address stops the flow.
   (`shadow_wake`), never a bridge key, so the page can never read it. If
   encryption fails nothing is stored; an undecryptable token is deleted and
   the dialog asks again. The token is never logged.
-- `https://` is accepted to any host; plain `http://` only to a development
-  build's wake host (below). The WebView never talks to the box.
+- `https://` is accepted to any host; plain `http://` only to a private IPv4
+  address (or a development build's wake host, below). The WebView never
+  talks to the box.
 - **Development cleartext hosts come from the build, never from the
   repository, and are empty by default.** The network security config is
   generated from `app/src/main/nsc/` per build type
@@ -178,13 +207,13 @@ good or changing the Core address stops the flow.
   -PshadowWakeHost=<box-lan-ip>` (or the same keys in
   `~/.gradle/gradle.properties`, outside the repository). A release build
   ignores both (its NSC and `BuildConfig` never get a cleartext host, even
-  when the properties are set); without them the app accepts only `wss://` /
-  `https://` and says so.
+  when the properties are set).
 - Phone setup (once): open the app while the PC is off, press **Bilgisayarı
-  uyandır**, enter `https://<box>.<tailnet>.ts.net:8443` and paste the token
-  from the box's `/etc/credstore/wake-svc.token` (docs/05 section 5),
-  **Kaydet**. The wake goes out right after saving. A plain `http://` wake
-  address stored by an older version is refused and the dialog asks again.
+  uyandır**, enter the Core's home address `ws://<pc-lan-ip>:8700/ws`, the
+  wake addresses `http://<box-lan-ip>:8704` and
+  `https://<box>.<tailnet>.ts.net:8443`, and paste the token from the box's
+  `/etc/credstore/wake-svc.token` (docs/05 section 5), **Kaydet**. The wake
+  goes out right after saving.
 
 **Local network permission (Android 17+).** With `targetSdk` 37, Android 17
 blocks connections to local network addresses unless the app holds the
@@ -227,12 +256,13 @@ comes from the provider, whose owner is checked.
   encryption fails the token is **not** stored (never a plaintext fallback).
   Other keys (`shadow.coreUrl`, `shadow.quality`, …) are plain
   SharedPreferences. Backups and device-to-device transfer are disabled.
-- **Cleartext**: a release APK's `network_security_config.xml` permits no
-  cleartext; everything must be HTTPS/WSS with a system CA. Only a development
-  build adds its `shadowCoreHost` / `shadowWakeHost` (see "Waking the PC"). A
-  `ws://` address to any other host is refused by the WebView, and the app
-  says so (`CoreAddress` / `WakeAddress.CLEARTEXT_HOST` and the generated XML
-  are checked against each other by a unit test).
+- **Cleartext** (T21.3.3): `network_security_config.xml` permits cleartext
+  in base-config, because the home LAN addresses are entered on the phone and
+  NSC cannot name address ranges; TLS always uses a system CA. The gate is in
+  code: plain `ws://` / `http://` only to a private IPv4 literal (see
+  "Network"), refused everywhere else, and the app says so. A development
+  build may add its `shadowCoreHost` / `shadowWakeHost` (see "Waking the
+  PC"). The updater accepts `https` only.
 - **WebView**: the bundle is served by `WebViewAssetLoader` from
   `https://appassets.androidplatform.net/assets/ui/`; file and content access
   are off; DOM storage is off (storage goes through the bridge). Every request
@@ -241,18 +271,19 @@ comes from the provider, whose owner is checked.
   bridge; the bridge methods also do nothing unless the main frame is the
   bundle.
 - **Content-Security-Policy** on every bundle response
-  (`UiOrigin.CONTENT_SECURITY_POLICY`): scripts only from the bundle (no
-  inline, no eval), no frames/plugins, and `connect-src` limited to the
-  bundle and `wss:` (plus `ws://<host>:*` only for a development build's Core
-  host). WebSocket handshakes do not pass through `shouldInterceptRequest`, so
-  this is what keeps a plain `ws://` connection — and the token in `hello` —
-  from going anywhere.
-- **Mixed content** is off (`MIXED_CONTENT_NEVER_ALLOW`): the Core is reached
-  over `wss://`. Only a development build with a Core host sets
-  `MIXED_CONTENT_ALWAYS_ALLOW`, because Chromium lets an https page open
-  `ws://` only with it; all non-asset HTTP(S) requests are refused anyway, so
-  there it admits only WebSockets, which the CSP limits to that host (plain)
-  or TLS.
+  (`UiOrigin.pagePolicy`, fixed per page load): scripts only from the bundle
+  (no inline, no eval), no frames/plugins, and `connect-src` limited to the
+  bundle, `wss:` and plain `ws://<ip>:<port>` only for the exact configured
+  Core address(es) that pass the cleartext gate (plus `ws://<host>:*` for a
+  development build's Core host). WebSocket handshakes do not pass through
+  `shouldInterceptRequest`, so this is what keeps a plain `ws://` connection
+  — and the token in `hello` — from going anywhere else.
+- **Mixed content** is off (`MIXED_CONTENT_NEVER_ALLOW`) unless a configured
+  Core address is a plain `ws://` one that passes the gate (or a development
+  Core host is set); only then `MIXED_CONTENT_ALWAYS_ALLOW`, because Chromium
+  lets an https page open `ws://` only with it. All non-asset HTTP(S)
+  requests are refused anyway, so it admits only WebSockets, which the CSP
+  limits as above.
 - WebView remote debugging (`chrome://inspect`) is on only in debug builds;
   there the page — and so the token — is inspectable over USB.
 
@@ -339,8 +370,8 @@ Without them `assembleRelease` produces an unsigned APK.
 
 **No addresses in CI.** The CI workflow sets neither `SHADOW_CORE_HOST` nor
 `SHADOW_WAKE_HOST`, and must not: the release APK reaches the Core and
-wake-svc over `wss://` / `https://` only (see "Network: home and away") and
-allows no cleartext.
+wake-svc over `wss://` / `https://`, or in plain text only to private IPv4
+addresses the user enters on the phone (see "Network: home and away").
 
 The repository is public, so workflow artifacts can be downloaded by other
 GitHub users. The APK contains no token and no address: the Core and wake
