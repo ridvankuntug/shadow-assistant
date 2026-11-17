@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- From 600dp up the card keeps the web .connect-card width (min(420px, 100%)). -->
+    <style name="Widget.Shadow.ErrorCard" parent="Widget.Shadow.ErrorCard.Base">
+        <item name="android:layout_width">420dp</item>
+    </style>
+</resources>

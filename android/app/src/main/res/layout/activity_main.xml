@@ -12,71 +12,91 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Native error screen: missing UI bundle, load failure, Core unreachable (+ waking the PC). -->
-    <LinearLayout
+    <!--
+      Native error screen: missing UI bundle, load failure, Core unreachable (+ waking the PC).
+      Styled like the web UI's connect screen (ui/src/index.css: .connect-card, .btn-primary,
+      .btn-ghost); scrolls when the text and buttons do not fit (small phones, landscape).
+    -->
+    <ScrollView
         android:id="@+id/error_panel"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@color/shadow_background"
+        android:background="@color/ui_bg"
         android:clickable="true"
+        android:fillViewport="true"
         android:focusable="true"
-        android:gravity="center"
-        android:orientation="vertical"
-        android:padding="32dp"
         android:visibility="gone">
 
-        <TextView
-            android:id="@+id/error_title"
-            android:layout_width="wrap_content"
+        <!-- Stretched to the viewport (fillViewport) so the card can sit centred in it. -->
+        <FrameLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center"
-            android:textColor="@color/shadow_text"
-            android:textSize="22sp"
-            android:textStyle="bold" />
+            android:padding="16dp"
+            tools:ignore="UselessParent">
 
-        <TextView
-            android:id="@+id/error_message"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:gravity="center"
-            android:textColor="@color/shadow_muted"
-            android:textSize="16sp" />
+            <LinearLayout style="@style/Widget.Shadow.ErrorCard">
 
-        <Button
-            android:id="@+id/error_retry"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
-            android:text="@string/error_retry" />
+                <!-- The .brand line of the connect screen. -->
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="sans-serif-medium"
+                    android:gravity="center"
+                    android:importantForAccessibility="no"
+                    android:letterSpacing="0.38"
+                    android:text="@string/error_brand"
+                    android:textColor="@color/ui_accent"
+                    android:textSize="18sp" />
 
-        <!-- Only on the "Çekirdeğe ulaşılamıyor" panel (docs/12 D2). -->
-        <Button
-            android:id="@+id/error_wake"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/wake_button"
-            android:visibility="gone" />
+                <TextView
+                    android:id="@+id/error_title"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:accessibilityHeading="true"
+                    android:fontFamily="sans-serif-medium"
+                    android:gravity="center"
+                    android:textColor="@color/ui_text"
+                    android:textSize="18sp" />
 
-        <Button
-            android:id="@+id/error_secondary"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/error_change_address"
-            android:textColor="@color/shadow_accent"
-            android:visibility="gone" />
+                <TextView
+                    android:id="@+id/error_message"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center"
+                    android:lineSpacingMultiplier="1.3"
+                    android:textColor="@color/ui_muted"
+                    android:textSize="15sp" />
 
-        <Button
-            android:id="@+id/error_wake_settings"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/wake_settings_button"
-            android:textColor="@color/shadow_muted"
-            android:textSize="13sp"
-            android:visibility="gone" />
-    </LinearLayout>
+                <Button
+                    android:id="@+id/error_retry"
+                    style="@style/Widget.Shadow.Button.Primary"
+                    android:layout_marginTop="20dp"
+                    android:text="@string/error_retry" />
+
+                <!-- Only on the "Çekirdeğe ulaşılamıyor" panel (docs/12 D2). -->
+                <Button
+                    android:id="@+id/error_wake"
+                    style="@style/Widget.Shadow.Button.Ghost"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/wake_button"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/error_secondary"
+                    style="@style/Widget.Shadow.Button.Ghost"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/error_change_address"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/error_wake_settings"
+                    style="@style/Widget.Shadow.Button.Ghost"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/wake_settings_button"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </FrameLayout>
+    </ScrollView>
 </FrameLayout>

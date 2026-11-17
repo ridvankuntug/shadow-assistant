@@ -5,6 +5,7 @@
     <string name="notification_channel_items">Bildirimler</string>
     <string name="notification_channel_urgent">Acil bildirimler</string>
 
+    <string name="error_brand" translatable="false">SHADOW</string>
     <string name="error_retry">Tekrar dene</string>
     <string name="error_change_address">Adresi değiştir</string>
     <string name="error_open_settings">Ayarları aç</string>
