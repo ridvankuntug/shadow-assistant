@@ -213,6 +213,19 @@ describe("Android adapter", () => {
     expect(failed).toHaveBeenCalledTimes(1);
   });
 
+  it("app.openAddresses only with a shell that offers it; it calls the bridge without arguments and never throws", () => {
+    const openAddresses = vi.fn(() => {
+      throw new Error("ignored");
+    });
+    const app = createAndroidAdapter({ ShadowAndroid: fakeBridge({ openAddresses }) }).app;
+    expect(() => app?.openAddresses?.()).not.toThrow();
+    expect(openAddresses).toHaveBeenCalledWith();
+    // An older shell (no openAddresses) is still accepted, just without the entry.
+    const old = createAndroidAdapter({ ShadowAndroid: fakeBridge() });
+    expect(old.kind).toBe("android");
+    expect(old.app?.openAddresses).toBeUndefined();
+  });
+
   it("app: version from getInfo; the update screen only with a shell that offers openUpdates", () => {
     const info = () => JSON.stringify({ bridgeVersion: 1, appVersion: "0.1.57", appVersionCode: 57 });
     const openUpdates = vi.fn(() => {
@@ -223,6 +236,8 @@ describe("Android adapter", () => {
     expect(app?.versionCode).toBe(57);
     expect(() => app?.openUpdates?.()).not.toThrow();
     expect(openUpdates).toHaveBeenCalledWith();
+
+    expect(app?.openAddresses).toBeUndefined();
 
     // A shell before T16.2: version name only, no versionCode, no update button.
     const old = createAndroidAdapter({ ShadowAndroid: fakeBridge() }).app;

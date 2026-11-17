@@ -1,7 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import type { HistoryItem } from "../protocol/types.ts";
 import { QUALITIES, type Quality } from "../scene/quality.ts";
-import { QUALITY_LABEL, devOpenText, formatTime } from "./strings.ts";
+import { ADDRESSES_HINT, QUALITY_LABEL, devOpenText, formatTime } from "./strings.ts";
 
 /** Slide-in side panel (modal on phones, docked look on wide screens). */
 export function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
@@ -83,6 +83,7 @@ export function SettingsPanel({
   onQuality,
   onVoiceReplies,
   onChangeConnection,
+  onOpenAddresses,
   onClose,
 }: {
   quality: Quality;
@@ -100,6 +101,8 @@ export function SettingsPanel({
   onQuality: (q: Quality) => void;
   onVoiceReplies: (v: boolean) => void;
   onChangeConnection: () => void;
+  /** Opens the host's native "Adresler" dialog (Android shells that offer it); absent = no button. */
+  onOpenAddresses?: () => void;
   onClose: () => void;
 }) {
   return (
@@ -153,6 +156,14 @@ export function SettingsPanel({
         <button type="button" className="btn btn-ghost" onClick={onChangeConnection}>
           Bağlantı ayarları
         </button>
+        {onOpenAddresses && (
+          <>
+            <p className="hint">{ADDRESSES_HINT}</p>
+            <button type="button" className="btn btn-ghost" onClick={onOpenAddresses}>
+              Adresler
+            </button>
+          </>
+        )}
       </div>
     </Drawer>
   );

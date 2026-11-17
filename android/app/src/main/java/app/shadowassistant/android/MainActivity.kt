@@ -304,6 +304,7 @@ class MainActivity : Activity() {
             // Nothing started (T16.3): tell the page, which shows a short hint.
             launchGemini = { if (!destroyed && !gemini.open()) sendEvent(BridgeJs.GEMINI_FAILED, JSONObject()) },
             launchUpdates = { if (!destroyed) openUpdateScreen() },
+            showAddresses = { if (!destroyed) wakeDialog.show() },
         )
         // Injected before the first load so selectAdapter() finds it (docs/03 §2).
         webView.addJavascriptInterface(bridge, "ShadowAndroid")

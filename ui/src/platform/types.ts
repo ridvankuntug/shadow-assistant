@@ -153,6 +153,11 @@ export type AppInfo = {
   versionCode?: number;
   /** Opens the shell's update check (Android shells from T16.2 on); absent = not offered here. */
   openUpdates?: () => void;
+  /**
+   * Opens the shell's native "Adresler" dialog (Android shells that offer it); absent = no
+   * "Adresler" button. The page passes nothing and gets nothing back.
+   */
+  openAddresses?: () => void;
 };
 
 /** Storage keys used by the app (documented for the Android side). */

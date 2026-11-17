@@ -58,6 +58,7 @@ interface PlatformAdapter {
     versionName?: string;                    // e.g. "0.1.57"
     versionCode?: number;                    // e.g. 57
     openUpdates?: () => void;                // the shell's update screen; absent = not offered
+    openAddresses?: () => void;              // the shell's native "Adresler" dialog; absent = no "Adresler" button
   };
 }
 
@@ -214,6 +215,7 @@ never block the bridge thread for long.
 | `canOpenGemini(): Boolean` | bool | sync | Whether the shell can open Gemini on this device (T15): the Gemini app (`com.google.android.apps.bard`) or else `https://gemini.google.com/app` in a browser. Asked when the UI starts and again each time the app returns to the foreground (T16.3); `false` or missing = no Gemini button. Optional (with `openGemini`). |
 | `openGemini()` | void | sync | Opens that fixed target (never `ACTION_ASSIST`, which would reopen Shadow as the default assistant). Takes no argument, so the page cannot start an arbitrary intent. Before calling it the UI cancels a recording and stops speech; leaving the app then pauses it (§4.5). When no target starts, the shell sends the event `geminiFailed` (§4.3). Optional. |
 | `openUpdates()` | void | sync | Opens the shell's own update screen (T16.2; the same one as the launcher shortcut "Güncellemeleri denetle"), from the UI's "Güncelleme ve sürüm" page. Takes no argument and has one fixed target, so the page cannot start anything else. Before calling it the UI cancels a recording and stops speech. Optional; missing = the page shows no button. |
+| `openAddresses()` | void | sync | Opens the shell's native **Adresler** dialog (Core home address, wake-svc addresses, wake token; the same dialog as on the "Çekirdeğe ulaşılamıyor" panel), from the UI's "Adresler" button (Ayarlar, next to "Bağlantı ayarları", and the connect screen). Takes no argument and returns nothing: the page never sees the dialog's values. Before calling it the UI cancels a recording and stops speech. Optional; missing = no button. |
 | `getItem(key: String): String?` | string or null | sync | Persistent storage (see storage keys). Store `shadow.deviceToken` encrypted (e.g. Android Keystore-backed). |
 | `setItem(key: String, value: String)` | void | sync | |
 | `removeItem(key: String)` | void | sync | |

@@ -127,7 +127,9 @@ Home: plain LAN addresses, so the phone needs no Tailscale at home
 - **Where they are entered.** The Core's away address is the UI's connect
   screen (`shadow.coreUrl`). The Core's home address and both wake addresses
   are in the native **Adresler** dialog (button on the "Çekirdeğe
-  ulaşılamıyor" panel; also opened by the first wake press). Every address
+  ulaşılamıyor" panel; the UI's **Adresler** button in Ayarlar and on the
+  connect screen, through the bridge method `openAddresses()`; also opened
+  by the first wake press). Every address
   may be empty: one address alone works.
 - **Selection.** On every Core check (page loaded, return to the
   foreground, **Tekrar dene**, address/token change, a finished wake) the app

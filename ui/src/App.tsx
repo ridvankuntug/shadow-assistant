@@ -239,6 +239,9 @@ export default function App({ adapter, controller }: Props) {
     controller.leaveForOtherApp();
     open();
   };
+  // The shell's native "Adresler" dialog (Android shells that offer it): settings and the connect screen.
+  const openAddresses = adapter.app?.openAddresses;
+  const onOpenAddresses = openAddresses ? () => handOff(openAddresses) : undefined;
 
   const devCount = devBadgeCount(state);
   const unreadCount = notificationsBadgeCount(state);
@@ -256,6 +259,7 @@ export default function App({ adapter, controller }: Props) {
         error={unauthorized ? noticeText("unauthorized") : undefined}
         onSubmit={saveConnection}
         onCancel={coreUrl && token && !unauthorized ? () => setPanel("none") : undefined}
+        onOpenAddresses={onOpenAddresses}
       />
     );
   }
@@ -470,6 +474,7 @@ export default function App({ adapter, controller }: Props) {
           onQuality={changeQuality}
           onVoiceReplies={changeVoiceReplies}
           onChangeConnection={() => setPanel("connect")}
+          onOpenAddresses={onOpenAddresses}
           onClose={closePanel}
         />
       )}

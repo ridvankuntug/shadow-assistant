@@ -456,3 +456,6 @@ export function pcPermissionsErrorText(code: string, message?: string | null): s
       return noticeText(code, message ?? undefined);
   }
 }
+
+/** Shown with the "Adresler" button (settings and the connect screen, Android shells only). */
+export const ADDRESSES_HINT = "Ev adresleri ve bilgisayarı uyandırma bu cihazın Adresler penceresinde.";

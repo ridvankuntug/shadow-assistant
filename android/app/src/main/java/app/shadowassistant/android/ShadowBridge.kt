@@ -31,6 +31,7 @@ class ShadowBridge(
     private val geminiAvailable: () -> Boolean,
     private val launchGemini: () -> Unit,
     private val launchUpdates: () -> Unit,
+    private val showAddresses: () -> Unit,
 ) {
     @JavascriptInterface
     fun getInfo(): String = if (trusted()) info else "{}"
@@ -118,6 +119,16 @@ class ShadowBridge(
     @JavascriptInterface
     fun openUpdates() {
         if (trusted()) main.post { launchUpdates() }
+    }
+
+    /**
+     * "Adresler" from the UI's menu (optional for the page): opens the shell's own address
+     * dialog ([WakeDialog]), the same one as the "Çekirdeğe ulaşılamıyor" panel. The page
+     * passes nothing and gets nothing back; the addresses and the wake token stay native.
+     */
+    @JavascriptInterface
+    fun openAddresses() {
+        if (trusted()) main.post { showAddresses() }
     }
 
     @JavascriptInterface

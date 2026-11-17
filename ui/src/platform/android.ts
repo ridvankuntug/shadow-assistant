@@ -44,6 +44,8 @@ export interface ShadowAndroidBridge {
   openGemini?(): void;
   /** Optional (shells from T16.2 on): opens the shell's update screen (a fixed target, no argument). */
   openUpdates?(): void;
+  /** Optional (newer shells): opens the shell's native "Adresler" dialog (no argument, no answer). */
+  openAddresses?(): void;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
@@ -238,7 +240,7 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
         }
       : undefined;
 
-  // The installed app (T16.2); the update screen only with a shell that offers it.
+  // The installed app (T16.2); the update screen and the "Adresler" dialog only with a shell that offers them.
   const app: AppInfo = {
     ...(info.appVersion !== undefined ? { versionName: info.appVersion } : {}),
     ...(info.appVersionCode !== undefined ? { versionCode: info.appVersionCode } : {}),
@@ -247,6 +249,17 @@ export function createAndroidAdapter(win: AndroidWindow, timers: { setTimeout: t
           openUpdates() {
             try {
               bridge.openUpdates?.();
+            } catch {
+              // ignore
+            }
+          },
+        }
+      : {}),
+    ...(typeof bridge.openAddresses === "function"
+      ? {
+          openAddresses() {
+            try {
+              bridge.openAddresses?.();
             } catch {
               // ignore
             }

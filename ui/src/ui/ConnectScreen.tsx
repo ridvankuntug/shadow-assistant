@@ -1,5 +1,6 @@
 import { useId, useState, type FormEvent } from "react";
 import { normalizeCoreUrl } from "../protocol/client.ts";
+import { ADDRESSES_HINT } from "./strings.ts";
 
 export const DEFAULT_CORE_URL = "ws://localhost:8700/ws";
 
@@ -10,10 +11,12 @@ type Props = {
   error?: string;
   onSubmit: (url: string, token: string) => void;
   onCancel?: () => void;
+  /** Opens the host's native "Adresler" dialog (Android shells that offer it); absent = no button. */
+  onOpenAddresses?: () => void;
 };
 
 /** Core URL + device token entry. Values are persisted by the caller through the adapter. */
-export function ConnectScreen({ initialUrl, initialToken, error, onSubmit, onCancel }: Props) {
+export function ConnectScreen({ initialUrl, initialToken, error, onSubmit, onCancel, onOpenAddresses }: Props) {
   const [url, setUrl] = useState(initialUrl || DEFAULT_CORE_URL);
   const [token, setToken] = useState(initialToken);
   const [showToken, setShowToken] = useState(false);
@@ -80,6 +83,14 @@ export function ConnectScreen({ initialUrl, initialToken, error, onSubmit, onCan
           </button>
         </div>
         <p className="hint">Anahtar yalnızca bu cihazda saklanır.</p>
+        {onOpenAddresses && (
+          <>
+            <p className="hint">{ADDRESSES_HINT}</p>
+            <button type="button" className="btn btn-ghost" onClick={onOpenAddresses}>
+              Adresler
+            </button>
+          </>
+        )}
         <div className="connect-actions">
           {onCancel && (
             <button type="button" className="btn btn-ghost" onClick={onCancel}>
