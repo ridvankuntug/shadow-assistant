@@ -344,6 +344,15 @@ input:focus-visible {
   box-shadow: 0 0 12px var(--accent);
   animation: pulse 1.8s ease-in-out infinite;
 }
+/* Not connected (ui/strings.ts stageLabel): muted and still, not the "ready" accent. */
+.phase-label-offline {
+  color: var(--muted);
+}
+.phase-label-offline .dot {
+  background: var(--muted);
+  box-shadow: none;
+  animation: none;
+}
 @keyframes pulse {
   0%,
   100% {

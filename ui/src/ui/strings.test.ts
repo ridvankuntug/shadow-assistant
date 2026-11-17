@@ -16,6 +16,9 @@ import {
   notificationsUnreadText,
   memoryErrorText,
   memoryWarningText,
+  PHASE_LABEL,
+  stageLabel,
+  stageOffline,
 } from "./strings.ts";
 
 describe("memory panel texts", () => {
@@ -104,5 +107,34 @@ describe("notification inbox texts", () => {
     expect(notificationsErrorText("timeout")).toContain("yanıt vermedi");
     expect(notificationsErrorText("unknown_item")).toContain("artık yok");
     expect(notificationsErrorText("notifications_unavailable")).toBe("Bildirimler okunamadı.");
+  });
+});
+
+describe("stage label", () => {
+  it("says Hazır only while connected", () => {
+    expect(stageLabel("idle", "connected")).toBe("Hazır");
+    for (const status of ["connecting", "authenticating", "reconnecting", "unauthorized", "incompatible", "closed"] as const) {
+      expect(stageLabel("idle", status)).not.toBe(PHASE_LABEL.idle);
+    }
+  });
+
+  it("shows the connection state while disconnected and idle", () => {
+    expect(stageLabel("idle", "connecting")).toBe("Bağlanıyor…");
+    expect(stageLabel("idle", "authenticating")).toBe("Bağlanıyor…");
+    expect(stageLabel("idle", "reconnecting")).toBe("Bağlanılamadı");
+    expect(stageLabel("idle", "unauthorized")).toBe("Bağlanılamadı");
+    expect(stageLabel("idle", "incompatible")).toBe("Sürüm uyumsuz");
+    expect(stageLabel("idle", "closed")).toBe("Bağlı değil");
+  });
+
+  it("marks only the connection-state labels as offline", () => {
+    expect(stageOffline("idle", "reconnecting")).toBe(true);
+    expect(stageOffline("idle", "connected")).toBe(false);
+    expect(stageOffline("speaking", "reconnecting")).toBe(false);
+  });
+
+  it("keeps a running phase's own label", () => {
+    expect(stageLabel("speaking", "reconnecting")).toBe("Konuşuyorum");
+    expect(stageLabel("thinking", "connected")).toBe("Düşünüyorum");
   });
 });

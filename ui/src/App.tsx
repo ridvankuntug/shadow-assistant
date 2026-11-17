@@ -393,7 +393,7 @@ export default function App({ adapter, controller }: Props) {
         </nav>
       </header>
 
-      <Stage phase={phase} quality={quality} active={visible} reducedMotion={reducedMotion} level={level} />
+      <Stage phase={phase} status={status} quality={quality} active={visible} reducedMotion={reducedMotion} level={level} />
 
       <section className="chat" aria-label="Konuşma">
         <Conversation messages={state.messages} />

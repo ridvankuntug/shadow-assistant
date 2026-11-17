@@ -23,6 +23,31 @@ export const CONNECTION_LABEL: Record<ConnectionStatus, string> = {
   closed: "Bağlı değil",
 };
 
+/** The stage label while the Core is not connected and nothing runs locally. */
+const OFFLINE_STAGE_LABEL: Record<Exclude<ConnectionStatus, "connected">, string> = {
+  connecting: "Bağlanıyor…",
+  authenticating: "Bağlanıyor…",
+  reconnecting: "Bağlanılamadı",
+  unauthorized: "Bağlanılamadı",
+  incompatible: "Sürüm uyumsuz",
+  closed: "Bağlı değil",
+};
+
+/**
+ * The stage's main status line. "Hazır" only with a connected Core: while
+ * disconnected an idle stage shows the connection state instead (the talk and
+ * send buttons are disabled then, so "ready" would be wrong). A phase that is
+ * running (e.g. a reply still playing) keeps its own label.
+ */
+export function stageLabel(phase: Phase, status: ConnectionStatus): string {
+  return stageOffline(phase, status) ? OFFLINE_STAGE_LABEL[status] : PHASE_LABEL[phase];
+}
+
+/** True when [stageLabel] shows the connection state rather than a phase (styled muted). */
+export function stageOffline(phase: Phase, status: ConnectionStatus): status is Exclude<ConnectionStatus, "connected"> {
+  return phase === "idle" && status !== "connected";
+}
+
 export const QUALITY_LABEL: Record<Quality, string> = {
   high: "Yüksek",
   medium: "Orta",

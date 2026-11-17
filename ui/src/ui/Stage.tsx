@@ -1,7 +1,8 @@
 import { Component, Suspense, lazy, type ReactNode } from "react";
 import type { Phase } from "../assistant/state.ts";
+import type { ConnectionStatus } from "../protocol/client.ts";
 import type { SceneProps } from "../scene/Scene.tsx";
-import { PHASE_LABEL } from "./strings.ts";
+import { stageLabel, stageOffline } from "./strings.ts";
 
 // The 3D scene (three.js) is a separate chunk: the interface is usable before
 // it arrives, and hosts without WebGL never download it.
@@ -37,8 +38,9 @@ class SceneBoundary extends Component<{ children: ReactNode }, { failed: boolean
   }
 }
 
-export function Stage(props: SceneProps & { phase: Phase }) {
+export function Stage({ status, ...props }: SceneProps & { phase: Phase; status: ConnectionStatus }) {
   const webgl = hasWebGL();
+  const offline = stageOffline(props.phase, status);
   return (
     <section className="stage" aria-label="Durum">
       <div className="stage-visual">
@@ -52,9 +54,14 @@ export function Stage(props: SceneProps & { phase: Phase }) {
           <FallbackOrb />
         )}
       </div>
-      <p className="phase-label" role="status" aria-live="polite">
+      {/* While offline the top bar's status already announces each retry: not twice. */}
+      <p
+        className={offline ? "phase-label phase-label-offline" : "phase-label"}
+        role="status"
+        aria-live={offline ? "off" : "polite"}
+      >
         <span className="dot" aria-hidden="true" />
-        {PHASE_LABEL[props.phase]}
+        {stageLabel(props.phase, status)}
       </p>
     </section>
   );
