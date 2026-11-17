@@ -25,8 +25,11 @@ class ShadowBridge(
     private val speaker: Speaker,
     private val storage: BridgeStorage,
     private val vibrate: (LongArray) -> Unit,
-    private val notify: (String, String) -> Unit,
-    private val notifyItem: (String, String, String, Boolean) -> Unit,
+    // Not named like the @JavascriptInterface methods below: inside the class a call such as
+    // `notify(t, b)` resolves to the member function before a property's invoke, so a
+    // same-named property is never called (the post would loop on the main thread instead).
+    private val postNotify: (String, String) -> Unit,
+    private val postNotifyItem: (String, String, String, Boolean) -> Unit,
     private val onStorageChanged: (String) -> Unit,
     private val geminiAvailable: () -> Boolean,
     private val launchGemini: () -> Unit,
@@ -82,7 +85,7 @@ class ShadowBridge(
         if (!trusted()) return
         val t = title.orEmpty().take(MAX_TITLE)
         val b = body.orEmpty().take(MAX_BODY)
-        if (t.isNotBlank() || b.isNotBlank()) main.post { notify(t, b) }
+        if (t.isNotBlank() || b.isNotBlank()) main.post { postNotify(t, b) }
     }
 
     /**
@@ -95,7 +98,7 @@ class ShadowBridge(
         val itemId = Notifier.validItemId(id) ?: return
         val t = title.orEmpty().take(MAX_TITLE)
         val b = body.orEmpty().take(MAX_BODY)
-        if (t.isNotBlank() || b.isNotBlank()) main.post { notifyItem(itemId, t, b, urgent) }
+        if (t.isNotBlank() || b.isNotBlank()) main.post { postNotifyItem(itemId, t, b, urgent) }
     }
 
     /**

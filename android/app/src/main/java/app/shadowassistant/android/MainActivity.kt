@@ -284,8 +284,8 @@ class MainActivity : Activity() {
             speaker = speaker,
             storage = storage,
             vibrate = ::vibrate,
-            notify = notifier::notify,
-            notifyItem = notifier::notifyItem,
+            postNotify = notifier::notify,
+            postNotifyItem = notifier::notifyItem,
             onStorageChanged = { key ->
                 if (key == BridgeStorage.CORE_URL_KEY) {
                     val url = storage.get(BridgeStorage.CORE_URL_KEY)
