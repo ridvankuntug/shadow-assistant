@@ -739,13 +739,13 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] Replace the "Araçlar" section of `core/prompts/system.md` with the
     Decision 9 draft.
   - [x] Leave `tier1.md` unchanged; check no test pins the old wording.
-- [~] **T4.3a — Pure write gate.** Durum: başlandı
-  - [ ] `isQuestionTurn(rawText)`: word list, particle rule, polite-request
+- [x] **T4.3a — Pure write gate.** Durum: bitti
+  - [x] `isQuestionTurn(rawText)`: word list, particle rule, polite-request
     exclusion, trailing `?` rule.
-  - [ ] `targetProvenance(input, utterances, snapshot?, names?)`: rules 3-5,
+  - [x] `targetProvenance(input, utterances, snapshot?, names?)`: rules 3-5,
     broad-call rule over the 3-utterance window; per-word stem forms (local to
     the gate).
-  - [ ] Table tests for every example in Decisions 3 and 4.
+  - [x] Table tests for every example in Decisions 3 and 4.
 - [ ] **T4.3b — Gate in the session.** Durum: başlamadı
   - [ ] `services.yaml` `target_check: true` on the HA service; schema in
     `services.ts`.
