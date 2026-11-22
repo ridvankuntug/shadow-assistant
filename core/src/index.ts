@@ -8,6 +8,7 @@ import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
 import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
+import { CONFIRMED_NAMES_DIR, ConfirmedNameStore } from "./confirmed-names.js";
 import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
 import { DevNotes, TurnNotes } from "./dev-notes.js";
@@ -352,6 +353,11 @@ export async function main(): Promise<void> {
     log: (m) => logger.warn(m),
   });
   await pcPermissions.load(); // the first badge count, for /health `inbox`
+  // Confirmed device names (docs/14 Decision 6, T4.4b): "Evet, hep bu" entries used by tier 0 and the
+  // write gate, listed and deleted in the "Cihaz adları" panel. Independent of memory. A corrupt file is
+  // quarantined (the Core starts with no confirmed names); the log carries ids and counts only.
+  const confirmedNames = new ConfirmedNameStore({ dir: join(cfg.dataDir, CONFIRMED_NAMES_DIR), log: (m) => logger.warn(m) });
+  await confirmedNames.load();
   // Backup producer (docs/09 (a)): reads <data dir>/backup/status.json written by backup-data.ps1.
   // Startup adoption reads the store directly (the center's list drops the dedupe key).
   const backupProducer = new BackupProducer({
@@ -435,6 +441,7 @@ export async function main(): Promise<void> {
           dev: devTab,
           notifications: notificationCenter,
           pcPermissions,
+          names: confirmedNames,
         },
         info,
         send,
@@ -456,6 +463,7 @@ export async function main(): Promise<void> {
       "notifications_suppress",
       "ha_urgency_feedback",
       "pc_permissions",
+      "names",
     ],
     serviceHealth: monitor,
     deviceState,
@@ -535,6 +543,8 @@ export async function main(): Promise<void> {
           { name: "ha urgency", run: () => haUrgency.flush() },
           // Writes are immediate; this waits for a switch still being written.
           { name: "pc permissions", run: () => pcPermissions.flush() },
+          // Sweeps and use counts whose write failed are retried once more.
+          { name: "confirmed names", run: () => confirmedNames.flush() },
         ],
       },
       { log: (m) => logger.warn(m), exit: (code) => process.exit(code) },

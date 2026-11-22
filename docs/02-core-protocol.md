@@ -84,7 +84,7 @@ the client protocol above.
 | `{"type":"hello","protocol":1,"token":"…","client":"web"\|"android","clientVersion":"…"}` | Authenticate (first frame only). |
 | `{"type":"user_text","id":"t1","text":"…"}` | Start a turn with typed text. |
 | `{"type":"audio","id":"t2","mime":"audio/webm","data":"<base64>"}` | One complete utterance (push-to-talk). See *Voice input*. |
-| `{"type":"confirm_response","requestId":"c1","approved":true}` | Answer a confirmation with the on-screen button. |
+| `{"type":"confirm_response","requestId":"c1","approved":true,"remember"?:true}` | Answer a confirmation with the on-screen button. `remember: true` = "Evet, hep bu" (only where the request offered `remember`; see *Confirmation flow*). |
 | `{"type":"speak","id":"t1","text":"…","voice"?:"tr_TR-dfki-medium"}` | Ask the Core to synthesize speech via tts-svc (web adapter). `voice` is optional; see *Voices*. The text is spoken through the *Pronunciation lexicon*. |
 | `{"type":"voices","id":"v1"}` | List the selectable tts-svc voices; answered by `voices` or `error tts_unavailable` (with the same `id`). See *Voices*. |
 | `{"type":"cancel","id":"t1"}` | Barge-in: stop turn `t1`. |
@@ -100,18 +100,20 @@ the client protocol above.
 | `{"type":"pc_permissions_list","id":"p1"}` | Ask for the PC permission list (feature `pc_permissions`). See *PC permissions*. |
 | `{"type":"pc_permission_set","id":"p2","rowId":"p-3f9a1c2e5b7d0a11","enabled":true}` | Switch one PC permission row (feature `pc_permissions`; only devices in `CORE_PC_PERMISSION_DEVICES`). See *PC permissions*. |
 | `{"type":"pc_permissions_seen","id":"p3"}` | Mark every PC permission row seen (feature `pc_permissions`). See *PC permissions*. |
+| `{"type":"names_list","id":"n1"}` | Ask for the confirmed device names (feature `names`). See *Device names*. |
+| `{"type":"names_delete","id":"n2","ids":["n-3f9a1c"]}` | Delete confirmed device names (feature `names`). See *Device names*. |
 
 ## Core → Client
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions","names"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
 | `{"type":"assistant_done","id":"t1","text":"<full text>"}` | Answer finished (also sent after `cancel`, with the partial text). |
 | `{"type":"tool","id":"t1","name":"<tool>","status":"started"\|"done"\|"denied"\|"error"}` | Tool activity. |
-| `{"type":"confirm_request","requestId":"c1","id":"t1","tool":"<tool>","summary":"…","expiresAt":<epoch ms>}` | The turn is paused until the user confirms. |
+| `{"type":"confirm_request","requestId":"c1","id":"t1","tool":"<tool>","summary":"…","expiresAt":<epoch ms>,"remember"?:{"spoken":"…","target":"…"}}` | The turn is paused until the user confirms. `remember`: the card may offer "Evet, hep bu" (see *Confirmation flow*). |
 | `{"type":"confirm_resolved","requestId":"c1","approved":true\|false,"by":"button"\|"voice"\|"timeout"}` | Sent exactly once per `confirm_request`. |
 | `{"type":"speech","id":"t1","mime":"audio/wav","data":"<base64>"}` | Synthesized audio for a `speak` request. |
 | `{"type":"speech_chunk","id":"t1","seq":0,"final":false,"mime"?:"audio/wav","data"?:"<base64>","text"?:"…"}` | One sentence of a turn's spoken answer, only after `speech_prefs` with `enabled:true`. See *Streamed speech*. |
@@ -123,6 +125,7 @@ the client protocol above.
 | `{"type":"notification_removed","notificationId":"n-…"}` | A notification was deleted or resolved (every authenticated socket). See *Notifications*. |
 | `{"type":"pc_permissions","id":"p1","rows":[…],"unseen":1,"canManage":true,"available":true}` | Reply to `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`. See *PC permissions*. |
 | `{"type":"pc_permissions_count","unseen":1}` | The PC permission badge count changed (every authenticated socket; feature `pc_permissions`). See *PC permissions*. |
+| `{"type":"names","id":"n1","items":[…]}` | Reply to `names_list` / `names_delete`. See *Device names*. |
 | `{"type":"voices","id":"v1","default":"tr_TR-dfki-medium","voices":[{"id":"tr_TR-dfki-medium","label":"DFKI (orta kalite)","quality":"medium"}]}` | Reply to a `voices` request. Added in protocol 1 without a version bump. |
 | `{"type":"history","items":[{"id":"…","role":"user"\|"assistant","text":"…","ts":<epoch ms>}]}` | Oldest first. |
 | `{"type":"error","id"?:"t1","code":"…","message":"…","retryAt"?:<epoch ms>}` | See *Errors*. `retryAt` only with `usage_limit`. |
@@ -149,6 +152,7 @@ The protocol number stays 1.
 | `notifications_suppress` | `notification_action` also accepts `action:"suppress"` ("Tekrar gösterme", see *Notifications*). Without it clients offer only `delete` (an older Core answers `suppress` with `bad_request`). |
 | `ha_urgency_feedback` | Learned urgency of Home Assistant alerts (T7.w.11.10): `notification_action` also accepts `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") on `source:"ha"` items, and the Development tab may list `kind:"ha_urgency"` suggestions that take `dev_action` `accept` ("Kabul") or `ignore` ("Yok say"). Without it clients offer neither (an older Core answers both actions with `bad_request`). |
 | `pc_permissions` | The PC permission list (T17.2, docs/11 D3): `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` are answered and `pc_permissions_count` is sent. Without it clients hide the İzinler page and its count. |
+| `names` | Confirmed device names (T4.4b, docs/14 Decisions 6-8): `names_list` / `names_delete` are answered with `names`. Without it clients hide the "Cihaz adları" panel. (`confirm_request.remember` needs no feature: it is optional and old clients ignore it.) |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -489,6 +493,53 @@ Rows are sorted most recently requested first.
   copy is next to it. Recovery is by hand (restore the quarantined copy or a
   backup; delete the copies to start empty on purpose) and a restart.
 
+## Device names
+
+With the feature `names` (T4.4b). Design:
+[`docs/14-intent-gate-and-confirmed-names.md`](14-intent-gate-and-confirmed-names.md)
+Decisions 6-8. A confirmed name maps the words the user said for a device to a
+device fingerprint (canonical name, domain, areas). Entries are created only by
+"Evet, hep bu" on a confirm card (see *Confirmation flow*); there is no add or
+edit frame.
+
+```json
+{"type":"names","id":"n1",
+ "items":[{"id":"n-3f9a1c","spoken":"bahçe pompasnı",
+           "target":{"name":"Bahçe Pompası","domain":"switch","areas":["Bahçe"]},
+           "status":"active","missingSince":null,
+           "lastUsedAt":"2026-11-21T18:40:00.000Z","uses":4}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | `n-` + 6 hex digits; send it back in `names_delete.ids`. |
+| `spoken` | The user's words for the device. |
+| `target` | The device fingerprint as seen when confirmed: `name` (canonical), `domain`, `areas` (may be empty). |
+| `status` | `active`, or `passive` after 30 days without a break missing from the live context (never used again; a fresh "Evet, hep bu" for the same words replaces it). Clients show unknown values as-is. |
+| `missingSince` | ISO 8601 of the first live context that lacked the device since it was last seen; `null` while it is seen. An active entry with a time is not used while missing ("Bulunamadı"). |
+| `lastUsedAt`, `uses` | Last tier-0 use (ISO 8601, `null` = never) and the use count. |
+
+Items never carry the match keys.
+
+- `names_list` is answered with `names` (same `id`).
+- `names_delete` deletes the given entries (any status), in order, and is
+  answered with a fresh `names` frame. Ids that are not (or no longer) stored
+  are ignored. `ids` must hold 1-200 non-empty strings (duplicates are
+  dropped), else `error bad_request`.
+- File that cannot be read: `names_list` is answered with an empty `items`
+  list (no error); `names_delete` answers `internal` ("device names are
+  unavailable"). A corrupt file is moved aside at load, so the list then
+  starts empty.
+- A write failure in `names_delete` stops the batch with `internal` ("device
+  names could not be written"); ids before it in the batch stay deleted. A
+  Core without a store answers both requests with `bad_request` ("device
+  names are disabled").
+- Every authenticated device may list and delete (as with memory). The panel
+  does not depend on memory being on.
+- `names` frames go only to the requesting socket.
+- Store: `<SHADOW_DATA_DIR>/device-names/names.json`, written atomically; a
+  corrupt file is moved aside and the Core starts with no confirmed names.
+
 ## Voices
 
 `{"type":"voices","id":"v1"}` returns the voices tts-svc can speak with:
@@ -632,7 +683,9 @@ first:
   only of yes-words — `evet`, `onayla`, `onaylıyorum`, `tamam`, `olur` — or only
   of no-words — `hayır`, `iptal`, `vazgeç`, `vazgeçtim` (fillers `lütfen`, `et`
   allowed). Matching is case- and diacritic-insensitive (`HAYIR` = `hayir`);
-  a voice answer applies to the oldest pending request;
+  a voice answer applies to the oldest pending request. A yes with `hep` or
+  `hatırla` ("evet hep bu", "evet hatırla") is "Evet, hep bu"; a plain "evet"
+  approves once;
 - timeout: `expiresAt` (default 60 s, `CORE_CONFIRM_TIMEOUT_MS`) → denied;
 - `cancel` of the turn → denied, reported as `by: "button"` (a client action);
   on socket close it is denied as well (logged as `cancel`).
@@ -640,6 +693,21 @@ first:
 `confirm_resolved` is emitted exactly once; later answers for the same
 `requestId` are ignored. A denied tool produces `tool … status: denied` and the
 model is told not to retry.
+
+**"Evet, hep bu"** (T4.4b, docs/14 Decision 7). A `confirm_request` may carry
+`remember: {spoken, target}`: the user's words for the device (`spoken`, from a
+tier-0 `<ad>` slot that found no device) and the device's name (`target`). A
+client then offers a third choice, "Evet, hep bu", and answers it with
+`confirm_response` `approved: true, remember: true`; without `remember` in the
+request the card has Evet / Hayır only (old clients ignore the field). The Core
+offers it only when the write gate raised the call for a target the user did
+not name, the call has a single `name` target, exactly one unresolved spoken
+name is in the last three user utterances, and the call reaches exactly one
+device; never in a question turn and never for a `services.yaml` confirm alone.
+`remember: true` counts only for the request that carried the offer and only
+with `approved: true` (anything else is a plain answer); the name is stored only
+if the call then succeeds. Next time tier 0 resolves those words to that device
+without a card (HA names and aliases always win).
 
 ## Permission gate
 

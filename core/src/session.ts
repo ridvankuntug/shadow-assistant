@@ -23,7 +23,8 @@ import type { PcPermissionStore } from "./pc/permissions.js";
 import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall, type TargetProvenanceHint } from "./direct.js";
 import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
 import type { LearnedRuleRecord, LearnedRuleStore } from "./learn/store.js";
-import { parseLiveContext, type LiveEntity } from "./live-context.js";
+import { fingerprintOf, verifyTarget, type ConfirmedName, type ConfirmedNameStore, type NameTarget } from "./confirmed-names.js";
+import { nameKeys, parseLiveContext, type LiveEntity } from "./live-context.js";
 import type { DirectToolClient } from "./mcp-direct.js";
 import type { DeviceMaintenance } from "./memory/lifecycle.js";
 import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
@@ -40,7 +41,7 @@ import {
 } from "./model-provider.js";
 import {
   ConfirmBroker,
-  parseVoiceAnswer,
+  parseVoiceConfirm,
   summarizeToolCall,
   type ConfirmRequest,
   type ConfirmResolution,
@@ -59,6 +60,7 @@ import {
 } from "./notifications.js";
 import type {
   ClientFrame,
+  ConfirmedNameInfo,
   DevAction,
   DevItem,
   ErrorCode,
@@ -77,6 +79,7 @@ import { EMPTY_LEXICON, type Lexicon } from "./pronunciation.js";
 import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
 import { SpeechStream } from "./speech-stream.js";
 import { buildTurnEnvelope, ESCALATION_CONTINUE, wrapDirectNotes } from "./turn-envelope.js";
+import { cleanTurkish, fold } from "./turkish.js";
 import { isQuestionTurn, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
@@ -103,11 +106,26 @@ interface UserUtterance {
   text: string;
   /**
    * The tier-0 `<ad>` slot that resolved to no entity or to several
-   * (`name_not_found` / `name_ambiguous`). Kept for the "Evet, hep bu" offer
-   * (T4.4b, Decision 7); not read yet.
+   * (`name_not_found` / `name_ambiguous`): the words the "Evet, hep bu" offer
+   * stores (Decision 7).
    */
   unresolvedName?: string;
 }
+
+/**
+ * An "Evet, hep bu" offer on one gate-raised confirm card (docs/14 Decision
+ * 7): the user's unresolved words and the fingerprint of the one entity the
+ * call reaches. `accepted`: the user chose "Evet, hep bu" for this request.
+ */
+interface RememberOffer {
+  spoken: string;
+  keys: string[];
+  target: NameTarget;
+  accepted: boolean;
+}
+
+/** What a session needs of the confirmed-name store (T4.4b). */
+export type SessionNames = Pick<ConfirmedNameStore, "lookup" | "verify" | "sweep" | "recordUse" | "add" | "delete" | "list">;
 
 /**
  * `p`, or undefined as soon as `signal` aborts (the shared promise keeps
@@ -243,6 +261,12 @@ export interface SessionDeps {
    * rule reaches `setEnabled` (pinned by test/pc-permissions-separation.test.ts).
    */
   pcPermissions?: Pick<PcPermissionStore, "list" | "setEnabled" | "markAllSeen" | "canManage">;
+  /**
+   * Confirmed device names (docs/14 Decision 6, feature `names`): the tier-0
+   * fallback, gate rule 5, the "Evet, hep bu" offer and `names_list` /
+   * `names_delete`; absent = none of these (`names_*` get `bad_request`).
+   */
+  names?: SessionNames;
 }
 
 /** What a session needs for pattern learning. */
@@ -303,6 +327,8 @@ interface ActiveTurn {
   utterance: UserUtterance;
   /** The write gate's own live-context read (rule 4), at most once per service and turn; `undefined` = not usable. */
   gateSnapshots?: Map<string, Promise<readonly LiveEntity[] | undefined>>;
+  /** Accepted "Evet, hep bu" offers by tool use id: stored once that call's result is not an error. */
+  remembers?: Map<string, RememberOffer>;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -317,7 +343,7 @@ type GateDeny = DenyReason | "tier_service";
 type GateLevel = PermissionLevel | "deny";
 /** `authorize` result; `gate`: the write gate raised the call to `confirm` (never learned from). */
 type AuthorizeResult =
-  | { allowed: true; level: GateLevel; gate?: GateRaise }
+  | { allowed: true; level: GateLevel; gate?: GateRaise; remember?: RememberOffer }
   | { allowed: false; reason: DenyReason; level: GateLevel; gate?: GateRaise };
 
 export class Session {
@@ -337,6 +363,8 @@ export class Session {
   private readonly directNotes: DirectNote[] = [];
   /** The last PROVENANCE_WINDOW user utterances of this session, oldest first (the write gate's window). */
   private readonly utterances: UserUtterance[] = [];
+  /** "Evet, hep bu" offers of the pending confirm cards, by request id (only these may be accepted). */
+  private readonly offers = new Map<string, RememberOffer>();
   /** Sequence number of the next tier-0 note (keeps refused batches in creation order). */
   private noteSeq = 0;
   private speechPrefs: SpeechPrefs | undefined;
@@ -416,6 +444,7 @@ export class Session {
         return;
       case "confirm_response":
         // Unknown or already-resolved ids are ignored: the button may lose the race to voice/timeout.
+        if (frame.approved && frame.remember === true) this.acceptRemember(frame.requestId);
         this.broker.resolve(frame.requestId, frame.approved, "button");
         return;
       case "speak":
@@ -475,7 +504,51 @@ export class Session {
       case "pc_permissions_seen":
         await this.handlePcPermissions(frame.id, "seen");
         return;
+      case "names_list":
+        await this.handleNames(frame.id);
+        return;
+      case "names_delete":
+        await this.handleNames(frame.id, frame.ids);
+        return;
     }
+  }
+
+  // ------------------------------------------------------------ confirmed device names (docs/14 Decision 8)
+
+  /**
+   * `names_list` (no `deleteIds`) and `names_delete`: answered with a fresh
+   * `names` frame to this socket only, or an `error` with the request id.
+   * Every authenticated device may list and delete (user decision 5). Ids
+   * that are not (or no longer) stored are ignored; a write failure stops
+   * the batch with `internal` (ids before it stay deleted).
+   */
+  private async handleNames(id: string, deleteIds?: readonly string[]): Promise<void> {
+    const names = this.deps.names;
+    if (!names) {
+      this.error("bad_request", "device names are disabled", id);
+      return;
+    }
+    try {
+      for (const nameId of deleteIds ?? []) {
+        const r = await names.delete(nameId);
+        // `unknown`: already gone, which is what the user asked for. Only stored (well-formed) ids reach the log.
+        if (r.ok) this.deps.logger.info(`[shadow-core] confirmed name ${nameId} deleted by device ${this.info.device}`);
+        else if (r.reason !== "unknown") {
+          this.error("internal", r.reason === "unavailable" ? "device names are unavailable" : "device names could not be written", id);
+          return;
+        }
+      }
+      this.emit({ type: "names", id, items: (await names.list()).map(nameInfo) });
+    } catch (err) {
+      this.deps.logger.warn(`[shadow-core] device names request failed: ${(err as Error)?.name ?? "error"}`);
+      this.error("internal", "device names are unavailable", id);
+    }
+  }
+
+  /** "Evet, hep bu" for `requestId`: honoured only for an offer this session made on a card still pending. */
+  private acceptRemember(requestId: string): void {
+    const offer = this.offers.get(requestId);
+    if (offer && this.broker.isPending(requestId)) offer.accepted = true;
   }
 
   // ------------------------------------------------------------ PC permission list (T17.2)
@@ -697,13 +770,17 @@ export class Session {
     }
 
     if (target !== undefined) {
-      const answer = parseVoiceAnswer(text);
+      const answer = parseVoiceConfirm(text);
       if (answer !== null) {
         void this.slog.append({ kind: "user", id, text, source: "voice" });
         // A spoken yes/no is a user utterance too: it moves the write gate's window (fail-safe: fewer old names count).
         this.pushUtterance({ text });
         // If the target was meanwhile resolved (button/timeout), the answer is dropped.
-        if (this.broker.isPending(target)) this.broker.resolve(target, answer, "voice");
+        if (this.broker.isPending(target)) {
+          // "evet hep bu" / "evet hatırla": like the card's "Evet, hep bu" (only where it was offered).
+          if (answer.approved && answer.remember) this.acceptRemember(target);
+          this.broker.resolve(target, answer.approved, "voice");
+        }
         return;
       }
     }
@@ -949,7 +1026,10 @@ export class Session {
           return { status: "unavailable", message };
         }
       };
-      outcome = await runDirectPlan(plan, call, { fallbackOnError: decision.fallbackOnError === true });
+      outcome = await runDirectPlan(plan, call, {
+        fallbackOnError: decision.fallbackOnError === true,
+        ...(this.deps.names ? { names: this.deps.names } : {}),
+      });
     }
     if (turn.abort.signal.aborted) outcome = { kind: "cancelled" };
     if (decision.source === "learned" && decision.learnedId !== undefined) this.reportLearned(decision.learnedId, outcome, id);
@@ -1371,6 +1451,7 @@ export class Session {
           this.toolFinished(id, name, isError);
           this.observeResult(turn, toolUseId, isError);
           this.noteModelResult(turn, toolUseId, name, isError, errorText);
+          this.rememberResult(turn, toolUseId, isError);
         },
       },
     );
@@ -1555,6 +1636,7 @@ export class Session {
             this.toolFinished(turn.id, name, isError);
             this.observeResult(turn, toolUseId, isError);
             this.noteModelResult(turn, toolUseId, name, isError, errorText);
+            this.rememberResult(turn, toolUseId, isError);
           },
         },
       });
@@ -1664,6 +1746,7 @@ export class Session {
         : await this.authorize(turn, toolName, input, opts.signal);
       this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level, "gate" in r ? r.gate : undefined);
       if (r.allowed) turn.allowedUseIds.add(opts.toolUseID);
+      if (r.allowed && r.remember) (turn.remembers ??= new Map()).set(opts.toolUseID, r.remember);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
         : { behavior: "deny", message: DENY_MESSAGES[r.reason], toolUseID: opts.toolUseID };
@@ -1774,7 +1857,10 @@ export class Session {
     if (level === "read" || level === "write") return allow();
 
     // confirm
+    const offer = gate === "unknown_target" ? await this.rememberOffer(turn, identity, input, signal) : undefined;
+    if (turn.abort.signal.aborted || signal.aborted) return deny("cancelled");
     const { request, result } = this.broker.open(id, tool, summarizeToolCall(identity, input, gate));
+    if (offer) this.offers.set(request.requestId, offer);
     const onAbort = () => this.broker.resolve(request.requestId, false, "cancel");
     signal.addEventListener("abort", onAbort, { once: true });
     this.emit({ type: "state", state: "awaiting_confirm" });
@@ -1785,11 +1871,80 @@ export class Session {
       tool,
       summary: request.summary,
       expiresAt: request.expiresAt,
+      ...(offer ? { remember: { spoken: offer.spoken, target: offer.target.name } } : {}),
     });
     const res = await result;
+    this.offers.delete(request.requestId);
     signal.removeEventListener("abort", onAbort);
-    if (res.approved) return allow(res.by, request.requestId);
+    if (res.approved) {
+      const allowed = allow(res.by, request.requestId);
+      return offer?.accepted && allowed.allowed ? { ...allowed, remember: offer } : allowed;
+    }
     return deny(res.by === "timeout" ? "timeout" : "declined", res.by, request.requestId);
+  }
+
+  /**
+   * The "Evet, hep bu" offer for a call the gate raised for an unknown target
+   * (docs/14 Decision 7), or undefined. Made only when the call has one
+   * `name` target (no `floor`), exactly one distinct unresolved tier-0 name is
+   * in the window (the current utterance included), and the call reaches
+   * exactly one entity of the gate's live context (its fingerprint is what is
+   * stored). Never in a question turn: the caller passes `unknown_target` only.
+   * A key is never invented: without an unresolved slot there is no offer.
+   */
+  private async rememberOffer(turn: ActiveTurn, identity: ToolIdentity, input: Record<string, unknown>, signal: AbortSignal): Promise<RememberOffer | undefined> {
+    if (!this.deps.names || identity.service === undefined || turn.question) return undefined;
+    const name = input.name;
+    const area = input.area;
+    if (typeof name !== "string" || input.floor !== undefined || (area !== undefined && typeof area !== "string")) return undefined;
+    const domains = callDomains(input.domain);
+    if (domains === null) return undefined;
+    const unresolved = new Map<string, string>();
+    for (const u of this.utterances) {
+      if (u.unresolvedName === undefined) continue;
+      const k = nameKeys(u.unresolvedName)[0];
+      if (k !== undefined) unresolved.set(k, u.unresolvedName);
+    }
+    if (unresolved.size !== 1) return undefined;
+    const spoken = [...unresolved.values()][0] as string;
+    // The gate's cached read (already made for this call's rule-4 check).
+    const snapshot = await untilAborted(this.gateSnapshot(turn, identity.service), signal);
+    if (!snapshot) return undefined;
+    const owners = snapshot.filter(
+      (e) =>
+        e.names.some((x) => foldKey(x) === foldKey(name)) &&
+        (area === undefined || e.areas.some((a) => foldKey(a) === foldKey(area))) &&
+        (domains === undefined || domains.includes(e.domain)),
+    );
+    if (owners.length !== 1) return undefined;
+    const target = fingerprintOf(owners[0] as LiveEntity);
+    // The stored fingerprint must name this one entity: another entity with the same canonical name,
+    // domain and areas (reached here through an alias) would make the entry unusable, so no offer.
+    if (verifyTarget(target, snapshot).status !== "present") return undefined;
+    return { spoken, keys: nameKeys(spoken), target, accepted: false };
+  }
+
+  /**
+   * A model tool result: an accepted "Evet, hep bu" offer of that call is
+   * stored only when the call succeeded (no `isError`) and the turn was not
+   * cancelled meanwhile (docs/14 Decision 7). Off the turn path.
+   */
+  private rememberResult(turn: ActiveTurn, toolUseId: string, isError: boolean): void {
+    const offer = turn.remembers?.get(toolUseId);
+    if (!offer) return;
+    turn.remembers?.delete(toolUseId);
+    const names = this.deps.names;
+    if (isError || turn.abort.signal.aborted || !names) return;
+    this.track(
+      names.add({ spoken: offer.spoken, keys: offer.keys, target: offer.target }).then((r) => {
+        if (r.ok) {
+          const replaced = r.replaced.length > 0 ? ` (replaces ${r.replaced.join(", ")})` : "";
+          this.deps.logger.info(`[shadow-core] confirmed name ${r.entry.id} stored for device ${this.info.device}${replaced}`);
+        } else {
+          this.deps.logger.warn(`[shadow-core] confirmed name not stored: ${r.reason}`);
+        }
+      }),
+    );
   }
 
   /**
@@ -1820,7 +1975,18 @@ export class Session {
     let p = targetProvenance(input, window, undefined, undefined, opts);
     if (p.status === "unknown" && p.needsSnapshot && identity.service !== undefined) {
       const snapshot = await untilAborted(this.gateSnapshot(turn, identity.service), signal);
-      if (snapshot) p = targetProvenance(input, window, snapshot, undefined, opts);
+      if (snapshot) {
+        // Rule 5: only active confirmed names whose fingerprint is present exactly once in this snapshot
+        // (the same check tier 0 makes): a missing device is never reached through its old name. HA names
+        // and aliases always win (Decision 6, as on tier 0): an entry with a key that is now the folded
+        // name or alias of any entity (any domain) is not used, so those words never vouch for the old target.
+        const store = this.deps.names;
+        const haNames = new Set(snapshot.flatMap((e) => e.names.map(foldKey)));
+        const names = store
+          ? (await store.list()).filter((n) => store.verify(n, snapshot).status === "present" && !n.keys.some((k) => haNames.has(foldKey(k))))
+          : undefined;
+        p = targetProvenance(input, window, snapshot, names, opts);
+      }
     }
     return p.status === "unknown" ? "unknown_target" : undefined;
   }
@@ -1848,6 +2014,8 @@ export class Session {
       const entities = parseLiveContext(ctx.text);
       // A valid snapshot has at least one entity (docs/14 Decision 6).
       if (entities.length === 0) throw new Error("empty");
+      // The missing clock of the confirmed names: an unfiltered read (no arguments); never rejects.
+      void this.deps.names?.sweep(entities);
       return entities;
     } catch {
       if (!turn.abort.signal.aborted) this.deps.logger.info(`[shadow-core] write gate: live context of ${service} not usable; target stays unknown`);
@@ -1893,6 +2061,30 @@ export class Session {
     await this.slog.append({ kind: "session_end", reason });
     await this.slog.flush();
   }
+}
+
+/** Folded comparison form of a name or area (as tier 0 and the write gate compare them). */
+const foldKey = (s: string) => fold(cleanTurkish(s));
+
+/** `domain` of an HA intent call: undefined when absent, null when malformed. */
+function callDomains(v: unknown): string[] | undefined | null {
+  if (v === undefined) return undefined;
+  const list = typeof v === "string" ? [v] : Array.isArray(v) ? v : undefined;
+  if (!list || list.length === 0 || !list.every((d) => typeof d === "string" && d.trim() !== "")) return null;
+  return (list as string[]).map((d) => d.trim());
+}
+
+/** One `names` item: the entry without its match keys or creation time. */
+function nameInfo(e: ConfirmedName): ConfirmedNameInfo {
+  return {
+    id: e.id,
+    spoken: e.spoken,
+    target: { name: e.target.name, domain: e.target.domain, areas: [...e.target.areas] },
+    status: e.status,
+    missingSince: e.missingSince,
+    lastUsedAt: e.lastUsedAt,
+    uses: e.uses,
+  };
 }
 
 /** The `memory` frame (docs/06 §Protocol) from a store snapshot: ids and texts only, no keywords or provenance. */

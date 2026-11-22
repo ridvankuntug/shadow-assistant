@@ -21,13 +21,24 @@
  * and no deny name word) and static light-set rules (no deny name word,
  * T7.w.13): a resolved entity it refuses is not called and the turn falls back
  * to the model.
+ *
+ * Confirmed names (docs/14 Decision 6, T4.4b): only when the spoken name
+ * matches no HA name or alias at all (HA names always win) are its stem forms
+ * looked up in the confirmed-name store; the entry's fingerprint must be
+ * present exactly once in the same live context, and the entity then passes
+ * the same rule domains and `targetFilter` as an HA-name match. Its call
+ * carries `provenance: "mapping"`; a successful call counts one use. Every
+ * parsed live context is handed to the store's missing-clock sweep.
  */
 import { LIGHT_SET_TOOL, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
+import type { ConfirmedName, ConfirmedNameStore } from "./confirmed-names.js";
 import {
+  callTarget,
   fillTemplate,
   findReadings,
   formatReading,
   LiveContextError,
+  nameKeys,
   parseLiveContext,
   resolveDevice,
   type LiveEntity,
@@ -66,9 +77,14 @@ export type DirectOutcome =
   /** Turn cancelled by the user: no answer. */
   | { kind: "cancelled" };
 
+/** What tier 0 needs of the confirmed-name store (T4.4b). */
+export type DirectNames = Pick<ConfirmedNameStore, "lookup" | "verify" | "recordUse" | "sweep">;
+
 export interface DirectOptions {
   /** router.yaml `direct.on_tool_error`: may unresolved/failed requests go to the model? */
   fallbackOnError: boolean;
+  /** Confirmed names (docs/14 Decision 6); absent = HA names only, no sweep. */
+  names?: DirectNames;
 }
 
 export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: DirectOptions): Promise<DirectOutcome> {
@@ -92,6 +108,9 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
     if (err instanceof LiveContextError) return failOr("live_context_unparseable", m.failed);
     throw err;
   }
+  // The missing clock of the confirmed names (an unfiltered read: no arguments). The store ignores an
+  // invalid (e.g. empty) snapshot and never rejects; it runs off the turn path.
+  void opts.names?.sweep(entities);
 
   // 2a) sensor question: answer from the context
   if (plan.tool === LIVE_CONTEXT_TOOL) {
@@ -108,7 +127,7 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
 
   // 2b) switch: resolve the name, then call the intent
   if (plan.name === undefined) return failOr("no_name", m.not_found);
-  const res = resolvePlanTarget(entities, plan);
+  const res = resolvePlanTarget(entities, plan, opts.names);
   if (res.status === "none") return failOr("name_not_found", m.not_found);
   if (res.status === "ambiguous") return failOr("name_ambiguous", m.ambiguous);
   // Always the model, whatever `direct.on_tool_error` says: nothing was called, and a
@@ -117,11 +136,13 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
   if (res.status === "refused") return { kind: "fallback", reason: "target_refused" };
   if (plan.tool === LIGHT_SET_TOOL && plan.brightness === undefined) return failOr("no_brightness", m.failed);
 
-  // The target is the entity the user's spoken name resolved to (provenance rule 1).
-  const act = await call(plan.tool, directCallArgs(plan, res), { provenance: "user" });
+  // The target is the entity the user's spoken name resolved to (provenance rule 1), or the
+  // one the user confirmed for these words earlier (rule 2).
+  const act = await call(plan.tool, directCallArgs(plan, res), { provenance: res.nameId !== undefined ? "mapping" : "user" });
   if (act.status === "denied") return denied(act.reason);
   if (act.status === "unavailable") return { kind: "reply", text: m.unavailable, status: "error" };
   if (act.result.isError) return failOr("tool_error", m.failed);
+  if (res.nameId !== undefined) void opts.names?.recordUse(res.nameId);
   const vars: Record<string, string> = { ad: res.label };
   if (plan.brightness !== undefined) vars.seviye = String(plan.brightness);
   return { kind: "reply", text: fillTemplate(plan.reply, vars), status: "done" };
@@ -137,17 +158,52 @@ export function directCallArgs(plan: DirectPlan, res: Extract<Resolution, { stat
   };
 }
 
-export type TargetResolution = Resolution | { status: "refused" };
+/** `nameId`: the resolution came from this confirmed name (provenance `mapping`). */
+export type TargetResolution =
+  | (Extract<Resolution, { status: "ok" }> & { nameId?: string })
+  | Exclude<Resolution, { status: "ok" }>
+  | { status: "refused" };
 
 /**
  * `resolveWithAliases()`, then the plan's `targetFilter` (learned rules, static switch and light-set rules)
  * on the one resolved entity: a refused target is never called. Without a
  * filter this is exactly `resolveWithAliases()`.
+ *
+ * With `names`, a spoken name that matches nothing (`none`, after the area
+ * synonyms) is looked up in the active confirmed names; an entry whose
+ * fingerprint is present exactly once in `entities` yields that entity, which
+ * must be of one of the rule's `domains` and pass the same `targetFilter`
+ * (a confirmed name never reaches a target the rule could not reach by its HA
+ * name). A missing, ambiguous or passive entry leaves the result `none`.
  */
-export function resolvePlanTarget(entities: readonly LiveEntity[], plan: DirectPlan): TargetResolution {
-  const res = resolveWithAliases(entities, plan);
+export function resolvePlanTarget(entities: readonly LiveEntity[], plan: DirectPlan, names?: Pick<DirectNames, "lookup" | "verify">): TargetResolution {
+  let res: TargetResolution = resolveWithAliases(entities, plan);
+  if (res.status === "none" && names && plan.name !== undefined && !haNameAnyDomain(entities, plan)) res = confirmedTarget(entities, plan, names) ?? res;
   if (res.status === "ok" && plan.targetFilter && !plan.targetFilter(res.entity)) return { status: "refused" };
   return res;
+}
+
+/**
+ * Whether the spoken name (or an area synonym) matches an HA name, alias or
+ * area of any domain, not only the rule's: HA names always win (docs/14
+ * Decision 6), so such words are never resolved through a confirmed name
+ * (e.g. a "Perde" cover added after "perde" was confirmed for a plug).
+ */
+function haNameAnyDomain(entities: readonly LiveEntity[], plan: DirectPlan): boolean {
+  const all = [...new Set(entities.map((e) => e.domain))];
+  return resolveWithAliases(entities, { ...plan, domains: all }).status !== "none";
+}
+
+/** The confirmed-name fallback of `resolvePlanTarget`; undefined = no usable entry. */
+function confirmedTarget(entities: readonly LiveEntity[], plan: DirectPlan, names: Pick<DirectNames, "lookup" | "verify">): TargetResolution | undefined {
+  const entry: Readonly<ConfirmedName> | undefined = names.lookup(nameKeys(plan.name ?? ""));
+  if (!entry) return undefined;
+  const v = names.verify(entry, entities);
+  if (v.status !== "present") return undefined;
+  // The rule's domains bound a confirmed name exactly as they bound an HA name.
+  if (!plan.domains.includes(v.entity.domain)) return { status: "refused" };
+  const res = callTarget(entities, v.entity, v.entity.names[0] as string);
+  return res.status === "ok" ? { ...res, nameId: entry.id } : res;
 }
 
 /**

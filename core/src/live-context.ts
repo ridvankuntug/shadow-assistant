@@ -69,6 +69,16 @@ export function parseLiveContext(text: string): LiveEntity[] {
 
 const key = (s: string) => fold(cleanTurkish(s));
 
+/**
+ * Match keys of a spoken `<ad>` slot for the confirmed-name store (docs/14
+ * Decision 6): its suffix-stripped forms (`stemCandidates`, as `resolveDevice`
+ * tries them), folded, distinct, input form first. The same function builds
+ * the keys on "Evet, hep bu" and looks them up on tier 0.
+ */
+export function nameKeys(spoken: string): string[] {
+  return [...new Set(stemCandidates(spoken).map(key).filter((k) => k !== ""))];
+}
+
 // ---------------------------------------------------------------- device resolution
 
 export type Resolution =
@@ -127,8 +137,17 @@ export function resolveDevice(entities: readonly LiveEntity[], spoken: string, o
   if (hits.length === 0) return { status: "none" };
   if (hits.length > 1) return { status: "ambiguous", count: hits.length };
   const { entity, label } = hits[0] as { entity: LiveEntity; label: string };
-  // HA resolves `name` among all exposed entities: when another entity of the
-  // same domain shares the name, narrow the call by area or give up.
+  return callTarget(entities, entity, label);
+}
+
+/**
+ * The call for one chosen entity: HA resolves `name` among all exposed
+ * entities, so when another entity of the same domain shares the canonical
+ * name the call is narrowed by area, or it is ambiguous. Used by
+ * `resolveDevice` and by the confirmed-name fallback of tier 0 (docs/14
+ * Decision 6), so both reach exactly the entity they chose.
+ */
+export function callTarget(entities: readonly LiveEntity[], entity: LiveEntity, label: string): Resolution {
   const callName = entity.names[0] as string;
   const sameName = entities.filter((o) => o !== entity && o.domain === entity.domain && o.names.some((n) => key(n) === key(callName)));
   if (sameName.length > 0) {

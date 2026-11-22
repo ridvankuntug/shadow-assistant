@@ -764,18 +764,18 @@ protocol shape is fixed and shares no file with the Core tasks.
     set/clear, `passive` after 30 days, injected clock; nothing on an invalid
     snapshot; passive never reactivated), `add` (replaces same key, active),
     `delete`.
-- [ ] **T4.4b — Names in tier 0, gate and protocol.** Durum: başlamadı
-  - [ ] `resolvePlanTarget`: confirmed-name fallback after `resolveDevice`, then
+- [x] **T4.4b — Names in tier 0, gate and protocol.** Durum: bitti
+  - [x] `resolvePlanTarget`: confirmed-name fallback after `resolveDevice`, then
     the same safety filters; provenance `"mapping"`.
-  - [ ] Sweep after each valid snapshot (tier-0 parse, gate rule-4 read).
-  - [ ] Gate rule 5 with the store.
-  - [ ] `confirm_request.remember?`, `confirm_response.remember?`; offer only on
+  - [x] Sweep after each valid snapshot (tier-0 parse, gate rule-4 read).
+  - [x] Gate rule 5 with the store.
+  - [x] `confirm_request.remember?`, `confirm_response.remember?`; offer only on
     an unknown-target raise, a single `name` target and exactly one unresolved
     spoken name in the window; never in a question turn; store on success.
-  - [ ] `parseVoiceAnswer`: "evet hep bu" / "evet hatırla" → approve + remember.
-  - [ ] `names_list` / `names_delete` / `names` (with `status`, `missingSince`),
+  - [x] `parseVoiceAnswer`: "evet hep bu" / "evet hatırla" → approve + remember.
+  - [x] `names_list` / `names_delete` / `names` (with `status`, `missingSince`),
     `welcome.features: "names"`; docs/02 updated.
-- [ ] **T4.4c — UI.** Durum: başlamadı
+- [~] **T4.4c — UI.** Durum: başlandı
   - [ ] ConfirmCard: third button "Evet, hep bu" when `remember` is present.
   - [ ] `NamesPanel.tsx`: rows, "Pasif" / "Bulunamadı" labels, Sil with
     "Silinsin mi?"; strings in `strings.ts`.

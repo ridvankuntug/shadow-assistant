@@ -169,24 +169,48 @@ export function normalizeTurkish(text: string): string {
     .trim();
 }
 
+/** "Evet, hep bu" by voice (docs/14 Decision 7): one of these next to a yes-word. */
+const REMEMBER_WORDS = new Set(["hep", "hatirla"]);
+/** Allowed only together with a remember word ("evet hep bu"). */
+const REMEMBER_FILLERS = new Set(["bu"]);
+
+/** A voice confirm answer: `remember` = "evet hep bu" / "evet hatırla" (approve and keep the name). */
+export interface VoiceAnswer {
+  approved: boolean;
+  remember: boolean;
+}
+
 /**
  * Interprets a short transcript as a confirm answer. Only a whole short
  * utterance made of yes-words (or no-words) counts; anything mixed or longer
- * returns null so it is not mistaken for an answer.
+ * returns null so it is not mistaken for an answer. A yes with `hep` or
+ * `hatırla` ("evet hep bu", "evet hatırla", at most 3 words) also asks to
+ * remember the name; a remember word without a yes-word, or next to a
+ * no-word, is no answer.
  */
-export function parseVoiceAnswer(text: string): boolean | null {
+export function parseVoiceConfirm(text: string): VoiceAnswer | null {
   const words = normalizeTurkish(text).split(" ").filter(Boolean);
   if (words.length === 0 || words.length > MAX_ANSWER_WORDS) return null;
   let yes = 0;
   let no = 0;
+  let remember = 0;
+  let rememberFillers = 0;
   for (const w of words) {
     if (YES_WORDS.has(w)) yes++;
     else if (NO_WORDS.has(w)) no++;
+    else if (REMEMBER_WORDS.has(w)) remember++;
+    else if (REMEMBER_FILLERS.has(w)) rememberFillers++;
     else if (!FILLER_WORDS.has(w)) return null;
   }
-  if (yes > 0 && no === 0) return true;
-  if (no > 0 && yes === 0) return false;
+  if (rememberFillers > 0 && remember === 0) return null;
+  if (yes > 0 && no === 0) return { approved: true, remember: remember > 0 };
+  if (no > 0 && yes === 0 && remember === 0) return { approved: false, remember: false };
   return null;
+}
+
+/** `parseVoiceConfirm` without the remember part: true (yes), false (no) or null. */
+export function parseVoiceAnswer(text: string): boolean | null {
+  return parseVoiceConfirm(text)?.approved ?? null;
 }
 
 // ---------------------------------------------------------------- confirm broker

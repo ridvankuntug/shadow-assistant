@@ -9,6 +9,7 @@ import {
   identifyTool,
   normalizeTurkish,
   parseVoiceAnswer,
+  parseVoiceConfirm,
   PermissionPolicy,
   summarizeToolCall,
   type ConfirmResolution,
@@ -157,6 +158,20 @@ test("voice answers: whole short utterance, diacritic/case-insensitive", () => {
     assert.equal(parseVoiceAnswer(other), null, other);
   }
   assert.equal(normalizeTurkish("  IŞIK  Açık? "), "isik acik");
+});
+
+test("voice answers (T4.4b): 'evet hep bu' / 'evet hatırla' approve and remember; a plain yes approves once", () => {
+  for (const yes of ["evet hep bu", "Evet, hep bu.", "EVET HEP", "evet hatırla", "Evet hatirla lütfen", "tamam hep bu", "hep bu evet"]) {
+    assert.deepEqual(parseVoiceConfirm(yes), { approved: true, remember: true }, yes);
+    assert.equal(parseVoiceAnswer(yes), true, yes);
+  }
+  for (const once of ["evet", "evet lütfen", "tamam onayla"]) assert.deepEqual(parseVoiceConfirm(once), { approved: true, remember: false }, once);
+  assert.deepEqual(parseVoiceConfirm("hayır"), { approved: false, remember: false });
+  // A remember word needs a yes; "bu" only next to "hep"; still at most three words.
+  for (const other of ["hep bu", "hatırla", "hayır hep bu", "hayır hatırla", "evet bu", "bu", "evet hep bu lütfen", "evet her zaman"]) {
+    assert.equal(parseVoiceConfirm(other), null, other);
+    assert.equal(parseVoiceAnswer(other), null, other);
+  }
 });
 
 test("ConfirmBroker: first resolution wins, emitted once", async () => {

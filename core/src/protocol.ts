@@ -21,6 +21,8 @@ export const MAX_TEXT_CHARS = 4000;
 export const MAX_ID_CHARS = 128;
 /** Max length of a `speak.voice` id; longer values are ignored (default voice). */
 export const MAX_VOICE_ID_CHARS = 128;
+/** Max ids in one `names_delete` (the store holds at most 200 names). */
+export const MAX_NAMES_DELETE_IDS = 200;
 
 // ---------------------------------------------------------------- client → core
 
@@ -50,6 +52,12 @@ export interface ConfirmResponseFrame {
   type: "confirm_response";
   requestId: string;
   approved: boolean;
+  /**
+   * "Evet, hep bu" (docs/14 Decision 7): approve and keep the offered name.
+   * Only honoured with `approved: true` and when the request carried
+   * `confirm_request.remember`; otherwise ignored (a plain yes).
+   */
+  remember?: true;
 }
 
 export interface SpeakFrame {
@@ -185,6 +193,20 @@ export interface PcPermissionsSeenFrame {
   id: string;
 }
 
+/** Asks for the confirmed device names (feature `names`, docs/14 Decision 8); answered by `names` or `error`. */
+export interface NamesListFrame {
+  type: "names_list";
+  id: string;
+}
+
+/** Deletes confirmed device names by id (any status); answered by a fresh `names` frame or `error`. */
+export interface NamesDeleteFrame {
+  type: "names_delete";
+  id: string;
+  /** `names.items[].id` values, 1..MAX_NAMES_DELETE_IDS. Ids no longer listed are ignored. */
+  ids: string[];
+}
+
 export type ClientFrame =
   | HelloFrame
   | UserTextFrame
@@ -204,7 +226,9 @@ export type ClientFrame =
   | NotificationActionFrame
   | PcPermissionsListFrame
   | PcPermissionSetFrame
-  | PcPermissionsSeenFrame;
+  | PcPermissionsSeenFrame
+  | NamesListFrame
+  | NamesDeleteFrame;
 
 // ---------------------------------------------------------------- core → client
 
@@ -246,7 +270,9 @@ export type ProtocolFeature =
   /** T7.w.11.10: `notification_action` `urgent_yes` / `urgent_no` and Development `ha_urgency` suggestions with `accept`. */
   | "ha_urgency_feedback"
   /** T17.2: the PC permission list (`pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`, `pc_permissions_count`). */
-  | "pc_permissions";
+  | "pc_permissions"
+  /** T4.4b: confirmed device names (`names_list` / `names_delete` → `names`; docs/14 Decision 8). */
+  | "names";
 
 export interface HistoryItem {
   id: string;
@@ -477,6 +503,31 @@ export interface PcPermissionsFrame {
   available: boolean;
 }
 
+/** One confirmed device name (docs/14 Decision 6) as the "Cihaz adları" panel shows it. */
+export interface ConfirmedNameInfo {
+  /** `n-` + 6 hex digits; send it back in `names_delete.ids`. */
+  id: string;
+  /** The words the user said. */
+  spoken: string;
+  /** The device fingerprint: canonical name, domain, areas (as seen when confirmed). */
+  target: { name: string; domain: string; areas: string[] };
+  /** `passive`: missing for 30 days, never used again until a fresh "Evet, hep bu". */
+  status: "active" | "passive";
+  /** ISO 8601 of the first live context that lacked the device since it was last seen; null while seen. */
+  missingSince: string | null;
+  /** ISO 8601 of the last tier-0 use; null when never used. */
+  lastUsedAt: string | null;
+  uses: number;
+}
+
+/** Reply to `names_list` / `names_delete` (feature `names`), to the requesting socket only. */
+export interface NamesFrame {
+  type: "names";
+  /** The `names_list` / `names_delete` request id. */
+  id: string;
+  items: ConfirmedNameInfo[];
+}
+
 /** The PC permission badge count changed; to every authenticated socket (feature `pc_permissions`). */
 export interface PcPermissionsCountFrame {
   type: "pc_permissions_count";
@@ -504,6 +555,11 @@ export type ServerFrame =
       tool: string;
       summary: string;
       expiresAt: number;
+      /**
+       * Offered "Evet, hep bu" (docs/14 Decision 7): `spoken` = the user's words
+       * for the device, `target` = the device's name. Absent = only Evet / Hayır.
+       */
+      remember?: { spoken: string; target: string };
     }
   | { type: "confirm_resolved"; requestId: string; approved: boolean; by: ConfirmResolvedBy }
   | { type: "speech"; id: string; mime: string; data: string }
@@ -517,6 +573,7 @@ export type ServerFrame =
   | NotificationRemovedFrame
   | PcPermissionsFrame
   | PcPermissionsCountFrame
+  | NamesFrame
   /** `retryAt` (epoch ms): only on `usage_limit`, when the reset time is known. */
   | { type: "error"; id?: string; code: ErrorCode; message: string; retryAt?: number }
   | { type: "services"; items: ServiceHealth[] }
@@ -595,9 +652,15 @@ export function parseClientFrame(raw: string): ParseResult {
     case "confirm_response":
       if (!isId(data.requestId)) return bad("confirm_response.requestId must be a string");
       if (typeof data.approved !== "boolean") return bad("confirm_response.approved must be a boolean");
+      if (data.remember !== undefined && typeof data.remember !== "boolean") return bad("confirm_response.remember must be a boolean");
       return {
         ok: true,
-        frame: { type: "confirm_response", requestId: data.requestId, approved: data.approved },
+        frame: {
+          type: "confirm_response",
+          requestId: data.requestId,
+          approved: data.approved,
+          ...(data.remember === true ? { remember: true as const } : {}),
+        },
       };
     case "speak": {
       if (!isId(data.id)) return bad("speak.id must be a non-empty string");
@@ -682,6 +745,17 @@ export function parseClientFrame(raw: string): ParseResult {
     case "pc_permissions_seen":
       if (!isId(data.id)) return bad("pc_permissions_seen.id must be a non-empty string");
       return { ok: true, frame: { type: "pc_permissions_seen", id: data.id } };
+    case "names_list":
+      if (!isId(data.id)) return bad("names_list.id must be a non-empty string");
+      return { ok: true, frame: { type: "names_list", id: data.id } };
+    case "names_delete": {
+      if (!isId(data.id)) return bad("names_delete.id must be a non-empty string");
+      const ids = data.ids;
+      if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_NAMES_DELETE_IDS || !ids.every(isId)) {
+        return bad(`names_delete.ids must be 1..${MAX_NAMES_DELETE_IDS} non-empty strings`);
+      }
+      return { ok: true, frame: { type: "names_delete", id: data.id, ids: [...new Set(ids as string[])] } };
+    }
     default:
       return bad(`unknown frame type`);
   }

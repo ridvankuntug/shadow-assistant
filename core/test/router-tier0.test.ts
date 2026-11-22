@@ -9,10 +9,14 @@
  * utterances seen in real use, so a regression is easy to read in the output.
  */
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { ConfirmedNameStore, fingerprintOf } from "../src/confirmed-names.js";
 import { runDirectPlan, type GatedCall } from "../src/direct.js";
-import { parseLiveContext } from "../src/live-context.js";
+import { nameKeys, parseLiveContext } from "../src/live-context.js";
 import {
   compilePattern,
   loadRouterFile,
@@ -639,5 +643,125 @@ rules:
     assert.equal(hasDenyName(e(["Su"], ["Pompası"]), ["su pompasi"]), false);
     assert.equal(hasDenyName(e(["Pompası Su"]), ["su pompasi"]), false);
     assert.equal(hasDenyName(e(["Su Pompası"]), []), false);
+  });
+});
+
+// ------------------------------------------------------------------ confirmed names (T4.4b, docs/14 Decision 6)
+
+describe("confirmed names on tier 0", () => {
+  const base = mkdtempSync(join(tmpdir(), "shadow-tier0-names-test-"));
+  after(() => rmSync(base, { recursive: true, force: true }));
+
+  /** Generic fake home: a plug, a light, a plain switch, a lock and a plug with a deny word. */
+  const HOME = JSON.stringify({
+    result: [
+      "Live Context: An overview of the areas and the devices in this smart home:",
+      ...["- names: Masa Prizi", "  domain: switch", "  state: 'off'", "  areas: Salon", "  attributes:", "    device_class: outlet"],
+      ...["- names: Tavan Işık", "  domain: light", "  state: 'off'", "  areas: Salon"],
+      ...["- names: Röle Işık", "  domain: switch", "  state: 'off'"],
+      ...["- names: Ön Kapı", "  domain: lock", "  state: 'locked'"],
+      ...["- names: Kapı Rölesi", "  domain: switch", "  state: 'off'", "  attributes:", "    device_class: outlet"],
+    ].join("\n"),
+  });
+  const entities = parseLiveContext(HOME);
+  const entity = (name: string) => entities.find((e) => e.names[0] === name) as (typeof entities)[number];
+
+  let n = 0;
+  /** A loaded store in a fresh folder with `spoken` (the rule slot of `text`) confirmed for `target`. */
+  async function storeWith(text: string, target: string, now?: () => number) {
+    const store = new ConfirmedNameStore({ dir: join(base, `s${++n}`), ...(now ? { now } : {}) });
+    await store.load();
+    const spoken = planOf(text).name as string;
+    const r = await store.add({ spoken, keys: nameKeys(spoken), target: fingerprintOf(entity(target)) });
+    assert.ok(r.ok);
+    return { store, id: r.entry.id };
+  }
+
+  function planOf(text: string): DirectPlan {
+    const hit = matchRules(cfg, prepareText(text, cfg.fillers));
+    assert.ok(hit?.tier === 0, `no tier-0 match for '${text}'`);
+    return hit.plan;
+  }
+
+  async function run(text: string, store: ConfirmedNameStore, live = HOME) {
+    const calls: Array<{ tool: string; args: Record<string, unknown>; provenance?: string }> = [];
+    const call: GatedCall = async (tool, args, opts) => {
+      calls.push({ tool, args, ...(opts?.provenance ? { provenance: opts.provenance } : {}) });
+      return { status: "ok", result: { text: tool === "homeassistant__GetLiveContext" ? live : "{}", isError: false } };
+    };
+    const outcome = await runDirectPlan(planOf(text), call, { fallbackOnError: true, names: store });
+    await store.flush();
+    return { outcome, calls };
+  }
+
+  test("a confirmed name resolves on tier 0: the fingerprint's entity, provenance 'mapping', one use counted", async () => {
+    const { store, id } = await storeWith("fıskiyeyi kapat", "Masa Prizi");
+    const { outcome, calls } = await run("fıskiyeyi kapat", store);
+    assert.equal(outcome.kind, "reply");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1], { tool: "intent__HassTurnOff", args: { name: "Masa Prizi", domain: ["switch"] }, provenance: "mapping" });
+    const [e] = await store.list();
+    assert.equal(e?.id, id);
+    assert.equal(e?.uses, 1);
+    assert.notEqual(e?.lastUsedAt, null);
+    // The other suffix forms of the same words hit the same entry.
+    assert.equal((await run("fıskiyeyi aç", store)).calls[1]?.args.name, "Masa Prizi");
+  });
+
+  test("HA names always win: a confirmed name for words that are an HA name is never consulted", async () => {
+    const { store } = await storeWith("masa prizini kapat", "Tavan Işık");
+    const { outcome, calls } = await run("masa prizini kapat", store);
+    assert.equal(outcome.kind, "reply");
+    assert.deepEqual(calls[1], { tool: "intent__HassTurnOff", args: { name: "Masa Prizi", domain: ["switch"] }, provenance: "user" });
+    assert.equal((await store.list())[0]?.uses, 0);
+  });
+
+  test("HA names win across domains: words that name an HA entity outside the rule's domains never use the confirmed name", async () => {
+    const { store } = await storeWith("fıskiyeyi kapat", "Masa Prizi");
+    const withCover = HOME.replace("Live Context: An overview of the areas and the devices in this smart home:", "Live Context:\\n- names: Fıskiye\\n  domain: cover\\n  state: open");
+    assert.ok(parseLiveContext(withCover).some((e) => e.domain === "cover"));
+    const { outcome, calls } = await run("fıskiyeyi kapat", store, withCover);
+    assert.deepEqual(outcome, { kind: "fallback", reason: "name_not_found" });
+    assert.equal(calls.length, 1, "nothing was switched");
+    assert.equal((await store.list())[0]?.uses, 0);
+  });
+
+  for (const [target, why] of [
+    ["Röle Işık", "a switch that is not an outlet"],
+    ["Ön Kapı", "a lock (outside the rule's domains)"],
+    ["Kapı Rölesi", "a deny name word"],
+  ] as const) {
+    test(`a confirmed name pointing at ${why} is refused like its HA name: nothing is called, the model decides`, async () => {
+      const { store } = await storeWith("fıskiyeyi aç", target);
+      const { outcome, calls } = await run("fıskiyeyi aç", store);
+      assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });
+      assert.equal(calls.length, 1, "only the live context was read");
+      assert.equal((await store.list())[0]?.uses, 0);
+    });
+  }
+
+  test("a missing fingerprint is not used (name_not_found) and starts the missing clock; the device back clears it", async () => {
+    const { store } = await storeWith("fıskiyeyi kapat", "Masa Prizi");
+    const without = JSON.stringify({ result: ["Live Context:", "- names: Tavan Işık", "  domain: light", "  state: 'off'", "  areas: Salon"].join("\n") });
+    const gone = await run("fıskiyeyi kapat", store, without);
+    assert.deepEqual(gone.outcome, { kind: "fallback", reason: "name_not_found" });
+    assert.equal(gone.calls.length, 1);
+    assert.notEqual((await store.list())[0]?.missingSince, null);
+    const back = await run("fıskiyeyi kapat", store);
+    assert.equal(back.outcome.kind, "reply");
+    assert.equal((await store.list())[0]?.missingSince, null);
+  });
+
+  test("a live context with no usable entity neither resolves nor starts the missing clock", async () => {
+    const { store } = await storeWith("fıskiyeyi kapat", "Masa Prizi");
+    const empty = JSON.stringify({ result: "Live Context:\n- foo: 1" });
+    const { outcome } = await run("fıskiyeyi kapat", store, empty);
+    assert.deepEqual(outcome, { kind: "fallback", reason: "name_not_found" });
+    assert.equal((await store.list())[0]?.missingSince, null);
+  });
+
+  test("without a store tier 0 behaves as before", async () => {
+    const call: GatedCall = async (tool) => ({ status: "ok", result: { text: tool === "homeassistant__GetLiveContext" ? HOME : "{}", isError: false } });
+    assert.deepEqual(await runDirectPlan(planOf("fıskiyeyi kapat"), call, { fallbackOnError: true }), { kind: "fallback", reason: "name_not_found" });
   });
 });

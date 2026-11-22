@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEV_ACTIONS, MAX_TEXT_CHARS, NOTIFICATION_ACTIONS, parseClientFrame } from "../src/protocol.js";
+import { DEV_ACTIONS, MAX_NAMES_DELETE_IDS, MAX_TEXT_CHARS, NOTIFICATION_ACTIONS, parseClientFrame } from "../src/protocol.js";
 
 const ok = (raw: unknown) => {
   const r = parseClientFrame(JSON.stringify(raw));
@@ -201,4 +201,43 @@ test("existing frames are unchanged by the notification frames; Core frames are 
   bad({ type: "notifications", id: "n1", items: [], unread: 0 });
   bad({ type: "notification", item: {} });
   bad({ type: "notification_removed", notificationId: "n-1" });
+});
+
+test("confirm_response.remember (T4.4b): optional, additive; only `true` is kept", () => {
+  assert.deepEqual(ok({ type: "confirm_response", requestId: "c1", approved: true, remember: true }), {
+    type: "confirm_response",
+    requestId: "c1",
+    approved: true,
+    remember: true,
+  });
+  // An old client's frame and an explicit false are plain answers.
+  assert.deepEqual(ok({ type: "confirm_response", requestId: "c1", approved: true }), { type: "confirm_response", requestId: "c1", approved: true });
+  assert.deepEqual(ok({ type: "confirm_response", requestId: "c1", approved: true, remember: false }), {
+    type: "confirm_response",
+    requestId: "c1",
+    approved: true,
+  });
+  // Parsed as sent; the session ignores `remember` without `approved: true` and an offer.
+  assert.equal((ok({ type: "confirm_response", requestId: "c1", approved: false, remember: true }) as { remember?: boolean }).remember, true);
+  for (const remember of ["yes", 1, null, {}]) bad({ type: "confirm_response", requestId: "c1", approved: true, remember });
+});
+
+test("names_list / names_delete (T4.4b, feature `names`)", () => {
+  assert.deepEqual(ok({ type: "names_list", id: "n1" }), { type: "names_list", id: "n1" });
+  assert.deepEqual(ok({ type: "names_delete", id: "n2", ids: ["n-3f9a1c"] }), { type: "names_delete", id: "n2", ids: ["n-3f9a1c"] });
+  // Duplicates are dropped; any non-empty string passes the parser (the store ignores unknown ids).
+  assert.deepEqual(ok({ type: "names_delete", id: "n3", ids: ["n-3f9a1c", "n-3f9a1c", "x"] }), { type: "names_delete", id: "n3", ids: ["n-3f9a1c", "x"] });
+  const max = Array.from({ length: MAX_NAMES_DELETE_IDS }, (_, i) => `n-${i.toString(16).padStart(6, "0")}`);
+  assert.equal(ok({ type: "names_delete", id: "n4", ids: max }).type, "names_delete");
+  bad({ type: "names_list" });
+  bad({ type: "names_list", id: "" });
+  assert.equal(bad({ type: "names_delete", id: "n5" }).id, "n5");
+  bad({ type: "names_delete", id: "n5", ids: [] });
+  bad({ type: "names_delete", id: "n5", ids: "n-3f9a1c" });
+  bad({ type: "names_delete", id: "n5", ids: ["n-3f9a1c", ""] });
+  bad({ type: "names_delete", id: "n5", ids: ["n-3f9a1c", 7] });
+  bad({ type: "names_delete", id: "n5", ids: [...max, "n-ffffff"] });
+  bad({ type: "names_delete", ids: ["n-3f9a1c"] });
+  // `names` is a Core → client frame.
+  bad({ type: "names", id: "n1", items: [] });
 });
