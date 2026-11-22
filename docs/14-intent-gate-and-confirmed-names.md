@@ -712,6 +712,26 @@ the repeated mistake.
    kalanında gönderilmez (`repeated_error`). T4.6 (docs/README satırı) görev
    listesinde kalır. Bkz. Decision 10.
 
+### Ek kararlar (kullanıcı, 2026-11-22, uygulama sonrası)
+
+9. **Yalnız `name` taşıyan hassas hedef (T4.5 açık maddesi) → seçenek A (T4.8):**
+   geçit, yalnız `name` taşıyan bir yazma çağrısının hedefini canlı snapshot'tan
+   bulur ve domain/device_class'ına `confirm_inputs` ile hassas tür kurallarını
+   uygular. Kilit, outlet olmayan switch ve deny-name hedefi hedef bilinen
+   (kural 3/4/5) olsa da her zaman kart açar. Snapshot okunamazsa kart.
+10. **Kural 3 sınırı → canlı listeyle kontrol (T4.9):** model yolunda hedef
+    kullanıcının sözündeki ada tam uymuyorsa (söz daha uzun ya da başka bir ad
+    ifadesi içeriyor) ve snapshot'ta benzer adlı başka bir cihaz varsa kart açılır.
+    Net tier-0 yolu etkilenmez (2 HA çağrısı, kart yok).
+11. **Onay kartı özeti sesli okunur (T4.10):** TTS açıkken; sessiz saat kuralları
+    geçerlidir.
+12. **Öğrenme kapalıyken `domainWords` (T4.11):** geniş çağrılar ve alan + cihaz
+    kelimesi için sözcük listesi öğrenmeden bağımsız olarak geçide verilir.
+13. **Gözlemlenebilirlik ve test (T4.12):** `permission` log kaydına gerekçe;
+    `ui/scripts/mock-core.mjs` `names_list` / `names_delete` / `names` ve
+    `remember` alanlarını bilir; `welcome.features` "names" ve `remember` için
+    protokol testleri.
+
 ## Implementation tasks
 
 Boxes: `[ ]` not started, `[~]` started, `[x]` done. **Files** lists everything a
@@ -828,6 +848,25 @@ protocol shape is fixed and shares no file with the Core tasks.
 - [x] **T4.6 — Docs index.** Durum: bitti
   - [x] Add this document to `docs/README.md` (left out of T4.1 on purpose).
   - [x] Progress log and statuses in this document after T4.2-T4.5 and T4.7.
+
+- [~] **T4.8 — Sensitive name-only targets (decision 9).** Durum: başlandı
+  - [ ] Gate: resolve a name-only write target in the live snapshot; apply
+    `confirm_inputs` (domain/device_class) and the tier-0 sensitive rules
+    (lock, non-outlet switch, deny-name) → always confirm; unreadable snapshot → confirm.
+  - [ ] Tests incl. the open T4.5 item (confirmed name on a lock / non-outlet switch / deny-name).
+- [~] **T4.9 — Rule 3 checked against the live list (decision 10).** Durum: başlandı
+  - [ ] Model path: text match that is not an exact fit for the user's name phrase
+    and a similarly named other device in the snapshot → confirm.
+  - [ ] Tests: "salon lambası 2 kapat" + call "Salon Lambası" → card; tier-0
+    brightness still two HA calls and no card.
+- [ ] **T4.10 — Confirm summary spoken (decision 11).** Durum: başlamadı
+  - [ ] Speak the confirm summary when TTS is on; quiet-hour rules apply; tests.
+- [~] **T4.11 — `domainWords` without learning (decision 12).** Durum: başlandı
+  - [ ] Pass router keyword lists to the gate independent of `deps.learning`; test with learning off.
+- [ ] **T4.12 — Logs, mock core, protocol tests (decision 13).** Durum: başlamadı
+  - [ ] `permission` log record carries the gate reason.
+  - [ ] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
+  - [ ] Protocol tests for `welcome.features` "names" and `remember` (core and ui).
 
 ## Progress log
 
