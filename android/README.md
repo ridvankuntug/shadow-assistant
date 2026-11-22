@@ -322,15 +322,16 @@ the *system* `SpeechRecognizer` (not Gboard's own voice typing) get an error.
 ## CI and signing
 
 Workflow: [`.github/workflows/android.yml`](../.github/workflows/android.yml)
-(separate from `ci.yml`). On pushes to `main` and PRs touching `android/`, `ui/` or the
+(separate from `ci.yml`). On pushes to `main` and PRs touching `android/`, `ui/`, `VERSION` or the
 workflow, and on manual dispatch, it builds `ui/dist`, runs unit tests and
 lint, and builds the **debug APK** (artifact `shadow-debug-apk`). If all four
 signing secrets exist (and the run is not a pull request) it also builds a
 **signed release APK** (artifact `shadow-release-apk`) and verifies the
 signature with `apksigner`. `versionCode` is the workflow run number, so each
 CI release installs over the previous one. `versionName` is derived by Gradle
-as `X.Y.<versionCode>`, where `X.Y` is `shadowVersionBase` in
-`gradle.properties` (its only source); local builds without
+as `X.Y.<versionCode>`, where `X.Y` is the content of the root
+[`VERSION`](../VERSION) file (its only source; the build stops if it is not
+`X.Y`); local builds without
 `-PshadowVersionCode` are `X.Y.0` / `1`.
 
 The keystore never enters the repository: CI decodes it from a secret into
@@ -387,7 +388,7 @@ must never be committed.
 Design: [`docs/10-android-updates.md`](../docs/10-android-updates.md).
 
 **Publishing (automatic, docs/10 D7):** every push to `main` whose app
-sources (`android/`, `ui/`; not `*.md` or test sources) changed since the
+sources (`android/`, `ui/`, `VERSION`; not `*.md` or test sources) changed since the
 latest release publishes a release. The **Android** workflow builds and tests
 as usual, fails if any signing secret is missing, builds the signed APK
 (`versionCode` = run number, `versionName` = `X.Y.<run>`), and a separate
@@ -403,7 +404,8 @@ No release when nothing in the app changed (e.g. only the workflow or docs).
 Pull requests, forks and manual runs never release. There is no manual tag
 path: pushing a `v*` tag does nothing. A release is never overwritten: if the
 release, its tag or a draft of it already exists (e.g. a re-run) the job fails.
-To start a new `X.Y` line, edit `shadowVersionBase` in `gradle.properties`.
+To start a new `X.Y` line, edit the root `VERSION` file (e.g. `0.2` → `0.3`);
+that commit itself releases.
 
 **Versioning:** "newer" means a higher `versionCode` only (one run-number
 counter for every build of this workflow). Never rename `android.yml`: a new

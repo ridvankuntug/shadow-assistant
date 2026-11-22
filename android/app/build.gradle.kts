@@ -153,14 +153,18 @@ android {
         targetSdk = 37
         // docs/10 D1/D7: CI passes versionCode = workflow run number (the only "newer" signal
         // of the in-app updater). versionName is derived, never set separately: the one
-        // source is `shadowVersionBase` ("X.Y", gradle.properties) plus the versionCode as
-        // patch, e.g. 0.1.57; the release tag is "v" + versionName. Local builds: 1 / X.Y.0.
+        // source is the version base ("X.Y", the repository's root `VERSION` file, shared
+        // with the core release) plus the versionCode as patch, e.g. 0.2.57; the release tag
+        // is "v" + versionName. Local builds: 1 / X.Y.0.
         val ciVersionCode = (findProperty("shadowVersionCode") as String?)?.let {
             it.toIntOrNull()?.takeIf { code -> code > 0 } ?: throw GradleException("shadowVersionCode must be a positive integer")
         }
-        val versionBase = (findProperty("shadowVersionBase") as String?).orEmpty()
+        // Read through `providers` so the file is a tracked build input. Missing file → "",
+        // which fails the X.Y check below like any other malformed value.
+        val versionFile = rootProject.layout.projectDirectory.file("../VERSION")
+        val versionBase = providers.fileContents(versionFile).asText.orNull.orEmpty().trim()
         if (!Regex("""^\d{1,6}\.\d{1,6}$""").matches(versionBase)) {
-            throw GradleException("shadowVersionBase (gradle.properties) must look like X.Y")
+            throw GradleException("VERSION (repository root) must contain X.Y, e.g. 0.2; found '$versionBase'")
         }
         versionCode = ciVersionCode ?: 1
         versionName = "$versionBase.${ciVersionCode ?: 0}"

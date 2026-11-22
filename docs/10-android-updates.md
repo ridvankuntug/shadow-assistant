@@ -139,9 +139,9 @@ component names of `MainActivity` and the `assist/` services (assist role).
 ### D7 — Automatic release on main (T16.1, user decision)
 
 - **Trigger:** every push to `main` that runs `android.yml` (paths `android/**`,
-  `ui/**`, the workflow) and whose **app sources changed since the latest
+  `ui/**`, `VERSION`, the workflow) and whose **app sources changed since the latest
   release** publishes a release. "App sources": `git diff <latest release tag>
-  HEAD -- android ui` minus `*.md`, `android/app/src/test/**` and
+  HEAD -- android ui VERSION` minus `*.md`, `android/app/src/test/**` and
   `ui/src/**/*.test.ts` (`ui/dist` is copied into the APK by `copyUiBundle`;
   `ui/` imports nothing outside itself). Diffing against the last release, not
   the previous push, means a skipped/replaced run never loses a change. No
@@ -156,14 +156,15 @@ component names of `MainActivity` and the `assist/` services (assist role).
   run number blocks updates; an offset — nothing to correct. Constraint: never
   rename/recreate `android.yml` (a new workflow restarts `run_number` at 1);
   if that ever happens, add a fixed offset above the last released code.
-- **versionName** has one source: `shadowVersionBase=X.Y` in
-  `android/gradle.properties`; Gradle derives `X.Y.<versionCode>` (local builds
+- **versionName** has one source: the repository's root `VERSION` file
+  (`X.Y`; the core release is to read the same file; the build stops if it is not `X.Y`;
+  formerly `shadowVersionBase` in `android/gradle.properties`); Gradle derives `X.Y.<versionCode>` (local builds
   without `-PshadowVersionCode`: code 1, name `X.Y.0`). `-PshadowVersionName`
   and the workflow's `BASE_VERSION_NAME` are gone. The release tag is `v` +
   the versionName read back from the built APK (`aapt2 dump badging`, patch
   must equal the run number), so the app's strict `vX.Y.Z` tag rule and
   `shadow-vX.Y.Z.apk` naming are unchanged. Bump `X.Y` by editing
-  `gradle.properties` (that commit itself releases).
+  `VERSION` (that commit itself releases).
 - **Manual `v*` tags: removed.** One release channel, one tag namespace
   (`vX.Y.<run>`, created only by the release job at the built commit via
   `target_commitish`). A manual tag would duplicate releases of the same code

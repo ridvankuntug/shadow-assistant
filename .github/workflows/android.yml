@@ -14,11 +14,13 @@ on:
     paths:
       - "android/**"
       - "ui/**"
+      - "VERSION"
       - ".github/workflows/android.yml"
   pull_request:
     paths:
       - "android/**"
       - "ui/**"
+      - "VERSION"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -51,9 +53,9 @@ jobs:
           fetch-depth: 0
 
       # docs/10 D7: release only for a push to main of this repository (not forks, PRs or
-      # manual runs) whose app sources changed since the latest release: android/ and ui/
-      # (ui/dist is copied into the APK by copyUiBundle), minus Markdown and test sources
-      # that never reach the APK. Workflow-only changes build and test but do not release.
+      # manual runs) whose app sources changed since the latest release: android/, ui/
+      # (ui/dist is copied into the APK by copyUiBundle) and VERSION (the versionName base),
+      # minus Markdown and test sources that never reach the APK. Workflow-only changes build and test but do not release.
       # No release yet → release. Latest release unreadable → release with a warning (an
       # extra release is harmless: same code, higher versionCode). A release without all
       # signing secrets fails here (never an unsigned or debug-signed release).
@@ -73,7 +75,7 @@ jobs:
           if [ "$code" = "200" ]; then
             tag="$(jq -r '.tag_name // empty' "$RUNNER_TEMP/latest.json")"
             if [ -n "$tag" ] && base="$(git rev-parse -q --verify "refs/tags/$tag^{commit}")"; then
-              changed="$(git diff --name-only "$base" HEAD -- android ui \
+              changed="$(git diff --name-only "$base" HEAD -- android ui VERSION \
                 ':(exclude,glob)**/*.md' \
                 ':(exclude)android/app/src/test' \
                 ':(exclude,glob)ui/src/**/*.test.ts')"
@@ -123,8 +125,8 @@ jobs:
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-37.0" "build-tools;37.0.0"
 
-      # docs/10 D1/D7: versionCode = run number; versionName = <shadowVersionBase>.<run>,
-      # derived by Gradle (android/gradle.properties is its only source).
+      # docs/10 D1/D7: versionCode = run number; versionName = <X.Y>.<run>, derived by
+      # Gradle (the root VERSION file is the only source of X.Y).
       - name: Unit tests, lint, debug APK
         working-directory: android
         # `bash ./gradlew`: works even if the executable bit was lost on a Windows checkout.

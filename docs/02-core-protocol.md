@@ -44,6 +44,39 @@ the lower-cased `<NAME>` (e.g. `browser`, `android`). Tokens are compared in
 constant time and are never logged. Without any configured token the Core
 refuses to start.
 
+## Protocol versioning
+
+Two numbers are involved: the **protocol number** (`hello.protocol` /
+`welcome.protocol`, today `1`) and the **release version** `X.Y.<n>`, whose
+base `X.Y` comes from the repository's root `VERSION` file and whose patch
+`<n>` is a CI run counter.
+
+**The protocol number goes up only when an older peer would break:**
+
+- an existing frame or field is removed, renamed, or changes meaning;
+- a field or frame that an older peer does not send becomes required;
+- the `hello` exchange or the authentication flow changes.
+
+**It does not go up for:** a new optional field, a new frame type, or an
+addition guarded by `welcome.features` (see *Features*). Every "added in
+protocol 1 without a version bump" note in this document follows this rule;
+it is why clients must ignore unknown frames and fields.
+
+**Compatibility rule (between two peers):**
+
+| Protocol number | Base `X.Y` | Result |
+|---|---|---|
+| different | any | Connection refused. |
+| same | different | Connection accepted, with a warning. |
+| same | same | Accepted silently. |
+
+Patch numbers are never compared: they come from different CI counters (the
+Android app and the Core are released by separate workflows).
+
+**Agent channel:** the device agent channel (`/agent`) keeps its own number,
+starting at `agentProtocol: 1`, and follows the same rule independently of
+the client protocol above.
+
 ## Client → Core
 
 | Frame | Meaning |
