@@ -735,11 +735,11 @@ T4.3b → T4.4b → T4.7 (session part); `direct.ts`, `permissions.ts` and
 `router-tier0.test.ts` serialize T4.3b → T4.4b. T4.4c starts once the T4.4b
 protocol shape is fixed and shares no file with the Core tasks.
 
-- [ ] **T4.2 — System prompt.** Durum: başlamadı
+- [~] **T4.2 — System prompt.** Durum: başlandı
   - [ ] Replace the "Araçlar" section of `core/prompts/system.md` with the
     Decision 9 draft.
   - [ ] Leave `tier1.md` unchanged; check no test pins the old wording.
-- [ ] **T4.3a — Pure write gate.** Durum: başlamadı
+- [~] **T4.3a — Pure write gate.** Durum: başlandı
   - [ ] `isQuestionTurn(rawText)`: word list, particle rule, polite-request
     exclusion, trailing `?` rule.
   - [ ] `targetProvenance(input, utterances, snapshot?, names?)`: rules 3-5,
@@ -758,9 +758,9 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [ ] Summary reason suffixes in `summarizeToolCall` (unknown target, question).
   - [ ] `observeCall`: gate-confirmed calls are not learning observations.
   - [ ] docs/04: one paragraph on the write gate.
-- [ ] **T4.4a — Confirmed-name store.** Durum: başlamadı
-  - [ ] Load/quarantine/atomic write, serial chain, cap 200 (refuse + log).
-  - [ ] `lookup(keys)`, `verify(snapshot)`, `sweep(snapshot)` (`missingSince`
+- [x] **T4.4a — Confirmed-name store.** Durum: bitti
+  - [x] Load/quarantine/atomic write, serial chain, cap 200 (refuse + log).
+  - [x] `lookup(keys)`, `verify(snapshot)`, `sweep(snapshot)` (`missingSince`
     set/clear, `passive` after 30 days, injected clock; nothing on an invalid
     snapshot; passive never reactivated), `add` (replaces same key, active),
     `delete`.
@@ -782,8 +782,8 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [ ] `App.tsx`: panel value `"names"`, "⋮" item "Cihaz adları" behind the
     feature `names`, list request on open.
   - [ ] Controller/state/types and tests (`namesPanel.test.ts`, protocol, assistant).
-- [ ] **T4.7 — Repeated-error stop.** Durum: başlamadı
-  - [ ] `repeat-guard.ts`: argument class (tool + sorted top-level keys),
+- [~] **T4.7 — Repeated-error stop.** Durum: başlandı
+  - [x] `repeat-guard.ts`: argument class (tool + sorted top-level keys),
     error-text normalization, per-turn counter; unit tests.
   - [ ] `Session.gate`: check before `authorize` (after the tier-service check),
     record allowed `toolUseId` → class, count `isError` results from
