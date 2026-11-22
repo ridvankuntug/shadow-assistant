@@ -126,8 +126,9 @@ T15 edits the `ui/` top bar and `ShadowBridge.kt` in parallel. T14 therefore add
 - Only on user action; no automatic check (an auto dialog would also interrupt
   the assist gesture).
 
-Optional later (open question 2): a UI menu item calling a one-line bridge
-method `openUpdates()` that starts `UpdateActivity` — only after T15 is merged.
+Also a UI menu item (open question 2, decided; built in T16.2): the UI's
+version page calls the one-line bridge method `openUpdates()`, which starts
+`UpdateActivity`.
 
 ### D6 — Data kept across updates (constraints for implementers)
 
@@ -263,6 +264,7 @@ Order: 14.1 → 14.2; 14.3 → 14.4; 14.5 last. No `ui/`, `ShadowBridge.kt`,
 
 1. **Phone's current signer:** run the safe check; if debug, choose A (reinstall),
    B (rotation) or C (debug key as release key).
-2. **Entry point:** shortcut only (D5), or also a UI menu item via a bridge
-   method after T15 lands?
+2. ~~**Entry point**~~ — decided (kullanıcı onayladı, 2026-11-22; built in
+   T16.2): the shortcut (D5) and a UI menu item via the bridge method
+   `openUpdates()`.
 3. ~~**Release cadence**~~ — decided (T16.1): automatic release on main, D7.

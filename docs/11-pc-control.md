@@ -662,6 +662,7 @@ user decides.
 
 Boxes: `[ ]` not started, `[~]` started, `[x]` done. **Files** lists what a
 task may touch. Tasks sharing a file are not run in parallel (**After**).
+The open tasks carry their v0.2 plan number: T17.3 → T16, T17.4–T17.11 → T30–T37.
 
 | Task | Files | After | Data |
 |---|---|---|---|
@@ -681,31 +682,31 @@ task may touch. Tasks sharing a file are not run in parallel (**After**).
   number. Acceptance: list / set / seen / count work; `not_allowed` outside the
   list and when unset; corrupt file → unavailable, nothing written; D3 negative
   tests green.
-- [ ] **T17.3 — `pc-svc` link.** Core `/pc` endpoint and token file; tray
+- [ ] **T17.3 — `pc-svc` link.** (v0.2 plan: T16) Core `/pc` endpoint and token file; tray
   client that dials the Core after sign-in and reconnects; `pc_state`;
   `pc-svc` in the services list. Acceptance: Core sees lock state; wrong or
   missing token and `Origin` refused; with the tray closed the Core keeps
   working and a PC request answers "oturum açık değil" without adding a row.
-- [ ] **T17.4 — Coordinator, `shadow-pc` service, volume / media / lock.**
+- [ ] **T17.4 — Coordinator, `shadow-pc` service, volume / media / lock.** (v0.2 plan: T30)
   Gateway `prepare`, code levels, Turkish confirm summaries, action log.
   Acceptance: "sesi yüzde 30 yap" with the row off → "izinli değil" + off row +
   badge; switched on → volume changes; log line present.
-- [ ] **T17.5 — Apps: inventory, resolution, open / close / force-close.**
+- [ ] **T17.5 — Apps: inventory, resolution, open / close / force-close.** (v0.2 plan: T31)
   Acceptance: scenario 7; ambiguous asks back; unknown → "bulamadım", no row;
   force-close always asks; locked and fullscreen rules of D8.
-- [ ] **T17.6 — Sites and searches.** Alias catalogue, host validation, DNS
+- [ ] **T17.6 — Sites and searches.** (v0.2 plan: T32) Alias catalogue, host validation, DNS
   existence, web / YouTube / YouTube Music search pages. Acceptance: scenario 9
   (results page); invented domain → "bulamadım"; IP / localhost refused.
-- [ ] **T17.7 — Games.** First verify the three launch mechanisms on the PC with
+- [ ] **T17.7 — Games.** (v0.2 plan: T33) First verify the three launch mechanisms on the PC with
   the user, then Steam / Epic / Battle.net adapters. Acceptance: "WoW'u aç"
   starts World of Warcraft through Battle.net.
-- [ ] **T17.8 — Power.** Sleep / shut down / restart with confirmation, "Shadow
+- [ ] **T17.8 — Power.** (v0.2 plan: T34) Sleep / shut down / restart with confirmation, "Shadow
   da kapanacak", delayed execution, `submitted` log. Acceptance: scenario 10.
-- [ ] **T17.9 — Series and films.** The D6 verification evening, then Prime
+- [ ] **T17.9 — Series and films.** (v0.2 plan: T35) The D6 verification evening, then Prime
   Video / HBO Max search (and episode links only if verified).
-- [ ] **T17.10 — Tier-0 PC rules.** D7 table, `‹hedef›` slot. Acceptance:
+- [ ] **T17.10 — Tier-0 PC rules.** (v0.2 plan: T36) D7 table, `‹hedef›` slot. Acceptance:
   scenario 8 path (typed) without a model call; off row answers without a model.
-- [ ] **T17.11 — Learning for PC phrasings (later).** Only after T17.10 has been
+- [ ] **T17.11 — Learning for PC phrasings (later).** (v0.2 plan: T37) Only after T17.10 has been
   in daily use.
 
 ## Progress log

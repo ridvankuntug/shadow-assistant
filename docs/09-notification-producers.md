@@ -107,7 +107,7 @@ service the Core depends on going down, and Home Assistant's own alerts.
   last update. An item the user deleted is not recreated by a text update of the
   same run (T20.2, see *Common rules*); a new failed run or the 72 h escalation
   raises it again.
-- **Varsayılan — kullanıcı onayı bekliyor:** with `lastSuccessAt: null` (no run ever
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** with `lastSuccessAt: null` (no run ever
   succeeded) the 72 h urgency counts from the earliest known start: the earliest
   `startedAt` seen since the Core started, or the `createdAt` of an open backup item
   adopted at startup. `backup:stale` needs no reference then (a failed or stuck run
@@ -155,7 +155,7 @@ service the Core depends on going down, and Home Assistant's own alerts.
   for the earliest deadline, `snapshot()` re-read when it fires; a failed store
   call is retried for that key after 60 s. Startup adoption: open `service` items count as
   raised (an urgent HA item as already escalated).
-- **Varsayılan — kullanıcı onayı bekliyor:**
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:**
   - Texts: vault "Not kasasına (vault) ulaşılamıyor", memory "Hafıza deposu
     kullanılamıyor"; "yüklenemedi" title `<servis> yüklenemedi`; detail codes as
     short Turkish sentences (`timeout` "Sağlık kontrolü zaman aşımına uğradı.",
@@ -223,7 +223,7 @@ service the Core depends on going down, and Home Assistant's own alerts.
   is resolved only when both are known good; adoption covers `repair:` items and
   suppressed `repair:` keys. Urgency learned per type (T7.w.11.10). Tests in
   `core/test/ha-producer.test.ts` (fake server on 127.0.0.1).
-- **Varsayılan — kullanıcı onayı bekliyor:**
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:**
   - **Resolve grace 60 s:** an id missing from a `current` listing is resolved
     only if still missing 60 s after it (a `removed` event resolves at once). HA
     serves its WebSocket API early while starting and keeps persistent
@@ -384,7 +384,7 @@ urgency*), UI in `controller.test.ts`, `notificationsPanel.test.ts`,
   urgent item (see below); the failed-login start is no exception.
 - **Record:** type key, direction, counter, approved level; no title/body, no
   secrets (like the suppression record). Where it lives is open question 5.
-- **Varsayılan — kullanıcı onayı bekliyor (open question 2, type key):**
+- **Varsayılan — kullanıcı onayladı, 2026-11-22 (open question 2, type key):**
   `pn:<notification_id>` with one variable tail stripped: `-<digits>`,
   `_<digits>`, or a UUID / hex tail of 8+ characters after `-` / `_`
   (`backup_failed_12` → `pn:backup_failed`; `http-login` stays). An id that is
@@ -392,18 +392,18 @@ urgency*), UI in `controller.test.ts`, `notificationsPanel.test.ts`,
   without an id, is the one anonymous type `pn:*`. Repairs:
   `repair:<domain>:<translation_key>`, `issue_id` without one. A key over 128
   characters is hashed (`pn:sha256:` / `repair:sha256:`). Never title/body text.
-- **Varsayılan — kullanıcı onayı bekliyor (open question 3, signals):** only the
+- **Varsayılan — kullanıcı onayladı, 2026-11-22 (open question 3, signals):** only the
   explicit "Bu acildi" / "Acil değildi" buttons count; reactions (opening the
   item quickly, "Tekrar gösterme") are not counted. Alternative from the design:
   count them as weaker signals. One signal per inbox item: a second tap on the
   same item in the same direction is not counted again (in memory; a tap in the
   other direction is counted and resets the run).
-- **Varsayılan — kullanıcı onayı bekliyor (open question 4, threshold):** 3
+- **Varsayılan — kullanıcı onayladı, 2026-11-22 (open question 4, threshold):** 3
   same-direction signals; an opposite signal resets the counter to 1 in the new
   direction. A suggestion is shown only when the direction differs from the
   type's current level (e.g. "acildi" ×3 on the already urgent failed-login type
   suggests nothing); the counter stops at 999.
-- **Varsayılan — kullanıcı onayı bekliyor (open question 5, record):** a separate
+- **Varsayılan — kullanıcı onayladı, 2026-11-22 (open question 5, record):** a separate
   small file next to `suppressed.json`:
   `<SHADOW_DATA_DIR>/notifications/ha-urgency.json`
   (`{version:1, items:[{type, direction?, count, firstAt?, lastAt?, level?}]}`,
@@ -413,11 +413,11 @@ urgency*), UI in `controller.test.ts`, `notificationsPanel.test.ts`,
   producer is never blocked. At most 500 types (a new one beyond is not
   recorded, logged). The `firstAt` / `lastAt` times are for the Development
   tab's `firstSeen` / `lastSeen`.
-- **Varsayılan — kullanıcı onayı bekliyor:** "Kabul" / "Yok say" work on any
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** "Kabul" / "Yok say" work on any
   device (not limited to `CORE_DEV_DEVICES`: they change which HA alerts are
   spoken, not how the home is controlled), and "Kabul" asks no second question
   (the suggestion itself is the question).
-- **Varsayılan — kullanıcı onayı bekliyor:** feedback on a repair item whose type
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** feedback on a repair item whose type
   is not known yet (the Core has not listed repairs from HA since it started, so
   its `translation_key` is unknown) answers `not_allowed` instead of guessing the
   `issue_id` type; a `pn:` item's type is derived from its key. Feedback on the
@@ -481,13 +481,13 @@ checked too since T7.w.11.7: a suppressed key is never raised, so it never becom
   nothing by itself: the pending items are spoken on the next speech-enabled
   connection (or speech turned on again). A later urgent raise outside the
   window is spoken as usual (that item only).
-- **Varsayılan — kullanıcı onayı bekliyor:** an unset or **blank**
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** an unset or **blank**
   `CORE_QUIET_HOURS` means the default 00:00-09:00 (like every blank line in
   `.env.example`); only `off` / `0` / `false` / `no` / `none` disables it.
-- **Varsayılan — kullanıcı onayı bekliyor:** an invalid value (bad format, hour
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** an invalid value (bad format, hour
   over 23, minute over 59, start equal to end) uses the default and logs one
   warning at startup; the Core still starts.
-- **Varsayılan — kullanıcı onayı bekliyor:** minute precision; 08:59:59 is still
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** minute precision; 08:59:59 is still
   quiet, 09:00:00 is not. A clock that fails counts as not quiet.
 
 ### Dismiss options: "Gördüm" vs "Tekrar gösterme"
@@ -522,13 +522,13 @@ removes the record. Producers adopt `NotificationCenter.suppressed()` at
 startup as open keys and count a `suppressed` raise as open, so recovery still
 resolves (and clears) them. Tests in `core/test/notification-suppressions.test.ts`.
 
-- **Varsayılan — kullanıcı onayı bekliyor:** the protocol shape is a new
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** the protocol shape is a new
   `action` value on the existing `notification_action` frame (not a new frame),
   plus the feature name `notifications_suppress` so a client shows the button
   only on a Core that supports it.
-- **Varsayılan — kullanıcı onayı bekliyor:** `suppress` on a keyless item (a
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** `suppress` on a keyless item (a
   one-off item, nothing can recur) only deletes it; no record, no error.
-- **Varsayılan — kullanıcı onayı bekliyor:** an unreadable or invalid
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** an unreadable or invalid
   `suppressed.json` means "nothing suppressed" (items are shown again, never
   lost); an invalid one is quarantined, an unreadable one is never overwritten
   and changes made meanwhile (additions and removals) are kept in memory and
@@ -536,7 +536,7 @@ resolves (and clears) them. Tests in `core/test/notification-suppressions.test.t
   but keeps running (only an unreadable inbox blocks its startup adoption),
   logs the unreadable suppression list once and re-reads it on later rounds,
   adopting its keys once it can be read. At most 1000 records (a new one beyond is not recorded, logged).
-- **Varsayılan — kullanıcı onayı bekliyor:** no expiry: a record stays until
+- **Varsayılan — kullanıcı onayladı, 2026-11-22:** no expiry: a record stays until
   its producer resolves the key (a key no producer resolves any more, e.g. a
   removed service, stays suppressed).
 
@@ -569,14 +569,14 @@ resolves (and clears) them. Tests in `core/test/notification-suppressions.test.t
 - T7.w.11.2 — Backup producer in the Core: 60 s read, `backup:failed` / `backup:stale` rules, 72 h urgent, resolve on success; tests. Implemented: [`backup-producer.ts`](../core/src/backup-producer.ts), wired in `index.ts` (started with the health monitor, closed in the shutdown chain); tests in `core/test/backup-producer.test.ts`.
 - T7.w.11.3 — Service producer on `HealthMonitor` (shown status, after its 2-check hysteresis): 90 s down / 60 s back, flap guard, loading 180 s, startup adoption, vault/memory health; HA urgent after 30 min down; tests. Implemented: [`service-producer.ts`](../core/src/service-producer.ts), wired in `index.ts` (started after the health monitor, closed in the shutdown chain); tests in `core/test/service-producer.test.ts`.
 - T7.w.11.4 — Pending speech for urgent items on attach (NotificationCenter) + docs/02 wording; tests. Implemented.
-- T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server. Implemented: [`ha-client.ts`](../core/src/ha-client.ts) + [`ha-producer.ts`](../core/src/ha-producer.ts), wired in `index.ts` (started after the service producer, closed in the shutdown chain); tests in `core/test/ha-producer.test.ts` (see *(c)*, defaults awaiting approval there).
-- T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope. Implemented: [`ha-producer.ts`](../core/src/ha-producer.ts) (+ allow-list in [`ha-client.ts`](../core/src/ha-client.ts)); tests in `core/test/ha-producer.test.ts` (see *(c)*, repairs defaults awaiting approval there).
+- T7.w.11.5 — HA alerts client: WebSocket auth, persistent-notification subscription, reconnect with backoff, `ha:access`; tests with a local `ws` server. Implemented: [`ha-client.ts`](../core/src/ha-client.ts) + [`ha-producer.ts`](../core/src/ha-producer.ts), wired in `index.ts` (started after the service producer, closed in the shutdown chain); tests in `core/test/ha-producer.test.ts` (see *(c)*, defaults approved by the user, 2026-11-22).
+- T7.w.11.6 — HA repairs: `repairs/list_issues` at connect and every 10 min, resolve on a complete listing; token is admin (decided), so repairs are in scope. Implemented: [`ha-producer.ts`](../core/src/ha-producer.ts) (+ allow-list in [`ha-client.ts`](../core/src/ha-client.ts)); tests in `core/test/ha-producer.test.ts` (see *(c)*, repairs defaults approved by the user, 2026-11-22).
 
-- T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests. Implemented: `notification_action` `suppress` + feature `notifications_suppress`, [`notification-suppressions.ts`](../core/src/notification-suppressions.ts), adoption in both producers (see *Dismiss options*, defaults awaiting approval there); tests in `core/test/notification-suppressions.test.ts`.
+- T7.w.11.7 — "Tekrar gösterme" in Core: persisted suppression record (`source`+`key`), applied in the `NotificationCenter` raise path, removed when the condition resolves (startup adoption included); protocol action + docs/02; tests. Implemented: `notification_action` `suppress` + feature `notifications_suppress`, [`notification-suppressions.ts`](../core/src/notification-suppressions.ts), adoption in both producers (see *Dismiss options*, defaults approved by the user, 2026-11-22); tests in `core/test/notification-suppressions.test.ts`.
 - T7.w.11.8 — Inbox UI: two separate actions "Gördüm" (delete; may come back once after a Core restart while the condition lasts) and "Tekrar gösterme" (suppressed while the condition lasts; shown again when it resolves and recurs); client tests.
-- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock. Implemented: `canSpeak` + `CORE_QUIET_HOURS` (see *Quiet hours for urgent speech*, defaults awaiting approval there); tests in `core/test/quiet-hours.test.ts` and `session-notifications.test.ts`.
+- T7.w.11.9 — Quiet hours 00:00-09:00 for urgent speech in `NotificationCenter` (raise path and pending speech), a Core setting with this default; the after-09:00 behaviour as decided in *Quiet hours* (spoken once on the first speech-enabled connection after 09:00); tests with a fake clock. Implemented: `canSpeak` + `CORE_QUIET_HOURS` (see *Quiet hours for urgent speech*, defaults approved by the user, 2026-11-22); tests in `core/test/quiet-hours.test.ts` and `session-notifications.test.ts`.
 
-- T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests. Implemented: [`ha-urgency.ts`](../core/src/ha-urgency.ts) + producer / center / Development tab / UI (see *Learned urgency of HA alerts*, defaults awaiting approval there); tests in `core/test/ha-urgency.test.ts`, `core/test/ha-producer.test.ts`, UI tests.
+- T7.w.11.10 — Learned urgency of HA alerts: alert type key, feedback ("Bu acildi" / "Acil değildi"), counter (3 same-direction signals, opposite resets), Development-tab suggestion and approval, failed-login as the initial urgent type; record store; tests. Implemented: [`ha-urgency.ts`](../core/src/ha-urgency.ts) + producer / center / Development tab / UI (see *Learned urgency of HA alerts*, defaults approved by the user, 2026-11-22); tests in `core/test/ha-urgency.test.ts`, `core/test/ha-producer.test.ts`, UI tests.
 
 11.1→11.2, 11.5→11.6, 11.7→11.8, 11.4→11.9, 11.5→11.10 are ordered; 11.3 stands alone.
 
@@ -597,16 +597,16 @@ service producer.
    *Quiet hours for urgent speech*.
 2. **Alert type key:** is the proposed key (normalized `notification_id` prefix;
    repairs `domain` + `translation_key`/`issue_id`) right, and how is a variable
-   suffix recognized (digits/UUID tail)? — **Varsayılan — kullanıcı onayı
-   bekliyor:** implemented as proposed (see *Learned urgency of HA alerts*).
+   suffix recognized (digits/UUID tail)? — **Varsayılan — kullanıcı onayladı,
+   2026-11-22:** implemented as proposed (see *Learned urgency of HA alerts*).
 3. **Reaction signal:** do reactions (opening quickly, "Tekrar gösterme") count
    as feedback, or only the explicit "Bu acildi" / "Acil değildi" buttons? —
-   **Varsayılan — kullanıcı onayı bekliyor:** only the explicit buttons.
+   **Varsayılan — kullanıcı onayladı, 2026-11-22:** only the explicit buttons.
 4. **Threshold:** is 3 same-direction signals (opposite resets) right for HA
-   alerts, or should it differ from docs/08? — **Varsayılan — kullanıcı onayı
-   bekliyor:** 3, an opposite signal resets to 1.
+   alerts, or should it differ from docs/08? — **Varsayılan — kullanıcı onayladı,
+   2026-11-22:** 3, an opposite signal resets to 1.
 5. **Where the record lives:** a separate small persisted file next to the
-   suppression record, or the same store? — **Varsayılan — kullanıcı onayı
-   bekliyor:** separate file `notifications/ha-urgency.json`.
+   suppression record, or the same store? — **Varsayılan — kullanıcı onayladı,
+   2026-11-22:** separate file `notifications/ha-urgency.json`.
 
 (HA alerts urgency is decided: learned, see T7.w.11.10.)

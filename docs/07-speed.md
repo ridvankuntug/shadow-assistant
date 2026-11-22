@@ -1,6 +1,6 @@
 # 07 - Turn latency: persistent agent session, streamed speech, continuity
 
-Status: design (T7.6, T7.7, T7.9 in [`01-v1-plan.md`](01-v1-plan.md)). T7.8 (the
+Status: design (T7.6, T7.7, T7.9 in [`archive/01-v1-plan.md`](archive/01-v1-plan.md)). T7.8 (the
 tier-0 Turkish router fix) is done separately and is not designed here.
 Memory (T10) builds on this document: see [`06-memory.md`](06-memory.md).
 
@@ -669,7 +669,7 @@ task may touch. Two tasks that share a file are never run in parallel; the
 | S9 | `core/src/sentence-splitter.ts` (new), `core/src/speech-stream.ts` (new), their tests (new) | – | – |
 | S10 | `core/src/session.ts`, `core/test/session*.test.ts` | S6, S9, P1 | – |
 | S11 | `ui/src/assistant/controller.ts`, `ui/src/assistant/state.ts`, `ui/src/assistant/*.test.ts`, `ui/src/ui/strings.ts`, `docs/03-platform-adapter.md` | P1 | – |
-| S12 | this doc §Results, `docs/01-v1-plan.md` boxes | S8, S10, S11 | – |
+| S12 | this doc §Results, `docs/archive/01-v1-plan.md` boxes | S8, S10, S11 | – |
 
 Parallel lanes: {S1, S2, S3, P1, S9, S11} can start at once. S4 and S5 run in
 parallel after S1. S7 needs only S3. S6, S8 and S10 are serialized on
@@ -687,7 +687,7 @@ parallel after S1. S7 needs only S3. S6, S8 and S10 are serialized on
 - [x] **S9 — Sentence splitter and speech stream.** As in [A2 Core](#core). Acceptance: table tests with Turkish text (decimals, ordinals, abbreviations, punctuation split across deltas, a long sentence without punctuation); speech-stream tests for ordering with lookahead, cancel during synthesis, tts failure → one error + `final`, and the lexicon applied in both modes.
 - [x] **S10 — Speech stream wiring.** `Session` handles `speech_prefs` and feeds the stream from the live text path (after tier-1 buffering and tier 0); `firstSpeechMs` goes into the `timing` log. Acceptance: session tests where an opted-in client gets `speech_chunk` frames in order and an old client gets none; scenario 5 shows the first sound before `assistant_done` for a multi-sentence tier-2 answer. — implemented 2026-10-28: `speech_prefs` stored per socket (latest wins, `enabled:false` stops); one `SpeechStream` per turn fed from the same live path as `assistant_delta` (after tier-1 buffering, tier 0 included), audio via tts-svc with voice/lexicon/clip, text mode for native TTS; a `cancel` (also after the visible end) stops it; `firstSpeechMs` in `timing`; `speak` unchanged. Session tests: chunks in order with `final`, no chunks for an old client or `enabled:false`, text mode, marker never spoken, cancel. Open: scenario 5 (manual, needs S11 UI) and independent review/test.
 - [x] **S11 — UI streaming playback and usage-limit text.** As in [A2 UI](#ui); Turkish text for `usage_limit`. Acceptance: controller tests: chunks played in order, barge-in clears the queue, no double speech after `assistant_done`, fallback to `speak` against a Core without `speech_stream`, native mode speaks the chunk texts.
-- [~] **S12 — After measurement.** The bench again; fill in §Results; tick the plan boxes. Acceptance: scenario 1 warm p50 ≤ 2.5 s, or a written analysis of the remaining gap. *Status: after-measurement with streamed speech pending (main session after redeploy).*
+- [~] **S12 — After measurement.** The bench again; fill in §Results; tick the plan boxes. Acceptance: scenario 1 warm p50 ≤ 2.5 s, or a written analysis of the remaining gap. *Status: after-measurement with streamed speech pending (main session after redeploy).* (v0.2 plan: T25)
 
 ### S1 spike questions
 

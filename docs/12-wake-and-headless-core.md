@@ -536,7 +536,7 @@ step may touch.
 | T21.3.1 | wake-svc service + tests + README | `services/wake-svc/**` (new) | – |
 | T21.3.2 | Deploy on the box | `deploy/linux/wake-svc.service`, `deploy/linux/wake-svc.env.example` (new), `docs/05-deploy.md` (new section), `docs/README.md` (list docs/12) | T21.3.1 |
 | T21.3.3 | Android: `WakeStore`, `WakeAddress` + NSC, `WakeFlow`, error-panel button, dialog, waking panel | `android/app/src/main/java/.../Wake*.kt` (new), `MainActivity.kt`, `res/layout/activity_main.xml`, `res/values/strings.xml`, `res/xml/network_security_config.xml`, android tests, `android/README.md` | T21.3.1 (protocol), not T21.3.2 |
-| T21.3.4 | HA diagnosis (D3 checklist) and results in this doc | this doc | – (user, any time) |
+| T21.3.4 | HA diagnosis (D3 checklist) and results in this doc (v0.2 plan: T23) | this doc | – (user, any time) |
 | T21.4.1 | Tray `--headless` and `--watch-task`, give-up exit code, `tray.log`, task control | `deploy/windows/tray/src/ShadowTray/{Program,TrayApp,CoreSupervisor,TraySettings}.cs` (+ a small `CoreTask.cs`), tray tests, `deploy/windows/tray/README.md` | – (shares `TrayApp.cs` with T17.3: not in parallel) |
 | T21.4.2 | Installer `-Headless` / `-Verify`, `restart-tasks.ps1`, uninstall of both tasks; docs/05 section 3 rewritten; **user runs the login checks** | `deploy/windows/{install,uninstall}-core-task.ps1`, `deploy/windows/restart-tasks.ps1` (new), `docs/05-deploy.md` | T21.4.1 |
 | T21.4.3 | Core: clear exit on `EADDRINUSE` (only if the check shows it is missing) | `core/src/server.ts` or `index.ts`, core tests | – |
@@ -568,6 +568,9 @@ user decides.
 | Q9 | Waking timeout on the phone | 4 min, adjusted after measuring a cold boot. |
 
 ## Not verified (must be checked before the step that uses it)
+
+Open items here are tracked in the v0.2 plan: the real WoL test and the HA
+diagnosis in T23, updating this document to the current state in T24.
 
 - The actual cause of the HA failures (D3: every row is a candidate).
 - That a password-logon task sees the Claude Code login and can refresh it
@@ -602,6 +605,9 @@ user decides.
 - Automatic sign-in (rejected by the user).
 
 ## Progress log
+
+- 2026-11-13: user approved Q1–Q9 with the defaults (see *Kullanıcı kararı
+  gerekli*; this log entry recorded 2026-11-22).
 
 - 2026-11-13: design written (software-architect, after a Codex review:
   systemd over Docker for a stdlib daemon, separate Android store for the wake

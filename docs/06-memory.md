@@ -1,6 +1,6 @@
 # 06 - Assistant memory
 
-Status: in progress — M6 and M7 implemented, see *Implementation notes* (T10 in [`01-v1-plan.md`](01-v1-plan.md)). This builds on the
+Status: in progress — M6 and M7 implemented, see *Implementation notes* (T10 in [`archive/01-v1-plan.md`](archive/01-v1-plan.md)). This builds on the
 persistent per-device agent session in [`07-speed.md`](07-speed.md) (A1). Read
 that first.
 
@@ -561,7 +561,7 @@ same no-shared-file rule applies across both documents.
 | M6 | `core/src/session.ts`, `core/src/index.ts`, `core/src/config.ts`, `core/src/device-registry.ts`, `core/src/device-agent.ts`, `core/prompts/system.md`, `core/test/session*.test.ts`, `.env.example` | S5, S8, S10, P1, M3, M4, M5 | `memory/*` |
 | M7 | `core/src/device-agent.ts`, `core/src/device-registry.ts`, `core/test/device-agent.test.ts`, `core/test/device-registry.test.ts` | M6, S1 (Q10) | SDK transcripts, `sessions/devices.json` (fallback) |
 | M8 | `ui/src/ui/MemoryPanel.tsx` (new), `ui/src/ui/Panels.tsx`, `ui/src/assistant/controller.ts`, `ui/src/assistant/state.ts`, `ui/src/ui/strings.ts`, their tests | P1, S11 | – |
-| M9 | `docs/05-deploy.md`, `docs/01-v1-plan.md` boxes, manual end-to-end checklist in this doc | M6, M7, M8 | – |
+| M9 | `docs/05-deploy.md`, `docs/archive/01-v1-plan.md` boxes, manual end-to-end checklist in this doc | M6, M7, M8 | – |
 
 Parallel lanes: M1, M2 at once (M1 after S3); then M3, M4, M5 in parallel; M8 in
 parallel with the Core lane once P1 and S11 are done; M6 → M7 serialized.
@@ -574,4 +574,4 @@ parallel with the Core lane once P1 and S11 are done; M6 → M7 serialized.
 - [x] **M6 — Core wiring.** Brief in the system prompt at query start, restart on brief change, `<hafiza>` block in the envelope, extractor notified at turn end and on idle, tools registered, `memory_list`/`memory_delete` frames, `features: ["memory"]`, `system.md` paragraph, configuration. Acceptance: session integration tests; the manual end-to-end steps up to "bunu unut". *Done: tests in `session-memory.test.ts`, `device-registry.test.ts`, `memory-lifecycle.test.ts`; the manual end-to-end steps are open (M9).*
 - [x] **M7 — Compaction.** Threshold, idle scheduling, extraction first, `/compact` with instructions, "already sent" reset, waiting turns, the fallback per S1. Acceptance: tests with a fake query (`compact_boundary` path and fallback path); manual: a long session drops below the threshold and still knows the room names. *Done: both paths tested with fake providers (`memory-lifecycle.test.ts`, `device-registry.test.ts`); Claude keeps `capabilities.compact` off, so the summary path is the live one; the manual check is open (M9).*
 - [x] **M8 — UI memory panel.** As in *UI*. Acceptance: component/controller tests (list, delete, warnings, hidden without the `memory` feature).
-- [~] **M9 — Docs and end-to-end check.** docs/05 (what is in the data dir and backup; how to turn memory off), the manual end-to-end list run once and ticked. Acceptance: checklist run and its result recorded here. *Status: manual end-to-end check pending (main session).*
+- [~] **M9 — Docs and end-to-end check.** docs/05 (what is in the data dir and backup; how to turn memory off), the manual end-to-end list run once and ticked. Acceptance: checklist run and its result recorded here. *Status: manual end-to-end check pending (main session).* (v0.2 plan: T26)

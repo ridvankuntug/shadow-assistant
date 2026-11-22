@@ -877,16 +877,19 @@ block.
    suspended rules (same device limit). **Kararlaştırıldı (kullanıcı, 2026-11-07):**
    the recommended form, built in T7.w.8.
 5. **Notification titles in the tray** (balloon text) or a native tray tab would
-   need a token for the tray. Default: counts only.
+   need a token for the tray. Default: counts only. **Kararlaştırıldı (kullanıcı,
+   2026-11-22):** the default as written.
 6. **"Missing capability" from the model's answer** through a prompt marker (like
    `[[ESCALATE]]`): more useful notes, more prompt and output tokens. Default: not
-   in v1.
+   in v1. **Kararlaştırıldı (kullanıcı, 2026-11-22):** the default as written.
 7. **Plugs without a device class.** Default: a `switch` is learnable only with
    `device_class: outlet` (some plugs may then never be learned). Alternative:
    accept switches without a device class, relying on the deny words and the gate.
+   **Kararlaştırıldı (kullanıcı, 2026-11-22):** the default as written.
 8. **Learning on by default** (`learning.enabled: true`): observing costs one live
    context read after each eligible model turn; nothing becomes active without
-   approval. Default: on.
+   approval. Default: on. **Kararlaştırıldı (kullanıcı, 2026-11-22):** the default
+   as written.
 
 ## Out of scope and deferred
 
