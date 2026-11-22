@@ -1,6 +1,7 @@
 # 14 - Intent gate and confirmed device names
 
-Status: design approved 2026-11-22 (T4.1); implementation T4.2-T4.7 pending.
+Status: design approved 2026-11-22 (T4.1); implemented 2026-11-22 (T4.2-T4.7). One
+T4.5 item is open (see the progress log).
 Builds on [`02-core-protocol.md`](02-core-protocol.md) (permission gate, confirm
 frames), [`04-router.md`](04-router.md) (tiers, tier 0), [`06-memory.md`](06-memory.md)
 (memory surface) and [`08-learning-fast-path.md`](08-learning-fast-path.md)
@@ -793,42 +794,48 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] Session tests: two identical failures → third call not sent; different
     error texts → not blocked; other argument class → not blocked; tier 0
     unaffected; count survives tier-1 → tier-2 escalation.
-- [ ] **T4.5 — Scenario tests.** Durum: başlamadı
-  - [ ] 2026-11-17: "Sonoff hangi cihazlar var"; the fake model calls
+- [~] **T4.5 — Scenario tests.** Durum: başlandı
+  - [x] 2026-11-17: "Sonoff hangi cihazlar var"; the fake model calls
     `GetLiveContext` with `name` and gets the same error twice → the third such
     call is not sent (`repeated_error`); then it calls `intent__HassTurnOff` on
     "Bahçe Pompası" → exactly one `confirm_request`, no `remember` offer;
     declined → no HA write; timed out → no HA write.
-  - [ ] Mixed "hangi ışıklar açık, hepsini kapat" → one card, no `remember`;
+  - [x] Mixed "hangi ışıklar açık, hepsini kapat" → one card, no `remember`;
     approved → write runs.
-  - [ ] Tier-0 rule matched in a question turn (typed "salon ışığını kapat?") →
+  - [x] Tier-0 rule matched in a question turn (typed "salon ışığını kapat?") →
     card, no `remember`; declined → no write.
-  - [ ] Model guesses on a non-question ("şunu kapat") → one `confirm_request`
+  - [x] Model guesses on a non-question ("şunu kapat") → one `confirm_request`
     with two options; declined → no write.
-  - [ ] Tier-0 "salon ışığını yüzde 40 yap": exactly two HA calls, no
+  - [x] Tier-0 "salon ışığını yüzde 40 yap": exactly two HA calls, no
     `confirm_request`, no extra `GetLiveContext`.
-  - [ ] Tier-0 on/off and a learned rule: no `confirm_request`.
-  - [ ] Model call with the canonical name for an HA alias the user said → no
+  - [x] Tier-0 on/off and a learned rule: no `confirm_request`.
+  - [x] Model call with the canonical name for an HA alias the user said → no
     `confirm_request` (rule 4, one extra read).
-  - [ ] "salon ışığı açık mı" → "kapat": allowed; with two other utterances in
+  - [x] "salon ışığı açık mı" → "kapat": allowed; with two other utterances in
     between (the naming utterance is 4th back and left the window) → confirm.
-  - [ ] Model asks which of several candidates; the user's next utterance names
+  - [x] Model asks which of several candidates; the user's next utterance names
     one → the write runs with no card.
-  - [ ] Polite request "salon lambasını kapatır mısın": not locked.
-  - [ ] "bahçe pompasnı kapat" → tier-0 miss → model call → card with `remember`
+  - [x] Polite request "salon lambasını kapatır mısın": not locked.
+  - [x] "bahçe pompasnı kapat" → tier-0 miss → model call → card with `remember`
     → "Evet, hep bu" → next "bahçe pompasnı kapat" runs on tier 0 with no card.
-  - [ ] Device missing from the fixture → entry not used, `missingSince` set,
+  - [x] Device missing from the fixture → entry not used, `missingSince` set,
     model call asks again; device back before 30 days → `missingSince` cleared,
     tier 0 uses it; missing 30 days (injected clock) → `passive`, not used even
     when the device returns; a new "Evet, hep bu" makes it active.
-  - [ ] Confirmed name pointing at a lock / non-outlet switch / deny-name target:
+  - [~] Confirmed name pointing at a lock / non-outlet switch / deny-name target:
     refused on tier 0, confirm on the model path.
-  - [ ] Broken/empty live context neither starts nor clears `missingSince`.
-- [ ] **T4.6 — Docs index.** Durum: başlamadı
-  - [ ] Add this document to `docs/README.md` (left out of T4.1 on purpose).
-  - [ ] Progress log and statuses in this document after T4.2-T4.5 and T4.7.
+  - [x] Broken/empty live context neither starts nor clears `missingSince`.
+- [x] **T4.6 — Docs index.** Durum: bitti
+  - [x] Add this document to `docs/README.md` (left out of T4.1 on purpose).
+  - [x] Progress log and statuses in this document after T4.2-T4.5 and T4.7.
 
 ## Progress log
 
 - 2026-11-22: T4.1 design written (this document).
 - 2026-11-22: user decisions 1-8 applied; design approved.
+- 2026-11-22: T4.2-T4.4c and T4.7 implemented; scenario tests T4.5 added
+  (`core/test/write-gate-scenarios.test.ts`, shipped `router.yaml` / `services.yaml`).
+  Open: a confirmed name that points at a lock, a non-outlet switch or a deny-name
+  target is refused on tier 0, but on the model path only a call that carries
+  `domain` (e.g. `lock`, through `confirm_inputs`) asks; a call with `name` only is
+  known through rule 5 and runs without a card. Awaiting a decision.

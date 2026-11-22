@@ -13,6 +13,7 @@ Project documentation and plans.
 - [`10-android-updates.md`](10-android-updates.md): signed GitHub Releases and in-app update for the Android app (T14).
 - [`11-pc-control.md`](11-pc-control.md): PC control (`pc-svc`) and the switched permission list (T17 design; T17.2 permission list implemented).
 - [`12-wake-and-headless-core.md`](12-wake-and-headless-core.md): waking the PC from the phone, and a Core that runs before sign-in (T21 design).
+- [`14-intent-gate-and-confirmed-names.md`](14-intent-gate-and-confirmed-names.md): write gate (question lock, target provenance), confirmed device names and the repeated-error stop (T4 design and implementation).
 
 Archive (completed plans, kept for history):
 
