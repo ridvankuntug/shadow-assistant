@@ -28,6 +28,7 @@ import { nameKeys, parseLiveContext, type LiveEntity } from "./live-context.js";
 import type { DirectToolClient } from "./mcp-direct.js";
 import type { DeviceMaintenance } from "./memory/lifecycle.js";
 import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
+import { RepeatGuard } from "./repeat-guard.js";
 import type { MemorySnapshot, MemoryStore } from "./memory/store.js";
 import { isEntryId, MEMORY_BUDGETS, type MemoryEntry } from "./memory/types.js";
 import {
@@ -186,6 +187,7 @@ const PC_SET_MESSAGES: Record<"not_allowed" | "unknown_item" | "pc_permissions_u
 /** What the model is told when the gate denies one of its tool calls. */
 const DENY_MESSAGES: Record<GateDeny, string> = {
   tier_service: "This tool is not available in this mode.",
+  repeated_error: "This tool failed twice in this form in this turn; do not try it again in the same form. Tell the user what happened.",
   cancelled: "Turn was cancelled.",
   builtin: "Built-in tools are disabled for this assistant.",
   read_only: "Read-only mode: only read tools may run.",
@@ -329,6 +331,11 @@ interface ActiveTurn {
   gateSnapshots?: Map<string, Promise<readonly LiveEntity[] | undefined>>;
   /** Accepted "Evet, hep bu" offers by tool use id: stored once that call's result is not an error. */
   remembers?: Map<string, RememberOffer>;
+  /**
+   * Repeated-error stop (docs/14 Decision 10): model tool calls only, one per
+   * turn, so the count holds across tier-1 -> tier-2 escalation.
+   */
+  repeats: RepeatGuard;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -338,7 +345,7 @@ interface SpeechPrefs {
 }
 
 /** Messages the model gets for gate denials. */
-type GateDeny = DenyReason | "tier_service";
+type GateDeny = DenyReason | "tier_service" | "repeated_error";
 /** The level the gate applied (`deny`: built-in tool). */
 type GateLevel = PermissionLevel | "deny";
 /** `authorize` result; `gate`: the write gate raised the call to `confirm` (never learned from). */
@@ -835,6 +842,7 @@ export class Session {
       toolCalls: 0,
       toolNames: new Set(),
       allowedUseIds: new Set(),
+      repeats: new RepeatGuard(),
       // The raw text, before the router's prepareText drops the punctuation ("?").
       question: isQuestionTurn(text),
       utterance,
@@ -1452,6 +1460,7 @@ export class Session {
           this.observeResult(turn, toolUseId, isError);
           this.noteModelResult(turn, toolUseId, name, isError, errorText);
           this.rememberResult(turn, toolUseId, isError);
+          this.repeatResult(turn, toolUseId, isError, errorText);
         },
       },
     );
@@ -1637,6 +1646,7 @@ export class Session {
             this.observeResult(turn, toolUseId, isError);
             this.noteModelResult(turn, toolUseId, name, isError, errorText);
             this.rememberResult(turn, toolUseId, isError);
+            this.repeatResult(turn, toolUseId, isError, errorText);
           },
         },
       });
@@ -1741,11 +1751,18 @@ export class Session {
     // (legacy runner; `GatewayGate.turnId`), for turn dev-notes such as `unknown_tool`.
     const gate: PermissionCallback = async (toolName, input, opts): Promise<PermissionDecision> => {
       this.countToolCall(turn, toolName);
-      const r = services && !this.inTierServices(toolName, services)
+      // Order: tier service, then the repeated-error stop (before `authorize`, so a blocked call never opens a card).
+      let r = services && !this.inTierServices(toolName, services)
         ? this.denyOutsideTier(turn, toolName, input)
-        : await this.authorize(turn, toolName, input, opts.signal);
+        : turn.repeats.isBlocked(toolName, input)
+          ? this.denyRepeated(turn, toolName, input)
+          : await this.authorize(turn, toolName, input, opts.signal);
+      // Parallel calls: the class may have been blocked while this call waited in `authorize`
+      // (live-context read, confirm card); it is still not sent.
+      if (r.allowed && turn.repeats.isBlocked(toolName, input)) r = this.denyRepeated(turn, toolName, input);
       this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level, "gate" in r ? r.gate : undefined);
       if (r.allowed) turn.allowedUseIds.add(opts.toolUseID);
+      if (r.allowed) turn.repeats.noteAllowed(opts.toolUseID, toolName, input);
       if (r.allowed && r.remember) (turn.remembers ??= new Map()).set(opts.toolUseID, r.remember);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
@@ -1775,6 +1792,20 @@ export class Session {
       turnId: id,
     });
     return { allowed: false, reason: "tier_service", level: "deny" };
+  }
+
+  /**
+   * Deny records for a call of an argument class that already failed twice the
+   * same way in this turn (docs/14 Decision 10). The call is not sent.
+   */
+  private denyRepeated(turn: ActiveTurn, toolName: string, input: Record<string, unknown>): { allowed: false; reason: GateDeny; level: "deny" } {
+    const { identity } = this.deps.policy.levelFor(toolName, input);
+    const id = turn.id;
+    void this.slog.append({ kind: "tool_call", id, tool: identity.full, level: "deny", reason: "repeated_error", input });
+    this.emit({ type: "tool", id, name: identity.tool, status: "denied" });
+    void this.slog.append({ kind: "permission", id, tool: identity.full, decision: "deny", level: "deny" });
+    this.deps.logger.info(`[shadow-core] denied ${identity.full} (repeated_error: same failure twice in this turn)`);
+    return { allowed: false, reason: "repeated_error", level: "deny" };
   }
 
   /**
@@ -1922,6 +1953,16 @@ export class Session {
     // domain and areas (reached here through an alias) would make the entry unusable, so no offer.
     if (verifyTarget(target, snapshot).status !== "present") return undefined;
     return { spoken, keys: nameKeys(spoken), target, accepted: false };
+  }
+
+  /**
+   * A model tool result for the repeated-error stop. Results of a cancelled
+   * turn are not counted (docs/14 Decision 10); the guard ignores calls the
+   * gate did not allow.
+   */
+  private repeatResult(turn: ActiveTurn, toolUseId: string, isError: boolean, errorText?: string): void {
+    if (turn.abort.signal.aborted) return;
+    turn.repeats.recordResult(toolUseId, isError, errorText);
   }
 
   /**
