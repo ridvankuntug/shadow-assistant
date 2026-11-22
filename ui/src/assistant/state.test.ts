@@ -12,6 +12,7 @@ import {
   hasFeature,
   initialState,
   memoryAvailable,
+  namesAvailable,
   reducer,
   shouldPlaySpeech,
   type Action,
@@ -675,5 +676,110 @@ describe("development panel (T7.w.4c)", () => {
     expect(dropped.dev).toMatchObject({ status: "error", errorCode: "connection" });
     const ready = run([srv(frame("d1"))], s);
     expect(run([srv(welcome(["dev"]))], ready).dev).toEqual(initialState.dev);
+  });
+});
+
+describe("confirm card remember offer (docs/14 Decision 7)", () => {
+  it("a confirm_request with remember carries it to the pending card; without it there is none", () => {
+    const remember = { spoken: "bahçe pompasnı", target: "Bahçe Pompası" };
+    const base = {
+      type: "confirm_request" as const,
+      requestId: "c1",
+      id: "t1",
+      tool: "intent__HassTurnOff",
+      summary: "Kapatılsın mı?",
+      expiresAt: 1,
+    };
+    expect(currentConfirm(run([srv({ ...base, remember })]))?.remember).toEqual(remember);
+    expect(currentConfirm(run([srv(base)]))).not.toHaveProperty("remember");
+  });
+});
+
+describe("device names panel (docs/14 Decision 8)", () => {
+  const welcome = (features?: string[]): ServerMessage =>
+    features
+      ? { type: "welcome", protocol: 1, sessionId: "s", device: "d", features }
+      : { type: "welcome", protocol: 1, sessionId: "s", device: "d" };
+  const item = {
+    id: "n-3f9a1c",
+    spoken: "bahçe pompasnı",
+    target: { name: "Bahçe Pompası", domain: "switch", areas: ["Bahçe"] },
+    status: "active",
+    missingSince: null,
+    lastUsedAt: null,
+    uses: 0,
+  };
+  const frame = (id: string, items = [item]): ServerMessage => ({ type: "names", id, items });
+
+  it("is available only while connected to a Core with the names feature (memory not needed)", () => {
+    expect(namesAvailable(run([srv(welcome(["names"]))]))).toBe(true);
+    expect(namesAvailable(run([srv(welcome(["memory"]))]))).toBe(false);
+    expect(namesAvailable(run([srv(welcome())]))).toBe(false);
+    const dropped = run([srv(welcome(["names"])), { type: "status", ev: { status: "reconnecting", attempt: 1 } }]);
+    expect(namesAvailable(dropped)).toBe(false);
+  });
+
+  it("list: loading, then only the answer to that request", () => {
+    const s = run([{ type: "names_requested", id: "n1" }]);
+    expect(s.names).toMatchObject({ status: "loading", requestId: "n1", deleting: null });
+    expect(run([srv(frame("other"))], s).names.status).toBe("loading");
+    expect(run([srv(frame("n1"))], s).names).toMatchObject({ status: "ready", deleting: null, items: [item] });
+  });
+
+  it("an unasked names frame changes nothing", () => {
+    expect(run([srv(frame("n1"))]).names).toEqual(initialState.names);
+  });
+
+  it("delete: remembers the row being deleted; the answer replaces the list", () => {
+    const s = run([
+      { type: "names_requested", id: "n1" },
+      srv(frame("n1")),
+      { type: "names_requested", id: "n2", deleting: "n-3f9a1c" },
+    ]);
+    expect(s.names).toMatchObject({ status: "loading", deleting: "n-3f9a1c", staleIds: ["n1"] });
+    expect(s.names.items).toHaveLength(1);
+    expect(run([srv(frame("n2", []))], s).names).toMatchObject({ status: "ready", deleting: null, items: [] });
+  });
+
+  it("an error for the request stays in the panel (no chat notice) and keeps the items", () => {
+    const s = run([
+      { type: "names_requested", id: "n1" },
+      srv(frame("n1")),
+      { type: "names_requested", id: "n2", deleting: "n-3f9a1c" },
+      srv({ type: "error", id: "n2", code: "internal", message: "device names could not be written" }),
+    ]);
+    expect(s.notice).toBeNull();
+    expect(s.names).toMatchObject({ status: "error", deleting: null, errorCode: "internal" });
+    expect(s.names.items).toHaveLength(1);
+  });
+
+  it("names_closed: the request becomes stale; its late answer and error are dropped", () => {
+    expect(run([{ type: "names_closed" }])).toBe(run([]));
+    const s = run([
+      { type: "names_requested", id: "n1" },
+      srv(frame("n1")),
+      { type: "names_requested", id: "n2", deleting: "n-3f9a1c" },
+      { type: "names_closed" },
+    ]);
+    expect(s.names).toMatchObject({ status: "ready", requestId: null, deleting: null, staleIds: ["n1", "n2"] });
+    const late = run([srv(frame("n2", [])), srv({ type: "error", id: "n2", code: "internal" })], s);
+    expect(late.notice).toBeNull();
+    expect(late.names).toEqual(s.names);
+    expect(run([{ type: "names_requested", id: "n1" }, { type: "names_closed" }]).names).toMatchObject({ status: "idle", items: null });
+  });
+
+  it("timeout only for the request still loading; a late answer still fills the panel", () => {
+    const s = run([{ type: "names_requested", id: "n1" }]);
+    expect(run([{ type: "names_timeout", id: "old" }], s)).toBe(s);
+    const timedOut = run([{ type: "names_timeout", id: "n1" }], s);
+    expect(timedOut.names).toMatchObject({ status: "error", errorCode: "timeout" });
+    expect(run([srv(frame("n1"))], timedOut).names.status).toBe("ready");
+  });
+
+  it("a dropped connection fails a request in flight; a welcome resets the view", () => {
+    const s = run([{ type: "names_requested", id: "n1" }, { type: "status", ev: { status: "reconnecting", attempt: 1 } }]);
+    expect(s.names).toMatchObject({ status: "error", errorCode: "connection" });
+    const ready = run([{ type: "names_requested", id: "n2" }, srv(frame("n2"))]);
+    expect(run([srv(welcome(["names"]))], ready).names).toEqual(initialState.names);
   });
 });

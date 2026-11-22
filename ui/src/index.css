@@ -552,6 +552,12 @@ input:focus-visible {
   min-height: 52px;
   font-size: 16px;
 }
+.confirm-actions-remember .confirm-always {
+  grid-column: 1 / -1;
+}
+.confirm-remember {
+  overflow-wrap: anywhere;
+}
 @keyframes rise {
   from {
     opacity: 0;

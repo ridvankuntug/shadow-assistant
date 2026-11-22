@@ -7,8 +7,10 @@
  */
 import type { StatusEvent } from "../protocol/client.ts";
 import type {
+  ConfirmRemember,
   ConfirmResolvedBy,
   CoreFeature,
+  DeviceNameItem,
   DevAction,
   DevItem,
   HistoryItem,
@@ -48,6 +50,8 @@ export type PendingConfirm = {
   expiresAt: number;
   /** A button answer was sent; waiting for `confirm_resolved`. */
   responding: boolean;
+  /** The card offers "Evet, hep bu" for these words and this device (docs/14 Decision 7). */
+  remember?: ConfirmRemember;
 };
 
 export type Notice = {
@@ -187,6 +191,24 @@ export type PcPermissionsView = {
   staleIds: string[];
 };
 
+/**
+ * The "Cihaz adları" panel (Core feature `names`, docs/14 Decision 8). Same
+ * request model as the memory panel: one `names_list` / `names_delete` at a
+ * time (`deleting` = the id being deleted), `error` keeps the last items, and
+ * closing the panel abandons the request in flight (`names_closed`).
+ */
+export type NamesView = {
+  status: "idle" | "loading" | "ready" | "error";
+  /** Id of the request in flight (or last answered). */
+  requestId: string | null;
+  deleting: string | null;
+  items: DeviceNameItem[] | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /** Replaced or abandoned request ids whose late errors are dropped (as `MemoryView.staleIds`). */
+  staleIds: string[];
+};
+
 /** A "Dene" voice sample: a `speak` that belongs to no turn. */
 export type VoicePreview = { id: string; failed: boolean };
 
@@ -235,6 +257,7 @@ export type AssistantState = {
   dev: DevView;
   notifications: NotificationsView;
   pcPermissions: PcPermissionsView;
+  names: NamesView;
 };
 
 export type Action =
@@ -265,7 +288,10 @@ export type Action =
   | { type: "notifications_requested"; id: string; acting?: { notificationId: string; action: NotificationAction } }
   | { type: "notifications_timeout"; id: string }
   | { type: "pc_permissions_requested"; id: string; acting?: { rowId: string; enabled: boolean } | "seen" }
-  | { type: "pc_permissions_timeout"; id: string };
+  | { type: "pc_permissions_timeout"; id: string }
+  | { type: "names_requested"; id: string; deleting?: string }
+  | { type: "names_timeout"; id: string }
+  | { type: "names_closed" };
 
 export const MAX_MESSAGES = 100;
 const MAX_CANCELLED = 20;
@@ -273,6 +299,7 @@ const MAX_STALE_MEMORY = 8;
 const MAX_STALE_DEV = 8;
 const MAX_STALE_NOTIFICATIONS = 8;
 const MAX_STALE_PC_PERMISSIONS = 8;
+const MAX_STALE_NAMES = 8;
 
 export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
@@ -330,6 +357,7 @@ export const initialState: AssistantState = {
     errorMessage: null,
     staleIds: [],
   },
+  names: { status: "idle", requestId: null, deleting: null, items: null, errorCode: null, errorMessage: null, staleIds: [] },
 };
 
 // ---------------------------------------------------------------------------
@@ -417,6 +445,11 @@ export function hasFeature(s: AssistantState, feature: CoreFeature): boolean {
 /** The memory panel may be offered: connected to a Core with the `memory` feature. */
 export function memoryAvailable(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "memory");
+}
+
+/** The "Cihaz adları" panel may be offered: connected to a Core with the `names` feature (independent of `memory`). */
+export function namesAvailable(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "names");
 }
 
 /** The Development panel and badge may be offered: connected to a Core with the `dev` feature. */
@@ -572,6 +605,11 @@ function devFailed(d: DevView, code: string, message?: string): DevView {
   return { ...d, status: "error", acting: null, errorCode: code, errorMessage: message ?? null };
 }
 
+/** A failed or unanswered device-names request (keeps the shown items). */
+function namesFailed(n: NamesView, code: string, message?: string): NamesView {
+  return { ...n, status: "error", deleting: null, errorCode: code, errorMessage: message ?? null };
+}
+
 /** A failed or unanswered memory request (keeps the shown contents). */
 function memoryFailed(m: MemoryView, code: string, message?: string): MemoryView {
   return { ...m, status: "error", deleting: null, errorCode: code, errorMessage: message ?? null };
@@ -647,6 +685,7 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         dev: s.dev.status === "loading" ? devFailed(s.dev, "connection") : s.dev,
         notifications: s.notifications.status === "loading" ? notificationsFailed(s.notifications, "connection") : s.notifications,
         pcPermissions: s.pcPermissions.status === "loading" ? pcPermissionsFailed(s.pcPermissions, "connection") : s.pcPermissions,
+        names: s.names.status === "loading" ? namesFailed(s.names, "connection") : s.names,
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,
@@ -816,6 +855,37 @@ export function reducer(s: AssistantState, a: Action): AssistantState {
         ? { ...s, pcPermissions: pcPermissionsFailed(s.pcPermissions, "timeout") }
         : s;
 
+    case "names_requested": {
+      const prev = s.names.requestId;
+      const staleIds = prev && prev !== a.id ? [...s.names.staleIds, prev].slice(-MAX_STALE_NAMES) : s.names.staleIds;
+      return {
+        ...s,
+        names: { ...s.names, status: "loading", requestId: a.id, deleting: a.deleting ?? null, errorCode: null, errorMessage: null, staleIds },
+      };
+    }
+
+    case "names_timeout":
+      return s.names.status === "loading" && s.names.requestId === a.id ? { ...s, names: namesFailed(s.names, "timeout") } : s;
+
+    case "names_closed": {
+      // As `memory_closed`: the request in flight no longer belongs to anything
+      // shown; a delete already sent stays done on the Core.
+      const n = s.names;
+      if (n.requestId === null) return s;
+      return {
+        ...s,
+        names: {
+          ...n,
+          status: n.items ? "ready" : "idle",
+          requestId: null,
+          deleting: null,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: [...n.staleIds, n.requestId].slice(-MAX_STALE_NAMES),
+        },
+      };
+    }
+
     case "server":
       return reduceServer(s, a.msg);
   }
@@ -847,6 +917,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         notifications: initialState.notifications,
         // And the PC permission list and its count (the controller asks again).
         pcPermissions: initialState.pcPermissions,
+        // And the confirmed device names (the panel asks again).
+        names: initialState.names,
       };
 
     case "state": {
@@ -918,6 +990,7 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
             summary: msg.summary,
             expiresAt: msg.expiresAt,
             responding: false,
+            ...(msg.remember ? { remember: msg.remember } : {}),
           },
         ],
       };
@@ -992,6 +1065,11 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         return s.pcPermissions.status === "loading" ? { ...s, pcPermissions: pcPermissionsFailed(s.pcPermissions, msg.code, msg.message) } : s;
       }
       if (msg.id !== undefined && s.pcPermissions.staleIds.includes(msg.id)) return s;
+      // And errors of the "Cihaz adları" panel (bad_request, internal).
+      if (msg.id !== undefined && msg.id === s.names.requestId) {
+        return s.names.status === "loading" ? { ...s, names: namesFailed(s.names, msg.code, msg.message) } : s;
+      }
+      if (msg.id !== undefined && s.names.staleIds.includes(msg.id)) return s;
       if (msg.id !== undefined && msg.id === s.voicePreview?.id) {
         return {
           ...s,
@@ -1114,6 +1192,23 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
           errorCode: null,
           errorMessage: null,
           staleIds: s.pcPermissions.staleIds,
+        },
+      };
+
+    case "names":
+      // Only the answer to the latest request of the open panel (as with
+      // memory); it still counts after the local timeout.
+      if (s.names.requestId === null || msg.id !== s.names.requestId) return s;
+      return {
+        ...s,
+        names: {
+          status: "ready",
+          requestId: msg.id,
+          deleting: null,
+          items: msg.items,
+          errorCode: null,
+          errorMessage: null,
+          staleIds: s.names.staleIds,
         },
       };
 

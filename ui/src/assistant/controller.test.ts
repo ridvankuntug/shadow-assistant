@@ -9,6 +9,7 @@ import {
   DEV_TIMEOUT_MS,
   MAX_UTTERANCE_MS,
   MEMORY_TIMEOUT_MS,
+  NAMES_TIMEOUT_MS,
   NOTIFICATIONS_RETRY_MS,
   NOTIFICATIONS_TIMEOUT_MS,
   PC_PERMISSIONS_TIMEOUT_MS,
@@ -2268,5 +2269,142 @@ describe("İzinler page (T17.2, feature pc_permissions)", () => {
     await flush();
     expect(t.sentTypes()).toContain("user_text");
     expect(t.sentTypes().filter((x) => x.startsWith("pc_"))).toEqual([]);
+  });
+});
+
+describe("confirm card “Evet, hep bu” (docs/14 Decision 7)", () => {
+  const offer = { spoken: "bahçe pompasnı", target: "Bahçe Pompası" };
+  const request = (remember?: { spoken: string; target: string }): ServerMessage => ({
+    type: "confirm_request",
+    requestId: "c1",
+    id: "t1",
+    tool: "intent__HassTurnOff",
+    summary: "Bahçe Pompası kapatılsın mı?",
+    expiresAt: 1,
+    ...(remember ? { remember } : {}),
+  });
+
+  it("Evet, hep bu: sends remember: true with approved, once", () => {
+    const t = setup();
+    t.receive(request(offer));
+    t.controller.respondConfirm(true, true);
+    t.controller.respondConfirm(true, true); // double tap
+    expect(t.sent).toEqual([{ type: "confirm_response", requestId: "c1", approved: true, remember: true }]);
+  });
+
+  it("plain Evet on an offering card: no remember", () => {
+    const t = setup();
+    t.receive(request(offer));
+    t.controller.respondConfirm(true);
+    expect(t.sent).toEqual([{ type: "confirm_response", requestId: "c1", approved: true }]);
+  });
+
+  it("remember is never sent with a no, nor for a card that did not offer it", () => {
+    const no = setup();
+    no.receive(request(offer));
+    no.controller.respondConfirm(false, true);
+    expect(no.sent).toEqual([{ type: "confirm_response", requestId: "c1", approved: false }]);
+    const plain = setup();
+    plain.receive(request());
+    plain.controller.respondConfirm(true, true);
+    expect(plain.sent).toEqual([{ type: "confirm_response", requestId: "c1", approved: true }]);
+  });
+});
+
+describe("device names panel (docs/14 Decision 8, feature names)", () => {
+  const item = {
+    id: "n-3f9a1c",
+    spoken: "bahçe pompasnı",
+    target: { name: "Bahçe Pompası", domain: "switch", areas: ["Bahçe"] },
+    status: "active",
+    missingSince: null,
+    lastUsedAt: null,
+    uses: 0,
+  };
+  const frame = (id: string, items = [item]): ServerMessage => ({ type: "names", id, items });
+
+  it("does nothing without the names feature or while not connected; never asked on welcome", () => {
+    const t = setup(undefined, ["memory"]);
+    expect(t.controller.requestNames()).toBe(false);
+    expect(t.sent).toEqual([]);
+    const a = fakeAdapter();
+    const c = fakeClient();
+    const controller = new AssistantController({ adapter: a.adapter, clientVersion: "test", createClient: c.create, newId: () => "x" });
+    controller.connect("ws://localhost:8700/ws", "tok");
+    c.connect(["names"]);
+    expect(c.sentTypes()).not.toContain("names_list");
+    c.drop();
+    expect(controller.requestNames()).toBe(false);
+  });
+
+  it("list: sends names_list, one request at a time, and shows the answer", () => {
+    const t = setup(undefined, ["names"]);
+    expect(t.controller.requestNames()).toBe(true);
+    expect(t.sent).toEqual([{ type: "names_list", id: "t1" }]);
+    expect(t.controller.requestNames()).toBe(false);
+    t.receive(frame("t1"));
+    expect(t.controller.getState().names).toMatchObject({ status: "ready", items: [item] });
+  });
+
+  it("delete: only a listed id, sent as names_delete with one id; the fresh list replaces the old one", () => {
+    const t = setup(undefined, ["names"]);
+    expect(t.controller.deleteName("n-3f9a1c")).toBe(false); // nothing listed yet
+    t.controller.requestNames();
+    t.receive(frame("t1"));
+    expect(t.controller.deleteName("n-unknown")).toBe(false);
+    expect(t.controller.deleteName("")).toBe(false);
+    expect(t.controller.deleteName("n-3f9a1c")).toBe(true);
+    expect(t.sent[1]).toEqual({ type: "names_delete", id: "t2", ids: ["n-3f9a1c"] });
+    expect(t.controller.getState().names.deleting).toBe("n-3f9a1c");
+    t.receive(frame("t2", []));
+    expect(t.controller.getState().names).toMatchObject({ status: "ready", deleting: null, items: [] });
+  });
+
+  it("an error is shown in the panel, not as a chat notice; a retry is possible", () => {
+    const t = setup(undefined, ["names"]);
+    t.controller.requestNames();
+    t.receive({ type: "error", id: "t1", code: "bad_request", message: "device names are disabled" });
+    expect(t.controller.getState().notice).toBeNull();
+    expect(t.controller.getState().names).toMatchObject({ status: "error", errorCode: "bad_request" });
+    expect(t.controller.requestNames()).toBe(true);
+  });
+
+  it("closing the panel abandons the request: its late answer and error change nothing", () => {
+    const t = setup(undefined, ["names"]);
+    t.controller.requestNames();
+    t.controller.closeNames();
+    t.receive(frame("t1"));
+    t.receive({ type: "error", id: "t1", code: "internal", message: "late" });
+    expect(t.controller.getState().names).toMatchObject({ status: "idle", requestId: null, items: null, errorCode: null });
+    expect(t.controller.getState().notice).toBeNull();
+  });
+
+  describe("with fake timers", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("no answer -> timeout error; a late answer still fills the panel", () => {
+      const t = setup(undefined, ["names"]);
+      t.controller.requestNames();
+      vi.advanceTimersByTime(NAMES_TIMEOUT_MS - 1);
+      expect(t.controller.getState().names.status).toBe("loading");
+      vi.advanceTimersByTime(1);
+      expect(t.controller.getState().names).toMatchObject({ status: "error", errorCode: "timeout" });
+      t.receive(frame("t1"));
+      expect(t.controller.getState().names.status).toBe("ready");
+    });
+
+    it("an answer in time or closing the panel cancels the timeout", () => {
+      const t = setup(undefined, ["names"]);
+      t.controller.requestNames();
+      t.receive(frame("t1"));
+      vi.advanceTimersByTime(NAMES_TIMEOUT_MS * 2);
+      expect(t.controller.getState().names.status).toBe("ready");
+      const c = setup(undefined, ["names"]);
+      c.controller.requestNames();
+      c.controller.closeNames();
+      vi.advanceTimersByTime(NAMES_TIMEOUT_MS * 2);
+      expect(c.controller.getState().names).toMatchObject({ status: "idle", errorCode: null });
+    });
   });
 });

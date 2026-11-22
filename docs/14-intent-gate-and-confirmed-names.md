@@ -775,22 +775,22 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] `parseVoiceAnswer`: "evet hep bu" / "evet hatırla" → approve + remember.
   - [x] `names_list` / `names_delete` / `names` (with `status`, `missingSince`),
     `welcome.features: "names"`; docs/02 updated.
-- [~] **T4.4c — UI.** Durum: başlandı
-  - [ ] ConfirmCard: third button "Evet, hep bu" when `remember` is present.
-  - [ ] `NamesPanel.tsx`: rows, "Pasif" / "Bulunamadı" labels, Sil with
+- [x] **T4.4c — UI.** Durum: bitti
+  - [x] ConfirmCard: third button "Evet, hep bu" when `remember` is present.
+  - [x] `NamesPanel.tsx`: rows, "Pasif" / "Bulunamadı" labels, Sil with
     "Silinsin mi?"; strings in `strings.ts`.
-  - [ ] `App.tsx`: panel value `"names"`, "⋮" item "Cihaz adları" behind the
+  - [x] `App.tsx`: panel value `"names"`, "⋮" item "Cihaz adları" behind the
     feature `names`, list request on open.
-  - [ ] Controller/state/types and tests (`namesPanel.test.ts`, protocol, assistant).
-- [~] **T4.7 — Repeated-error stop.** Durum: başlandı
+  - [x] Controller/state/types and tests (`namesPanel.test.ts`, protocol, assistant).
+- [x] **T4.7 — Repeated-error stop.** Durum: bitti
   - [x] `repeat-guard.ts`: argument class (tool + sorted top-level keys),
     error-text normalization, per-turn counter; unit tests.
-  - [ ] `Session.gate`: check before `authorize` (after the tier-service check),
+  - [x] `Session.gate`: check before `authorize` (after the tier-service check),
     record allowed `toolUseId` → class, count `isError` results from
     `onToolResult`; skip aborted turns.
-  - [ ] `GateDeny` gains `repeated_error`; `DENY_MESSAGES` text; deny records and
+  - [x] `GateDeny` gains `repeated_error`; `DENY_MESSAGES` text; deny records and
     log line.
-  - [ ] Session tests: two identical failures → third call not sent; different
+  - [x] Session tests: two identical failures → third call not sent; different
     error texts → not blocked; other argument class → not blocked; tier 0
     unaffected; count survives tier-1 → tier-2 escalation.
 - [ ] **T4.5 — Scenario tests.** Durum: başlamadı

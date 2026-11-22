@@ -27,6 +27,11 @@ export type ConfirmResponseMessage = {
   type: "confirm_response";
   requestId: string;
   approved: boolean;
+  /**
+   * "Evet, hep bu": only with `approved: true` and only for a request that
+   * offered `remember` (docs/02 §Confirmation flow); otherwise absent.
+   */
+  remember?: true;
 };
 /** `voice`: a tts-svc voice id from `voices`; absent or unknown -> the Core's default voice. */
 export type SpeakMessage = { type: "speak"; id: string; text: string; voice?: string };
@@ -84,6 +89,10 @@ export type PcPermissionsListMessage = { type: "pc_permissions_list"; id: string
 export type PcPermissionSetMessage = { type: "pc_permission_set"; id: string; rowId: string; enabled: boolean };
 /** Marks every PC permission row seen (the page was opened). */
 export type PcPermissionsSeenMessage = { type: "pc_permissions_seen"; id: string };
+/** Asks for the confirmed device names (Core feature `names`, docs/02 §Device names). */
+export type NamesListMessage = { type: "names_list"; id: string };
+/** Deletes confirmed device names (1-200 ids); answered by a fresh `names` frame. */
+export type NamesDeleteMessage = { type: "names_delete"; id: string; ids: string[] };
 
 export type ClientMessage =
   | HelloMessage
@@ -104,7 +113,9 @@ export type ClientMessage =
   | NotificationActionMessage
   | PcPermissionsListMessage
   | PcPermissionSetMessage
-  | PcPermissionsSeenMessage;
+  | PcPermissionsSeenMessage
+  | NamesListMessage
+  | NamesDeleteMessage;
 
 // ---------------------------------------------------------------------------
 // Core -> Client
@@ -118,7 +129,8 @@ export type CoreFeature =
   | "notifications"
   | "notifications_suppress"
   | "ha_urgency_feedback"
-  | "pc_permissions";
+  | "pc_permissions"
+  | "names";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;
@@ -133,6 +145,11 @@ export type AssistantDeltaMessage = { type: "assistant_delta"; id: string; text:
 export type AssistantDoneMessage = { type: "assistant_done"; id: string; text: string };
 export type ToolStatus = "started" | "done" | "denied" | "error";
 export type ToolMessage = { type: "tool"; id: string; name: string; status: ToolStatus };
+/**
+ * "Evet, hep bu" offer of a confirm card (docs/14 Decision 7): `spoken` = the
+ * user's words for the device, `target` = the device's canonical name.
+ */
+export type ConfirmRemember = { spoken: string; target: string };
 export type ConfirmRequestMessage = {
   type: "confirm_request";
   requestId: string;
@@ -140,6 +157,8 @@ export type ConfirmRequestMessage = {
   tool: string;
   summary: string;
   expiresAt: number;
+  /** Absent = plain yes / no card. A malformed offer is dropped (the card stays). */
+  remember?: ConfirmRemember;
 };
 export type ConfirmResolvedBy = "button" | "voice" | "timeout";
 export type ConfirmResolvedMessage = {
@@ -287,6 +306,24 @@ export type PcPermissionsMessage = {
 };
 /** PC permission badge count change, broadcast to every authenticated socket. */
 export type PcPermissionsCountMessage = { type: "pc_permissions_count"; unseen: number };
+/** The device a confirmed name points to, as seen when it was confirmed. `areas` may be empty. */
+export type DeviceNameTarget = { name: string; domain: string; areas: string[] };
+/**
+ * One confirmed device name (display only; never carries the match keys).
+ * `status`: `active` | `passive`; unknown values are shown as-is.
+ * `missingSince` / `lastUsedAt`: ISO 8601 or null.
+ */
+export type DeviceNameItem = {
+  id: string;
+  spoken: string;
+  target: DeviceNameTarget;
+  status: string;
+  missingSince: string | null;
+  lastUsedAt: string | null;
+  uses: number;
+};
+/** Answer to `names_list` / `names_delete` (only to the requesting socket). */
+export type NamesMessage = { type: "names"; id: string; items: DeviceNameItem[] };
 
 export type ServerMessage =
   | WelcomeMessage
@@ -311,6 +348,7 @@ export type ServerMessage =
   | NotificationRemovedMessage
   | PcPermissionsMessage
   | PcPermissionsCountMessage
+  | NamesMessage
   | PongMessage;
 
 // ---------------------------------------------------------------------------
@@ -577,6 +615,69 @@ function toPcPermissions(o: Obj): PcPermissionsMessage | null {
   };
 }
 
+/** The "Evet, hep bu" offer, or null when it is missing or malformed (both strings needed, non-blank). */
+function toConfirmRemember(v: unknown): ConfirmRemember | null {
+  if (!isObj(v) || !str(v, "spoken") || !str(v, "target")) return null;
+  const spoken = (v.spoken as string).trim();
+  const target = (v.target as string).trim();
+  if (!spoken || !target) return null;
+  return { spoken: spoken.slice(0, 200), target: target.slice(0, 200) };
+}
+
+/** A `confirm_request` with only its known fields; a malformed `remember` is dropped, not the card. */
+function toConfirmRequest(o: Obj): ConfirmRequestMessage | null {
+  if (!str(o, "requestId") || !str(o, "id") || !str(o, "tool") || !str(o, "summary") || !num(o, "expiresAt")) return null;
+  const msg: ConfirmRequestMessage = {
+    type: "confirm_request",
+    requestId: o.requestId as string,
+    id: o.id as string,
+    tool: o.tool as string,
+    summary: o.summary as string,
+    expiresAt: o.expiresAt as number,
+  };
+  const remember = toConfirmRemember(o.remember);
+  if (remember) msg.remember = remember;
+  return msg;
+}
+
+const isoOrNull = (o: Obj, k: string) => o[k] === null || str(o, k);
+
+/**
+ * A valid confirmed name with only the known fields, or null. Strings are cut
+ * so a bad item cannot flood the panel.
+ */
+function toDeviceNameItem(v: unknown): DeviceNameItem | null {
+  if (!isObj(v) || !str(v, "id") || !v.id || !str(v, "spoken") || !str(v, "status")) return null;
+  if (!isoOrNull(v, "missingSince") || !isoOrNull(v, "lastUsedAt") || !isCount(v.uses)) return null;
+  const t = v.target;
+  if (!isObj(t) || !str(t, "name") || !str(t, "domain")) return null;
+  const areas = strings(t.areas);
+  if (!areas) return null;
+  return {
+    // Sent back in `names_delete`: never cut.
+    id: v.id as string,
+    spoken: (v.spoken as string).slice(0, 200),
+    target: {
+      name: (t.name as string).slice(0, 200),
+      domain: (t.domain as string).slice(0, 64),
+      areas: areas.map((a) => a.slice(0, 100)),
+    },
+    status: (v.status as string).slice(0, 32),
+    missingSince: v.missingSince as string | null,
+    lastUsedAt: v.lastUsedAt as string | null,
+    uses: v.uses,
+  };
+}
+
+function toNames(o: Obj): NamesMessage | null {
+  if (!str(o, "id") || !Array.isArray(o.items)) return null;
+  return {
+    type: "names",
+    id: o.id as string,
+    items: o.items.map(toDeviceNameItem).filter((i): i is DeviceNameItem => i !== null),
+  };
+}
+
 /** `speak` is kept only when it is exactly `true`. */
 function toNotification(o: Obj): NotificationMessage | null {
   const item = toNotificationInfo(o.item);
@@ -617,9 +718,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
         ? (o as ToolMessage)
         : null;
     case "confirm_request":
-      return str(o, "requestId") && str(o, "id") && str(o, "tool") && str(o, "summary") && num(o, "expiresAt")
-        ? (o as ConfirmRequestMessage)
-        : null;
+      return toConfirmRequest(o);
     case "confirm_resolved":
       return str(o, "requestId") && bool(o, "approved") && oneOf(o, "by", RESOLVED_BY)
         ? (o as ConfirmResolvedMessage)
@@ -671,6 +770,8 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       return toPcPermissions(o);
     case "pc_permissions_count":
       return isCount(o.unseen) ? { type: "pc_permissions_count", unseen: o.unseen } : null;
+    case "names":
+      return toNames(o);
     case "pong":
       return { type: "pong" };
     default:

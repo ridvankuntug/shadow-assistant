@@ -699,3 +699,86 @@ describe("CoreClient", () => {
     expect(t.messages).toHaveLength(0);
   });
 });
+
+describe("parseServerMessage: confirmed device names (docs/14, feature names)", () => {
+  const base = {
+    type: "confirm_request",
+    requestId: "c1",
+    id: "t1",
+    tool: "intent__HassTurnOff",
+    summary: "Bahçe Pompası kapatılsın mı?",
+    expiresAt: 5,
+  };
+  const item = {
+    id: "n-3f9a1c",
+    spoken: "bahçe pompasnı",
+    target: { name: "Bahçe Pompası", domain: "switch", areas: ["Bahçe"] },
+    status: "active",
+    missingSince: null,
+    lastUsedAt: "2026-11-21T18:40:00.000Z",
+    uses: 4,
+  };
+  const passive = {
+    ...item,
+    id: "n-000002",
+    status: "passive",
+    missingSince: "2026-10-01T00:00:00.000Z",
+    lastUsedAt: null,
+    uses: 0,
+    target: { name: "Bahçe Pompası", domain: "switch", areas: [] },
+  };
+
+  it("confirm_request keeps a valid remember offer (trimmed) and drops unknown fields", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({ ...base, extra: 1, remember: { spoken: " bahçe pompasnı ", target: "Bahçe Pompası", x: 2 } }),
+    );
+    expect(msg).toEqual({ ...base, remember: { spoken: "bahçe pompasnı", target: "Bahçe Pompası" } });
+  });
+
+  it("confirm_request without remember stays a plain card", () => {
+    expect(parseServerMessage(JSON.stringify(base))).toEqual(base);
+  });
+
+  it.each([
+    ["not an object", "evet"],
+    ["missing target", { spoken: "bahçe pompasnı" }],
+    ["blank spoken", { spoken: "  ", target: "Bahçe Pompası" }],
+    ["non-string target", { spoken: "bahçe pompasnı", target: 3 }],
+    ["null", null],
+  ])("confirm_request with a malformed remember (%s) keeps the card without the offer", (_, remember) => {
+    expect(parseServerMessage(JSON.stringify({ ...base, remember }))).toEqual(base);
+  });
+
+  it("names: keeps valid items with known fields only; drops malformed items", () => {
+    const raw = {
+      type: "names",
+      id: "n1",
+      items: [
+        { ...item, keys: ["bahce pompasni"] },
+        passive,
+        { ...item, id: "" },
+        { ...item, id: "n-x1", uses: -1 },
+        { ...item, id: "n-x2", target: { name: "A", domain: "switch", areas: [1] } },
+        { ...item, id: "n-x3", missingSince: 5 },
+        { ...item, id: "n-x4", target: null },
+        "junk",
+      ],
+    };
+    expect(parseServerMessage(JSON.stringify(raw))).toEqual({ type: "names", id: "n1", items: [item, passive] });
+  });
+
+  it("names: an unknown status is kept as-is; the frame needs an id and an items array", () => {
+    const msg = parseServerMessage(JSON.stringify({ type: "names", id: "n1", items: [{ ...item, status: "archived" }] }));
+    expect(msg?.type === "names" && msg.items[0].status).toBe("archived");
+    expect(parseServerMessage(JSON.stringify({ type: "names", items: [] }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ type: "names", id: "n1" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ type: "names", id: "n1", items: [] }))).toEqual({ type: "names", id: "n1", items: [] });
+  });
+
+  it("welcome keeps the names feature", () => {
+    const msg = parseServerMessage(
+      JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "browser", features: ["names"] }),
+    );
+    expect(msg?.type === "welcome" && msg.features).toEqual(["names"]);
+  });
+});

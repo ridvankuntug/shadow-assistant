@@ -1,7 +1,7 @@
 /** User-facing Turkish strings. */
 import type { Notice, Phase } from "../assistant/state.ts";
 import type { ConnectionStatus } from "../protocol/client.ts";
-import type { DevAction, DevRuleInfo, MemoryWarning, NotificationAction } from "../protocol/types.ts";
+import type { DevAction, DevRuleInfo, DeviceNameItem, MemoryWarning, NotificationAction } from "../protocol/types.ts";
 import type { Quality } from "../scene/quality.ts";
 import type { SttStatus } from "./serviceHealth.ts";
 
@@ -484,3 +484,85 @@ export function pcPermissionsErrorText(code: string, message?: string | null): s
 
 /** Shown with the "Adresler" button (settings and the connect screen, Android shells only). */
 export const ADDRESSES_HINT = "Ev adresleri ve bilgisayarı uyandırma bu cihazın Adresler penceresinde.";
+
+// ------------------------------------------- confirm card "Evet, hep bu" (docs/14 Decision 7)
+
+/** The three answers of a card that offers `remember`. */
+export const CONFIRM_REMEMBER_LABEL = { no: "Hayır", once: "Evet", always: "Evet, hep bu" } as const;
+
+/** What the user said and which device it means: "“bahçe pompasnı” → Bahçe Pompası". */
+export function confirmRememberText(spoken: string, target: string): string {
+  return `“${spoken}” → ${target}`;
+}
+
+export const CONFIRM_REMEMBER_HINT =
+  "“Evet” yalnız bu seferlik. “Evet, hep bu”: bu söz bu cihaz için kaydedilir, bir dahaki sefere sorulmaz.";
+
+export const CONFIRM_REMEMBER_VOICE_HINT = "Sesle de cevap verebilirsin: “evet”, “evet hep bu” ya da “hayır”.";
+
+// ------------------------------------------------ device names panel ("Cihaz adları", docs/14 Decision 8)
+
+export const NAMES_TITLE = "Cihaz adları";
+
+export const NAMES_INTRO =
+  "Onay kartında “Evet, hep bu” dediğin cihaz adları. Shadow bu sözleri sormadan aynı cihaza bağlar. Yanlış ya da gereksiz olanları silebilirsin.";
+
+/** Fixed texts of the panel (buttons, states, the delete question). */
+export const NAMES_UI = {
+  refresh: "Yenile",
+  offline: "Bağlantı yok.",
+  loading: "Yükleniyor…",
+  deleting: "Siliniyor…",
+  remove: "Sil",
+  ask: "Silinsin mi?",
+  yes: "Evet, sil",
+  cancel: "Vazgeç",
+  askGroup: "Silme onayı",
+} as const;
+
+/** Screen-reader label of a row's Sil button. */
+export function nameDeleteLabel(rowText: string): string {
+  return `Sil: ${rowText}`;
+}
+
+export const NAMES_EMPTY = "Henüz kayıtlı cihaz adı yok. Onay kartında “Evet, hep bu” dediğinde buraya eklenir.";
+
+/** "bahçe pompasnı → Bahçe Pompası (Bahçe)"; no parentheses without an area. */
+export function nameRowText(item: Pick<DeviceNameItem, "spoken" | "target">): string {
+  const areas = item.target.areas.filter((a) => a.trim());
+  return `${item.spoken} → ${item.target.name}${areas.length > 0 ? ` (${areas.join(", ")})` : ""}`;
+}
+
+/**
+ * The status label of a row: "Pasif" for a passive entry, "Bulunamadı" for an
+ * active one missing from the live context, nothing for an active one that is
+ * seen; an unknown status is shown as-is.
+ */
+export function nameStatusText(item: Pick<DeviceNameItem, "status" | "missingSince">): string | null {
+  if (item.status === "passive") return "Pasif";
+  if (item.status === "active") return item.missingSince ? "Bulunamadı" : null;
+  return item.status || null;
+}
+
+/** Shown under a row with a status label: what the status means. */
+export function nameStatusHint(item: Pick<DeviceNameItem, "status" | "missingSince">): string | undefined {
+  if (item.status === "passive") return "30 gündür bulunamadı; artık kullanılmıyor. Silebilir ya da onay kartında yeniden “Evet, hep bu” diyebilirsin.";
+  if (item.status === "active" && item.missingSince) return "Cihaz şu an evde görünmüyor; dönene kadar bu ad kullanılmıyor.";
+  return undefined;
+}
+
+/** Why the last request of the panel failed (`timeout` / `connection` are local codes). */
+export function namesErrorText(code: string, message?: string | null): string {
+  switch (code) {
+    case "timeout":
+      return "Çekirdek cihaz adları isteğine yanıt vermedi.";
+    case "connection":
+      return "Bağlantı koptu; cihaz adları alınamadı.";
+    case "bad_request":
+      return "Çekirdek isteği reddetti: cihaz adları kapalı olabilir. Listeyi yenile.";
+    case "internal":
+      return "Cihaz adları okunamadı ya da kaydedilemedi. Biraz sonra yeniden dene.";
+    default:
+      return noticeText(code, message ?? undefined);
+  }
+}

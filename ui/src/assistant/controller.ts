@@ -29,6 +29,7 @@ import {
   initialState,
   isCancelled,
   memoryAvailable,
+  namesAvailable,
   notificationsAvailable,
   notificationsUnavailable,
   notificationToggleAction,
@@ -72,6 +73,8 @@ export const DEV_TIMEOUT_MS = 8_000;
 export const NOTIFICATIONS_TIMEOUT_MS = 8_000;
 /** Same for `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` on the İzinler page. */
 export const PC_PERMISSIONS_TIMEOUT_MS = 8_000;
+/** Same for `names_list` / `names_delete` in the "Cihaz adları" panel. */
+export const NAMES_TIMEOUT_MS = 8_000;
 /**
  * While the Core cannot read its notifications file ("!" badge), the inbox is
  * asked for again this often, so the badge recovers without a reconnect once
@@ -203,6 +206,7 @@ export class AssistantController {
   private memoryTimer: ReturnType<typeof setTimeout> | null = null;
   private devTimer: ReturnType<typeof setTimeout> | null = null;
   private pcPermissionsTimer: ReturnType<typeof setTimeout> | null = null;
+  private namesTimer: ReturnType<typeof setTimeout> | null = null;
   /** The İzinler page is open: a list that arrives with new rows is answered with `pc_permissions_seen`. */
   private pcPermissionsOpen = false;
   private notificationsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -334,6 +338,7 @@ export class AssistantController {
     this.clearMemoryTimer();
     this.clearDevTimer();
     this.clearPcPermissionsTimer();
+    this.clearNamesTimer();
     this.clearNotificationsTimer();
     // The Core picked this socket to speak them; a new connection never speaks them again.
     this.announcements.length = 0;
@@ -358,6 +363,7 @@ export class AssistantController {
     this.clearMemoryTimer();
     this.clearDevTimer();
     this.clearPcPermissionsTimer();
+    this.clearNamesTimer();
     this.clearNotificationsTimer();
     this.clearNotificationsRetryTimer();
     this.stopLocalAudio();
@@ -503,10 +509,19 @@ export class AssistantController {
     this.dispatch({ type: "notice", notice: { code: "gemini_failed" } });
   }
 
-  respondConfirm(approved: boolean): void {
+  /**
+   * Answers the shown confirmation. `remember` ("Evet, hep bu") is sent only
+   * with `approved` and only when the card offered it; otherwise the answer
+   * is a plain yes / no.
+   */
+  respondConfirm(approved: boolean, remember = false): void {
     const c = currentConfirm(this.state);
     if (!c || c.responding) return;
-    if (this.send({ type: "confirm_response", requestId: c.requestId, approved })) {
+    const frame: ClientMessage =
+      approved && remember && c.remember
+        ? { type: "confirm_response", requestId: c.requestId, approved, remember: true }
+        : { type: "confirm_response", requestId: c.requestId, approved };
+    if (this.send(frame)) {
       this.dispatch({ type: "confirm_sent", requestId: c.requestId });
       this.adapter.vibrate([10]);
     }
@@ -693,6 +708,43 @@ export class AssistantController {
   }
 
   /**
+   * Asks the Core for the confirmed device names (`names_list`). Only with the
+   * `names` feature, while connected and no request of the panel is in flight.
+   */
+  requestNames(): boolean {
+    return this.sendNames((id) => ({ type: "names_list", id }));
+  }
+
+  /**
+   * Deletes one listed confirmed name (`names_delete`); the Core answers with
+   * the fresh list. Only for an id in the last list ("Silinsin mi?" is asked
+   * in the panel first). Same guards as requestNames.
+   */
+  deleteName(nameId: string): boolean {
+    if (!nameId || !this.state.names.items?.some((i) => i.id === nameId)) return false;
+    return this.sendNames((id) => ({ type: "names_delete", id, ids: [nameId] }), nameId);
+  }
+
+  /** The panel was closed: as closeMemory, its request in flight is abandoned. */
+  closeNames(): void {
+    this.clearNamesTimer();
+    this.dispatch({ type: "names_closed" });
+  }
+
+  private sendNames(frame: (id: string) => Extract<ClientMessage, { type: "names_list" | "names_delete" }>, deleting?: string): boolean {
+    if (!namesAvailable(this.state) || this.state.names.status === "loading") return false;
+    const id = this.newId();
+    if (!this.client?.send(frame(id))) return false;
+    this.dispatch(deleting === undefined ? { type: "names_requested", id } : { type: "names_requested", id, deleting });
+    this.clearNamesTimer();
+    this.namesTimer = setTimeout(() => {
+      this.namesTimer = null;
+      this.dispatch({ type: "names_timeout", id });
+    }, NAMES_TIMEOUT_MS);
+    return true;
+  }
+
+  /**
    * Asks the Core for the inbox (`notifications_list`). Only with the
    * `notifications` feature, while connected and no inbox request is in
    * flight. Also sent after `welcome`, for the badge and the catch-up.
@@ -840,6 +892,11 @@ export class AssistantController {
     this.pcPermissionsTimer = null;
   }
 
+  private clearNamesTimer(): void {
+    if (this.namesTimer !== null) clearTimeout(this.namesTimer);
+    this.namesTimer = null;
+  }
+
   private clearNotificationsTimer(): void {
     if (this.notificationsTimer !== null) clearTimeout(this.notificationsTimer);
     this.notificationsTimer = null;
@@ -868,6 +925,7 @@ export class AssistantController {
         this.clearMemoryTimer(); // and the memory view
         this.clearDevTimer(); // and the Development view
         this.clearPcPermissionsTimer(); // and the İzinler page
+        this.clearNamesTimer(); // and the device names
         this.clearNotificationsTimer(); // and the inbox
         this.catchUpPending = true;
         this.sentPrefs = null; // a new Core session: opt in again
@@ -885,6 +943,9 @@ export class AssistantController {
         break;
       case "memory":
         if (msg.id === this.state.memory.requestId) this.clearMemoryTimer();
+        break;
+      case "names":
+        if (msg.id === this.state.names.requestId) this.clearNamesTimer();
         break;
       // Development frames are silent: no notify, vibration or sound (docs/08 §T7.w.4).
       case "dev":
@@ -945,6 +1006,12 @@ export class AssistantController {
           break;
         }
         if (msg.id !== undefined && this.state.pcPermissions.staleIds.includes(msg.id)) break;
+        // Same for the "Cihaz adları" panel.
+        if (msg.id !== undefined && msg.id === this.state.names.requestId) {
+          this.clearNamesTimer();
+          break;
+        }
+        if (msg.id !== undefined && this.state.names.staleIds.includes(msg.id)) break;
         // Same for the inbox.
         if (msg.id !== undefined && msg.id === this.state.notifications.requestId) {
           this.clearNotificationsTimer();

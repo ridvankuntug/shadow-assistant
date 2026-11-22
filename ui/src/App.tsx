@@ -8,6 +8,7 @@ import {
   devBadgeCount,
   hasFeature,
   memoryAvailable,
+  namesAvailable,
   notificationsAvailable,
   notificationsBadgeCount,
   notificationsSuppressAvailable,
@@ -27,6 +28,7 @@ import { ConnectScreen } from "./ui/ConnectScreen.tsx";
 import { Conversation } from "./ui/Conversation.tsx";
 import { DevPanel } from "./ui/DevPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
+import { NamesPanel } from "./ui/NamesPanel.tsx";
 import { NotificationsPanel } from "./ui/NotificationsPanel.tsx";
 import { HistoryPanel, SettingsPanel } from "./ui/Panels.tsx";
 import { PermissionsPanel } from "./ui/PermissionsPanel.tsx";
@@ -41,6 +43,7 @@ import { Stage } from "./ui/Stage.tsx";
 import {
   CONNECTION_LABEL,
   devOpenText,
+  NAMES_TITLE,
   noticeMessage,
   noticeText,
   notificationsUnreadText,
@@ -51,7 +54,7 @@ import {
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
 
-type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect" | "version" | "permissions";
+type Panel = "none" | "history" | "settings" | "memory" | "dev" | "notifications" | "connect" | "version" | "permissions" | "names";
 
 /** The tray opens the UI at `#dev` / `#notifications` (docs/08 §T7.w.4, §T7.w.5; ui/trayHash.ts). */
 const atHash = (panel: "dev" | "notifications") => typeof window !== "undefined" && trayTarget(window.location.hash) === panel;
@@ -147,6 +150,17 @@ export default function App({ adapter, controller }: Props) {
     controller.openPcPermissions();
     return () => controller.closePcPermissions();
   }, [controller, panel, pcPermissionsOn]);
+
+  // The "Cihaz adları" panel lists the names each time it opens (and again
+  // after a reconnect, which resets them); leaving it abandons its request.
+  const namesOn = namesAvailable(state);
+  useEffect(() => {
+    if (panel === "names" && namesOn) controller.requestNames();
+  }, [controller, panel, namesOn]);
+  useEffect(() => {
+    if (panel !== "names") return;
+    return () => controller.closeNames();
+  }, [controller, panel]);
 
   // The open panel for the hash listener (a hash for the open panel is dropped there).
   const panelRef = useRef<Panel>(panel);
@@ -387,6 +401,8 @@ export default function App({ adapter, controller }: Props) {
                     },
                   ]
                 : []),
+              // Only with the Core feature `names`; no count (docs/14 Decision 8).
+              ...(namesOn ? [{ id: "names", label: NAMES_TITLE, onSelect: () => setPanel("names") }] : []),
               { id: "version", label: "Güncelleme ve sürüm", onSelect: () => setPanel("version") },
             ]}
           />
@@ -424,7 +440,7 @@ export default function App({ adapter, controller }: Props) {
             {resolvedText(state.lastResolved.approved, state.lastResolved.by)}
           </p>
         )}
-        {confirm && <ConfirmCard key={confirm.requestId} confirm={confirm} onAnswer={(a) => controller.respondConfirm(a)} />}
+        {confirm && <ConfirmCard key={confirm.requestId} confirm={confirm} onAnswer={(a, r) => controller.respondConfirm(a, r)} />}
 
         <Composer
           phase={phase}
@@ -505,6 +521,16 @@ export default function App({ adapter, controller }: Props) {
           connected={connected}
           onRefresh={() => controller.requestPcPermissions()}
           onSwitch={(rowId, enabled) => controller.setPcPermission(rowId, enabled)}
+          onClose={closePanel}
+        />
+      )}
+      {/* Hidden without the Core feature `names` (e.g. after reconnecting to an older Core). */}
+      {panel === "names" && hasFeature(state, "names") && (
+        <NamesPanel
+          names={state.names}
+          connected={connected}
+          onRefresh={() => controller.requestNames()}
+          onDelete={(nameId) => controller.deleteName(nameId)}
           onClose={closePanel}
         />
       )}
