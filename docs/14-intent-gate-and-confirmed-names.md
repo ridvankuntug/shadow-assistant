@@ -735,10 +735,10 @@ T4.3b → T4.4b → T4.7 (session part); `direct.ts`, `permissions.ts` and
 `router-tier0.test.ts` serialize T4.3b → T4.4b. T4.4c starts once the T4.4b
 protocol shape is fixed and shares no file with the Core tasks.
 
-- [~] **T4.2 — System prompt.** Durum: başlandı
-  - [ ] Replace the "Araçlar" section of `core/prompts/system.md` with the
+- [x] **T4.2 — System prompt.** Durum: bitti
+  - [x] Replace the "Araçlar" section of `core/prompts/system.md` with the
     Decision 9 draft.
-  - [ ] Leave `tier1.md` unchanged; check no test pins the old wording.
+  - [x] Leave `tier1.md` unchanged; check no test pins the old wording.
 - [~] **T4.3a — Pure write gate.** Durum: başlandı
   - [ ] `isQuestionTurn(rawText)`: word list, particle rule, polite-request
     exclusion, trailing `?` rule.
