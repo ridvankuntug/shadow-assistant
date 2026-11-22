@@ -199,6 +199,37 @@ test("summary is Turkish, bounded and names the tool", () => {
   assert.ok(s.length <= 300);
 });
 
+test("summary: the write gate's reason is appended in Turkish and never clipped away (docs/14 Decision 5)", () => {
+  const id = identifyTool(`${HA}intent__HassTurnOff`, ["home-assistant"]);
+  const plain = summarizeToolCall(id, { name: "Bahçe Pompası" });
+  assert.equal(summarizeToolCall(id, { name: "Bahçe Pompası" }, "unknown_target"), `${plain} Bu cihazın adını söylemedin.`);
+  assert.equal(summarizeToolCall(id, { name: "Bahçe Pompası" }, "question_turn"), `${plain} Soru sordun; yine de yapılsın mı?`);
+  const long = summarizeToolCall(id, { name: "x".repeat(500), area: "y".repeat(500) }, "question_turn");
+  assert.ok(long.length <= 300, String(long.length));
+  assert.ok(long.endsWith("Soru sordun; yine de yapılsın mı?"));
+});
+
+test("targetChecked: only services with target_check: true", () => {
+  const p = new PermissionPolicy(
+    parseServices(
+      [
+        "services:",
+        "  - name: home-assistant",
+        "    kind: mcp",
+        "    url: http://localhost:1/sse",
+        "    target_check: true",
+        "  - name: shadow-memory",
+        "    kind: memory",
+      ].join("\n"),
+      {},
+    ).services,
+  );
+  assert.equal(p.targetChecked(p.levelFor(`${HA}intent__HassTurnOff`).identity), true);
+  assert.equal(p.targetChecked(p.levelFor("mcp__shadow-memory__memory_forget").identity), false);
+  assert.equal(p.targetChecked(p.levelFor("mcp__unknown__x").identity), false);
+  assert.equal(p.targetChecked(p.levelFor("Bash").identity), false);
+});
+
 test("ConfirmBroker: an answer after expiresAt counts as timeout", async () => {
   let now = 1_000;
   const seen: ConfirmResolution[] = [];

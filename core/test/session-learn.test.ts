@@ -344,6 +344,27 @@ test("a confirm-level call is never learned", async () => {
   assert.equal(h.observed.length, 0);
 });
 
+test("write gate on (target_check): a named target is still observed; a gate-confirmed call never is (docs/14)", async () => {
+  const gated = () => harness({ services: servicesYaml(["    target_check: true"]) });
+  // The user named the device: no card, observed as before.
+  const named = gated();
+  named.agent.queue.push({ uses: [setLevel("Salon Lamba", 40)] });
+  await named.say("salon lamba parlaklığı yüzde 40 olsun");
+  await until(() => named.observed.length === 1);
+  assert.equal(named.frames.filter((f) => f.type === "confirm_request").length, 0);
+
+  // The model picked the device: raised to a card; approved and successful, yet not an observation.
+  const h = gated();
+  h.agent.queue.push({ uses: [setLevel("Salon Lamba", 40)] });
+  const turn = h.say("parlaklık yüzde 40 olsun");
+  const req = (await h.waitFor((f) => f.type === "confirm_request")) as Extract<ServerFrame, { type: "confirm_request" }>;
+  await h.session.handle({ type: "confirm_response", requestId: req.requestId, approved: true });
+  await turn;
+  await drain(h);
+  assert.equal(h.observed.length, 0);
+  assert.equal(h.ha.reads, 1, "the gate's own read only; the learner made none");
+});
+
 test("two action calls, an isError result, a denied call: no observation", async () => {
   const two = harness();
   two.agent.queue.push({ uses: [setLevel("Salon Lamba", 40), setLevel("Mutfak Lamba", 40)] });

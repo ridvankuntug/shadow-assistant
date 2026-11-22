@@ -746,18 +746,18 @@ protocol shape is fixed and shares no file with the Core tasks.
     broad-call rule over the 3-utterance window; per-word stem forms (local to
     the gate).
   - [x] Table tests for every example in Decisions 3 and 4.
-- [ ] **T4.3b — Gate in the session.** Durum: başlamadı
-  - [ ] `services.yaml` `target_check: true` on the HA service; schema in
+- [x] **T4.3b — Gate in the session.** Durum: bitti
+  - [x] `services.yaml` `target_check: true` on the HA service; schema in
     `services.ts`.
-  - [ ] `ActiveTurn.question` set at turn start; session window of the last 3
+  - [x] `ActiveTurn.question` set at turn start; session window of the last 3
     user utterances (folded text + unresolved spoken name), no time limit.
-  - [ ] `authorize`: question lock raises to confirm (tier 0 included, no
+  - [x] `authorize`: question lock raises to confirm (tier 0 included, no
     remember), provenance raise to confirm, lazy turn-cached `GetLiveContext`
     read for rule 4; log reason `+gate:question_turn` / `+gate:unknown_target`.
-  - [ ] `GatedCall` third argument `{ provenance }`; tier 0 passes `"user"`.
-  - [ ] Summary reason suffixes in `summarizeToolCall` (unknown target, question).
-  - [ ] `observeCall`: gate-confirmed calls are not learning observations.
-  - [ ] docs/04: one paragraph on the write gate.
+  - [x] `GatedCall` third argument `{ provenance }`; tier 0 passes `"user"`.
+  - [x] Summary reason suffixes in `summarizeToolCall` (unknown target, question).
+  - [x] `observeCall`: gate-confirmed calls are not learning observations.
+  - [x] docs/04: one paragraph on the write gate.
 - [x] **T4.4a — Confirmed-name store.** Durum: bitti
   - [x] Load/quarantine/atomic write, serial chain, cap 200 (refuse + log).
   - [x] `lookup(keys)`, `verify(snapshot)`, `sweep(snapshot)` (`missingSince`

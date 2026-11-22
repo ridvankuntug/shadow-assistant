@@ -20,10 +20,10 @@ import {
 } from "./dev-notes.js";
 import type { DeviceRegistry } from "./device-registry.js";
 import type { PcPermissionStore } from "./pc/permissions.js";
-import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall } from "./direct.js";
+import { runDirectPlan, type DenyReason, type DirectOutcome, type GatedCall, type TargetProvenanceHint } from "./direct.js";
 import { checkTurn, extractPattern, type LearnPolicy, type ObservedCall } from "./learn/extract.js";
 import type { LearnedRuleRecord, LearnedRuleStore } from "./learn/store.js";
-import { parseLiveContext } from "./live-context.js";
+import { parseLiveContext, type LiveEntity } from "./live-context.js";
 import type { DirectToolClient } from "./mcp-direct.js";
 import type { DeviceMaintenance } from "./memory/lifecycle.js";
 import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
@@ -44,7 +44,9 @@ import {
   summarizeToolCall,
   type ConfirmRequest,
   type ConfirmResolution,
+  type GateRaise,
   type PermissionPolicy,
+  type ToolIdentity,
 } from "./permissions.js";
 import {
   inQuietHours,
@@ -75,6 +77,7 @@ import { EMPTY_LEXICON, type Lexicon } from "./pronunciation.js";
 import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type TtsClient } from "./speech.js";
 import { SpeechStream } from "./speech-stream.js";
 import { buildTurnEnvelope, ESCALATION_CONTINUE, wrapDirectNotes } from "./turn-envelope.js";
+import { isQuestionTurn, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -88,6 +91,42 @@ interface DirectNote {
   seq: number;
   text: string;
 }
+
+/**
+ * One user utterance in the write gate's window (docs/14 Decision 4): the
+ * last PROVENANCE_WINDOW of the session, no time limit. Every turn's own text
+ * counts, tier-0 turns included (their `<bilgi>` records are the user's
+ * words); assistant text never does.
+ */
+interface UserUtterance {
+  /** Raw turn text (not folded: the gate's stemming needs Turkish letters). */
+  text: string;
+  /**
+   * The tier-0 `<ad>` slot that resolved to no entity or to several
+   * (`name_not_found` / `name_ambiguous`). Kept for the "Evet, hep bu" offer
+   * (T4.4b, Decision 7); not read yet.
+   */
+  unresolvedName?: string;
+}
+
+/**
+ * `p`, or undefined as soon as `signal` aborts (the shared promise keeps
+ * running for other waiters; a cancelled call is denied by the caller).
+ */
+function untilAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  if (signal.aborted) return Promise.resolve(undefined);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([p, aborted]).finally(() => {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  });
+}
+
+/** Tier-0 fallbacks whose `<ad>` slot is kept as the utterance's unresolved spoken name. */
+const UNRESOLVED_NAME_FALLBACKS: ReadonlySet<string> = new Set(["name_not_found", "name_ambiguous"]);
 
 /** Gated calls kept per model turn for learning; a turn with more is never learned from (one action is the limit anyway). */
 export const MAX_OBSERVED_CALLS = 8;
@@ -254,6 +293,16 @@ interface ActiveTurn {
   toolNames: Set<string>;
   /** Tool use ids the gate allowed: only their `isError` results are `tool_error` notes (a denial is not an error). */
   allowedUseIds: Set<string>;
+  /**
+   * The turn's raw text is a question (`isQuestionTurn`, docs/14 Decision 3),
+   * set at turn start: every target-checked write or confirm call of the turn
+   * asks first. Holds across tier-0 fallback and tier escalation.
+   */
+  question: boolean;
+  /** This turn's entry in the session's utterance window. */
+  utterance: UserUtterance;
+  /** The write gate's own live-context read (rule 4), at most once per service and turn; `undefined` = not usable. */
+  gateSnapshots?: Map<string, Promise<readonly LiveEntity[] | undefined>>;
 }
 
 /** Latest `speech_prefs` of the client; absent = no `speech_chunk` frames. */
@@ -266,6 +315,10 @@ interface SpeechPrefs {
 type GateDeny = DenyReason | "tier_service";
 /** The level the gate applied (`deny`: built-in tool). */
 type GateLevel = PermissionLevel | "deny";
+/** `authorize` result; `gate`: the write gate raised the call to `confirm` (never learned from). */
+type AuthorizeResult =
+  | { allowed: true; level: GateLevel; gate?: GateRaise }
+  | { allowed: false; reason: DenyReason; level: GateLevel; gate?: GateRaise };
 
 export class Session {
   private turn: ActiveTurn | null = null;
@@ -282,6 +335,8 @@ export class Session {
   private closed = false;
   /** Tier-0 exchanges not yet shown to the model. */
   private readonly directNotes: DirectNote[] = [];
+  /** The last PROVENANCE_WINDOW user utterances of this session, oldest first (the write gate's window). */
+  private readonly utterances: UserUtterance[] = [];
   /** Sequence number of the next tier-0 note (keeps refused batches in creation order). */
   private noteSeq = 0;
   private speechPrefs: SpeechPrefs | undefined;
@@ -645,6 +700,8 @@ export class Session {
       const answer = parseVoiceAnswer(text);
       if (answer !== null) {
         void this.slog.append({ kind: "user", id, text, source: "voice" });
+        // A spoken yes/no is a user utterance too: it moves the write gate's window (fail-safe: fewer old names count).
+        this.pushUtterance({ text });
         // If the target was meanwhile resolved (button/timeout), the answer is dropped.
         if (this.broker.isPending(target)) this.broker.resolve(target, answer, "voice");
         return;
@@ -691,6 +748,8 @@ export class Session {
   }
 
   private async runTurn(id: string, text: string, source: "text" | "voice"): Promise<void> {
+    const utterance: UserUtterance = { text };
+    this.pushUtterance(utterance);
     const turn: ActiveTurn = {
       id,
       abort: new AbortController(),
@@ -699,6 +758,9 @@ export class Session {
       toolCalls: 0,
       toolNames: new Set(),
       allowedUseIds: new Set(),
+      // The raw text, before the router's prepareText drops the punctuation ("?").
+      question: isQuestionTurn(text),
+      utterance,
     };
     this.turn = turn;
     // Any tier, for the whole turn (tier-0 confirmations included): no compaction starts meanwhile.
@@ -741,6 +803,12 @@ export class Session {
       endActivity?.();
       this.deps.maintenance?.turnEnded(this.info.device);
     }
+  }
+
+  /** Adds one user utterance to the write gate's window (the last PROVENANCE_WINDOW are kept). */
+  private pushUtterance(u: UserUtterance): void {
+    this.utterances.push(u);
+    if (this.utterances.length > PROVENANCE_WINDOW) this.utterances.splice(0, this.utterances.length - PROVENANCE_WINDOW);
   }
 
   /** Waits while maintenance holds the device (docs/06 §Trigger); a cancel stops the wait. */
@@ -859,9 +927,10 @@ export class Session {
       // Service disabled (e.g. token missing): the model path decides what to tell the user.
       outcome = { kind: "fallback", reason: "service_disabled" };
     } else {
-      const call: GatedCall = async (tool, args) => {
+      const call: GatedCall = async (tool, args, opts) => {
         const full = `mcp__${plan.service}__${tool}`;
-        const auth = await this.authorize(turn, full, args, turn.abort.signal, tool === plan.tool ? plan.permission : undefined);
+        const minLevel = tool === plan.tool ? plan.permission : undefined;
+        const auth = await this.authorize(turn, full, args, turn.abort.signal, minLevel, opts?.provenance);
         if (!auth.allowed) return { status: "denied", reason: auth.reason };
         tools.push(tool);
         try {
@@ -901,6 +970,7 @@ export class Session {
     });
 
     if (outcome.kind === "fallback") {
+      if (UNRESOLVED_NAME_FALLBACKS.has(outcome.reason) && plan.name !== undefined) turn.utterance.unresolvedName = plan.name;
       // The spoken name matched no entity (static or learned rule): a missing HA alias, most likely (T7.w.10i).
       if (outcome.reason === "name_not_found" && plan.name !== undefined) this.note({ kind: "unknown_name", name: plan.name, turnId: id });
       void this.slog.append({ kind: "route", id, tier: 0, rule: plan.rule, fallback: outcome.reason });
@@ -1001,11 +1071,23 @@ export class Session {
 
   // ------------------------------------------------------------ pattern learning (T7.w.2)
 
-  /** Keeps one gated call of an observed model turn. */
-  private observeCall(turn: ActiveTurn, toolName: string, input: Record<string, unknown>, toolUseId: string, allowed: boolean, level: ObservedCall["level"]): void {
+  /**
+   * Keeps one gated call of an observed model turn. A call the write gate
+   * raised (`gate`) drops the whole turn: its target was not the user's until
+   * the user said yes, so it is never a learning observation (docs/14).
+   */
+  private observeCall(
+    turn: ActiveTurn,
+    toolName: string,
+    input: Record<string, unknown>,
+    toolUseId: string,
+    allowed: boolean,
+    level: ObservedCall["level"],
+    gate?: GateRaise,
+  ): void {
     const obs = turn.observed;
     if (!obs || obs.overflow) return;
-    if (obs.calls.length >= MAX_OBSERVED_CALLS) {
+    if (gate !== undefined || obs.calls.length >= MAX_OBSERVED_CALLS) {
       obs.overflow = true;
       obs.calls.length = 0;
       obs.byUseId.clear();
@@ -1580,7 +1662,7 @@ export class Session {
       const r = services && !this.inTierServices(toolName, services)
         ? this.denyOutsideTier(turn, toolName, input)
         : await this.authorize(turn, toolName, input, opts.signal);
-      this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level);
+      this.observeCall(turn, toolName, input, opts.toolUseID, r.allowed, r.level, "gate" in r ? r.gate : undefined);
       if (r.allowed) turn.allowedUseIds.add(opts.toolUseID);
       return r.allowed
         ? { behavior: "allow", updatedInput: input, toolUseID: opts.toolUseID }
@@ -1615,7 +1697,9 @@ export class Session {
   /**
    * The permission gate, shared by model tool calls (via `gate`) and tier-0
    * direct calls. `minLevel` (router.yaml rule `permission`) can only raise
-   * the services.yaml level, never lower it.
+   * the services.yaml level, never lower it; nor can the write gate
+   * (`writeGate`, docs/14), which runs last. `provenance`: tier 0's hint
+   * that the target came from the user's words.
    */
   private async authorize(
     turn: ActiveTurn,
@@ -1623,7 +1707,8 @@ export class Session {
     input: Record<string, unknown>,
     signal: AbortSignal,
     minLevel?: PermissionLevel,
-  ): Promise<{ allowed: true; level: GateLevel } | { allowed: false; reason: DenyReason; level: GateLevel }> {
+    provenance?: TargetProvenanceHint,
+  ): Promise<AuthorizeResult> {
     const decision = this.deps.policy.levelFor(toolName, input);
     const { identity } = decision;
     let level = decision.level;
@@ -1632,11 +1717,20 @@ export class Session {
       level = minLevel;
       reason = `${reason}+route:${minLevel}`;
     }
+    // Not consulted when the call is denied anyway (cancelled, read-only): no live-context read for nothing.
+    const gate =
+      (level === "write" || level === "confirm") && !turn.abort.signal.aborted && !signal.aborted && !this.deps.policy.options.readOnly
+        ? await this.writeGate(turn, identity, input, level, provenance, signal)
+        : undefined;
+    if (gate) {
+      level = "confirm";
+      reason = `${reason}+gate:${gate}`;
+    }
     const tool = identity.tool;
     const id = turn.id;
     void this.slog.append({ kind: "tool_call", id, tool: identity.full, level, reason, input });
 
-    const deny = (why: DenyReason, by?: string, requestId?: string): { allowed: false; reason: DenyReason; level: GateLevel } => {
+    const deny = (why: DenyReason, by?: string, requestId?: string): AuthorizeResult => {
       this.emit({ type: "tool", id, name: tool, status: "denied" });
       void this.slog.append({
         kind: "permission",
@@ -1648,9 +1742,9 @@ export class Session {
         ...(requestId ? { requestId } : {}),
       });
       this.deps.logger.info(`[shadow-core] denied ${identity.full} (${reason}${by ? `, by ${by}` : ""})`);
-      return { allowed: false, reason: why, level };
+      return { allowed: false, reason: why, level, ...(gate ? { gate } : {}) };
     };
-    const allow = (by?: string, requestId?: string): { allowed: true; level: GateLevel } => {
+    const allow = (by?: string, requestId?: string): AuthorizeResult => {
       this.emit({ type: "tool", id, name: tool, status: "started" });
       void this.slog.append({
         kind: "permission",
@@ -1666,10 +1760,11 @@ export class Session {
           `[shadow-core] ${level} tool ${identity.full} allowed for device ${this.info.device}${by ? ` (by ${by})` : ""}`,
         );
       }
-      return { allowed: true, level };
+      return { allowed: true, level, ...(gate ? { gate } : {}) };
     };
 
-    if (turn.abort.signal.aborted) return deny("cancelled");
+    // `signal`: this call's own abort (the model's tool call), which may fire while the gate read the live context.
+    if (turn.abort.signal.aborted || signal.aborted) return deny("cancelled");
     if (level === "deny") {
       // Tool name only (the SDK's own guard denies most built-ins before they get here).
       this.note({ kind: "missing_capability", reason: "builtin", tool, turnId: id });
@@ -1679,7 +1774,7 @@ export class Session {
     if (level === "read" || level === "write") return allow();
 
     // confirm
-    const { request, result } = this.broker.open(id, tool, summarizeToolCall(identity, input));
+    const { request, result } = this.broker.open(id, tool, summarizeToolCall(identity, input, gate));
     const onAbort = () => this.broker.resolve(request.requestId, false, "cancel");
     signal.addEventListener("abort", onAbort, { once: true });
     this.emit({ type: "state", state: "awaiting_confirm" });
@@ -1695,6 +1790,69 @@ export class Session {
     signal.removeEventListener("abort", onAbort);
     if (res.approved) return allow(res.by, request.requestId);
     return deny(res.by === "timeout" ? "timeout" : "declined", res.by, request.requestId);
+  }
+
+  /**
+   * The write gate (docs/14 Decisions 2-4) for one `write` / `confirm` call of
+   * a `target_check` service: why it must ask, or undefined. Only ever raises.
+   *
+   *   question turn             -> `question_turn` (tier 0 included, whatever its hint)
+   *   `confirm` call            -> asks anyway (provenance decides the T4.4b offer only)
+   *   tier-0 provenance hint    -> nothing (no text match, no HA read: clear commands stay fast)
+   *   target not the user's     -> `unknown_target`; a rule-4 miss without a
+   *                                snapshot reads the live context once per turn
+   *                                (a failed read leaves the target unknown)
+   */
+  private async writeGate(
+    turn: ActiveTurn,
+    identity: ToolIdentity,
+    input: Record<string, unknown>,
+    level: "write" | "confirm",
+    provenance: TargetProvenanceHint | undefined,
+    signal: AbortSignal,
+  ): Promise<GateRaise | undefined> {
+    if (!this.deps.policy.targetChecked(identity)) return undefined;
+    if (turn.question) return "question_turn";
+    if (level === "confirm" || provenance !== undefined) return undefined;
+    const window = this.utterances.map((u) => u.text);
+    // Device words per domain (router.yaml `learning.keywords`): broad calls and area + keyword matches.
+    const opts = { domainWords: this.deps.learning?.policy.config.learning.keywords };
+    let p = targetProvenance(input, window, undefined, undefined, opts);
+    if (p.status === "unknown" && p.needsSnapshot && identity.service !== undefined) {
+      const snapshot = await untilAborted(this.gateSnapshot(turn, identity.service), signal);
+      if (snapshot) p = targetProvenance(input, window, snapshot, undefined, opts);
+    }
+    return p.status === "unknown" ? "unknown_target" : undefined;
+  }
+
+  /** The write gate's live context for `service`, read at most once per turn (cached, failures included). */
+  private gateSnapshot(turn: ActiveTurn, service: string): Promise<readonly LiveEntity[] | undefined> {
+    turn.gateSnapshots ??= new Map();
+    let p = turn.gateSnapshots.get(service);
+    if (!p) {
+      p = this.readGateSnapshot(turn, service);
+      turn.gateSnapshots.set(service, p);
+    }
+    return p;
+  }
+
+  private async readGateSnapshot(turn: ActiveTurn, service: string): Promise<readonly LiveEntity[] | undefined> {
+    const client = this.deps.direct;
+    const policy = this.deps.policy;
+    // Same ceiling as the learner's read: only through the direct client and only while the live context is a `read` tool.
+    if (!client || !policy.serviceNames.includes(service)) return undefined;
+    if (policy.levelFor(`mcp__${service}__${LIVE_CONTEXT_TOOL}`).level !== "read") return undefined;
+    try {
+      const ctx = await client.callTool(service, LIVE_CONTEXT_TOOL, {}, turn.abort.signal);
+      if (ctx.isError) throw new Error("tool error");
+      const entities = parseLiveContext(ctx.text);
+      // A valid snapshot has at least one entity (docs/14 Decision 6).
+      if (entities.length === 0) throw new Error("empty");
+      return entities;
+    } catch {
+      if (!turn.abort.signal.aborted) this.deps.logger.info(`[shadow-core] write gate: live context of ${service} not usable; target stays unknown`);
+      return undefined;
+    }
   }
 
   private onConfirmResolved(req: ConfirmRequest, res: ConfirmResolution): void {

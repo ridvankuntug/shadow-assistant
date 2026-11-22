@@ -167,3 +167,20 @@ test("memory health: ok when the folder is (or can be made) writable; not config
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("target_check: parsed as a boolean, absent = off; the repo file sets it on Home Assistant only", () => {
+  const yaml = (v: string) => ["services:", "  - name: ha", "    kind: mcp", "    url: http://x", ...(v ? [`    target_check: ${v}`] : [])].join("\n");
+  assert.equal(parseServices(yaml("true"), {}).services[0]?.targetCheck, true);
+  assert.equal(parseServices(yaml("false"), {}).services[0]?.targetCheck, undefined);
+  assert.equal(parseServices(yaml(""), {}).services[0]?.targetCheck, undefined);
+  assert.deepEqual(parseServices(yaml("true"), {}).warnings, []);
+  assert.throws(
+    () => parseServices(yaml('"yes"'), {}),
+    (err: unknown) => err instanceof ServicesConfigError && err.problems.some((p) => p.includes("target_check must be true/false")),
+  );
+  const cfg = loadServicesFile(REPO_SERVICES, { HA_URL: "http://homeassistant.local:8123", HA_CORE_TOKEN: "t" });
+  assert.deepEqual(
+    cfg.services.filter((s) => s.targetCheck).map((s) => s.name),
+    ["home-assistant"],
+  );
+});

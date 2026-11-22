@@ -46,6 +46,12 @@ export interface ServiceDef {
    * `{ domain: ["lock"], device_class: ["garage"] }`. Never lowers a level.
    */
   confirmInputs: Record<string, string[]>;
+  /**
+   * services.yaml `target_check` (docs/14 Decision 2): `write` / `confirm`
+   * calls of this service pass the write gate (question lock, target
+   * provenance), which can only raise them to `confirm`. Absent = false.
+   */
+  targetCheck?: boolean;
   /** vault only: allowlist of relative note globs. */
   allow?: string[];
   /** vault only: max bytes returned per note. */
@@ -104,6 +110,7 @@ const KNOWN_KEYS = new Set([
   "allow",
   "max_bytes",
   "confirm_inputs",
+  "target_check",
 ]);
 
 export function parseServices(text: string, env: NodeJS.ProcessEnv = process.env): ServicesConfig {
@@ -195,6 +202,10 @@ export function parseServices(text: string, env: NodeJS.ProcessEnv = process.env
       }
     }
 
+    if (raw.target_check !== undefined && typeof raw.target_check !== "boolean") {
+      problems.push(`${at}: target_check must be true/false`);
+    }
+
     const def: ServiceDef = {
       name,
       kind,
@@ -204,6 +215,7 @@ export function parseServices(text: string, env: NodeJS.ProcessEnv = process.env
         : "confirm") as PermissionLevel,
       tools,
       confirmInputs,
+      ...(raw.target_check === true ? { targetCheck: true } : {}),
     };
 
     const missing: string[] = [];

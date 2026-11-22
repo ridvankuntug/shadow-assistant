@@ -210,6 +210,25 @@ These go to a model on purpose:
 
    The client sees the usual `tool` (started/done/denied/error) and
    `confirm_request` frames.
+
+   **Write gate** ([14](14-intent-gate-and-confirmed-names.md)). For a
+   service with `target_check: true` in services.yaml (Home Assistant), every
+   `write` or `confirm` call, from tier 0 or from a model, also passes the
+   write gate in `Session.authorize`. It can only raise a call to `confirm`,
+   never lower or deny one, and runs after every other rule above. A turn whose
+   raw text is a question (`isQuestionTurn`: "hangi", "açık mı", a trailing
+   `?`, but not polite requests like "kapatır mısın") raises every such call,
+   tier 0 included: a tier-0 rule that matches a question opens the same
+   confirm card instead of falling back. Otherwise a model call's target
+   (`name`, `area`, `floor`) must come from the user's last three utterances
+   of the session (word match with suffix stripping, or an HA alias of the
+   same entity, checked against one live-context read per turn); an unknown
+   target asks. Tier-0 calls carry the hint that their target came from the
+   spoken name, so clear commands get no text check, no extra HA read and no
+   card. The card text says why it asks ("Soru sordun; yine de yapılsın mı?",
+   "Bu cihazın adını söylemedin."); the `tool_call` log reason ends in
+   `+gate:question_turn` or `+gate:unknown_target`, and such a call is never
+   a learning observation.
 6. **Answer.** The reply template is filled in and sent as one
    `assistant_delta` plus `assistant_done`. The turn is written to the
    conversation log (`route`, `tool_call`, `permission`, `tool_result`,

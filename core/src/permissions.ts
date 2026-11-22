@@ -120,6 +120,12 @@ export class PermissionPolicy {
     return { classified: svc !== undefined && findRule(svc, tool) !== undefined, level };
   }
 
+  /** Whether the tool's service has services.yaml `target_check: true` (the write gate, docs/14). */
+  targetChecked(identity: ToolIdentity): boolean {
+    const svc = identity.service ? this.byName.get(identity.service) : undefined;
+    return svc?.targetCheck === true;
+  }
+
   /** The exact (non-glob) tool names the service's rules mention. */
   exactToolRules(service: string): string[] {
     return (this.byName.get(service)?.tools ?? []).filter((r) => !isGlob(r.pattern)).map((r) => r.pattern);
@@ -282,8 +288,23 @@ function clip(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
-/** Human-readable Turkish description of a tool call for the confirm dialog. */
-export function summarizeToolCall(identity: ToolIdentity, input: Record<string, unknown>): string {
+/** Why the write gate (docs/14) raised a call to `confirm`; `question_turn` wins over `unknown_target`. */
+export type GateRaise = "question_turn" | "unknown_target";
+
+/** Card text the write gate appends to the summary (docs/14 Decision 5). */
+export const GATE_SUMMARY_SUFFIX: Record<GateRaise, string> = {
+  question_turn: "Soru sordun; yine de yapılsın mı?",
+  unknown_target: "Bu cihazın adını söylemedin.",
+};
+
+const MAX_SUMMARY_CHARS = 300;
+
+/**
+ * Human-readable Turkish description of a tool call for the confirm dialog.
+ * `gate`: the write gate raised the call; its reason is appended and never
+ * clipped away (the call description is shortened instead).
+ */
+export function summarizeToolCall(identity: ToolIdentity, input: Record<string, unknown>, gate?: GateRaise): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(input)) {
     if (v === undefined || v === null || v === "") continue;
@@ -293,5 +314,8 @@ export function summarizeToolCall(identity: ToolIdentity, input: Record<string, 
   }
   const where = identity.service ? `${identity.service} / ` : "";
   const args = parts.length > 0 ? ` (${parts.join("; ")})` : "";
-  return clip(`${where}${identity.tool} çalıştırılsın mı?${args}`, 300);
+  const base = `${where}${identity.tool} çalıştırılsın mı?${args}`;
+  if (!gate) return clip(base, MAX_SUMMARY_CHARS);
+  const suffix = ` ${GATE_SUMMARY_SUFFIX[gate]}`;
+  return `${clip(base, MAX_SUMMARY_CHARS - suffix.length)}${suffix}`;
 }

@@ -473,6 +473,20 @@ describe("static turn-on / off rules: lights and outlet switches only", () => {
     });
   }
 
+  test("the write call carries provenance 'user' (docs/14 rule 1); the live-context read carries none", async () => {
+    const hints: Array<[string, unknown]> = [];
+    const call: GatedCall = async (tool, _args, opts) => {
+      hints.push([tool, opts?.provenance]);
+      return { status: "ok", result: { text: tool === "homeassistant__GetLiveContext" ? HOME : "{}", isError: false } };
+    };
+    const outcome = await runDirectPlan(planOf("tavan ışığını kapat"), call, { fallbackOnError: true });
+    assert.equal(outcome.kind, "reply");
+    assert.deepEqual(hints, [
+      ["homeassistant__GetLiveContext", undefined],
+      ["intent__HassTurnOff", "user"],
+    ]);
+  });
+
   test("a refused target falls back even with direct.on_tool_error: reply", async () => {
     const { outcome, calls } = await run("kontaktörü aç", false);
     assert.deepEqual(outcome, { kind: "fallback", reason: "target_refused" });

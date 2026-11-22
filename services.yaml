@@ -13,6 +13,9 @@
 # Lookup order per tool: exact name, then the first matching glob (file
 # order), then the service `permission` default. `confirm_inputs` can only
 # raise a call to `confirm`. Tools of unknown services always need `confirm`.
+# `target_check: true` puts a service's write/confirm calls behind the write
+# gate (docs/14): in a question turn, or when the target was not named by the
+# user, the call is raised to `confirm`. It never lowers a level.
 # Tool names below are the MCP server's own names, without the SDK's
 # `mcp__<service>__` prefix.
 
@@ -27,6 +30,8 @@ services:
     enabled: true
     # Any HA tool not listed below needs confirmation (safe default).
     permission: confirm
+    # Write gate (docs/14): question turns and targets the user did not name ask first.
+    target_check: true
     tools:
       "homeassistant__GetLiveContext": read
       "llm__GetDateTime": read

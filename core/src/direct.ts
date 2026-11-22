@@ -43,8 +43,20 @@ export type GatedCallResult =
   | { status: "denied"; reason: DenyReason }
   | { status: "unavailable"; message: string };
 
+/**
+ * Where a call's target came from (docs/14 Decision 4): `user` = tier 0
+ * resolved it from the spoken `<ad>` slot; `mapping` = through a confirmed
+ * name (T4.4b). With a hint the write gate skips its target check (no text
+ * match, no live-context read); the question lock still applies.
+ */
+export type TargetProvenanceHint = "user" | "mapping";
+
+export interface GatedCallOptions {
+  provenance?: TargetProvenanceHint;
+}
+
 /** Gate + call + client frames/logs for one tool call; implemented by the session. */
-export type GatedCall = (tool: string, args: Record<string, unknown>) => Promise<GatedCallResult>;
+export type GatedCall = (tool: string, args: Record<string, unknown>, opts?: GatedCallOptions) => Promise<GatedCallResult>;
 
 export type DirectOutcome =
   /** Answer the user with `text` (success or a short Turkish error). */
@@ -105,7 +117,8 @@ export async function runDirectPlan(plan: DirectPlan, call: GatedCall, opts: Dir
   if (res.status === "refused") return { kind: "fallback", reason: "target_refused" };
   if (plan.tool === LIGHT_SET_TOOL && plan.brightness === undefined) return failOr("no_brightness", m.failed);
 
-  const act = await call(plan.tool, directCallArgs(plan, res));
+  // The target is the entity the user's spoken name resolved to (provenance rule 1).
+  const act = await call(plan.tool, directCallArgs(plan, res), { provenance: "user" });
   if (act.status === "denied") return denied(act.reason);
   if (act.status === "unavailable") return { kind: "reply", text: m.unavailable, status: "error" };
   if (act.result.isError) return failOr("tool_error", m.failed);

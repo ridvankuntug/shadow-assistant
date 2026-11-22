@@ -209,6 +209,21 @@ test("read tool is allowed; write allowed and recorded; builtin denied", async (
   assert.deepEqual(write?.input, { name: "lamba" });
 });
 
+test("write gate: a service without target_check is unchanged in a question turn (docs/14)", async () => {
+  const results: PermissionResult[] = [];
+  const h = harness(async (req) => {
+    results.push(await useTool(req, `${HA}intent__HassTurnOn`, { name: "Bahçe Pompası" }));
+    return { text: "tamam" };
+  });
+  await h.send({ type: "user_text", id: "t1", text: "hangi cihazlar açık?" });
+  assert.deepEqual(results.map((r) => r.behavior), ["allow"]);
+  assert.equal(h.of("confirm_request").length, 0);
+  await h.session.close("test");
+  const call = sessionLines(h).find((l) => l.kind === "tool_call");
+  assert.equal(call?.level, "write");
+  assert.doesNotMatch(String(call?.reason), /gate/);
+});
+
 test("read-only mode denies write and confirm without asking", async () => {
   const results: PermissionResult[] = [];
   const h = harness(
