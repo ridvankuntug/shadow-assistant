@@ -30,7 +30,7 @@ import type { DeviceMaintenance } from "./memory/lifecycle.js";
 import { renderMemoryBlock, selectRelevant, SentEntries } from "./memory/match.js";
 import { RepeatGuard } from "./repeat-guard.js";
 import type { MemorySnapshot, MemoryStore } from "./memory/store.js";
-import { isEntryId, MEMORY_BUDGETS, type MemoryEntry } from "./memory/types.js";
+import { isEntryId, LESSON_TOPIC, MEMORY_BUDGETS, type MemoryEntry } from "./memory/types.js";
 import {
   SessionBusyError,
   SessionClosedError,
@@ -747,9 +747,16 @@ export class Session {
         brief.push(e);
         briefChars += e.text.length;
       }
+      // Lessons (T5) are in the system prompt like the brief; the legacy runner gets them here.
+      let lessonChars = 0;
+      for (const e of withBrief ? fresh.filter((x) => x.location === LESSON_TOPIC) : []) {
+        if (lessonChars + e.text.length > MEMORY_BUDGETS.lessonsPromptMaxChars) break;
+        brief.push(e);
+        lessonChars += e.text.length;
+      }
       const notes = selectRelevant(
         text,
-        fresh.filter((e) => e.location !== "brief"),
+        fresh.filter((e) => e.location !== "brief" && e.location !== LESSON_TOPIC),
       );
       const picked: MemoryEntry[] = [...brief, ...notes];
       if (picked.length === 0) return none;

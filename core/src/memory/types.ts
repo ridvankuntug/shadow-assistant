@@ -3,16 +3,25 @@
  * task M1). Pure module: no I/O.
  */
 
-/** Entry kinds. `identity` lives in the brief while it has room, else in `kisiler`. */
-export type MemoryKind = "alias" | "preference" | "person" | "routine" | "fact" | "identity";
-export const MEMORY_KINDS: readonly MemoryKind[] = ["alias", "preference", "person", "routine", "fact", "identity"];
+/**
+ * Entry kinds. `identity` lives in the brief while it has room, else in `kisiler`.
+ * `lesson` (T5): a behaviour lesson that only makes the assistant more careful
+ * ("X'i kapatmadan önce onay iste"); its texts pass the stricter lesson filter
+ * (filters.ts) and are loaded into the system prompt under a heading that says
+ * they grant nothing. The permission gate never reads memory.
+ */
+export type MemoryKind = "alias" | "preference" | "person" | "routine" | "fact" | "identity" | "lesson";
+export const MEMORY_KINDS: readonly MemoryKind[] = ["alias", "preference", "person", "routine", "fact", "identity", "lesson"];
 
 /**
- * The five fixed topic notes. This list is a whitelist: file names are only
+ * The fixed topic notes. This list is a whitelist: file names are only
  * ever built from it (`notes/<topic>.md`), never from caller input.
  */
-export type Topic = "ev" | "tercihler" | "kisiler" | "rutinler" | "genel";
-export const TOPICS: readonly Topic[] = ["ev", "tercihler", "kisiler", "rutinler", "genel"];
+export type Topic = "ev" | "tercihler" | "kisiler" | "rutinler" | "genel" | "dersler";
+export const TOPICS: readonly Topic[] = ["ev", "tercihler", "kisiler", "rutinler", "genel", "dersler"];
+
+/** The topic of `lesson` entries: in the system prompt, not in the per-turn `<hafiza>` match. */
+export const LESSON_TOPIC = "dersler" satisfies Topic;
 
 /** Where an entry is stored: the always-loaded brief or one topic note. */
 export type MemoryLocation = "brief" | Topic;
@@ -23,6 +32,7 @@ export const TOPIC_OF_KIND: Readonly<Record<Exclude<MemoryKind, "identity">, Top
   person: "kisiler",
   routine: "rutinler",
   fact: "genel",
+  lesson: "dersler",
 };
 
 /** Kind of an entry found in a topic file without index metadata. */
@@ -32,6 +42,7 @@ export const KIND_OF_TOPIC: Readonly<Record<Topic, MemoryKind>> = {
   kisiler: "person",
   rutinler: "routine",
   genel: "fact",
+  dersler: "lesson",
 };
 
 /** Heading written into a new file. */
@@ -42,6 +53,7 @@ export const TOPIC_TITLES: Readonly<Record<MemoryLocation, string>> = {
   kisiler: "Kişiler",
   rutinler: "Rutinler",
   genel: "Genel",
+  dersler: "Dersler",
 };
 
 export function isTopic(value: unknown): value is Topic {
@@ -72,6 +84,8 @@ export const MEMORY_BUDGETS = {
   /** Per-turn `<hafiza>` block. */
   turnMaxChars: 1200,
   turnMaxEntries: 8,
+  /** Lessons in the system prompt: summed entry text length (whole entries, file order). */
+  lessonsPromptMaxChars: 800,
   /** One entry text. */
   textMaxChars: 160,
   keywordsMax: 6,
@@ -79,7 +93,8 @@ export const MEMORY_BUDGETS = {
   tombstonesMax: 500,
 } as const;
 
-export type EntrySourceBy = "extract" | "manual" | "migrated";
+/** `tool`: written by the model's `memory_note` tool ("not al", T5.2). */
+export type EntrySourceBy = "extract" | "manual" | "migrated" | "tool";
 
 export interface EntrySource {
   by: EntrySourceBy;

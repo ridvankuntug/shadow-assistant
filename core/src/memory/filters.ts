@@ -18,6 +18,11 @@
  * | permission      | keep           | reject |
  * | transient       | keep           | reject |
  * | tombstone       | –              | reject |
+ * | lesson          | keep           | reject (kind `lesson` only) |
+ *
+ * A `lesson` entry (T5) replaces the `permission` row with a stricter rule
+ * (`lessonRejectReason`): it must tighten (a prohibition or "ask first") and
+ * must not loosen anything; doubtful wording is rejected.
  *
  * Every filter first normalizes the text (`normalizeText`: invisible format
  * characters such as ZWSP/ZWJ/soft hyphen/BOM removed, then NFKC), so "ş"
@@ -30,6 +35,7 @@
  * which holds filter names and numbers only, never text.
  */
 import { fold } from "../turkish.js";
+import type { MemoryKind } from "./types.js";
 
 /**
  * vault.ts `VAULT_SERVER_NAME`, copied so this pure module does not load the
@@ -44,7 +50,8 @@ export type FilterName =
   | "private_path"
   | "permission"
   | "transient"
-  | "tombstone";
+  | "tombstone"
+  | "lesson";
 
 /** Replacement for a redacted value. */
 export const REDACTED = "[gizli]";
@@ -667,6 +674,268 @@ function isTransient(form: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Lessons (kind `lesson`, output only; T5)
+
+/**
+ * A lesson is accepted only in a narrow shape (lessonRejectReason): one clause
+ * of Latin-script words, ending in a prohibition or "ask first" (Turkish is
+ * verb-final, so the last word governs the clause), or starting with
+ * "Never / Do not / Ask the user before" (English). On top of that, any word
+ * of the lists below rejects it.
+ *
+ * Wording that loosens, widens or carves an exception (match form). Any hit
+ * rejects a lesson (as `permission`), on top of PERMISSION. Deliberately broad:
+ * a false hit only costs one lesson (the prompt asks for the plain forms
+ * "X'ten önce onay iste" / "X yapma"), a missed one could read as consent.
+ * "Without asking" forms ("sormadan kapatma", "without asking") are rejected
+ * too, even when the sentence as a whole forbids something: the filter does
+ * not parse sentences, so the canonical "önce sor" form is required.
+ */
+const LESSON_LOOSEN = wordRegex([
+  // Not asking / not telling / not waiting: a negated safety verb ("danışma",
+  // "haber vermeden", "sorulmasın").
+  "sor(?:ma|mu|maz|ulma|ulmu|ulmaz)\\p{L}*",
+  "iste(?:me|mez|mi)\\p{L}*",
+  "isten(?:me|mi)\\p{L}*",
+  "(?:danis|soyle|bildir|uyar|bekle|dogrula|onayla|sorgula)(?:ma|me|mi|mu)\\p{L}*",
+  "(?:kontrol|teyit|dikkat)\\s+et(?:me|mi)\\p{L}*",
+  "(?:haber|bilgi)\\s+ver(?:me|mi)\\p{L}*",
+  "(?:onay|izin)\\p{L}*\\s+al(?:ma|mi)\\p{L}*",
+  // Conditions and time limits ("evdeyse kapat", "geceden sonra"): an exception in disguise.
+  "\\p{L}+(?:yse|ysa|ise|isa|irse|irsa|arsa|erse|ursa|urse)",
+  "\\p{L}+ken",
+  "eger",
+  "sayet",
+  "sonra\\p{L}*",
+  "kadar",
+  "(?<!hicbir\\s)zaman\\p{L}*",
+  "durum(?:da|unda|larda)",
+  "halinde",
+  "takdirde",
+  "gerek(?:\\s+yok|mez|miyor|siz)\\p{L}*",
+  "lazim\\s+degil",
+  "yeter(?:li)?",
+  // Consent, permission, scope widening.
+  "evet\\p{L}*",
+  "izin(?:li|siz)\\p{L}*",
+  "izin\\p{L}*\\s+(?:ver|var)\\p{L}*",
+  "onayl\\p{L}*",
+  "onaysiz\\p{L}*",
+  "yetki\\p{L}*",
+  "erisim\\p{L}*",
+  "arac(?:i|in|lar\\p{L}*)?",
+  "serbest\\p{L}*",
+  "rahat\\p{L}*",
+  "kabul\\s+(?:et|edil)\\p{L}*",
+  "\\p{L}*\\s+say(?:ar|il)?\\p{L}*",
+  "varsay\\p{L}*",
+  "\\p{L}*(?:abil|ebil)\\p{L}*",
+  "istedigin\\p{L}*",
+  "kendiliginden",
+  "kendi\\s+basina",
+  "otomatik\\p{L}*",
+  "dogrudan",
+  "direkt\\p{L}*",
+  // Exceptions and contrast ("X yapma ama Y'yi sormadan yap").
+  "haric\\p{L}*",
+  "disinda\\p{L}*",
+  "istisna\\p{L}*",
+  "sadece",
+  "yalniz(?:ca)?",
+  "ama",
+  "fakat",
+  "ancak",
+  "lakin",
+  "sevm(?:ez|iyor)\\p{L}*",
+  "istem(?:ez|iyor)\\p{L}*",
+  "bikti\\p{L}*",
+  // Talk about the rules themselves.
+  "kural\\p{L}*",
+  "talimat\\p{L}*",
+  "sistem\\p{L}*",
+  "prompt\\p{L}*",
+  "gecit\\p{L}*",
+  // English.
+  "without",
+  "allow\\p{L}*",
+  "permi(?:t|ssion)\\p{L}*",
+  "authori[sz]\\p{L}*",
+  "approv\\p{L}*",
+  "grant\\p{L}*",
+  "access\\p{L}*",
+  "tools?",
+  "rules?",
+  "instructions?",
+  "skip\\p{L}*",
+  "no\\s+need",
+  "needn['’]?t",
+  "need\\s+not",
+  "not\\s+needed",
+  "free(?:ly)?",
+  "fine",
+  "ok(?:ay)?",
+  "yes",
+  "automatic\\p{L}*",
+  "directly",
+  "go\\s+ahead",
+  "(?:you|shadow)\\s+(?:can|may)",
+  "assume\\p{L}*",
+  "(?:do\\s+not|don['’]?t|never|no\\s+longer|stop|quit)\\s+(?:ask|confirm|check|request|require|wait|tell|notify|warn|bother)\\p{L}*",
+  "requir\\p{L}*",
+  "need\\p{L}*",
+  "if",
+  "when\\p{L}*",
+  "while",
+  "after",
+  "until",
+  "during",
+  "anymore",
+  "any\\s+more",
+  "unless",
+  "except\\p{L}*",
+  "but",
+  "however",
+  "though",
+  "only",
+  "just",
+]);
+
+/**
+ * After "onay" / "izin" / "teyit" only "iste", "al", "sor" may follow (match
+ * form). Anything else ("onay istenmesin", "izni olmadan", "onayını almadan",
+ * "onay istemelisin") rejects the lesson.
+ */
+const ASK_OBJECT = /(?<![\p{L}\p{N}])(?:onay|izin|teyit)\p{L}*\s+(\p{L}+)/gu;
+const ASK_VERBS: ReadonlySet<string> = new Set(["iste", "al", "sor"]);
+
+/**
+ * The whole lesson: one clause of Latin-script letters, digits, spaces,
+ * apostrophes and hyphens, with at most one final full stop. No second
+ * sentence, no comma or semicolon clause, no Cyrillic/Greek look-alike letters
+ * (NFKC does not fold them, so "аsk" with a Cyrillic "а" would slip past the
+ * word lists).
+ */
+const LESSON_SHAPE = /^[\p{Script=Latin}\p{N} '’-]+\.?$/u;
+
+/**
+ * The consent channel (match form): the user, asking, confirming, notifying,
+ * waiting. A lesson may name it only inside its fixed "ask first" part (the
+ * Turkish tail / the English head below); anywhere else ("Never solicit
+ * confirmation.", "Kullanıcıyı bekletme.") the lesson is rejected. So a
+ * prohibition can only be about an action on the home, never about the asking
+ * itself, and a word list of every possible negated verb is not needed.
+ */
+const CONSENT_WORDS = wordRegex([
+  // Turkish
+  "kullanici\\p{L}*",
+  "ben\\p{L}*",
+  "bana",
+  "onay\\p{L}*",
+  "izin\\p{L}*",
+  "teyit\\p{L}*",
+  "sor\\p{L}*",
+  "soru\\p{L}*",
+  "iste\\p{L}*",
+  "talep\\p{L}*",
+  "karar\\p{L}*",
+  "kart\\p{L}*",
+  "bildir\\p{L}*",
+  "uyar\\p{L}*",
+  "haber\\p{L}*",
+  "bilgi\\p{L}*",
+  "bekle\\p{L}*",
+  "danis\\p{L}*",
+  "cevap\\p{L}*",
+  "yanit\\p{L}*",
+  "tamam\\p{L}*",
+  "durak\\p{L}*",
+  "tereddut\\p{L}*",
+  "gecik\\p{L}*",
+  // English
+  "ask\\p{L}*",
+  "confirm\\p{L}*",
+  "consent\\p{L}*",
+  "approv\\p{L}*",
+  "permi\\p{L}*",
+  "authori\\p{L}*",
+  "request\\p{L}*",
+  "solicit\\p{L}*",
+  "quer\\p{L}*",
+  "question\\p{L}*",
+  "consult\\p{L}*",
+  "check\\p{L}*",
+  "verif\\p{L}*",
+  "notif\\p{L}*",
+  "tell\\p{L}*",
+  "inform\\p{L}*",
+  "warn\\p{L}*",
+  "wait\\p{L}*",
+  "prompt\\p{L}*",
+  "card\\p{L}*",
+  "dialog\\p{L}*",
+  "answer\\p{L}*",
+  "repl\\p{L}*",
+  "interrupt\\p{L}*",
+  "bother\\p{L}*",
+  "disturb\\p{L}*",
+  "pause\\p{L}*",
+  "hesitat\\p{L}*",
+  "delay\\p{L}*",
+  "user\\p{L}*",
+  "me",
+  "my",
+  "i",
+]);
+
+/**
+ * Turkish "ask first" tail (match form, final full stop removed): "(önce)
+ * (kullanıcıdan/benden) onay/izin/teyit … iste/al/sor", "önce (bana/
+ * kullanıcıya) sor/danış", "kullanıcıya sor".
+ */
+const TR_ASK_TAIL = new RegExp(
+  `(?:^|\\s)(?:(?:once\\s+)?(?:(?:kullanicidan|kullanicinin|benden|benim)\\s+)?(?:onay|izin|teyit)\\p{L}*\\s+(?:iste|al|sor)` +
+    `|once\\s+(?:(?:bana|kullaniciya)\\s+)?(?:sor|danis)` +
+    `|(?:bana|kullaniciya)\\s+(?:sor|danis))$`,
+  "u",
+);
+
+/** Turkish prohibition: a negative imperative or obligation as the last word ("kapatma", "değiştirmemeli"). */
+const TR_PROHIBITION = new RegExp(`${B}\\p{L}{2,}(?:ma|me|mamali|memeli|mamalisin|memelisin)$`, "u");
+
+/** English "ask first" head and prohibition head; the rest of the clause follows. */
+const EN_ASK_HEAD = /^(?:always\s+)?ask\s+(?:me|the\s+user)\s+before\s+(?=\p{L})/u;
+const EN_PROHIBITION = /^(?:never|do\s+not|don['’]t)\s+(?=\p{L})/u;
+
+/**
+ * Lesson rule on the match form:
+ *   - `permission` when the text loosens anything (PERMISSION, LESSON_LOOSEN,
+ *     or "onay/izin/teyit" followed by a word other than "iste/al/sor");
+ *   - `lesson` when it is not one clause (LESSON_SHAPE) of one of the forms
+ *     "<action> … onay iste" / "<action> yapma" / "Ask the user before
+ *     <action>" / "Never <action>";
+ *   - `permission` when the <action> part names the consent channel
+ *     (CONSENT_WORDS): a lesson may not be about the asking itself;
+ *   - else undefined (accepted).
+ */
+function lessonRejectReason(form: string): FilterName | undefined {
+  if (PERMISSION.test(form) || LESSON_LOOSEN.test(form)) return "permission";
+  for (const m of form.matchAll(ASK_OBJECT)) if (!ASK_VERBS.has(m[1] as string)) return "permission";
+  const clause = form.trim();
+  if (!LESSON_SHAPE.test(clause)) return "lesson";
+  const body = clause.replace(/\.$/, "").trim();
+  let action: string | undefined;
+  const tail = TR_ASK_TAIL.exec(body);
+  if (tail) action = body.slice(0, tail.index);
+  else if (TR_PROHIBITION.test(body)) action = body;
+  else {
+    const head = EN_ASK_HEAD.exec(body) ?? EN_PROHIBITION.exec(body);
+    if (head) action = body.slice(head[0].length);
+  }
+  if (action === undefined || action.trim() === "") return "lesson";
+  return CONSENT_WORDS.test(action) ? "permission" : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 
 export interface RejectOptions {
@@ -675,6 +944,12 @@ export interface RejectOptions {
    * The hash itself is the memory store's business (M1).
    */
   isForgotten?: (text: string) => boolean;
+  /**
+   * The entry kind. `lesson` swaps the `permission` check for the stricter
+   * lesson rule (lessonRejectReason): rejected as `permission` (loosens) or
+   * `lesson` (does not tighten).
+   */
+  kind?: MemoryKind;
 }
 
 /**
@@ -688,7 +963,10 @@ export function rejectReason(text: string, options: RejectOptions = {}): FilterN
   const form = matchForm(normal);
   if (HEALTH.test(form) || HEALTH_UNFOLDED.test(normal.toLocaleLowerCase("tr-TR"))) return "health";
   if (mentionsPrivatePath(normal)) return "private_path";
-  if (PERMISSION.test(form)) return "permission";
+  if (options.kind === "lesson") {
+    const why = lessonRejectReason(form);
+    if (why) return why;
+  } else if (PERMISSION.test(form)) return "permission";
   if (isTransient(form)) return "transient";
   if (options.isForgotten?.(text)) return "tombstone";
   return undefined;

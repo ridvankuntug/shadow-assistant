@@ -49,6 +49,7 @@ import {
   isEntryId,
   isMemoryKind,
   KIND_OF_TOPIC,
+  LESSON_TOPIC,
   MEMORY_BUDGETS,
   TOPIC_OF_KIND,
   TOPIC_TITLES,
@@ -76,7 +77,10 @@ export interface MemoryStoreOptions {
   dir: string;
   now?: () => number;
   logger?: MemoryLogger;
-  /** Called after every successful write; `briefChanged` tells the registry to restart idle queries (M6). */
+  /**
+   * Called after every successful write; `briefChanged` tells the registry to restart idle queries (M6).
+   * It is also set when a lesson changed: lessons are in the system prompt too (T5).
+   */
   onChange?: (change: { briefChanged: boolean }) => void;
   /** Injected into the atomic writer (tests simulate disk failures). */
   atomicFs?: AtomicFs;
@@ -206,6 +210,16 @@ interface Model {
 
 const LOCATIONS: readonly MemoryLocation[] = ["brief", ...TOPICS];
 
+/** Locations loaded into the system prompt (brief, lessons): a change there restarts idle queries. */
+function inSystemPrompt(loc: MemoryLocation): boolean {
+  return loc === "brief" || loc === LESSON_TOPIC;
+}
+
+/** The filter kind of a line read from `loc`: only dersler.md lines get the lesson rule. */
+function filterKindOf(loc: MemoryLocation): MemoryKind | undefined {
+  return loc === LESSON_TOPIC ? "lesson" : undefined;
+}
+
 const BULLET_RE = /^(\s*[-*+]\s+)(.*)$/;
 const TRAILING_ID_RE = /\s*\^(m-[0-9a-fA-F]{6})\s*$/;
 /** An id marker inside a proposed text would be misread as the line's id. */
@@ -282,7 +296,7 @@ const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFin
 const HASH_RE = /^sha256:[0-9a-f]{16}$/;
 
 function validSource(v: unknown): EntrySource {
-  if (!isObj(v) || (v.by !== "extract" && v.by !== "manual" && v.by !== "migrated")) return { by: "manual" };
+  if (!isObj(v) || (v.by !== "extract" && v.by !== "manual" && v.by !== "migrated" && v.by !== "tool")) return { by: "manual" };
   const s: EntrySource = { by: v.by };
   for (const k of ["device", "sessionId", "turnId"] as const) {
     const x = v[k];
@@ -419,9 +433,9 @@ export class MemoryStore {
     return this.lock(async () => this.allEntries(await this.load()));
   }
 
-  /** Topic entries only (the matcher's input; the brief is in the system prompt). */
+  /** Topic entries only (the matcher's input; the brief and the lessons are in the system prompt). */
   async noteEntries(): Promise<MemoryEntry[]> {
-    return (await this.entries()).filter((e) => e.location !== "brief");
+    return (await this.entries()).filter((e) => !inSystemPrompt(e.location));
   }
 
   async get(id: string): Promise<MemoryEntry | undefined> {
@@ -452,12 +466,26 @@ export class MemoryStore {
    * Empty string when there is no brief.
    */
   briefForPrompt(): Promise<string> {
+    return this.promptLines("brief", MEMORY_BUDGETS.briefMaxChars);
+  }
+
+  /**
+   * The lessons (kind `lesson`, T5) for the system prompt, like the brief:
+   * `- text` lines, whole entries in file order within 800 chars. Empty
+   * string when there are none. The caller frames them (lifecycle.ts
+   * `formatLessons`); the permission gate never reads them.
+   */
+  lessonsForPrompt(): Promise<string> {
+    return this.promptLines(LESSON_TOPIC, MEMORY_BUDGETS.lessonsPromptMaxChars);
+  }
+
+  private promptLines(loc: MemoryLocation, maxChars: number): Promise<string> {
     return this.lock(async () => {
       const m = await this.load();
       const out: string[] = [];
       let chars = 0;
-      for (const l of this.visibleLines(m, "brief")) {
-        if (chars + l.text.length > MEMORY_BUDGETS.briefMaxChars) break;
+      for (const l of this.visibleLines(m, loc)) {
+        if (chars + l.text.length > maxChars) break;
         out.push(`- ${l.text}`);
         chars += l.text.length;
       }
@@ -708,7 +736,7 @@ export class MemoryStore {
         // Every line is vetted (normal form, length, output filters): the folded hash ignores
         // punctuation and case, so an unchanged hash does not mean the text passed the checks.
         // Tombstones apply only to new or changed lines (an indexed text is not dropped by a later tombstone).
-        const t = this.vet(l.text, !known || known.hash !== textHash(l.text) ? forgotten : NO_HASHES);
+        const t = this.vet(l.text, !known || known.hash !== textHash(l.text) ? forgotten : NO_HASHES, filterKindOf(loc));
         if (typeof t !== "string") {
           rejected.set(t.reject, (rejected.get(t.reject) ?? 0) + 1);
           f.lines[i] = { type: "other", raw: l.raw ?? `${l.prefix}${l.text}` };
@@ -916,15 +944,16 @@ export class MemoryStore {
   }
 
   /** Normal form + output filters (tombstones included): the normalized text or the rejection. */
-  private vet(text: string, forgotten: ReadonlySet<string>): string | { reject: WriteRejection } {
+  /** `kind` selects the filter variant: `lesson` texts pass the stricter lesson rule (filters.ts). */
+  private vet(text: string, forgotten: ReadonlySet<string>, kind?: MemoryKind): string | { reject: WriteRejection } {
     const t = normalizeEntryText(text);
     if (t === undefined) return { reject: "invalid_text" };
-    const reason = rejectReason(t, { isForgotten: (x) => forgotten.has(textHash(x)) });
+    const reason = rejectReason(t, { kind, isForgotten: (x) => forgotten.has(textHash(x)) });
     return reason ? { reject: reason } : t;
   }
 
-  private checkText(m: Model, text: string, selfId?: string): string | { reject: WriteRejection } {
-    const t = this.vet(text, this.blockedSet(m));
+  private checkText(m: Model, text: string, selfId: string | undefined, kind: MemoryKind | undefined): string | { reject: WriteRejection } {
+    const t = this.vet(text, this.blockedSet(m), kind);
     if (typeof t !== "string") return t;
     const hash = textHash(t);
     if (Object.entries(m.index.entries).some(([id, e]) => id !== selfId && e.hash === hash)) return { reject: "duplicate" };
@@ -934,7 +963,7 @@ export class MemoryStore {
   private async addUnlocked(input: AddInput): Promise<WriteResult> {
     if (!isMemoryKind(input.kind)) return { ok: false, reason: "invalid_kind" };
     const r = await this.mutate((m) => {
-      const t = this.checkText(m, input.text);
+      const t = this.checkText(m, input.text, undefined, input.kind);
       if (typeof t !== "string") return t;
       if (Object.keys(m.index.entries).length >= MEMORY_BUDGETS.entriesMax) return { reject: "memory_full" as const };
       let loc: MemoryLocation;
@@ -960,7 +989,7 @@ export class MemoryStore {
       return { id, loc };
     });
     if ("reject" in r) return { ok: false, reason: r.reject };
-    return this.written(r.result.id, r.result.loc === "brief");
+    return this.written(r.result.id, inSystemPrompt(r.result.loc));
   }
 
   private async updateUnlocked(id: string, input: UpdateInput): Promise<WriteResult> {
@@ -970,7 +999,8 @@ export class MemoryStore {
       const e = m.index.entries[id] as IndexEntry;
       let text = found.line.text;
       if (input.text !== undefined) {
-        const t = this.checkText(m, input.text, id);
+        // The filter follows where the entry lives: a line in dersler.md is a lesson.
+        const t = this.checkText(m, input.text, id, filterKindOf(found.loc));
         if (typeof t !== "string") return t;
         text = t;
       }
@@ -992,7 +1022,7 @@ export class MemoryStore {
       return { loc: found.loc };
     });
     if ("reject" in r) return { ok: false, reason: r.reject };
-    return this.written(id, r.result.loc === "brief");
+    return this.written(id, inSystemPrompt(r.result.loc));
   }
 
   /**
@@ -1027,7 +1057,7 @@ export class MemoryStore {
             if (e) hashes.push(e.hash);
             delete m.index.entries[l.id];
             m.indexDirty = f.dirty = changed = true;
-            if (loc === "brief") briefChanged = true;
+            if (inSystemPrompt(loc)) briefChanged = true;
             return false;
           });
         };

@@ -99,10 +99,10 @@ test("permission policy from the repo services.yaml: list read, forget write, al
   assert.equal(policy.levelFor(`${P}memory_add`, {}).level, "confirm");
 });
 
-test("the gateway tools are exactly memory_list and memory_forget; `all` accepts only the string", async () => {
+test("the gateway tools are exactly memory_list, memory_forget and memory_note; `all` accepts only the string", async () => {
   const { store } = await seeded();
   const tools = memoryTools(store);
-  assert.deepEqual(tools.map((t) => t.name).sort(), ["memory_forget", "memory_list"]);
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["memory_forget", "memory_list", "memory_note"]);
   const forget = tools.find((t) => t.name === "memory_forget");
   assert.ok(forget);
   const schema = z.object(forget.shape);

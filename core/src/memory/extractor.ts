@@ -583,7 +583,8 @@ export async function applyOps(
       continue;
     }
     if (op.text !== undefined) {
-      const why = rejectReason(op.text);
+      // The store re-checks every write (an update of a lesson gets the lesson rule there).
+      const why = rejectReason(op.text, op.op === "add" ? { kind: op.kind } : {});
       if (why) {
         reject(why);
         continue;

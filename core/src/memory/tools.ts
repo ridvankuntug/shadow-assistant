@@ -1,7 +1,9 @@
 /**
  * `shadow-memory` tools, served by the Core MCP gateway (docs/06-memory.md §Voice commands,
- * task M5): `memory_list` (read) and `memory_forget` (write; `all` raised to
- * confirm by services.yaml `confirm_inputs`).
+ * task M5): `memory_list` (read), `memory_forget` (write; `all` raised to
+ * confirm by services.yaml `confirm_inputs`) and `memory_note` (write, T5.2:
+ * "not al / hatırla / unutma" and behaviour lessons, stored at once through
+ * the same store filters as the extractor's writes).
  *
  * `all` is the string "true", not a boolean: the permission gate's
  * `confirm_inputs` compares string arguments only (permissions.ts), so a
@@ -16,8 +18,8 @@
 import { z } from "zod";
 import type { LocalTool } from "../mcp-gateway.js";
 import { selectRelevant } from "./match.js";
-import type { MemoryStore } from "./store.js";
-import { isEntryId, MEMORY_BUDGETS, warningKey, type MemoryEntry } from "./types.js";
+import type { MemoryStore, WriteRejection } from "./store.js";
+import { isEntryId, isMemoryKind, MEMORY_BUDGETS, MEMORY_KINDS, warningKey, type MemoryEntry, type MemoryKind } from "./types.js";
 
 export const MEMORY_SERVER_NAME = "shadow-memory";
 /** The only accepted value of `memory_forget.all` (see the module comment). */
@@ -87,6 +89,60 @@ export async function memoryForget(store: MemoryStore, args: ForgetArgs): Promis
   return { text: parts.join(" "), isError: false };
 }
 
+export interface NoteArgs {
+  kind?: string;
+  text?: string;
+  keywords?: readonly string[];
+}
+
+/** Turkish reason for a rejected `memory_note` (the model rephrases or tells the user). */
+function noteRejectText(reason: WriteRejection, kind: MemoryKind): string {
+  switch (reason) {
+    case "permission":
+    case "lesson":
+      return kind === "lesson"
+        ? "Ders kaydedilmedi: ders yalnız daha temkinli olmayı söyleyebilir ve 'X'i yapmadan önce onay iste' ya da 'X'i yapma' biçiminde, virgülsüz tek cümle ve koşulsuz, istisnasız olmalı. Onayı kaldıran, izin veren, istisna tanıyan veya 'sormadan' içeren ifadeler kaydedilmez."
+        : "Kaydedilmedi: asistanın izinlerini veya onay kurallarını değiştiren bilgiler hafızaya yazılmaz.";
+    case "secret":
+    case "personal_number":
+      return "Kaydedilmedi: şifre, kod, numara gibi gizli bilgiler hafızaya yazılmaz.";
+    case "health":
+      return "Kaydedilmedi: sağlıkla ilgili bilgiler hafızaya yazılmaz.";
+    case "private_path":
+      return "Kaydedilmedi: özel klasöre ait bilgiler hafızaya yazılmaz.";
+    case "transient":
+      return "Kaydedilmedi: anlık veya bugüne bağlı bilgiler kalıcı hafızaya yazılmaz.";
+    case "tombstone":
+      return "Kaydedilmedi: kullanıcı bu bilginin unutulmasını istemişti.";
+    case "duplicate":
+      return "Bu bilgi zaten hafızada.";
+    case "memory_full":
+    case "note_full":
+    case "brief_full":
+      return "Kaydedilmedi: hafıza dolu; önce eski kayıtlardan bazıları unutulmalı.";
+    case "invalid_text":
+      return `Kaydedilmedi: metin boş ya da ${MEMORY_BUDGETS.textMaxChars} karakterden uzun.`;
+    default:
+      return "Hafıza yazılamadı.";
+  }
+}
+
+/**
+ * `memory_note`: stores one entry at once ("not al", "bunu hatırla", a lesson).
+ * The store runs the same output filters as for extracted entries; a lesson
+ * passes the stricter lesson rule (filters.ts), so the tool cannot store
+ * anything that loosens the assistant's behaviour.
+ */
+export async function memoryNote(store: MemoryStore, args: NoteArgs): Promise<{ text: string; isError: boolean }> {
+  const kind = args.kind;
+  if (!isMemoryKind(kind)) return { text: `'kind' şunlardan biri olmalı: ${MEMORY_KINDS.join(", ")}.`, isError: true };
+  const text = args.text?.trim();
+  if (!text) return { text: "Kaydedilecek metin yok.", isError: true };
+  const r = await store.add({ kind, text, keywords: args.keywords ?? [], source: { by: "tool" } });
+  if (!r.ok) return { text: noteRejectText(r.reason, kind), isError: r.reason !== "duplicate" };
+  return { text: `Not alındı (${r.entry.id}).`, isError: false };
+}
+
 /** The memory tools for the gateway (`kind: local` source). */
 export function memoryTools(store: MemoryStore): LocalTool[] {
   return [
@@ -121,6 +177,28 @@ export function memoryTools(store: MemoryStore): LocalTool[] {
       handler: async (args) => {
         try {
           return await memoryForget(store, args as ForgetArgs);
+        } catch {
+          return { text: "Hafıza yazılamadı.", isError: true };
+        }
+      },
+    },
+    {
+      name: "memory_note",
+      description:
+        "Kalıcı hafızaya hemen bir kayıt yazar ('not al', 'bunu hatırla', 'unutma'). " +
+        "kind 'lesson': kullanıcının düzelttiği bir hatadan ders; yalnız daha temkinli olmayı söyler, " +
+        "'X'i yapmadan önce onay iste' ya da 'X'i yapma' biçiminde, virgülsüz tek cümle olarak yaz. Onayı kaldıran veya izin veren ifadeler reddedilir.",
+      shape: {
+        kind: z.enum(MEMORY_KINDS as [MemoryKind, ...MemoryKind[]]).describe("Kayıt türü; davranış dersi için lesson"),
+        text: z
+          .string()
+          .max(MEMORY_BUDGETS.textMaxChars)
+          .describe("Kısa Türkçe cümle, üçüncü şahıs ('Kullanıcı ... sever.') ya da ders ('Kombiyi kapatmadan önce onay iste.')"),
+        keywords: z.array(z.string().max(40)).max(MEMORY_BUDGETS.keywordsMax).optional().describe("İsteğe bağlı 1-6 kısa anahtar sözcük"),
+      },
+      handler: async (args) => {
+        try {
+          return await memoryNote(store, args as NoteArgs);
         } catch {
           return { text: "Hafıza yazılamadı.", isError: true };
         }

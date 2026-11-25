@@ -81,6 +81,9 @@ services:
     tools:
       memory_list: read
       memory_forget: write
+      # "Not al" and lessons (T5.2): stored at once, no confirm card; the
+      # store filters reject anything that loosens permissions.
+      memory_note: write
     # "Her şeyi unut" (`all: "true"`) asks first.
     confirm_inputs:
       all: ["true"]

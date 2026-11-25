@@ -23,7 +23,7 @@ import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health
 import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
 import { LEARNED_RULES_DIR, LearnedRuleStore } from "./learn/store.js";
 import { MemoryExtractor } from "./memory/extractor.js";
-import { DeviceMaintenance, formatBrief } from "./memory/lifecycle.js";
+import { DeviceMaintenance, formatBrief, formatLessons } from "./memory/lifecycle.js";
 import { MemoryStore } from "./memory/store.js";
 import { memoryTools } from "./memory/tools.js";
 import { createGatewaySdkServers } from "./gateway-sdk.js";
@@ -239,7 +239,9 @@ export async function main(): Promise<void> {
       // the next session started after it answered.
       systemAppend: async () => {
         await gateway.whenListed(GATEWAY_SESSION_WAIT_MS);
-        return memory ? formatBrief(await memory.briefForPrompt()) : "";
+        if (!memory) return "";
+        const parts = [formatBrief(await memory.briefForPrompt()), formatLessons(await memory.lessonsForPrompt())];
+        return parts.filter(Boolean).join("\n\n");
       },
       log: (level, m) => (level === "warn" ? logger.warn(m) : logger.info(m)),
     });

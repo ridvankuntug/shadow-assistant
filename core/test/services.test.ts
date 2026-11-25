@@ -130,6 +130,7 @@ test("kind memory: repo entry, levels, confirm_inputs; no remote keys; only one"
   assert.deepEqual(mem?.tools, [
     { pattern: "memory_list", level: "read" },
     { pattern: "memory_forget", level: "write" },
+    { pattern: "memory_note", level: "write" },
   ]);
   assert.deepEqual(mem?.confirmInputs, { all: ["true"] });
   assert.equal(mem?.url, undefined);
