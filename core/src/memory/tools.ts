@@ -101,7 +101,7 @@ function noteRejectText(reason: WriteRejection, kind: MemoryKind): string {
     case "permission":
     case "lesson":
       return kind === "lesson"
-        ? "Ders kaydedilmedi: ders yalnız daha temkinli olmayı söyleyebilir ve 'X'i yapmadan önce onay iste' ya da 'X'i yapma' biçiminde, virgülsüz tek cümle ve koşulsuz, istisnasız olmalı. Onayı kaldıran, izin veren, istisna tanıyan veya 'sormadan' içeren ifadeler kaydedilmez."
+        ? "Ders kaydedilmedi: ders yalnız daha temkinli olmayı söyleyebilir ve 'X'i yapmadan önce onay iste' ya da 'X'i yapma' (veya 'Sormadan X'i yapma') biçiminde, virgülsüz tek cümle ve koşulsuz, istisnasız olmalı. Onayı kaldıran, izin veren, istisna tanıyan ifadeler kaydedilmez; 'sormadan' yalnız bir yasakla birlikte ('Sormadan X'i yapma') kabul edilir."
         : "Kaydedilmedi: asistanın izinlerini veya onay kurallarını değiştiren bilgiler hafızaya yazılmaz.";
     case "secret":
     case "personal_number":
@@ -187,7 +187,7 @@ export function memoryTools(store: MemoryStore): LocalTool[] {
       description:
         "Kalıcı hafızaya hemen bir kayıt yazar ('not al', 'bunu hatırla', 'unutma'). " +
         "kind 'lesson': kullanıcının düzelttiği bir hatadan ders; yalnız daha temkinli olmayı söyler, " +
-        "'X'i yapmadan önce onay iste' ya da 'X'i yapma' biçiminde, virgülsüz tek cümle olarak yaz. Onayı kaldıran veya izin veren ifadeler reddedilir.",
+        "'X'i yapmadan önce onay iste', 'X'i yapma' ya da 'Sormadan X'i yapma' biçiminde, virgülsüz tek cümle olarak yaz. Onayı kaldıran veya izin veren ifadeler reddedilir.",
       shape: {
         kind: z.enum(MEMORY_KINDS as [MemoryKind, ...MemoryKind[]]).describe("Kayıt türü; davranış dersi için lesson"),
         text: z

@@ -471,20 +471,29 @@ export class MemoryStore {
 
   /**
    * The lessons (kind `lesson`, T5) for the system prompt, like the brief:
-   * `- text` lines, whole entries in file order within 800 chars. Empty
-   * string when there are none. The caller frames them (lifecycle.ts
-   * `formatLessons`); the permission gate never reads them.
+   * `- text` lines, whole entries newest first (index `updatedAt`, later
+   * file position on a tie) within 800 chars, so a full budget drops the
+   * oldest lessons. Empty string when there are none. The caller frames them
+   * (lifecycle.ts `formatLessons`); the permission gate never reads them.
    */
   lessonsForPrompt(): Promise<string> {
-    return this.promptLines(LESSON_TOPIC, MEMORY_BUDGETS.lessonsPromptMaxChars);
+    return this.promptLines(LESSON_TOPIC, MEMORY_BUDGETS.lessonsPromptMaxChars, true);
   }
 
-  private promptLines(loc: MemoryLocation, maxChars: number): Promise<string> {
+  private promptLines(loc: MemoryLocation, maxChars: number, newestFirst = false): Promise<string> {
     return this.lock(async () => {
       const m = await this.load();
       const out: string[] = [];
       let chars = 0;
-      for (const l of this.visibleLines(m, loc)) {
+      let lines = this.visibleLines(m, loc);
+      if (newestFirst) {
+        const at = (id: string) => m.index.entries[id]?.updatedAt ?? 0;
+        lines = lines
+          .map((l, pos) => ({ l, pos }))
+          .sort((a, b) => at(b.l.id) - at(a.l.id) || b.pos - a.pos)
+          .map((x) => x.l);
+      }
+      for (const l of lines) {
         if (chars + l.text.length > maxChars) break;
         out.push(`- ${l.text}`);
         chars += l.text.length;

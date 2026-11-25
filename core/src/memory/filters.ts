@@ -687,9 +687,9 @@ function isTransient(form: string): boolean {
  * rejects a lesson (as `permission`), on top of PERMISSION. Deliberately broad:
  * a false hit only costs one lesson (the prompt asks for the plain forms
  * "X'ten önce onay iste" / "X yapma"), a missed one could read as consent.
- * "Without asking" forms ("sormadan kapatma", "without asking") are rejected
- * too, even when the sentence as a whole forbids something: the filter does
- * not parse sentences, so the canonical "önce sor" form is required.
+ * "Without asking" forms ("sormadan", "without asking") are rejected too,
+ * except in the plain prohibitions that canonicalLesson rewrites first
+ * ("Sormadan X'i kapatma", "Don't X without asking").
  */
 const LESSON_LOOSEN = wordRegex([
   // Not asking / not telling / not waiting: a negated safety verb ("danışma",
@@ -907,7 +907,101 @@ const EN_ASK_HEAD = /^(?:always\s+)?ask\s+(?:me|the\s+user)\s+before\s+(?=\p{L})
 const EN_PROHIBITION = /^(?:never|do\s+not|don['’]t)\s+(?=\p{L})/u;
 
 /**
- * Lesson rule on the match form:
+ * Tightening paraphrases (T5.1 follow-up) that the word lists would reject:
+ * "Sormadan X'i kapatma", "Bana sormadan X'i kapatma", "X'ten önce onay
+ * istemelisin", "Don't X without asking". lessonRejectReason first rewrites
+ * them to a canonical form and then runs every check on that form, so the
+ * rewrite can only drop the fixed "without asking" part or the obligation
+ * suffix, never the rest of the sentence.
+ *
+ * "sormadan" / "without asking" is dropped only inside a prohibition (the
+ * clause stays a negative imperative after the drop) and only when the
+ * remaining action is one plain action. Otherwise the text is left as is and
+ * the PERMISSION list rejects "sormadan" / "without asking". Not plain:
+ *   - a second action: a conjunction ("ve", "and") or, in Turkish, a bare
+ *     positive imperative before the final verb ("ışıkları kapat ve televizyonu
+ *     açma");
+ *   - an action on another action, which turns the prohibition into an
+ *     encouragement: TR verbal nouns, infinitives, negated or "without" forms
+ *     ("kapatmaktan çekinme", "kapatmayı unutma", "kapatmazlık etme",
+ *     "habersiz"), encouraging final verbs ("çekinme", "vazgeçme"); EN "to",
+ *     "from", "be", head verbs such as "hesitate", "forget", "stop",
+ *     "discontinue", and "-ing" words other than common nouns ("heating",
+ *     "living room").
+ * Cost: a noun that looks like a verbal noun ("klimayı") rejects the
+ * "sormadan" form; the "önce onay iste" form still works for it.
+ */
+const TR_WITHOUT_ASKING = /(?:^|\s)(?:(?:bana|kullaniciya)\s+)?sormadan\s+(?=\p{L})/u;
+/** A non-final word of a plain Turkish action may not be any of these (match form). */
+const TR_NOT_PLAIN_WORD = new RegExp(
+  "^(?:" +
+    [
+      // Conjunctions and additive particles: a second action.
+      "ve|veya|ya|yahut|ile|hem|de|da|ki|ayrica|sonra\\p{L}*|once\\p{L}*",
+      // Verbal nouns and infinitives ("kapatmayı", "kapatmaktan", "kapatmadan", "kapatması").
+      "\\p{L}+m[ae](?:k\\p{L}*|y\\p{L}+|s[iu]\\p{L}*|d[ae]n|n[iu]n)",
+      // Negated (aorist, "-mazlık") and "without" forms.
+      "\\p{L}*m[ae]z\\p{L}*|\\p{L}+s[iu]z\\p{L}*",
+      // Common bare positive imperatives (a second, positive command).
+      "(?:kapat|kapa|ac|sil|yak|sondur|gonder|baslat|durdur|calistir|kilitle|ayarla|degistir|yap|kur|at|ver|al|oynat|indir|yukle|kaydet|ara|kis|artir|azalt|bitir|iptal\\s+et|et|ol|kal)",
+    ].join("|") +
+    ")$",
+  "u",
+);
+/** Turkish final verbs that encourage rather than forbid, or light verbs that need a nominal ("sormadan çekinme"). */
+const TR_ENCOURAGING = new RegExp(
+  `${B}(?:cekin|kork|unut|ihmal\\s+et|dur|birak|vazgec|ertele|geciktir|engelle|kacin|sakin|utan|aksat|atla|kisitla|sinirla|yasakla|reddet|et|ol|kal)m[ae]\\p{L}*$`,
+  "u",
+);
+const EN_WITHOUT_ASKING =
+  /^((?:never|do\s+not|don['’]t)\s+)(\p{L}.*?)\s+without\s+asking(?:\s+(?:me|the\s+user))?(?:\s+first)?$/u;
+const EN_NOT_PLAIN = new RegExp(
+  `${B}(?:to|from|be|and|or|nor|then|also|plus|not|no|never|nothing|none|don['’]?t|doesn['’]?t|forget\\p{L}*|fail\\p{L}*|stop\\p{L}*|quit\\p{L}*|cease\\p{L}*|discontinu\\p{L}*|continu\\p{L}*|avoid\\p{L}*|refrain\\p{L}*|prevent\\p{L}*|block\\p{L}*|hinder\\p{L}*|resist\\p{L}*|delay\\p{L}*|postpone\\p{L}*|neglect\\p{L}*|hold\\p{L}*|hesitat\\p{L}*|shy\\p{L}*|mind\\p{L}*|fear\\p{L}*|worry\\p{L}*|keep\\p{L}*|let\\p{L}*|omit\\p{L}*|miss\\p{L}*|abstain\\p{L}*|decline\\p{L}*|refus\\p{L}*|object\\p{L}*|ban\\p{L}*|forbid\\p{L}*|restrict\\p{L}*|limit\\p{L}*|hate\\p{L}*|interrupt\\p{L}*|pause\\p{L}*|end|afraid|scared|(?!(?:heating|ceiling|living|dining|lighting|building|parking|evening|morning)${E})\\p{L}+ing)${E}`,
+  "u",
+);
+const TR_ASK_OBLIGATION =
+  /((?:^|\s)(?:(?:onay|izin|teyit)\p{L}*\s+(?:iste|al|sor)|(?:once|bana|kullaniciya)\s+(?:sor|danis)))m[ae]l[iı](?:s[iı]n(?:[iı]z)?)?$/u;
+
+/** A word with a case or possessive ending ("prizini", "odası", "salona", "mutfakta", "kapının"; match form). */
+const TR_MARKED_WORD = /(?:[aeiu]|[iu]n|[dt][ae]n)$/u;
+/** Bare adverbs allowed after the object ("Kombiyi bir daha kapatma"). */
+const TR_ADVERBS: ReadonlySet<string> = new Set(["asla", "hic", "hicbir", "bir", "daha", "kesinlikle", "sakin"]);
+/** A "-la/-le" verb stem as a second command ("temizle", "kilitle", "güncelle"). */
+const TR_LA_VERB = /^\p{L}{2,}l[ae]$/u;
+
+/**
+ * One plain prohibition: final negative imperative, no word of
+ * TR_NOT_PLAIN_WORD, no "-la/-le" stem, and the object noun phrase is one
+ * block: bare words (compound modifiers such as "salon", "yatak") only before
+ * the first case-marked word, after it only case-marked words or TR_ADVERBS.
+ * A bare word after the object is a second command ("dosyaları sil ışıkları
+ * açma"). Residual: a vowel-final verb stem ("taşı") looks case-marked.
+ */
+function plainTrProhibition(rest: string): boolean {
+  if (!TR_PROHIBITION.test(rest) || TR_ENCOURAGING.test(rest)) return false;
+  const words = rest.split(/\s+/).slice(0, -1).map((w) => w.replace(/['’-]/gu, ""));
+  if (words.some((w) => TR_NOT_PLAIN_WORD.test(w) || TR_LA_VERB.test(w))) return false;
+  const first = words.findIndex((w) => TR_MARKED_WORD.test(w));
+  return first < 0 || words.slice(first).every((w) => TR_MARKED_WORD.test(w) || TR_ADVERBS.has(w));
+}
+
+function canonicalLesson(clause: string): string {
+  const dot = clause.endsWith(".") ? "." : "";
+  let body = dot ? clause.slice(0, -1).trimEnd() : clause;
+  // "… onay istemelisin" / "önce bana sormalısın" -> "… onay iste" / "önce bana sor".
+  body = body.replace(TR_ASK_OBLIGATION, "$1");
+  const tr = TR_WITHOUT_ASKING.exec(body);
+  if (tr) {
+    const rest = `${body.slice(0, tr.index)} ${body.slice(tr.index + tr[0].length)}`.trim();
+    if (plainTrProhibition(rest)) body = rest;
+  }
+  const en = EN_WITHOUT_ASKING.exec(body);
+  if (en && !EN_NOT_PLAIN.test(en[2] as string)) body = `${en[1]}${en[2]}`;
+  return body + dot;
+}
+
+/**
+ * Lesson rule on the match form, after canonicalLesson:
  *   - `permission` when the text loosens anything (PERMISSION, LESSON_LOOSEN,
  *     or "onay/izin/teyit" followed by a word other than "iste/al/sor");
  *   - `lesson` when it is not one clause (LESSON_SHAPE) of one of the forms
@@ -917,7 +1011,8 @@ const EN_PROHIBITION = /^(?:never|do\s+not|don['’]t)\s+(?=\p{L})/u;
  *     (CONSENT_WORDS): a lesson may not be about the asking itself;
  *   - else undefined (accepted).
  */
-function lessonRejectReason(form: string): FilterName | undefined {
+function lessonRejectReason(raw: string): FilterName | undefined {
+  const form = canonicalLesson(raw.trim());
   if (PERMISSION.test(form) || LESSON_LOOSEN.test(form)) return "permission";
   for (const m of form.matchAll(ASK_OBJECT)) if (!ASK_VERBS.has(m[1] as string)) return "permission";
   const clause = form.trim();
