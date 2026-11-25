@@ -260,6 +260,139 @@ function callOwners(snapshot: readonly LiveEntity[], name: string, area: string 
 const MAX_RUN_WORDS = 6;
 
 /**
+ * What the "whole name phrase" checks need for one called entity: tier 0's
+ * resolver over every domain of the snapshot, the device words of the
+ * entity's domain and of the other domains, and the longest phrase to look at.
+ */
+interface EntityView {
+  entity: LiveEntity;
+  /** Device words of the entity's domain, folded. */
+  kw: ReadonlySet<string>;
+  /**
+   * `resolveDevice` over every domain of the snapshot: a word run that is
+   * another device's name (a switch "Salon" next to a light "Salon Işık")
+   * never counts for this one.
+   */
+  resolve: (spoken: string) => ReturnType<typeof resolveDevice>;
+  /** Device words of the other domains ("priz" next to a light's name), folded. */
+  foreign: ReadonlySet<string>;
+  /**
+   * Longest phrase checked around a match: the longest snapshot name, so a
+   * long device name ("Salon Lambası Philips Hue Beyaz Ambiyans 2") is never
+   * cut short.
+   */
+  maxRun: number;
+}
+
+function entityView(snapshot: readonly LiveEntity[], entity: LiveEntity, opts: ProvenanceOptions): EntityView {
+  const keywords = opts.domainWords?.[entity.domain] ?? [];
+  const kw = new Set(keywords.map(key));
+  const allDomains = [...new Set(snapshot.map((e) => e.domain))];
+  const foreign = new Set(
+    Object.entries(opts.domainWords ?? {})
+      .filter(([d]) => d !== entity.domain)
+      .flatMap(([, ws]) => ws.map(key))
+      .filter((w) => !kw.has(w)),
+  );
+  const maxRun = Math.max(MAX_RUN_WORDS, ...snapshot.flatMap((e) => e.names.map((x) => key(x).split(" ").filter(Boolean).length)));
+  return { entity, kw, resolve: (spoken) => resolveDevice(snapshot, spoken, { domains: allDomains, keywords }), foreign, maxRun };
+}
+
+/**
+ * Whether a longer word run around `[i, j)` of `u` names something else: a
+ * run that strictly contains it or, with `adjacent`, starts right after /
+ * ends right before it (`maxRun` words at most), resolves to another device
+ * or to several ("salon lambası 2", "mutfak | kahve makinesini"). Runs that
+ * resolve to nothing or to this entity again are fine ("salon lambasını |
+ * kapat"). `self` is the set of entities that count as "this one" (rule 3:
+ * every entity the call's name reaches).
+ */
+function longerRunNamesOther(v: EntityView, u: Utterance, i: number, j: number, adjacent: boolean, self: ReadonlySet<LiveEntity> = new Set([v.entity])): boolean {
+  const n = u.words.length;
+  for (let a = Math.max(0, i - v.maxRun); a <= j; a++) {
+    for (let b = a + 1; b <= Math.min(n, a + v.maxRun); b++) {
+      const contains = a <= i && b >= j && (a < i || b > j);
+      if (!contains && (!adjacent || (b !== i && a !== j))) continue;
+      const r = v.resolve(u.words.slice(a, b).join(" "));
+      if (r.status === "ambiguous" || (r.status === "ok" && !self.has(r.entity))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The run `[i, j)` of `u` is the user's whole name phrase for this entity (docs/14 T4.3a,
+ * team-lead decision (a)): no longer phrase around it names something else. Rejected when
+ *  - a containing or adjacent run names another device or several (`longerRunNamesOther`), or
+ *  - a word a containing run could add is a device word of another domain
+ *    ("mutfak prizini", "mutfak akıllı prizini").
+ * In doubt this says no: the result is only an extra confirm card.
+ */
+function standsAlone(v: EntityView, u: Utterance, i: number, j: number): boolean {
+  if (longerRunNamesOther(v, u, i, j, true)) return false;
+  const n = u.words.length;
+  const reach = v.maxRun - (j - i);
+  for (let k = Math.max(0, i - reach); k < Math.min(n, j + reach); k++) {
+    if (k >= i && k < j) continue;
+    if ([...(u.forms[k] as ReadonlySet<string>)].some((f) => v.foreign.has(f))) return false;
+  }
+  return true;
+}
+
+/**
+ * Rule 3 against the live list (docs/14 decision 10, T4.9): when the call's
+ * `name` reaches one entity or several (its owners), a text match counts only
+ * where
+ *  - the user's matched words themselves do not resolve to a device outside
+ *    the owners (stemming: "salondaki lambayı" matches "Salon Lamba", yet it
+ *    is the name of the light "Salondaki Lamba"), and
+ *  - no longer run of the user's words around it (a strictly containing one)
+ *    is the name of a device outside the owners or of several ("salon lambası
+ *    2" said, "Salon Lambası" called).
+ * Adjacent phrases and other-domain words are not looked at here: a command
+ * naming two devices ("salon lambasını ve mutfak ışığını kapat") stays known.
+ * A name that reaches no entity is left to HA and to the name-only check
+ * (`nameOnlyTarget`): the text match stands.
+ */
+function textMatchFits(
+  window: readonly Utterance[],
+  snapshot: readonly LiveEntity[],
+  name: string,
+  area: string | undefined,
+  domains: string[] | undefined,
+  opts: ProvenanceOptions,
+): boolean {
+  const owners = callOwners(snapshot, name, area, domains);
+  if (owners.length === 0) return true;
+  const self = new Set(owners);
+  const v = entityView(snapshot, owners[0] as LiveEntity, opts);
+  const target = key(name).split(" ").filter(Boolean);
+  const fits = (u: Utterance, s: number): boolean => {
+    const said = v.resolve(u.words.slice(s, s + target.length).join(" "));
+    if (said.status === "ok" && !self.has(said.entity)) return false;
+    return !longerRunNamesOther(v, u, s, s + target.length, false, self);
+  };
+  return window.some((u) => runStarts(u, target).some((s) => fits(u, s)));
+}
+
+/**
+ * Whether rule 3's answer for this call's `name` may change with a snapshot
+ * (T4.9): the name is matched by text, and every matching run has a word
+ * next to it (an utterance that is only the name, e.g. the answer to a choice
+ * question, cannot be part of a longer name). The caller reads the live
+ * context only when this is true; without a snapshot `targetProvenance`
+ * keeps the plain text answer.
+ */
+export function nameMatchNeedsSnapshot(input: Readonly<Record<string, unknown>>, utterances: readonly string[]): boolean {
+  const name = textValue(input.name);
+  if (name === undefined) return false;
+  const target = key(name).split(" ").filter(Boolean);
+  const window = utterances.slice(-PROVENANCE_WINDOW).map(prepare);
+  const starts = window.flatMap((u) => runStarts(u, target).map((s) => ({ u, s })));
+  return starts.length > 0 && starts.every(({ u, s }) => s > 0 || s + target.length < u.words.length);
+}
+
+/**
  * Rule 4: the call's `name` is one exposed entity's name (narrowed by `area`
  * and `domain` when given), and the user named that same entity by any of its
  * names/aliases, or by its area followed by a device word, as tier 0's
@@ -277,53 +410,11 @@ function aliasKnown(
   const owners = callOwners(snapshot, name, area, domains);
   if (owners.length !== 1) return false;
   const entity = owners[0] as LiveEntity;
-  const keywords = opts.domainWords?.[entity.domain] ?? [];
-  const kw = new Set(keywords.map(key));
-  // Resolved over every domain of the snapshot: a word run that is another device's name
-  // (a switch "Salon" next to a light "Salon Işık") never counts for this one.
-  const allDomains = [...new Set(snapshot.map((e) => e.domain))];
-  const resolve = (spoken: string) => resolveDevice(snapshot, spoken, { domains: allDomains, keywords });
+  const v = entityView(snapshot, entity, opts);
+  const { kw, resolve } = v;
   const resolvesHere = (spoken: string) => {
     const r = resolve(spoken);
     return r.status === "ok" && r.entity === entity;
-  };
-  // Device words of the other domains ("priz" next to a light's name): the user named something else.
-  const foreign = new Set(
-    Object.entries(opts.domainWords ?? {})
-      .filter(([d]) => d !== entity.domain)
-      .flatMap(([, ws]) => ws.map(key))
-      .filter((w) => !kw.has(w)),
-  );
-  /**
-   * The run `[i, j)` of `u` is the user's whole name phrase for this entity (docs/14 T4.3a,
-   * team-lead decision (a)): no longer phrase around it names something else. Rejected when
-   *  - a run that strictly contains it, or starts right after / ends right before it
-   *    (`maxRun` words at most), resolves to another device or to several
-   *    ("salon lambası 2", "mutfak | kahve makinesini"), or
-   *  - a word a containing run could add is a device word of another domain
-   *    ("mutfak prizini", "mutfak akıllı prizini").
-   * Runs that resolve to nothing or to this entity again are fine ("salon lambasını | kapat").
-   * In doubt this says no: the result is only an extra confirm card.
-   */
-  // Longest phrase checked around a match: the longest snapshot name, so a long device name
-  // ("Salon Lambası Philips Hue Beyaz Ambiyans 2") is never cut short.
-  const maxRun = Math.max(MAX_RUN_WORDS, ...snapshot.flatMap((e) => e.names.map((x) => key(x).split(" ").filter(Boolean).length)));
-  const standsAlone = (u: Utterance, i: number, j: number): boolean => {
-    const n = u.words.length;
-    for (let a = Math.max(0, i - maxRun); a <= j; a++) {
-      for (let b = a + 1; b <= Math.min(n, a + maxRun); b++) {
-        const contains = a <= i && b >= j && (a < i || b > j);
-        if (!contains && b !== i && a !== j) continue;
-        const r = resolve(u.words.slice(a, b).join(" "));
-        if (r.status === "ambiguous" || (r.status === "ok" && r.entity !== entity)) return false;
-      }
-    }
-    const reach = maxRun - (j - i);
-    for (let k = Math.max(0, i - reach); k < Math.min(n, j + reach); k++) {
-      if (k >= i && k < j) continue;
-      if ([...(u.forms[k] as ReadonlySet<string>)].some((f) => foreign.has(f))) return false;
-    }
-    return true;
   };
   // A name/alias the user said (rule 3 forms) that tier 0 resolves to this entity alone, and
   // the user's own words for it do not resolve to a different device or to several
@@ -334,7 +425,7 @@ function aliasKnown(
     for (const u of window) {
       for (const start of runStarts(u, words)) {
         const said = resolve(u.words.slice(start, start + words.length).join(" "));
-        if ((said.status === "none" || (said.status === "ok" && said.entity === entity)) && standsAlone(u, start, start + words.length)) return true;
+        if ((said.status === "none" || (said.status === "ok" && said.entity === entity)) && standsAlone(v, u, start, start + words.length)) return true;
       }
     }
   }
@@ -345,7 +436,7 @@ function aliasKnown(
     for (let i = 0; i < u.words.length; i++) {
       for (let len = 1; len <= MAX_RUN_WORDS && i + len <= u.words.length; len++) {
         const spoken = u.words.slice(i, i + len).join(" ");
-        if (!resolvesHere(spoken) || !standsAlone(u, i, i + len)) continue;
+        if (!resolvesHere(spoken) || !standsAlone(v, u, i, i + len)) continue;
         const cands = stemCandidates(spoken).map(key);
         // Same test as `resolveDevice` scores 3 and 2: a name equals the run, or starts with it and
         // continues with device words / numbers only. Anything else was an area hit (score 1).
@@ -406,7 +497,9 @@ function confirmedNameKnown(
  *                    softening rules need Turkish letters). Only the last
  *                    `PROVENANCE_WINDOW` count; assistant text must never be
  *                    passed.
- * @param snapshot    parsed `GetLiveContext` entities, when at hand (rules 4, 5).
+ * @param snapshot    parsed `GetLiveContext` entities, when at hand (rules 4, 5;
+ *                    with it a rule-3 `name` match must also fit the user's
+ *                    whole name phrase, T4.9 / `nameMatchNeedsSnapshot`).
  * @param names       active confirmed names (rule 5).
  *
  * Every target argument present (`name`, `area`, `floor`) must be known:
@@ -441,7 +534,8 @@ export function targetProvenance(
   if (present(input, "domain") && !domains) return { status: "unknown", needsSnapshot: false };
 
   if (floor !== undefined && !textMatch(window, floor)) return { status: "unknown", needsSnapshot: false };
-  const nameText = name === undefined || textMatch(window, name);
+  // With a snapshot, a name match must also fit the user's whole name phrase (T4.9).
+  const nameText = name === undefined || (textMatch(window, name) && (!snapshot || textMatchFits(window, snapshot, name, area, domains, opts)));
   const areaText = area === undefined || textMatch(window, area);
   if (nameText && areaText) return { status: "known", via: "text" };
   // Rules 4 and 5 identify an entity by its name; without one, nothing else can help.
@@ -450,4 +544,37 @@ export function targetProvenance(
   if (aliasKnown(window, snapshot, name, area, domains, opts)) return { status: "known", via: "alias" };
   if (names && confirmedNameKnown(window, snapshot, names, name, area, domains)) return { status: "known", via: "confirmed_name" };
   return { status: "unknown", needsSnapshot: false };
+}
+
+// ---------------------------------------------------------------- name-only targets (docs/14 decision 9)
+
+/**
+ * A call that names its target by `name` alone: no `domain`, no
+ * `device_class` (`confirm_inputs` cannot see what kind of device it is).
+ */
+export function isNameOnlyCall(input: Readonly<Record<string, unknown>>): boolean {
+  return present(input, "name") && !present(input, "domain") && !present(input, "device_class");
+}
+
+/** `ok`: one entity, not sensitive; `sensitive`: some entity the call can reach is; `unresolved`: none or several. */
+export type NameOnlyTarget = "ok" | "sensitive" | "unresolved";
+
+/**
+ * Decision 9 (T4.8): the entities a name-only call reaches in the live
+ * snapshot (its name or alias, narrowed by `area` when given), checked with
+ * `isSensitive` (the caller's `confirm_inputs` and tier-0 rules). Any
+ * reachable entity being sensitive wins; otherwise the call must reach
+ * exactly one entity. A `name` that is not a usable string is `unresolved`.
+ */
+export function nameOnlyTarget(
+  input: Readonly<Record<string, unknown>>,
+  snapshot: readonly LiveEntity[],
+  isSensitive: (entity: LiveEntity) => boolean,
+): NameOnlyTarget {
+  const name = textValue(input.name);
+  const area = present(input, "area") ? textValue(input.area) : undefined;
+  if (name === undefined || (present(input, "area") && area === undefined)) return "unresolved";
+  const owners = callOwners(snapshot, name, area, undefined);
+  if (owners.some(isSensitive)) return "sensitive";
+  return owners.length === 1 ? "ok" : "unresolved";
 }

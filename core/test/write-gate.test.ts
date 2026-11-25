@@ -6,7 +6,16 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { LiveEntity } from "../src/live-context.js";
-import { gateWordForms, isQuestionTurn, PROVENANCE_WINDOW, targetProvenance, type GateConfirmedName } from "../src/write-gate.js";
+import {
+  gateWordForms,
+  isNameOnlyCall,
+  isQuestionTurn,
+  nameMatchNeedsSnapshot,
+  nameOnlyTarget,
+  PROVENANCE_WINDOW,
+  targetProvenance,
+  type GateConfirmedName,
+} from "../src/write-gate.js";
 
 const entity = (names: string[], domain: string, areas: string[] = []): LiveEntity => ({ names, domain, state: "off", areas, attributes: {} });
 
@@ -318,5 +327,76 @@ describe("gateWordForms", () => {
     assert.ok(gateWordForms("salondan").has("salon"));
     assert.ok(gateWordForms("mutfağı").has("mutfak"));
     assert.ok(!gateWordForms("pompayı").has("pompasi"));
+  });
+});
+
+describe("rule 3 against the live list (docs/14 decision 10, T4.9)", () => {
+  const lamps = [entity(["Salon Lambası"], "light", ["Salon"]), entity(["Salon Lambası 2"], "light", ["Salon"])];
+  test("a longer phrase that is another device's name: the text match does not count", () => {
+    assert.equal(targetProvenance({ name: "Salon Lambası" }, ["salon lambası 2 kapat"], lamps, [], opts).status, "unknown");
+    assert.equal(targetProvenance({ name: "Salon Lambası", domain: "light" }, ["salon lambası 2 kapat"], lamps, [], opts).status, "unknown");
+    // Left extension naming another device.
+    const masa = [...lamps, entity(["Masa Salon Lambası"], "light", ["Salon"])];
+    assert.equal(targetProvenance({ name: "Salon Lambası" }, ["masa salon lambasını kapat"], masa, [], opts).status, "unknown");
+    // Without a snapshot the plain text answer stands (the caller reads one when `nameMatchNeedsSnapshot`).
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası" }, ["salon lambası 2 kapat"]), { status: "known", via: "text" });
+  });
+  test("the name as the whole phrase, a second phrase next to it, or another utterance that fits: known", () => {
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası" }, ["salon lambasını kapat"], lamps, [], opts), { status: "known", via: "text" });
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası" }, ["salon lambasını ve salon lambası 2'yi kapat"], lamps, [], opts), { status: "known", via: "text" });
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası" }, ["salon lambası açık mı", "salon lambası 2 kapat"], lamps, [], opts), { status: "known", via: "text" });
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası 2" }, ["salon lambası 2 kapat"], lamps, [], opts), { status: "known", via: "text" });
+  });
+  test("a name that reaches no entity keeps the text match (left to HA and the name-only check)", () => {
+    assert.deepEqual(targetProvenance({ name: "Depo Lambası" }, ["depo lambası 2 kapat"], lamps, [], opts), { status: "known", via: "text" });
+  });
+  test("a name owned by several entities: a longer phrase naming another device still does not count", () => {
+    const twins = [entity(["Salon Lambası"], "light", ["Salon"]), entity(["Salon Lambası"], "light", ["Mutfak"]), entity(["Salon Lambası 2"], "light", ["Salon"])];
+    assert.equal(targetProvenance({ name: "Salon Lambası", domain: ["light"] }, ["salon lambası 2 kapat"], twins, [], opts).status, "unknown");
+    assert.deepEqual(targetProvenance({ name: "Salon Lambası", domain: ["light"] }, ["salon lambasını kapat"], twins, [], opts), { status: "known", via: "text" });
+  });
+  test("the matched words themselves naming another device (by stemming) do not count", () => {
+    const clash = [entity(["Salon Lamba"], "light", ["Salon"]), entity(["Salondaki Lamba"], "light", ["Salon"])];
+    assert.equal(targetProvenance({ name: "Salon Lamba" }, ["salondaki lambayı kapat"], clash, [], opts).status, "unknown");
+    assert.deepEqual(targetProvenance({ name: "Salon Lamba" }, ["salon lambayı kapat"], clash, [], opts), { status: "known", via: "text" });
+    // Without a snapshot the plain text answer stands (the session reads one first, nameMatchNeedsSnapshot).
+    assert.deepEqual(targetProvenance({ name: "Salon Lamba" }, ["salondaki lambayı kapat"]), { status: "known", via: "text" });
+  });
+  test("nameMatchNeedsSnapshot: a text match with a word next to it", () => {
+    assert.equal(nameMatchNeedsSnapshot({ name: "Salon Lambası" }, ["salon lambası 2 kapat"]), true);
+    assert.equal(nameMatchNeedsSnapshot({ name: "Salon Lambası" }, ["salon lambasını kapat"]), true);
+    assert.equal(nameMatchNeedsSnapshot({ name: "Salon Lambası" }, ["salon lambası"]), false, "the whole utterance");
+    assert.equal(nameMatchNeedsSnapshot({ name: "Salon Lambası" }, ["salon lambası 2 kapat", "salon lambası"]), false, "one whole-utterance match is enough");
+    assert.equal(nameMatchNeedsSnapshot({ name: "Salon Lambası" }, ["mutfağı kapat"]), false, "no text match");
+    assert.equal(nameMatchNeedsSnapshot({ area: "Salon" }, ["salon ışıklarını kapat"]), false, "no name");
+  });
+});
+
+describe("name-only targets (docs/14 decision 9, T4.8)", () => {
+  test("isNameOnlyCall: `name` without `domain` / `device_class`", () => {
+    assert.equal(isNameOnlyCall({ name: "Ön Kapı" }), true);
+    assert.equal(isNameOnlyCall({ name: "Ön Kapı", area: "Giriş" }), true);
+    assert.equal(isNameOnlyCall({ name: "Ön Kapı", domain: "lock" }), false);
+    assert.equal(isNameOnlyCall({ name: "Ön Kapı", device_class: "door" }), false);
+    assert.equal(isNameOnlyCall({ area: "Salon" }), false);
+  });
+  const sensitive = (e: LiveEntity) => e.domain === "lock";
+  const snap = [entity(["Ön Kapı", "Kapı"], "lock", ["Giriş"]), entity(["Salon Lambası"], "light", ["Salon"]), entity(["Tavan"], "light", ["Salon"]), entity(["Tavan"], "light", ["Mutfak"])];
+  test("one plain entity -> ok; a sensitive one (also by alias) -> sensitive", () => {
+    assert.equal(nameOnlyTarget({ name: "Salon Lambası" }, snap, sensitive), "ok");
+    assert.equal(nameOnlyTarget({ name: "ön kapı" }, snap, sensitive), "sensitive");
+    assert.equal(nameOnlyTarget({ name: "Kapı" }, snap, sensitive), "sensitive");
+  });
+  test("no entity, several, a contradicting area or a bad value -> unresolved; area narrows", () => {
+    assert.equal(nameOnlyTarget({ name: "Depo" }, snap, sensitive), "unresolved");
+    assert.equal(nameOnlyTarget({ name: "Tavan" }, snap, sensitive), "unresolved");
+    assert.equal(nameOnlyTarget({ name: "Tavan", area: "Mutfak" }, snap, sensitive), "ok");
+    assert.equal(nameOnlyTarget({ name: "Salon Lambası", area: "Mutfak" }, snap, sensitive), "unresolved");
+    assert.equal(nameOnlyTarget({ name: 42 }, snap, sensitive), "unresolved");
+    assert.equal(nameOnlyTarget({ name: "Salon Lambası", area: 7 }, snap, sensitive), "unresolved");
+  });
+  test("a sensitive entity among several wins", () => {
+    const shared = [entity(["Giriş"], "lock"), entity(["Giriş"], "light")];
+    assert.equal(nameOnlyTarget({ name: "Giriş" }, shared, sensitive), "sensitive");
   });
 });

@@ -155,7 +155,7 @@ const LEARNED = compileLearnedRule(
 );
 
 let counter = 0;
-/** Wired like `index.ts`: shipped configs, learned rules, learning policy (router keywords), a confirmed-name store with a clock. */
+/** Wired like `index.ts`: shipped configs, learned rules, learning policy, the gate's router words, a confirmed-name store with a clock. */
 async function harness(o: { confirmTimeoutMs?: number; transcript?: string; clock?: { now: () => number } } = {}) {
   const dir = join(base, `d${++counter}`);
   const store = new ConfirmedNameStore({ dir: join(dir, "device-names"), ...(o.clock ? { now: o.clock.now } : {}), log: () => {} });
@@ -178,6 +178,7 @@ async function harness(o: { confirmTimeoutMs?: number; transcript?: string; cloc
       direct: ha,
       learning: { store: { observe: async () => undefined, recordOutcome: async () => ({ suspended: false }) } as never, policy: POLICY },
       names: store,
+      gateWords: { domainWords: ROUTER.learning.keywords, denyNameWords: ROUTER.learning.denyNameWords },
     },
     { sessionId: `s${counter}`, device: "browser" },
     (f) => {
@@ -422,7 +423,9 @@ test("several candidates: tier 0 is ambiguous, the model turn makes no call (its
   await h.say("mutfak ışık 2");
   assert.equal(h.confirms().length, 0);
   assert.deepEqual(h.ha.writes.map((c) => c.args.name), ["Mutfak Işık 2"]);
-  assert.equal(h.ha.readsBeforeWrite, 1, "tier 0's read in turn 1 only: the name was in the user's words (rule 3), no gate read");
+  // The name was in the user's words (rule 3, the whole utterance: no T4.9 read); the call carries `name` only,
+  // so the gate reads the live context once for its kind (T4.8).
+  assert.equal(h.ha.readsBeforeWrite, 2, "tier 0's read in turn 1, the gate's name-only read in turn 2");
 });
 
 // ------------------------------------------------------------------ confirmed names
@@ -547,6 +550,57 @@ test("confirmed name pointing at a lock: the model's lock call (domain lock) ask
   assert.equal(req.tool, OFF);
   assert.equal(req.remember, undefined);
   assert.equal(h.ha.writes.length, writes);
+});
+
+// docs/14 decision 9 (T4.8): the open T4.5 item. A name-only model call is known through the
+// confirmed name (rule 5), yet its target is sensitive: the gate finds it in the live context and asks.
+for (const [target, why] of [
+  ["Ön Kapı", "a lock (confirm_inputs domain)"],
+  ["Röle Anahtarı", "a switch that is not an outlet"],
+  ["Kapı Rölesi", "a deny-name target"],
+] as const) {
+  test(`confirmed name pointing at ${why}: the model's name-only call opens a card (no remember); declined -> no write`, async () => {
+    const h = await harness();
+    h.model.queue.push([turnOff(target)]);
+    await h.sayAndAnswer("fıskiyeyi kapat", (r) => h.respond(r, true, true));
+    assert.equal((await h.entry())?.target.name, target);
+    const writes = h.ha.writes.length;
+
+    h.model.queue.push([turnOff(target)]);
+    const req = await h.sayAndAnswer("fıskiyeyi kapat", (r) => h.respond(r, false));
+    assert.equal(h.model.calls.length, 2, "tier 0 refused, the model got the turn");
+    assert.equal(req.tool, OFF);
+    assert.equal(req.remember, undefined, "the target is known (rule 5): no offer");
+    assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), req.summary);
+    assert.equal(h.model.decisions.at(-1)?.behavior, "deny");
+    assert.equal(h.ha.writes.length, writes, "nothing switched");
+    const write = (await h.lines()).filter((l) => l.kind === "tool_call" && l.tool === `${HA}${OFF}`).at(-1);
+    assert.match(write?.reason ?? "", /\+gate:sensitive_target$/);
+  });
+}
+
+test("a lock the user named: the model's name-only call opens a card; declined -> no write, approved -> the write runs", async () => {
+  const h = await harness();
+  h.model.queue.push([turnOff("Ön Kapı")]);
+  const req = await h.sayAndAnswer("ön kapıyı kapat", (r) => h.respond(r, false));
+  assert.equal(h.model.calls.length, 1, "tier 0 does not switch a lock");
+  assert.equal(req.remember, undefined);
+  assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), req.summary);
+  assert.equal(h.ha.writes.length, 0);
+
+  h.model.queue.push([turnOff("Ön Kapı")]);
+  await h.sayAndAnswer("ön kapıyı kapat", (r) => h.respond(r, true));
+  assert.deepEqual(h.ha.writes.map((c) => c.args), [{ name: "Ön Kapı" }]);
+});
+
+test("a name-only call on a light or a plug the user named: no card (T4.8 raises sensitive kinds only)", async () => {
+  const h = await harness();
+  h.model.queue.push([turnOff("Sonoff Priz"), turnOff("Mutfak Işık 1")]);
+  await h.say("sonoff priz ve mutfak ışık 1 kapansın");
+  assert.equal(h.model.calls.length, 1);
+  assert.equal(h.confirms().length, 0);
+  assert.deepEqual(h.ha.writes.map((c) => c.args.name), ["Sonoff Priz", "Mutfak Işık 1"]);
+  assert.equal(h.ha.readsBeforeWrite, 1, "no tier-0 rule: the gate's one read, cached for both calls");
 });
 
 test("broken or empty live context neither starts nor clears missingSince (tier-0 read and gate read)", async () => {

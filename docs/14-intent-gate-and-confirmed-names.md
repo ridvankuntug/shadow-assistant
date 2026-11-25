@@ -814,7 +814,7 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] Session tests: two identical failures → third call not sent; different
     error texts → not blocked; other argument class → not blocked; tier 0
     unaffected; count survives tier-1 → tier-2 escalation.
-- [~] **T4.5 — Scenario tests.** Durum: başlandı
+- [x] **T4.5 — Scenario tests.** Durum: bitti
   - [x] 2026-11-17: "Sonoff hangi cihazlar var"; the fake model calls
     `GetLiveContext` with `name` and gets the same error twice → the third such
     call is not sent (`repeated_error`); then it calls `intent__HassTurnOff` on
@@ -842,28 +842,28 @@ protocol shape is fixed and shares no file with the Core tasks.
     model call asks again; device back before 30 days → `missingSince` cleared,
     tier 0 uses it; missing 30 days (injected clock) → `passive`, not used even
     when the device returns; a new "Evet, hep bu" makes it active.
-  - [~] Confirmed name pointing at a lock / non-outlet switch / deny-name target:
+  - [x] Confirmed name pointing at a lock / non-outlet switch / deny-name target:
     refused on tier 0, confirm on the model path.
   - [x] Broken/empty live context neither starts nor clears `missingSince`.
 - [x] **T4.6 — Docs index.** Durum: bitti
   - [x] Add this document to `docs/README.md` (left out of T4.1 on purpose).
   - [x] Progress log and statuses in this document after T4.2-T4.5 and T4.7.
 
-- [~] **T4.8 — Sensitive name-only targets (decision 9).** Durum: başlandı
-  - [ ] Gate: resolve a name-only write target in the live snapshot; apply
+- [x] **T4.8 — Sensitive name-only targets (decision 9).** Durum: bitti
+  - [x] Gate: resolve a name-only write target in the live snapshot; apply
     `confirm_inputs` (domain/device_class) and the tier-0 sensitive rules
     (lock, non-outlet switch, deny-name) → always confirm; unreadable snapshot → confirm.
-  - [ ] Tests incl. the open T4.5 item (confirmed name on a lock / non-outlet switch / deny-name).
-- [~] **T4.9 — Rule 3 checked against the live list (decision 10).** Durum: başlandı
-  - [ ] Model path: text match that is not an exact fit for the user's name phrase
+  - [x] Tests incl. the open T4.5 item (confirmed name on a lock / non-outlet switch / deny-name).
+- [x] **T4.9 — Rule 3 checked against the live list (decision 10).** Durum: bitti
+  - [x] Model path: text match that is not an exact fit for the user's name phrase
     and a similarly named other device in the snapshot → confirm.
-  - [ ] Tests: "salon lambası 2 kapat" + call "Salon Lambası" → card; tier-0
+  - [x] Tests: "salon lambası 2 kapat" + call "Salon Lambası" → card; tier-0
     brightness still two HA calls and no card.
-- [ ] **T4.10 — Confirm summary spoken (decision 11).** Durum: başlamadı
+- [~] **T4.10 — Confirm summary spoken (decision 11).** Durum: başlandı
   - [ ] Speak the confirm summary when TTS is on; quiet-hour rules apply; tests.
-- [~] **T4.11 — `domainWords` without learning (decision 12).** Durum: başlandı
-  - [ ] Pass router keyword lists to the gate independent of `deps.learning`; test with learning off.
-- [ ] **T4.12 — Logs, mock core, protocol tests (decision 13).** Durum: başlamadı
+- [x] **T4.11 — `domainWords` without learning (decision 12).** Durum: bitti
+  - [x] Pass router keyword lists to the gate independent of `deps.learning`; test with learning off.
+- [~] **T4.12 — Logs, mock core, protocol tests (decision 13).** Durum: başlandı
   - [ ] `permission` log record carries the gate reason.
   - [ ] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
   - [ ] Protocol tests for `welcome.features` "names" and `remember` (core and ui).

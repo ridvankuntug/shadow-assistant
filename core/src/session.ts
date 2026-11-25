@@ -73,7 +73,7 @@ import type {
 } from "./protocol.js";
 import type { SuppressionRecord, SuppressionStore } from "./notification-suppressions.js";
 import type { HaUrgencyStore, UrgencyFeedbackPort, UrgencySuggestion } from "./ha-urgency.js";
-import { LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, type DirectPlan } from "./router-config.js";
+import { BASE_DENY_NAME_WORDS, LEARNABLE_SERVICE, LIVE_CONTEXT_TOOL, staticDenyNameFilter, staticSwitchTarget, type DirectPlan } from "./router-config.js";
 import { ESCALATION_MARKER, type ModelTier, type RouteDecision, type Router, type UsageOutcome, type UsageRecord } from "./router.js";
 import type { PermissionLevel } from "./services.js";
 import { EMPTY_LEXICON, type Lexicon } from "./pronunciation.js";
@@ -81,7 +81,7 @@ import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type Tts
 import { SpeechStream } from "./speech-stream.js";
 import { buildTurnEnvelope, ESCALATION_CONTINUE, wrapDirectNotes } from "./turn-envelope.js";
 import { cleanTurkish, fold } from "./turkish.js";
-import { isQuestionTurn, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
+import { isNameOnlyCall, isQuestionTurn, nameMatchNeedsSnapshot, nameOnlyTarget, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -269,6 +269,20 @@ export interface SessionDeps {
    * `names_delete`; absent = none of these (`names_*` get `bad_request`).
    */
   names?: SessionNames;
+  /**
+   * Router words of the write gate (docs/14), independent of `learning`
+   * (decision 12, T4.11); absent = `learning`'s router config when set, else
+   * no device words and the built-in deny name words only.
+   */
+  gateWords?: SessionGateWords;
+}
+
+/** router.yaml words the write gate uses (index.ts passes `CompiledRouterConfig.learning`). */
+export interface SessionGateWords {
+  /** Device words per domain (`learning.keywords`): broad calls and area + device word matches. */
+  domainWords?: Readonly<Record<string, readonly string[]>>;
+  /** Folded deny name words (`learning.denyNameWords`): name-only targets holding one always ask (T4.8). */
+  denyNameWords?: Iterable<string>;
 }
 
 /** What a session needs for pattern learning. */
@@ -387,12 +401,20 @@ export class Session {
   private readonly notificationListener: NotificationListener | undefined;
   /** Stops the notification broadcasts to this socket (close()). */
   private readonly detachNotifications: (() => void) | undefined;
+  /** Device words per domain for the write gate (`SessionDeps.gateWords`, T4.11). */
+  private readonly gateDomainWords: Readonly<Record<string, readonly string[]>> | undefined;
+  /** No deny name word in the entity's names, aliases or areas: tier 0's static light-set filter (T4.8). */
+  private readonly gateNameAllowed: (entity: LiveEntity) => boolean;
 
   constructor(
     private readonly deps: SessionDeps,
     readonly info: SessionInfo,
     private readonly send: (frame: ServerFrame) => void,
   ) {
+    const routerLearning = deps.learning?.policy.config.learning;
+    this.gateDomainWords = deps.gateWords?.domainWords ?? routerLearning?.keywords;
+    // The same deny words and the same matcher as tier 0 (router-config.ts), never a copy of them.
+    this.gateNameAllowed = staticDenyNameFilter(deps.gateWords?.denyNameWords ?? routerLearning?.denyNameWords ?? BASE_DENY_NAME_WORDS.map(foldKey));
     this.slog = deps.log.session(info.sessionId);
     this.broker = new ConfirmBroker(deps.confirmTimeoutMs, (req, res) => this.onConfirmResolved(req, res));
     void this.slog.append({
@@ -1989,7 +2011,7 @@ export class Session {
   }
 
   /**
-   * The write gate (docs/14 Decisions 2-4) for one `write` / `confirm` call of
+   * The write gate (docs/14 Decisions 2-4, decisions 9 and 10) for one `write` / `confirm` call of
    * a `target_check` service: why it must ask, or undefined. Only ever raises.
    *
    *   question turn             -> `question_turn` (tier 0 included, whatever its hint)
@@ -1998,6 +2020,16 @@ export class Session {
    *   target not the user's     -> `unknown_target`; a rule-4 miss without a
    *                                snapshot reads the live context once per turn
    *                                (a failed read leaves the target unknown)
+   *   `name` said, but inside a longer phrase (T4.9)
+   *                             -> the same read; the match must fit the user's whole
+   *                                name phrase ("salon lambası 2" said, "Salon Lambası"
+   *                                called -> `unknown_target`); a failed read keeps the match
+   *   name-only call (T4.8)     -> the same read, always; `sensitive_target` when the name
+   *                                reaches a sensitive entity (`gateSensitive`), even when
+   *                                the user named it; `unverified_target` when the read
+   *                                fails or the name reaches no entity or several
+   *
+   * Live-context reads happen on the model path only and share the per-turn cache.
    */
   private async writeGate(
     turn: ActiveTurn,
@@ -2011,25 +2043,46 @@ export class Session {
     if (turn.question) return "question_turn";
     if (level === "confirm" || provenance !== undefined) return undefined;
     const window = this.utterances.map((u) => u.text);
-    // Device words per domain (router.yaml `learning.keywords`): broad calls and area + keyword matches.
-    const opts = { domainWords: this.deps.learning?.policy.config.learning.keywords };
+    // Device words per domain (router.yaml `learning.keywords`, also with learning off): broad calls and area + keyword matches.
+    const opts = { domainWords: this.gateDomainWords };
     let p = targetProvenance(input, window, undefined, undefined, opts);
-    if (p.status === "unknown" && p.needsSnapshot && identity.service !== undefined) {
-      const snapshot = await untilAborted(this.gateSnapshot(turn, identity.service), signal);
-      if (snapshot) {
-        // Rule 5: only active confirmed names whose fingerprint is present exactly once in this snapshot
-        // (the same check tier 0 makes): a missing device is never reached through its old name. HA names
-        // and aliases always win (Decision 6, as on tier 0): an entry with a key that is now the folded
-        // name or alias of any entity (any domain) is not used, so those words never vouch for the old target.
-        const store = this.deps.names;
-        const haNames = new Set(snapshot.flatMap((e) => e.names.map(foldKey)));
-        const names = store
-          ? (await store.list()).filter((n) => store.verify(n, snapshot).status === "present" && !n.keys.some((k) => haNames.has(foldKey(k))))
-          : undefined;
-        p = targetProvenance(input, window, snapshot, names, opts);
-      }
+    const nameOnly = isNameOnlyCall(input);
+    const recheck = (p.status === "unknown" && p.needsSnapshot) || (p.status === "known" && p.via === "text" && nameMatchNeedsSnapshot(input, window));
+    if (!recheck && !nameOnly) return p.status === "unknown" ? "unknown_target" : undefined;
+    const snapshot = identity.service !== undefined ? await untilAborted(this.gateSnapshot(turn, identity.service), signal) : undefined;
+    if (snapshot && recheck) {
+      // Rule 5: only active confirmed names whose fingerprint is present exactly once in this snapshot
+      // (the same check tier 0 makes): a missing device is never reached through its old name. HA names
+      // and aliases always win (Decision 6, as on tier 0): an entry with a key that is now the folded
+      // name or alias of any entity (any domain) is not used, so those words never vouch for the old target.
+      const store = this.deps.names;
+      const haNames = new Set(snapshot.flatMap((e) => e.names.map(foldKey)));
+      const names = store
+        ? (await store.list()).filter((n) => store.verify(n, snapshot).status === "present" && !n.keys.some((k) => haNames.has(foldKey(k))))
+        : undefined;
+      p = targetProvenance(input, window, snapshot, names, opts);
     }
-    return p.status === "unknown" ? "unknown_target" : undefined;
+    // An unknown target keeps its reason (and the "Evet, hep bu" rules of Decision 7).
+    if (p.status === "unknown") return "unknown_target";
+    if (!nameOnly) return undefined;
+    if (!snapshot) return "unverified_target";
+    const target = nameOnlyTarget(input, snapshot, (e) => this.gateSensitive(identity, e));
+    return target === "sensitive" ? "sensitive_target" : target === "unresolved" ? "unverified_target" : undefined;
+  }
+
+  /**
+   * Decision 9 (T4.8): an entity a name-only write must always ask for, whatever the
+   * provenance: its `domain` / `device_class` hit the service's `confirm_inputs` (a lock,
+   * a cover, a door ...), it is a switch without positive plug evidence (tier 0's
+   * `staticSwitchTarget`), or a name, alias or area holds a deny name word (tier 0's
+   * deny filter, same words). Fans, media players etc. are not raised here.
+   */
+  private gateSensitive(identity: ToolIdentity, entity: LiveEntity): boolean {
+    const deviceClass = entity.attributes.device_class;
+    const kind = { domain: entity.domain, ...(typeof deviceClass === "string" ? { device_class: deviceClass } : {}) };
+    if (this.deps.policy.confirmInputHit(identity, kind) !== undefined) return true;
+    if (entity.domain === "switch" && !staticSwitchTarget(entity)) return true;
+    return !this.gateNameAllowed(entity);
   }
 
   /** The write gate's live context for `service`, read at most once per turn (cached, failures included). */

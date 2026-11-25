@@ -39,7 +39,7 @@ import { checkRouterServices } from "./router-config.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
-import { DevelopmentTab, NotificationCenter, Session, type Logger, type SessionLearning } from "./session.js";
+import { DevelopmentTab, NotificationCenter, Session, type Logger, type SessionGateWords, type SessionLearning } from "./session.js";
 import { onShutdownSignal, runShutdown, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { PiperTtsClient, WhisperClient } from "./speech.js";
 import { UsageLog } from "./usage-log.js";
@@ -288,7 +288,10 @@ export async function main(): Promise<void> {
   // Learned tier-0 rules (docs/08 T7.w.2): only with the tiered router, direct calls and router.yaml `learning.enabled`.
   let learnedRules: LearnedRuleStore | undefined;
   let learning: SessionLearning | undefined;
+  // The write gate's router words (docs/14 decision 12): also with learning off.
+  let gateWords: SessionGateWords | undefined;
   if (cfg.router) {
+    gateWords = { domainWords: cfg.router.learning.keywords, denyNameWords: cfg.router.learning.denyNameWords };
     const enabled = cfg.services.services.filter((s) => s.enabled).map((s) => s.name);
     for (const w of checkRouterServices(cfg.router, enabled)) logger.warn(`[shadow-core] router.yaml: ${w}`);
     let learned: TieredRouterOptions["learned"];
@@ -442,6 +445,7 @@ export async function main(): Promise<void> {
           notifications: notificationCenter,
           pcPermissions,
           names: confirmedNames,
+          gateWords,
         },
         info,
         send,

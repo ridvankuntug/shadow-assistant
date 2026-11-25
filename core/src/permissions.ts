@@ -120,6 +120,16 @@ export class PermissionPolicy {
     return { classified: svc !== undefined && findRule(svc, tool) !== undefined, level };
   }
 
+  /**
+   * The services.yaml `confirm_inputs` value of the tool's service that `input`
+   * hits (`"<arg>=<value>"`), or undefined. The write gate (docs/14 decision 9)
+   * asks it with a name-only call's resolved `domain` / `device_class`.
+   */
+  confirmInputHit(identity: ToolIdentity, input: Record<string, unknown>): string | undefined {
+    const svc = identity.service ? this.byName.get(identity.service) : undefined;
+    return svc ? matchConfirmInputs(svc.confirmInputs, input) : undefined;
+  }
+
   /** Whether the tool's service has services.yaml `target_check: true` (the write gate, docs/14). */
   targetChecked(identity: ToolIdentity): boolean {
     const svc = identity.service ? this.byName.get(identity.service) : undefined;
@@ -312,13 +322,21 @@ function clip(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
-/** Why the write gate (docs/14) raised a call to `confirm`; `question_turn` wins over `unknown_target`. */
-export type GateRaise = "question_turn" | "unknown_target";
+/**
+ * Why the write gate (docs/14) raised a call to `confirm`; `question_turn` wins over
+ * `unknown_target`, which wins over the name-only checks of decision 9 (T4.8):
+ * `sensitive_target` (a lock, a non-outlet switch, a deny-name or `confirm_inputs`
+ * target) and `unverified_target` (no usable live context, or the name reaches no
+ * entity or several).
+ */
+export type GateRaise = "question_turn" | "unknown_target" | "sensitive_target" | "unverified_target";
 
 /** Card text the write gate appends to the summary (docs/14 Decision 5). */
 export const GATE_SUMMARY_SUFFIX: Record<GateRaise, string> = {
   question_turn: "Soru sordun; yine de yapılsın mı?",
   unknown_target: "Bu cihazın adını söylemedin.",
+  sensitive_target: "Bu cihaz için her zaman onay gerekiyor.",
+  unverified_target: "Cihaz canlı listede doğrulanamadı.",
 };
 
 const MAX_SUMMARY_CHARS = 300;
