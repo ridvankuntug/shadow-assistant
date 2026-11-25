@@ -142,6 +142,12 @@ type SpeechQueue = {
    * answer text instead of ending at `final`.
    */
   awaitingText: boolean;
+  /**
+   * The user talked over the spoken confirm summary (docs/14 Decision 11):
+   * chunks that arrive while the confirm is still pending stay silent; the
+   * answer after it is spoken.
+   */
+  muted?: boolean;
 };
 
 export interface CoreClientLike {
@@ -808,6 +814,7 @@ export class AssistantController {
   private bargeIn(): void {
     const target = bargeInTarget(this.state);
     this.dropPendingSpeech();
+    if (!target && this.silenceForConfirm()) return;
     this.stopLocalAudio();
     if (!target) return;
     if (this.queuedTurn?.id === target) {
@@ -824,6 +831,23 @@ export class AssistantController {
       this.settleTimer = setTimeout(() => this.flushQueuedTurn(), CANCEL_SETTLE_MS);
     }
     this.dispatch({ type: "barge_in", turnId: target });
+  }
+
+  /**
+   * Talking while the active turn waits for a confirm (docs/14 Decision 11):
+   * the spoken card summary stops, but the turn's queue stays open (closing
+   * it would drop the answer after the confirm, e.g. after a spoken "evet").
+   * False when there is no such queue (the caller stops audio as usual).
+   */
+  private silenceForConfirm(): boolean {
+    const q = this.speech;
+    if (!q || q.closed || q.turnId !== this.state.activeTurn?.id) return false;
+    q.items = [];
+    q.muted = true;
+    // Resolves the pending play(): the queue pumps on and waits for the next chunk.
+    this.adapter.playback.stop();
+    this.adapter.tts.fallback?.stop();
+    return true;
   }
 
   /** Stops the clip or native fallback speech now playing and clears the streamed-speech queue. */
@@ -1218,8 +1242,9 @@ export class AssistantController {
     const q = this.queueFor(msg.id);
     if (q.closed || msg.seq < q.nextSeq) return; // stopped, or a repeated frame
     q.nextSeq = msg.seq + 1;
+    if (q.muted && !confirmPending(this.state)) q.muted = false;
     // Only audio is playable (mode `audio`); a `text` payload is ignored.
-    if (msg.data && msg.mime) {
+    if (msg.data && msg.mime && !q.muted) {
       q.items.push({ clip: { mime: msg.mime, data: msg.data } });
       q.audio = true;
     }

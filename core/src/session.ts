@@ -253,9 +253,10 @@ export interface SessionDeps {
    * attaches itself for the `notification` broadcasts, reports its turns (for
    * the urgent speaker), tells when it turns speech on (pending urgent
    * speech, T7.w.11.4) and answers `notifications_list` /
-   * `notification_action`; absent = `bad_request`.
+   * `notification_action`; absent = `bad_request`. Its quiet hours also
+   * silence the spoken confirm summary (docs/14 Decision 11).
    */
-  notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "speechOn" | "list" | "act">;
+  notifications?: Pick<NotificationCenter, "attach" | "turnStarted" | "speechOn" | "list" | "act" | "quietNow">;
   /**
    * The PC permission list (T17.2, feature `pc_permissions`, docs/11 D3):
    * `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`; absent = `bad_request`.
@@ -956,6 +957,17 @@ export class Session {
       if (this.speaking.get(turn.id) === stream) this.speaking.delete(turn.id);
     });
     return stream;
+  }
+
+  /**
+   * Speaks a short confirm summary on the turn's speech stream (docs/14
+   * Decision 11): only when the client has speech on (the turn has a stream)
+   * and the home is not in quiet hours. The card itself is unchanged.
+   */
+  private speakConfirm(turn: ActiveTurn, identity: ToolIdentity, input: Record<string, unknown>, offer?: RememberOffer): void {
+    if (!turn.speech || turn.abort.signal.aborted) return;
+    if (safe(() => this.deps.notifications?.quietNow() ?? false, false)) return;
+    turn.speech.say(spokenConfirmSummary(identity, input, offer ? { spoken: offer.spoken, target: offer.target.name } : undefined));
   }
 
   /** End of the turn's text: the rest is spoken (nothing after a cancel). */
@@ -1876,6 +1888,7 @@ export class Session {
         level,
         ...(by ? { by } : {}),
         ...(requestId ? { requestId } : {}),
+        ...(gate ? { gate } : {}),
       });
       this.deps.logger.info(`[shadow-core] denied ${identity.full} (${reason}${by ? `, by ${by}` : ""})`);
       return { allowed: false, reason: why, level, ...(gate ? { gate } : {}) };
@@ -1890,6 +1903,7 @@ export class Session {
         level,
         ...(by ? { by } : {}),
         ...(requestId ? { requestId } : {}),
+        ...(gate ? { gate } : {}),
       });
       if (level !== "read") {
         this.deps.logger.info(
@@ -1926,6 +1940,7 @@ export class Session {
       expiresAt: request.expiresAt,
       ...(offer ? { remember: { spoken: offer.spoken, target: offer.target.name } } : {}),
     });
+    this.speakConfirm(turn, identity, input, offer);
     const res = await result;
     this.offers.delete(request.requestId);
     signal.removeEventListener("abort", onAbort);
@@ -2159,6 +2174,23 @@ export class Session {
 
 /** Folded comparison form of a name or area (as tier 0 and the write gate compare them). */
 const foldKey = (s: string) => fold(cleanTurkish(s));
+
+/**
+ * The spoken form of a confirm card (docs/14 Decision 11): short Turkish, no
+ * argument list. The target is the call's `name` (else `area`) when it is a
+ * string; a "Evet, hep bu" offer is named too.
+ */
+export function spokenConfirmSummary(
+  identity: Pick<ToolIdentity, "tool">,
+  input: Record<string, unknown>,
+  remember?: { spoken: string; target: string },
+): string {
+  const raw = typeof input["name"] === "string" ? input["name"] : typeof input["area"] === "string" ? input["area"] : "";
+  const target = raw.trim().slice(0, 60);
+  const ask = `Onay gerekiyor: ${target ? `${target}, ` : ""}${identity.tool} çalıştırılsın mı?`;
+  if (!remember) return ask;
+  return `${ask} İstersen "Evet, hep bu" de; "${remember.spoken}" bundan sonra ${remember.target} olur.`;
+}
 
 /** `domain` of an HA intent call: undefined when absent, null when malformed. */
 function callDomains(v: unknown): string[] | undefined | null {
@@ -2939,8 +2971,11 @@ export class NotificationCenter {
     return safe(() => l.speaks(), false);
   }
 
-  /** Inside the quiet-hours window now. A failing clock counts as not quiet (speech as before T7.w.11.9). */
-  private quietNow(): boolean {
+  /**
+   * Inside the quiet-hours window now. A failing clock counts as not quiet (speech as before T7.w.11.9).
+   * Also asked by the session before it speaks a confirm summary (docs/14 Decision 11).
+   */
+  quietNow(): boolean {
     const q = this.o.quietHours;
     if (!q) return false;
     return safe(() => inQuietHours(q, (this.o.now ?? (() => new Date()))()), false);

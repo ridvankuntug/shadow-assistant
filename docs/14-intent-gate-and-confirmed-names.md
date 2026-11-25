@@ -1,7 +1,6 @@
 # 14 - Intent gate and confirmed device names
 
-Status: design approved 2026-11-22 (T4.1); implemented 2026-11-22 (T4.2-T4.7). One
-T4.5 item is open (see the progress log).
+Status: design approved 2026-11-22 (T4.1); implemented (T4.2-T4.12).
 Builds on [`02-core-protocol.md`](02-core-protocol.md) (permission gate, confirm
 frames), [`04-router.md`](04-router.md) (tiers, tier 0), [`06-memory.md`](06-memory.md)
 (memory surface) and [`08-learning-fast-path.md`](08-learning-fast-path.md)
@@ -859,14 +858,14 @@ protocol shape is fixed and shares no file with the Core tasks.
     and a similarly named other device in the snapshot → confirm.
   - [x] Tests: "salon lambası 2 kapat" + call "Salon Lambası" → card; tier-0
     brightness still two HA calls and no card.
-- [~] **T4.10 — Confirm summary spoken (decision 11).** Durum: başlandı
-  - [ ] Speak the confirm summary when TTS is on; quiet-hour rules apply; tests.
+- [x] **T4.10 — Confirm summary spoken (decision 11).** Durum: bitti
+  - [x] Speak the confirm summary when TTS is on; quiet-hour rules apply; tests.
 - [x] **T4.11 — `domainWords` without learning (decision 12).** Durum: bitti
   - [x] Pass router keyword lists to the gate independent of `deps.learning`; test with learning off.
-- [~] **T4.12 — Logs, mock core, protocol tests (decision 13).** Durum: başlandı
-  - [ ] `permission` log record carries the gate reason.
-  - [ ] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
-  - [ ] Protocol tests for `welcome.features` "names" and `remember` (core and ui).
+- [x] **T4.12 — Logs, mock core, protocol tests (decision 13).** Durum: bitti
+  - [x] `permission` log record carries the gate reason.
+  - [x] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
+  - [x] Protocol tests for `welcome.features` "names" and `remember` (core and ui).
 
 ## Progress log
 
@@ -878,3 +877,5 @@ protocol shape is fixed and shares no file with the Core tasks.
   target is refused on tier 0, but on the model path only a call that carries
   `domain` (e.g. `lock`, through `confirm_inputs`) asks; a call with `name` only is
   known through rule 5 and runs without a card. Awaiting a decision.
+- 2026-11-25: follow-up decisions 9-13 implemented (T4.8-T4.12); the open T4.5
+  item is closed by T4.8 (name-only sensitive targets always ask).

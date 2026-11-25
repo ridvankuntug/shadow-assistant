@@ -790,6 +790,26 @@ describe("streamed speech (speech_stream)", () => {
     expect(playedData(t)).toEqual(["A"]);
   });
 
+  it("talking over the spoken confirm summary: it stops, nothing is cancelled, the answer after the confirm is spoken (docs/14 Decision 11)", async () => {
+    const t = setup(undefined, STREAM);
+    t.controller.sendText("kapıyı aç");
+    t.receive({ type: "state", state: "awaiting_confirm" });
+    t.receive({ type: "confirm_request", requestId: "c1", id: "t1", tool: "lock", summary: "Açılsın mı?", expiresAt: 1 });
+    t.receive(chunk("t1", 0, "S1"));
+    t.receive(chunk("t1", 1, "S2"));
+    await t.controller.startTalk(); // the voice answer
+    expect(t.calls).toContain("playback.stop");
+    expect(t.sent).not.toContainEqual({ type: "cancel", id: "t1" });
+    t.receive(chunk("t1", 2, "S3")); // late summary while the confirm still waits: silent
+    await flush();
+    expect(playedData(t)).toEqual(["S1"]);
+    t.receive({ type: "confirm_resolved", requestId: "c1", approved: true, by: "voice" });
+    t.receive({ type: "state", state: "thinking" });
+    t.receive(chunk("t1", 3, "A", true));
+    await flush();
+    expect(playedData(t)).toEqual(["S1", "A"]);
+  });
+
   it("stop() and stopSpeaking() clear the queue; later chunks of that turn stay silent", async () => {
     const t = setup(undefined, STREAM);
     t.controller.sendText("anlat");

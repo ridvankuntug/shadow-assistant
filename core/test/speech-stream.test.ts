@@ -324,3 +324,20 @@ test("firstChunkAt is set when the first content frame is sent", async () => {
 test("audio mode without a TTS client is a programming error", () => {
   assert.throws(() => new SpeechStream({ turnId: "t", mode: "audio", lexicon, send: () => {} }));
 });
+
+test("say(): pending text is cut off, the text is sent at once, the stream stays open (docs/14 Decision 11)", async () => {
+  const { stream, frames } = make({ mode: "text" });
+  stream.push("Bakıyorum");
+  stream.say("Onay  gerekiyor: x çalıştırılsın mı?");
+  await tick();
+  assert.deepEqual(
+    frames.map((f) => ("text" in f ? f.text : undefined)),
+    ["Bakıyorum", "Onay gerekiyor: x çalıştırılsın mı?"],
+  );
+  assert.ok(frames.every((f) => !f.final));
+  stream.push(`${C} `);
+  await stream.end();
+  assert.deepEqual(frames.at(-1), { type: "speech_chunk", id: "t1", seq: 2, final: true, text: C });
+  stream.say("sonra");
+  assert.equal(frames.length, 3, "ignored after end");
+});

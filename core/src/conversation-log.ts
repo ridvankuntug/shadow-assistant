@@ -26,6 +26,8 @@ export type LogEntry =
       level: string;
       by?: string;
       requestId?: string;
+      /** Why the write gate raised the call to a card (docs/14 Decision 13); absent = no gate raise. */
+      gate?: string;
     }
   | {
       kind: "usage";

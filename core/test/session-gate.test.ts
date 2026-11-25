@@ -22,7 +22,7 @@ import type { ServerFrame } from "../src/protocol.js";
 import { parseRouterConfig } from "../src/router-config.js";
 import { TieredRouter } from "../src/router.js";
 import { parseServices } from "../src/services.js";
-import { Session, type SessionLearning } from "../src/session.js";
+import { Session, spokenConfirmSummary, type SessionLearning } from "../src/session.js";
 
 const base = mkdtempSync(join(tmpdir(), "shadow-session-gate-test-"));
 const open: Session[] = [];
@@ -147,7 +147,16 @@ interface LogLine {
 
 let counter = 0;
 function harness(
-  o: { targetCheck?: boolean; readOnly?: boolean; learning?: boolean; gateWords?: boolean; confirmTimeoutMs?: number; transcript?: string } = {},
+  o: {
+    targetCheck?: boolean;
+    readOnly?: boolean;
+    learning?: boolean;
+    gateWords?: boolean;
+    confirmTimeoutMs?: number;
+    transcript?: string;
+    /** A notification inbox stub whose quiet hours are on (true) or off (false); absent = no inbox. */
+    quiet?: boolean;
+  } = {},
 ) {
   const dir = join(base, `d${++counter}`);
   const config = parseRouterConfig(ROUTER_YAML);
@@ -173,6 +182,18 @@ function harness(
       confirmTimeoutMs: o.confirmTimeoutMs ?? 5_000,
       direct: ha,
       ...(learning ? { learning } : {}),
+      ...(o.quiet !== undefined
+        ? {
+            notifications: {
+              attach: () => () => {},
+              turnStarted: () => {},
+              speechOn: async () => {},
+              list: async () => [],
+              act: async () => ({}),
+              quietNow: () => o.quiet === true,
+            } as never,
+          }
+        : {}),
       // Like index.ts: the router words reach the gate whether or not learning is on (T4.11).
       ...(o.gateWords ? { gateWords: { domainWords: config.learning.keywords, denyNameWords: config.learning.denyNameWords } } : {}),
     },
@@ -200,6 +221,8 @@ function harness(
     agent,
     frames,
     say: (text: string) => session.handle({ type: "user_text", id: `t${++turn}`, text }),
+    speechOn: () => session.handle({ type: "speech_prefs", enabled: true, mode: "text" }),
+    spoken: () => frames.flatMap((f) => (f.type === "speech_chunk" && "text" in f && typeof f.text === "string" ? [f.text] : [])),
     /** Says `text` and answers the (first new) confirm card with `approved`. */
     sayAndAnswer: async (text: string, approved: boolean) => {
       const before = frames.filter((f) => f.type === "confirm_request").length;
@@ -665,4 +688,61 @@ test("T4.11: learning off, 'tüm ışıkları kapat' broad call -> no card (rout
   without.agent.queue.push([{ tool: "intent__HassTurnOff", args: { domain: ["light"] } }]);
   const req = await without.sayAndAnswer("tüm ışıkları kapat", false);
   assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.unknown_target), req.summary);
+});
+
+// ------------------------------------------------------------------ spoken confirm summary (T4.10)
+
+test("speech on: the confirm summary is spoken before the answer, short and without arguments", async () => {
+  const h = harness({ quiet: false });
+  await h.speechOn();
+  h.agent.queue.push([turnOff("Bahçe Pompası")]);
+  await h.sayAndAnswer("bahçe pompası açık mı", false);
+  const spoken = h.spoken();
+  assert.equal(spoken[0], "Onay gerekiyor: Bahçe Pompası, intent__HassTurnOff çalıştırılsın mı?");
+  assert.ok(!spoken.join(" ").includes("name:"), "no argument list");
+});
+
+test("speech on, no inbox (no quiet hours known): the confirm summary is spoken", async () => {
+  const h = harness();
+  await h.speechOn();
+  h.agent.queue.push([turnOff("Bahçe Pompası")]);
+  await h.sayAndAnswer("bahçe pompası açık mı", false);
+  assert.match(h.spoken()[0] ?? "", /^Onay gerekiyor: /);
+});
+
+test("speech off: the confirm summary is not spoken", async () => {
+  const h = harness({ quiet: false });
+  h.agent.queue.push([turnOff("Bahçe Pompası")]);
+  await h.sayAndAnswer("bahçe pompası açık mı", false);
+  assert.equal(h.confirms().length, 1);
+  assert.equal(h.frames.filter((f) => f.type === "speech_chunk").length, 0);
+});
+
+test("quiet hours: the confirm summary is not spoken (the answer still is)", async () => {
+  const h = harness({ quiet: true });
+  await h.speechOn();
+  h.agent.queue.push([turnOff("Bahçe Pompası")]);
+  await h.sayAndAnswer("bahçe pompası açık mı", false);
+  assert.equal(h.confirms().length, 1);
+  assert.ok(!h.spoken().some((t) => t.startsWith("Onay gerekiyor")), JSON.stringify(h.spoken()));
+});
+
+test("permission log carries the gate reason; no gate raise -> no gate field", async () => {
+  const h = harness();
+  h.agent.queue.push([turnOff("Bahçe Pompası")]);
+  await h.sayAndAnswer("bahçe pompası açık mı", false);
+  await h.say("salon ışığını kapat");
+  const perms = (await h.lines()).filter((l) => l.kind === "permission" && l.tool === `${HA}intent__HassTurnOff`) as Array<LogLine & { gate?: string }>;
+  assert.equal(perms.length, 2);
+  assert.equal(perms[0]?.gate, "question_turn");
+  assert.equal(perms[1]?.decision, "allow");
+  assert.equal(perms[1]?.gate, undefined);
+});
+
+test("spokenConfirmSummary: a remember offer names the \"Evet, hep bu\" choice; no target -> tool only", () => {
+  assert.equal(
+    spokenConfirmSummary({ tool: "intent__HassTurnOn" }, { name: "pompa" }, { spoken: "pompa", target: "Bahçe Pompası" }),
+    'Onay gerekiyor: pompa, intent__HassTurnOn çalıştırılsın mı? İstersen "Evet, hep bu" de; "pompa" bundan sonra Bahçe Pompası olur.',
+  );
+  assert.equal(spokenConfirmSummary({ tool: "x" }, { brightness: 5 }), "Onay gerekiyor: x çalıştırılsın mı?");
 });

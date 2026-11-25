@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEV_ACTIONS, MAX_NAMES_DELETE_IDS, MAX_TEXT_CHARS, NOTIFICATION_ACTIONS, parseClientFrame } from "../src/protocol.js";
+import {
+  DEV_ACTIONS,
+  MAX_NAMES_DELETE_IDS,
+  MAX_TEXT_CHARS,
+  NOTIFICATION_ACTIONS,
+  parseClientFrame,
+  type ProtocolFeature,
+  type ServerFrame,
+} from "../src/protocol.js";
 
 const ok = (raw: unknown) => {
   const r = parseClientFrame(JSON.stringify(raw));
@@ -240,4 +248,23 @@ test("names_list / names_delete (T4.4b, feature `names`)", () => {
   bad({ type: "names_delete", ids: ["n-3f9a1c"] });
   // `names` is a Core → client frame.
   bad({ type: "names", id: "n1", items: [] });
+});
+
+test("server frames (T4.12): welcome may list `names`; confirm_request carries an optional remember offer", () => {
+  // Type-checked shapes (the client parsers are tested in ui/src/protocol/protocol.test.ts).
+  const feature: ProtocolFeature = "names";
+  const welcome: ServerFrame = { type: "welcome", protocol: 1, sessionId: "s1", device: "browser", features: [feature] };
+  const card: ServerFrame = {
+    type: "confirm_request",
+    requestId: "c1",
+    id: "t1",
+    tool: "intent__HassTurnOn",
+    summary: "intent__HassTurnOn çalıştırılsın mı?",
+    expiresAt: 1,
+    remember: { spoken: "pompa", target: "Bahçe Pompası" },
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(welcome)).features, ["names"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(card)).remember, { spoken: "pompa", target: "Bahçe Pompası" });
+  // The answer to such a card: `remember: true` is parsed (see confirm_response.remember above).
+  assert.equal((ok({ type: "confirm_response", requestId: "c1", approved: true, remember: true }) as { remember?: boolean }).remember, true);
 });

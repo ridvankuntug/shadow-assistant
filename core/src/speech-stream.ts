@@ -116,6 +116,19 @@ export class SpeechStream {
     this.pump();
   }
 
+  /**
+   * Speaks `text` now, after what was pushed so far (docs/14 Decision 11, the
+   * confirm summary): the splitter's pending text is cut off first, so the
+   * text does not wait for more answer deltas. The stream stays open.
+   * Ignored after end/cancel/failure.
+   */
+  say(text: string): void {
+    if (this.ended || this.stopped) return;
+    for (const chunk of this.splitter.flush()) this.enqueue(chunk);
+    this.enqueue(text.replace(/\s+/gu, " ").trim());
+    this.pump();
+  }
+
   /** End of the answer: flushes the splitter; resolves when the last frame is sent. */
   end(): Promise<void> {
     if (!this.ended && !this.stopped) {

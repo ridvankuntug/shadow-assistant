@@ -15,7 +15,11 @@
 //               MOCK_MEMORY_SILENT=1 (memory frames are never answered, to see the UI timeout),
 //               MOCK_DEV=0 (no `dev` feature; dev_list/dev_action get bad_request),
 //               MOCK_DEV_MANAGE=0 (canManage false: "Kuralı ekle" hidden, add_rule gets not_allowed),
-//               MOCK_NOTIFICATIONS=0 (no `notifications` feature; notifications_list/notification_action get bad_request).
+//               MOCK_NOTIFICATIONS=0 (no `notifications` feature; notifications_list/notification_action get bad_request),
+//               MOCK_NAMES=0 (no `names` feature; names_list/names_delete get bad_request).
+// Confirm cards: a message with "kilit"/"kilid" asks for the lock (Evet / Hayır only); one with
+// "pompa" asks with a "Evet, hep bu" offer (`confirm_request.remember`). Answering that card with
+// `confirm_response {approved: true, remember: true}` stores the name (shown by names_list).
 // Test producer for the inbox (with notifications on): a message starting with "bildirim:" raises
 // a normal item, "acil:" an urgent one (title = the rest), broadcast to every socket; the urgent
 // one carries `speak: true` to the sender only, when it sent speech_prefs enabled (the real Core
@@ -36,8 +40,10 @@ const MEMORY = process.env.MOCK_MEMORY !== "0";
 const DEV = process.env.MOCK_DEV !== "0";
 const DEV_MANAGE = process.env.MOCK_DEV_MANAGE !== "0";
 const NOTIFICATIONS = process.env.MOCK_NOTIFICATIONS !== "0";
+const NAMES = process.env.MOCK_NAMES !== "0";
 // Like the real Core: service tool names without the Agent SDK's mcp__<service>__ prefix.
 const LOCK_TOOL = "intent__HassTurnOff";
+const PUMP_TOOL = "intent__HassTurnOn";
 
 // Shared across connections.
 const history = [];
@@ -224,7 +230,8 @@ function streamAnswer(ctx, turn, text) {
   later(ctx, 120, () => step(0));
 }
 
-function resolveConfirm(ctx, approved, by) {
+/** `remember`: the client chose "Evet, hep bu" (used only with `approved` and a card that offered it). */
+function resolveConfirm(ctx, approved, by, remember = false) {
   const turn = ctx.turn;
   const pending = turn?.confirm;
   if (!pending) return false;
@@ -233,9 +240,29 @@ function resolveConfirm(ctx, approved, by) {
   turn.confirm = null;
   send(ctx.ws, { type: "confirm_resolved", requestId: pending.requestId, approved, by });
   send(ctx.ws, { type: "state", state: "thinking" });
-  send(ctx.ws, { type: "tool", id: turn.id, name: LOCK_TOOL, status: approved ? "done" : "denied" });
-  streamAnswer(ctx, turn, approved ? "Tamam, kilidi açtım." : "Peki, kilit açılmadı.");
+  send(ctx.ws, { type: "tool", id: turn.id, name: pending.tool, status: approved ? "done" : "denied" });
+  if (approved && remember && pending.remember) rememberName(pending.remember);
+  streamAnswer(ctx, turn, approved ? pending.yes : pending.no);
   return true;
+}
+
+/** Opens a confirm card for `tool`; `remember` = the "Evet, hep bu" offer, or undefined. */
+function openConfirm(ctx, turn, { tool, summary, yes, no, remember }) {
+  send(ctx.ws, { type: "tool", id: turn.id, name: tool, status: "started" });
+  send(ctx.ws, { type: "state", state: "awaiting_confirm" });
+  const requestId = `c${++confirmCounter}`;
+  const timer = setTimeout(() => resolveConfirm(ctx, false, "timeout"), CONFIRM_MS);
+  ctx.timers.add(timer);
+  turn.confirm = { requestId, timer, tool, yes, no, remember };
+  send(ctx.ws, {
+    type: "confirm_request",
+    requestId,
+    id: turn.id,
+    tool,
+    summary,
+    expiresAt: Date.now() + CONFIRM_MS,
+    ...(remember ? { remember: { spoken: remember.spoken, target: remember.target.name } } : {}),
+  });
 }
 
 function runTurn(ctx, id, text) {
@@ -245,22 +272,27 @@ function runTurn(ctx, id, text) {
   send(ctx.ws, { type: "state", state: "thinking" });
 
   if (/kili[td]/.test(normalise(text))) {
-    later(ctx, 500, () => {
-      send(ctx.ws, { type: "tool", id, name: LOCK_TOOL, status: "started" });
-      send(ctx.ws, { type: "state", state: "awaiting_confirm" });
-      const requestId = `c${++confirmCounter}`;
-      const timer = setTimeout(() => resolveConfirm(ctx, false, "timeout"), CONFIRM_MS);
-      ctx.timers.add(timer);
-      turn.confirm = { requestId, timer };
-      send(ctx.ws, {
-        type: "confirm_request",
-        requestId,
-        id,
+    later(ctx, 500, () =>
+      openConfirm(ctx, turn, {
         tool: LOCK_TOOL,
         summary: "Ön kapı kilidi açılacak. Onaylıyor musun?",
-        expiresAt: Date.now() + CONFIRM_MS,
-      });
-    });
+        yes: "Tamam, kilidi açtım.",
+        no: "Peki, kilit açılmadı.",
+      }),
+    );
+    return;
+  }
+
+  if (normalise(text).includes("pompa")) {
+    later(ctx, 500, () =>
+      openConfirm(ctx, turn, {
+        tool: PUMP_TOOL,
+        summary: `${PUMP_TOOL} çalıştırılsın mı? (name: pompa) Bu cihazın adını söylemedin.`,
+        yes: "Tamam, pompayı açtım.",
+        no: "Peki, pompa açılmadı.",
+        remember: { spoken: "pompa", target: { name: "Bahçe Pompası", domain: "switch", areas: ["Bahçe"] } },
+      }),
+    );
     return;
   }
 
@@ -295,16 +327,21 @@ function startTurnOrBusy(ctx, id, text) {
 }
 
 // Whole short utterance (max 3 words) of only yes-words or only no-words; fillers allowed.
+// "evet hep bu" = yes + "Evet, hep bu" (simplified from the Core's parseVoiceConfirm).
 const YES = new Set(["evet", "onayla", "onayliyorum", "tamam", "olur"]);
 const NO = new Set(["hayir", "iptal", "vazgec", "vazgectim"]);
 const FILLERS = new Set(["lutfen", "et"]);
+const REMEMBER = new Set(["hep", "bu"]);
+/** {approved, remember} or null (not an answer). */
 function voiceAnswer(text) {
   const words = normalise(text).split(" ").filter(Boolean);
   if (words.length === 0 || words.length > 3) return null;
   const core = words.filter((w) => !FILLERS.has(w));
   if (core.length === 0) return null;
-  if (core.every((w) => YES.has(w))) return true;
-  if (core.every((w) => NO.has(w))) return false;
+  const remember = core.includes("hep");
+  const rest = core.filter((w) => !REMEMBER.has(w));
+  if (rest.length > 0 && rest.every((w) => YES.has(w)) && (remember || rest.length === core.length)) return { approved: true, remember };
+  if (core.every((w) => NO.has(w))) return { approved: false, remember: false };
   return null;
 }
 
@@ -317,7 +354,7 @@ function handleAudio(ctx, msg) {
     send(ws, { type: "transcript", id: msg.id, text });
     if (ctx.turn?.confirm) {
       const answer = voiceAnswer(text);
-      if (answer !== null) return void resolveConfirm(ctx, answer, "voice");
+      if (answer !== null) return void resolveConfirm(ctx, answer.approved, "voice", answer.remember);
     }
     startTurnOrBusy(ctx, msg.id, text);
   });
@@ -370,6 +407,58 @@ function handleMemory(ctx, msg) {
     }
     send(ctx.ws, memoryFrame(msg.id));
   });
+}
+
+// ------------------------------------------------------------- device names
+// Confirmed device names (docs/02 *Device names*, feature `names`); shared across
+// connections, last until the mock restarts. "Evet, hep bu" on the pompa card adds one.
+const namesDay = new Date(Date.now() - 86400000).toISOString();
+const namesStore = [
+  {
+    id: "n-3f9a1c",
+    spoken: "salon lambası",
+    target: { name: "Salon Lamba", domain: "light", areas: ["Salon"] },
+    status: "active",
+    missingSince: null,
+    lastUsedAt: namesDay,
+    uses: 4,
+  },
+  {
+    id: "n-77b0d4",
+    spoken: "eski priz",
+    target: { name: "Eski Priz", domain: "switch", areas: [] },
+    status: "passive",
+    missingSince: namesDay,
+    lastUsedAt: null,
+    uses: 0,
+  },
+];
+let namesCounter = 0;
+
+function rememberName(offer) {
+  // Like the Core: a fresh "Evet, hep bu" for the same words replaces the entry.
+  const at = namesStore.findIndex((e) => e.spoken === offer.spoken);
+  if (at >= 0) namesStore.splice(at, 1);
+  const id = `n-${(0xa00000 + ++namesCounter).toString(16)}`;
+  namesStore.push({ id, spoken: offer.spoken, target: offer.target, status: "active", missingSince: null, lastUsedAt: null, uses: 0 });
+  console.log(`[mock-core] name stored: ${id}`);
+}
+
+function handleNames(ctx, msg) {
+  if (!NAMES) return sendError(ctx.ws, "bad_request", "device names are disabled", msg.id);
+  if (typeof msg.id !== "string" || msg.id === "") return sendError(ctx.ws, "bad_request", "id must be a non-empty string");
+  if (msg.type === "names_delete") {
+    const ids = msg.ids;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 200 || ids.some((x) => typeof x !== "string" || x === "")) {
+      return sendError(ctx.ws, "bad_request", "names_delete.ids must hold 1-200 non-empty strings", msg.id);
+    }
+    for (const id of new Set(ids)) {
+      const at = namesStore.findIndex((e) => e.id === id);
+      if (at >= 0) namesStore.splice(at, 1); // ids not stored are ignored
+    }
+    console.log(`[mock-core] names_delete: ${ids.length} id(s)`);
+  }
+  later(ctx, 200, () => send(ctx.ws, { type: "names", id: msg.id, items: namesStore }));
 }
 
 // --------------------------------------------------------------- development
@@ -583,7 +672,7 @@ function handleFrame(ctx, msg) {
       if (!ctx.turn?.confirm || ctx.turn.confirm.requestId !== msg.requestId) {
         return sendError(ws, "bad_request", "Bilinmeyen requestId");
       }
-      return void resolveConfirm(ctx, msg.approved === true, "button");
+      return void resolveConfirm(ctx, msg.approved === true, "button", msg.remember === true);
     case "speak":
       return handleSpeak(ctx, msg);
     case "voices":
@@ -596,6 +685,9 @@ function handleFrame(ctx, msg) {
     case "dev_list":
     case "dev_action":
       return handleDev(ctx, msg);
+    case "names_list":
+    case "names_delete":
+      return handleNames(ctx, msg);
     case "notifications_list":
     case "notification_action":
       return handleNotifications(ctx, msg);
@@ -641,7 +733,7 @@ function onMessage(ctx, raw) {
     ctx.authed = true;
     clearTimeout(ctx.authTimer);
     const welcome = { type: "welcome", protocol: 1, sessionId: randomUUID(), device: "browser" };
-    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : []), ...(DEV ? ["dev"] : []), ...(NOTIFICATIONS ? ["notifications"] : [])];
+    const features = [...(SPEECH_STREAM ? ["speech_stream", "usage_limit"] : []), ...(MEMORY ? ["memory"] : []), ...(DEV ? ["dev"] : []), ...(NOTIFICATIONS ? ["notifications"] : []), ...(NAMES ? ["names"] : [])];
     if (features.length > 0) welcome.features = features;
     send(ctx.ws, welcome);
     send(ctx.ws, { type: "state", state: "idle" });
