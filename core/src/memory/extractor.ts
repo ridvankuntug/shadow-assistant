@@ -47,11 +47,19 @@ import { fileURLToPath } from "node:url";
 import { dayStamp } from "../conversation-log.js";
 import type { ModelProvider, OneShotResult } from "../model-provider.js";
 import type { UsageRecord } from "../router.js";
-import { formatFilterCounts, mergeFilterCounts, redactTurn, rejectReason, type FilterCounts } from "./filters.js";
+import {
+  formatFilterCounts,
+  formatLesson,
+  LESSON_TARGET_MAX_CHARS,
+  mergeFilterCounts,
+  redactTurn,
+  rejectReason,
+  type FilterCounts,
+} from "./filters.js";
 import { readDeviceTurns, type LogTurn } from "./log-source.js";
 import { foldedWords, selectRelevant, textHash } from "./match.js";
 import type { MemoryLogger, MemoryStore, MemoryTx } from "./store.js";
-import { isEntryId, isMemoryKind, MEMORY_BUDGETS, MEMORY_KINDS, type EntrySource, type MemoryEntry, type MemoryKind, type MemoryState } from "./types.js";
+import { isEntryId, isLessonRule, isMemoryKind, LESSON_RULES, MEMORY_BUDGETS, MEMORY_KINDS, type EntrySource, type MemoryEntry, type MemoryKind, type MemoryState } from "./types.js";
 
 export type ExtractReason = "idle" | "turns" | "compact" | "startup";
 
@@ -136,6 +144,9 @@ export const OPS_SCHEMA: Record<string, unknown> = {
           kind: { type: "string", enum: [...MEMORY_KINDS] },
           id: { type: "string", pattern: "^m-[0-9a-f]{6}$" },
           text: { type: "string", maxLength: MEMORY_BUDGETS.textMaxChars },
+          // A lesson (T5.4) has no free text: rule + target become a fixed template (filters.ts formatLesson).
+          rule: { type: "string", enum: [...LESSON_RULES] },
+          target: { type: "string", maxLength: LESSON_TARGET_MAX_CHARS },
           keywords: { type: "array", maxItems: MEMORY_BUDGETS.keywordsMax, items: { type: "string" } },
         },
       },
@@ -151,7 +162,9 @@ export type MemoryOp =
 /**
  * Validates the model's answer: `{ ops: [...] }`, at most MAX_OPS ops are
  * kept. Undefined when the shape is wrong; single malformed ops are dropped
- * and counted in `invalid`.
+ * and counted in `invalid`. A lesson `add` needs `rule` + `target` (its
+ * `text` is ignored) and an `update` with both gets the template as its text
+ * (T5.4); either way `text` is the template built by formatLesson.
  */
 export function parseOps(value: unknown): { ops: MemoryOp[]; invalid: number } | undefined {
   if (!isObj(value) || !Array.isArray(value.ops)) return undefined;
@@ -171,18 +184,28 @@ function parseOp(v: unknown): MemoryOp | undefined {
     ? v.keywords.filter((k): k is string => typeof k === "string").slice(0, MEMORY_BUDGETS.keywordsMax)
     : undefined;
   switch (v.op) {
-    case "add":
-      if (!isMemoryKind(v.kind) || typeof v.text !== "string") return undefined;
-      return { op: "add", kind: v.kind, text: v.text, keywords: keywords ?? [] };
-    case "update":
-      if (!isEntryId(v.id) || (v.text !== undefined && typeof v.text !== "string")) return undefined;
-      if (v.text === undefined && keywords === undefined) return undefined;
-      return { op: "update", id: v.id, ...(typeof v.text === "string" ? { text: v.text } : {}), ...(keywords ? { keywords } : {}) };
+    case "add": {
+      if (!isMemoryKind(v.kind)) return undefined;
+      const text = v.kind === "lesson" ? lessonText(v) : v.text;
+      if (typeof text !== "string") return undefined;
+      return { op: "add", kind: v.kind, text, keywords: keywords ?? [] };
+    }
+    case "update": {
+      const text = lessonText(v) ?? v.text;
+      if (!isEntryId(v.id) || (text !== undefined && typeof text !== "string")) return undefined;
+      if (text === undefined && keywords === undefined) return undefined;
+      return { op: "update", id: v.id, ...(typeof text === "string" ? { text } : {}), ...(keywords ? { keywords } : {}) };
+    }
     case "delete":
       return isEntryId(v.id) ? { op: "delete", id: v.id } : undefined;
     default:
       return undefined;
   }
+}
+
+/** The lesson template text of an op with a valid `rule` and a string `target`, else undefined. */
+function lessonText(v: Record<string, unknown>): string | undefined {
+  return isLessonRule(v.rule) && typeof v.target === "string" ? formatLesson(v.rule, v.target) : undefined;
 }
 
 /** Token Jaccard similarity of two texts (folded words). */

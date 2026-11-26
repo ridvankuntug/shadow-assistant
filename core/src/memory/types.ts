@@ -6,12 +6,21 @@
 /**
  * Entry kinds. `identity` lives in the brief while it has room, else in `kisiler`.
  * `lesson` (T5): a behaviour lesson that only makes the assistant more careful
- * ("X'i kapatmadan önce onay iste"); its texts pass the stricter lesson filter
- * (filters.ts) and are loaded into the system prompt under a heading that says
- * they grant nothing. The permission gate never reads memory.
+ * ("kombiyi kapatmak → önce onay iste."); since T5.4 its text is built from a
+ * `LessonRule` and a target in a fixed template (filters.ts `formatLesson`)
+ * and is loaded into the system prompt under a heading that says it grants
+ * nothing. The permission gate never reads memory.
  */
 export type MemoryKind = "alias" | "preference" | "person" | "routine" | "fact" | "identity" | "lesson";
 export const MEMORY_KINDS: readonly MemoryKind[] = ["alias", "preference", "person", "routine", "fact", "identity", "lesson"];
+
+/** The two lesson templates (T5.4): `ask_first` "<target> → önce onay iste.", `never` "<target> → asla yapma.". */
+export type LessonRule = "ask_first" | "never";
+export const LESSON_RULES: readonly LessonRule[] = ["ask_first", "never"];
+
+export function isLessonRule(v: unknown): v is LessonRule {
+  return typeof v === "string" && (LESSON_RULES as readonly string[]).includes(v);
+}
 
 /**
  * The fixed topic notes. This list is a whitelist: file names are only

@@ -43,7 +43,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { stat, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { readJsonOrQuarantine, writeFileAtomic, type AtomicFs, type QuarantineInfo } from "../atomic-file.js";
-import { normalizeText, rejectReason, type FilterName } from "./filters.js";
+import { formatLesson, normalizeText, parseLesson, rejectReason, type FilterName } from "./filters.js";
 import { deriveKeywords, foldedWords, normalizeKeyword, textHash } from "./match.js";
 import {
   isEntryId,
@@ -215,7 +215,10 @@ function inSystemPrompt(loc: MemoryLocation): boolean {
   return loc === "brief" || loc === LESSON_TOPIC;
 }
 
-/** The filter kind of a line read from `loc`: only dersler.md lines get the lesson rule. */
+/**
+ * The filter kind of a line read from `loc`: only dersler.md lines get the lesson rule
+ * (a fixed template since T5.4; free-text lines from before stay readable, see reconcile).
+ */
 function filterKindOf(loc: MemoryLocation): MemoryKind | undefined {
   return loc === LESSON_TOPIC ? "lesson" : undefined;
 }
@@ -745,7 +748,11 @@ export class MemoryStore {
         // Every line is vetted (normal form, length, output filters): the folded hash ignores
         // punctuation and case, so an unchanged hash does not mean the text passed the checks.
         // Tombstones apply only to new or changed lines (an indexed text is not dropped by a later tombstone).
-        const t = this.vet(l.text, !known || known.hash !== textHash(l.text) ? forgotten : NO_HASHES, filterKindOf(loc));
+        const unchanged = known !== undefined && known.hash === textHash(l.text);
+        // A free-text lesson from before T5.4 stays readable while it is indexed as a lesson and
+        // unchanged (it passed the old lesson rule when written); a new or edited one must be a template.
+        const legacyLesson = loc === LESSON_TOPIC && unchanged && known.kind === "lesson";
+        const t = this.vet(l.text, unchanged ? NO_HASHES : forgotten, filterKindOf(loc), legacyLesson);
         if (typeof t !== "string") {
           rejected.set(t.reject, (rejected.get(t.reject) ?? 0) + 1);
           f.lines[i] = { type: "other", raw: l.raw ?? `${l.prefix}${l.text}` };
@@ -952,12 +959,25 @@ export class MemoryStore {
     if (intent) await this.clearPending();
   }
 
-  /** Normal form + output filters (tombstones included): the normalized text or the rejection. */
-  /** `kind` selects the filter variant: `lesson` texts pass the stricter lesson rule (filters.ts). */
-  private vet(text: string, forgotten: ReadonlySet<string>, kind?: MemoryKind): string | { reject: WriteRejection } {
-    const t = normalizeEntryText(text);
+  /**
+   * Normal form + output filters (tombstones included): the normalized text or the rejection.
+   * `kind` selects the filter variant: `lesson` texts must be a template (filters.ts) and are
+   * returned in its canonical form ("->" / case / missing full stop of a hand edit fixed).
+   * `legacyLesson` (reconcile only): see filters.ts `RejectOptions.legacyLesson`.
+   */
+  private vet(
+    text: string,
+    forgotten: ReadonlySet<string>,
+    kind?: MemoryKind,
+    legacyLesson = false,
+  ): string | { reject: WriteRejection } {
+    let t = normalizeEntryText(text);
     if (t === undefined) return { reject: "invalid_text" };
-    const reason = rejectReason(t, { kind, isForgotten: (x) => forgotten.has(textHash(x)) });
+    if (kind === "lesson") {
+      const lesson = parseLesson(t);
+      if (lesson) t = formatLesson(lesson.rule, lesson.target);
+    }
+    const reason = rejectReason(t, { kind, legacyLesson, isForgotten: (x) => forgotten.has(textHash(x)) });
     return reason ? { reject: reason } : t;
   }
 

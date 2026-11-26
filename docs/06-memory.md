@@ -323,7 +323,7 @@ table-driven tests.
 | Permission-like text | entries that try to change behaviour: `onay isteme`, `her zaman evet`, `izin ver`, `kuralı yok say`, … | keep | reject |
 | Transient state | time-bound wording: `şu an`, `şimdi`, `bugün`, `yarın`, `bu akşam`, clock times without a routine word (`her`, `genelde`, `hep`) | keep | reject |
 | Tombstones | folded hash in `forgotten` | – | reject |
-| Lessons (kind `lesson` only) | replaces the permission row: must tighten (a prohibition or "ask first") and must not loosen; see *Behaviour lessons* | keep | reject (`permission` / `lesson`) |
+| Lessons (kind `lesson` only) | replaces the permission row: the text must be one of two fixed templates (T5.4) and the target must pass a sanity check; see *Behaviour lessons* | keep | reject (`permission` / `lesson`) |
 
 A rejection is logged as a count per filter, never with the text.
 
@@ -337,7 +337,7 @@ in-process MCP server `shadow-memory`. It is declared in `services.yaml` as
 |---|---|---|
 | `memory_list` | `read` | Returns brief + all entries (`id`, `kind`, `text`) and warnings; optional `query` filters by the same keyword matching. |
 | `memory_forget` | `write` | Arguments: `ids: string[]` (from `memory_list`), or `all: true`. Deletes the entries and adds tombstones. `all: true` is raised to `confirm` through `confirm_inputs` (`all: [true]`), so "her şeyi unut" asks first. |
-| `memory_note` | `write` | "Not al" and lessons (T5.2): `kind`, `text`, optional `keywords`; stores at once through the store filters. See *Behaviour lessons and "not al"*. |
+| `memory_note` | `write` | "Not al" and lessons (T5.2): `kind`, `text` (or `rule` + `target` for a lesson, T5.4), optional `keywords`; stores at once through the store filters. See *Behaviour lessons and "not al"*. |
 
 - "bunu unut" usually refers to something in the current conversation. The model
   lists, picks the matching ids and forgets them. If no entry matches (the fact
@@ -359,70 +359,67 @@ rejected every behaviour sentence as permission-like, there was no kind for a
 lesson, and the assistant did not know memory is extracted later.
 
 **Kind `lesson`, topic `dersler`.** A seventh kind for lessons the user taught
-by correcting a mistake. Lessons may only make the assistant more careful:
-"Kombiyi kapatmadan önce kullanıcıdan onay iste.", "Kombiyi kapatma." They are
-stored in `notes/dersler.md` (title "Dersler").
+by correcting a mistake. Lessons may only make the assistant more careful. They
+are stored in `notes/dersler.md` (title "Dersler").
 
-**Filter: tighten accepted, loosen rejected, two layers.**
+**Fixed template (T5.4).** A lesson is never free text. It has two fields,
+`rule` and `target`, and its text is built from them in one of two fixed forms
+(`filters.ts` `formatLesson`):
 
-1. *Prompt* (`memory-extract.md`): lessons are extracted only when they tighten,
-   in the forms "X'i yapmadan önce onay iste" / "X'i yapma"; anything that
-   loosens or widens ("onay isteme", "sormadan yap", "izin verilmiş say", "artık
-   sorma", tool or device access, exceptions) is never stored, in any kind; a
-   mixed sentence ("bunu yapma ama şunu sormadan yap") is skipped whole.
-2. *Deterministic* (`filters.ts`, `rejectReason(text, { kind: "lesson" })`; the
-   prompt can be talked around, this cannot). The `permission` check is replaced
-   by a stricter rule, on the folded match form:
-   - reject as `permission` on the usual PERMISSION list, on a loosening list
-     (not asking: `sorma…`, `isteme…`, `istenme…`, `gerek yok`; consent and scope:
-     `evet`, `izinli`, `izin ver`, `onayl…`, `onaysız`, `yetki`, `erişim`, `araç`,
-     `serbest`, `-ebil-` "can"; exceptions and contrast: `hariç`, `dışında`,
-     `istisna`, `sadece`, `ama`, `fakat`; talk about rules; English equivalents
-     `without`, `allow`, `permission`, `you can`, `don't ask`, `unless`,
-     `except`, `but`, `only`, …), negated safety verbs (`danışma`, `haber verme`,
-     `bekleme`, `don't wait`), conditions and time limits (`-se/-sa`, `-ken`,
-     `sonra`, `kadar`, `if`, `when`, `after`), and when `onay`/`izin`/`teyit` is
-     followed by anything but `iste`/`al`/`sor` ("onay istenmesin", "izni
-     olmadan");
-   - first, a few tightening paraphrases are rewritten to the canonical form
-     and every check below runs on the rewrite: "(bana) sormadan X'i yapma" and
-     "Don't/Do not/Never X without asking (me/the user) (first)" drop the
-     "without asking" part only when the rest is still one plain prohibition
-     (no second action: `ve`/`and`, a bare imperative such as `kapat` or a
-     `-la/-le` stem, a bare word after the object noun phrase; no action
-     on an action: verbal nouns, `-maz`/`-sız` forms, `not`, `to`/`from`, `-ing` words
-     other than nouns like `heating`, encouraging verbs such as `çekinme`,
-     `vazgeçme`, `hesitate`, `forget`, `stop`, `discontinue`); "… onay istemelisin" / "önce bana
-     sormalısın" become "… onay iste" / "önce bana sor". "Sormadan yap",
-     "Sormadan kapatabilirsin" or "Turn off X without asking" are not rewritten
-     and stay rejected as `permission`;
-   - otherwise reject as `lesson` unless the **whole text** is one tightening
-     clause: only Latin-script letters, digits, spaces, apostrophes and hyphens
-     with at most one final full stop (no second sentence, no comma/semicolon
-     clause, no Cyrillic look-alikes), and either a Turkish ending (Turkish is
-     verb-final: `… onay iste`, `… izin al`, `önce (kullanıcıya) sor`, or a
-     negative imperative / obligation as the last word: `kapatma`,
-     `değiştirmemeli`) or an English start (`Never …`, `Do not …`, `Don't …`,
-     `(Always) ask me / the user before …`);
-   - reject as `permission` when the action part (everything but the fixed
-     "ask first" tail/head) names the consent channel: the user, asking,
-     confirming, notifying, waiting (`kullanıcı`, `onay`, `sor`, `bekle`,
-     `bildir`, `kart`, `ask`, `confirm`, `solicit`, `notify`, `wait`, `user`,
-     `me`, …). A prohibition may only be about an action on the home, never
-     about the asking itself.
+| `rule` | Stored text |
+|--------|-------------|
+| `ask_first` | `<target> → önce onay iste.` |
+| `never` | `<target> → asla yapma.` |
 
-   A word-list scan alone was not enough: review found "Kombiyi kapatma;
-   kullanıcı evdeyse kapat." (passed on its first clause) and "Never solicit
-   confirmation." (a negated verb missing from the list); the shape and the
-   consent-channel rule close those classes instead of single words;
-   - the other filters (secret, health, transient, tombstone) apply unchanged.
+`target` is the action or device the rule is about ("kombiyi kapatmak", "salon
+prizi"). The fixed tail always tightens, so a loosening sentence cannot be
+expressed at all. *Why:* the T5.1 rule-based free-text filter rejected real
+lessons ("Sormadan klimayı kapatma" needed a special rewrite) and a loosening
+sentence with a verb missing from its lists could pass; checking the shape of a
+sentence by word lists does not converge (user decision, 2026-11-25).
 
-   In doubt it rejects: the filter does not parse sentences, so a "sormadan"
-   prohibition whose object looks like a verbal noun ("klimayı") is rejected;
-   the "önce onay iste" form always works. The store applies
-   the rule by location: an add of kind `lesson`, an update of an entry in
-   `dersler.md`, and every hand-written line of `dersler.md` (a rejected line
-   stays in the file, ignored). Other kinds keep the old permission filter.
+**Two layers.**
+
+1. *Prompt* (`memory-extract.md`, `system.md`): lessons are extracted or noted
+   only when they tighten, as `rule` + `target`; anything that loosens or widens
+   ("onay isteme", "sormadan yap", "izin verilmiş say", "artık sorma", tool or
+   device access, exceptions) is never stored, in any kind; a mixed sentence
+   ("bunu yapma ama şunu sormadan yap") is skipped whole.
+2. *Deterministic* (`filters.ts`; the prompt can be talked around, this cannot).
+   `rejectReason(text, { kind: "lesson" })` replaces the `permission` check:
+   - the text must parse as one of the two templates (`parseLesson`: exactly one
+     arrow, a known tail; a hand edit may use `->`, any case, no final full
+     stop, and is written back in the canonical form); else reject as `lesson`;
+   - the target gets a sanity check (`lessonTargetRejectReason`, on the folded
+     match form): reject as `permission` on the PERMISSION list, the loosening
+     list (not asking, consent and scope words, `-ebil-` "can", conditions and
+     time limits `-se/-sa`, `-ken`, `sonra`, `kadar`, exceptions `hariç`,
+     `sadece`, `ama`, talk about rules/system/prompt, English equivalents), the
+     consent channel (`kullanıcı`, `onay`, `sor`, `bekle`, `kart`, `ask`,
+     `confirm`, `user`, …: the fixed tail is the only place for the asking, so
+     "beklemek → asla yapma" cannot be stored), and words that invert the
+     action so that "asla yapma" would become a duty to act (negated verb forms
+     `kapatmamak`, `kapatmaz`, `kapatmadan`, `kapatmayan`, `-maksızın`;
+     `değil`, `asla`, `hiç`; `çekinmek`, `unutmak`, `ertelemek`,
+     `geciktirmek`, `durmak`; blocking verbs `reddetmek`, `engellemek`,
+     `itiraz etmek`, `önlemek`, `kısıtlamak`; `not`, `never`, `forget`,
+     `stop`, `avoid`, `refuse`, `deny`, …), and end/cancel verbs acting on
+     another action (`kombiyi kapatmayı iptal etmek / durdurmak`, `cancel
+     turning off …`; on a device they stay allowed: `süpürgeyi durdurmak`,
+     `alarmı iptal etmek`);
+     reject as `lesson` when it is empty, has no letter, is longer than 80
+     characters or 8 words, or has anything but Latin-script letters, digits,
+     spaces, apostrophes and hyphens (no second clause, no `:`/`<` of an
+     injected instruction, no Cyrillic look-alikes). The plain verbal noun
+     ("kombiyi kapatma") is allowed;
+   - the other filters (secret, personal number, health, private path,
+     transient, tombstone) apply to the whole text unchanged.
+
+   In doubt it rejects: a false hit costs one lesson, a missed one could read
+   as consent. The store applies the rule by location: an add of kind
+   `lesson`, an update of an entry in `dersler.md`, and every hand-written line
+   of `dersler.md` (a rejected line stays in the file verbatim, ignored). Other
+   kinds keep the old permission filter.
 
 **Loading.** Lessons are not matched per turn. Like the brief, they are appended
 to the system prompt (whole entries newest first by `updatedAt`, at most 800
@@ -437,16 +434,31 @@ permission gate (`permissions.ts`, `write-gate.ts`, `confirmed-names.ts`) takes
 no input from memory (a test checks that they do not import it).
 
 **"Not al" tool.** `memory_note` (`write`: no confirm card, logged) with `kind`,
-`text` (≤ 160) and optional `keywords` stores one entry at once, with
+`text` (≤ 160; every kind but `lesson`), `rule` + `target` (≤ 80; `lesson`
+only, required, and `text` must then be absent) and optional `keywords` stores
+one entry at once, with
 provenance `source.by: "tool"`, through the same store filters. The system
 prompt says that memory is otherwise extracted at the end of a conversation /
 when idle, that "not al", "bunu hatırla", "unutma" store at once, and that when
 the user corrects a mistake ("bunu yapma") and the assistant says it will not,
 it stores the tightening lesson directly with the tool, without asking "not
-alayım mı?" (user decision). A rejected note returns a Turkish reason.
+alayım mı?" (user decision). A rejected note returns a Turkish reason. The
+extractor's answer schema has the same `rule` / `target` fields: a lesson `add`
+without a valid pair is dropped as invalid (its `text` is ignored), and an
+`update` with both gets the template as its text.
 
 **Compatibility.** No migration: a store without `dersler.md` loads as before;
 index.json entries of kind `lesson` or `source.by: "tool"` are new values only.
+Free-text lessons written before T5.4 stay readable without a rewrite: a
+`dersler.md` line that is not a template is still loaded when index.json
+already holds it as a `lesson` with the same text hash (it passed the T5.1
+rule when it was written; `RejectOptions.legacyLesson`) and still has the old
+one-clause shape (Latin-script words, in-word hyphens, at most one final full
+stop): the folded hash ignores punctuation and case, so a hand edit such as
+"Never! Turn off the heater!" keeps the hash but leaves the shape and is
+ignored. Only the general filters apply to it beyond that. It can be listed, forgotten and deleted as before; an
+update must give a template. A new or edited free-text line, or one whose
+index entry is lost (index.json rebuilt), is ignored and stays in the file.
 An older Core drops `lesson` index entries (unknown kind) and ignores
 `dersler.md` (not in its topic list); `tool` reads as `manual`.
 

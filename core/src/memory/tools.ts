@@ -18,8 +18,20 @@
 import { z } from "zod";
 import type { LocalTool } from "../mcp-gateway.js";
 import { selectRelevant } from "./match.js";
+import { formatLesson, LESSON_TARGET_MAX_CHARS, LESSON_TARGET_MAX_WORDS } from "./filters.js";
 import type { MemoryStore, WriteRejection } from "./store.js";
-import { isEntryId, isMemoryKind, MEMORY_BUDGETS, MEMORY_KINDS, warningKey, type MemoryEntry, type MemoryKind } from "./types.js";
+import {
+  isEntryId,
+  isLessonRule,
+  isMemoryKind,
+  LESSON_RULES,
+  MEMORY_BUDGETS,
+  MEMORY_KINDS,
+  warningKey,
+  type LessonRule,
+  type MemoryEntry,
+  type MemoryKind,
+} from "./types.js";
 
 export const MEMORY_SERVER_NAME = "shadow-memory";
 /** The only accepted value of `memory_forget.all` (see the module comment). */
@@ -91,9 +103,17 @@ export async function memoryForget(store: MemoryStore, args: ForgetArgs): Promis
 
 export interface NoteArgs {
   kind?: string;
+  /** Every kind except `lesson`. */
   text?: string;
+  /** `lesson` only (T5.4): the template, with `target`. */
+  rule?: string;
+  /** `lesson` only: the action or device the rule is about ("kombiyi kapatmak"). */
+  target?: string;
   keywords?: readonly string[];
 }
+
+const LESSON_FIELDS_TEXT =
+  "Ders için 'text' değil, 'rule' (\"ask_first\": önce onay iste, \"never\": asla yapma) ve 'target' (eylem ya da cihaz, ör. 'kombiyi kapatmak') ver.";
 
 /** Turkish reason for a rejected `memory_note` (the model rephrases or tells the user). */
 function noteRejectText(reason: WriteRejection, kind: MemoryKind): string {
@@ -101,7 +121,7 @@ function noteRejectText(reason: WriteRejection, kind: MemoryKind): string {
     case "permission":
     case "lesson":
       return kind === "lesson"
-        ? "Ders kaydedilmedi: ders yalnız daha temkinli olmayı söyleyebilir ve 'X'i yapmadan önce onay iste' ya da 'X'i yapma' (veya 'Sormadan X'i yapma') biçiminde, virgülsüz tek cümle ve koşulsuz, istisnasız olmalı. Onayı kaldıran, izin veren, istisna tanıyan ifadeler kaydedilmez; 'sormadan' yalnız bir yasakla birlikte ('Sormadan X'i yapma') kabul edilir."
+        ? `Ders kaydedilmedi: 'target' kısa bir eylem ya da cihaz olmalı (ör. 'kombiyi kapatmak', 'salon prizi'), en fazla ${LESSON_TARGET_MAX_CHARS} karakter ve ${LESSON_TARGET_MAX_WORDS} sözcük, noktalama işaretsiz. Kullanıcıyı, onayı ya da sormayı anlatan; olumsuz, koşullu veya istisna içeren hedefler kabul edilmez.`
         : "Kaydedilmedi: asistanın izinlerini veya onay kurallarını değiştiren bilgiler hafızaya yazılmaz.";
     case "secret":
     case "personal_number":
@@ -129,15 +149,26 @@ function noteRejectText(reason: WriteRejection, kind: MemoryKind): string {
 
 /**
  * `memory_note`: stores one entry at once ("not al", "bunu hatırla", a lesson).
- * The store runs the same output filters as for extracted entries; a lesson
- * passes the stricter lesson rule (filters.ts), so the tool cannot store
- * anything that loosens the assistant's behaviour.
+ * The store runs the same output filters as for extracted entries. A lesson
+ * takes no free text (T5.4): `rule` + `target` become a fixed template
+ * (filters.ts `formatLesson`) and the target passes the lesson target check,
+ * so the tool cannot store anything that loosens the assistant's behaviour.
  */
 export async function memoryNote(store: MemoryStore, args: NoteArgs): Promise<{ text: string; isError: boolean }> {
   const kind = args.kind;
   if (!isMemoryKind(kind)) return { text: `'kind' şunlardan biri olmalı: ${MEMORY_KINDS.join(", ")}.`, isError: true };
-  const text = args.text?.trim();
-  if (!text) return { text: "Kaydedilecek metin yok.", isError: true };
+  let text: string | undefined;
+  if (kind === "lesson") {
+    if (args.text !== undefined && args.text.trim() !== "") return { text: LESSON_FIELDS_TEXT, isError: true };
+    if (!isLessonRule(args.rule) || typeof args.target !== "string") return { text: LESSON_FIELDS_TEXT, isError: true };
+    text = formatLesson(args.rule, args.target);
+  } else {
+    if (args.rule !== undefined || args.target !== undefined) {
+      return { text: "'rule' ve 'target' yalnız kind 'lesson' için; diğer türlerde 'text' ver.", isError: true };
+    }
+    text = args.text?.trim();
+    if (!text) return { text: "Kaydedilecek metin yok.", isError: true };
+  }
   const r = await store.add({ kind, text, keywords: args.keywords ?? [], source: { by: "tool" } });
   if (!r.ok) return { text: noteRejectText(r.reason, kind), isError: r.reason !== "duplicate" };
   return { text: `Not alındı (${r.entry.id}).`, isError: false };
@@ -186,14 +217,24 @@ export function memoryTools(store: MemoryStore): LocalTool[] {
       name: "memory_note",
       description:
         "Kalıcı hafızaya hemen bir kayıt yazar ('not al', 'bunu hatırla', 'unutma'). " +
-        "kind 'lesson': kullanıcının düzelttiği bir hatadan ders; yalnız daha temkinli olmayı söyler, " +
-        "'X'i yapmadan önce onay iste', 'X'i yapma' ya da 'Sormadan X'i yapma' biçiminde, virgülsüz tek cümle olarak yaz. Onayı kaldıran veya izin veren ifadeler reddedilir.",
+        "kind 'lesson': kullanıcının düzelttiği bir hatadan ders; yalnız daha temkinli olmayı söyler. Ders için 'text' verme: " +
+        "'rule' (\"ask_first\" = '<target> → önce onay iste', \"never\" = '<target> → asla yapma') ve 'target' (eylem ya da cihaz, ör. 'kombiyi kapatmak') ver; cümle bunlardan kurulur.",
       shape: {
         kind: z.enum(MEMORY_KINDS as [MemoryKind, ...MemoryKind[]]).describe("Kayıt türü; davranış dersi için lesson"),
         text: z
           .string()
           .max(MEMORY_BUDGETS.textMaxChars)
-          .describe("Kısa Türkçe cümle, üçüncü şahıs ('Kullanıcı ... sever.') ya da ders ('Kombiyi kapatmadan önce onay iste.')"),
+          .optional()
+          .describe("lesson dışındaki türler için kısa Türkçe cümle, üçüncü şahıs ('Kullanıcı ... sever.')"),
+        rule: z
+          .enum(LESSON_RULES as [LessonRule, ...LessonRule[]])
+          .optional()
+          .describe("Yalnız lesson: ask_first (önce onay iste) ya da never (asla yapma)"),
+        target: z
+          .string()
+          .max(LESSON_TARGET_MAX_CHARS)
+          .optional()
+          .describe("Yalnız lesson: kuralın konusu olan eylem ya da cihaz, ör. 'kombiyi kapatmak', 'salon prizi'"),
         keywords: z.array(z.string().max(40)).max(MEMORY_BUDGETS.keywordsMax).optional().describe("İsteğe bağlı 1-6 kısa anahtar sözcük"),
       },
       handler: async (args) => {
