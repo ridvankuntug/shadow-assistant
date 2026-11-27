@@ -182,11 +182,13 @@ put_file() {
     sed 's/^/    | /'
     return 0
   fi
-  tmp="$(mktemp "$(dirname -- "$path")/.$(basename -- "$path").XXXXXX")"
-  cat > "$tmp"
-  chmod "$mode" -- "$tmp"
+  tmp="$(mktemp "$(dirname -- "$path")/.$(basename -- "$path").XXXXXX")" || die "cannot create a temporary file next to ${path#"$ROOT"}"
+  # Explicit checks: a short write (full disk) must never be renamed into place.
+  if ! cat > "$tmp" || ! chmod "$mode" -- "$tmp"; then
+    rm -f -- "$tmp"; die "cannot write ${path#"$ROOT"}; left unchanged"
+  fi
   own root:root -- "$tmp"
-  mv -f -T -- "$tmp" "$path"
+  mv -f -T -- "$tmp" "$path" || { rm -f -- "$tmp"; die "cannot replace ${path#"$ROOT"}"; }
 }
 
 file_mode() { stat -c '%a' -- "$1"; }
@@ -413,17 +415,22 @@ RELEASE_SWITCHED=0
 
 # ---------------------------------------------------------------- unit, env, state
 # install_copy <mode> <file in this folder> <real destination>: copies it if
-# the destination differs; returns 0 if it was (re)written, 1 if up to date.
+# the destination differs and sets COPIED=1 (0 if up to date). Always called
+# as a plain command, never in a condition: bash turns set -e off inside a
+# function called from a condition, and a failed write must stop the script.
+COPIED=0
 install_copy() {
   local mode="$1" src="$SCRIPT_DIR/$2" real="$3" dst
   [[ -f "$src" ]] || die "$src not found (run the script from a copy of deploy/linux/)"
   dst="$(p "$real")"
+  COPIED=0
   if [[ -f "$dst" && ! -L "$dst" ]] && cmp -s -- "$src" "$dst"; then
     info "$real is up to date"
     check_root_owned "$dst"
-    return 1
+    return 0
   fi
   info "installing $real"
+  COPIED=1
   if [[ $DRY_RUN -eq 1 ]]; then
     in_root "$dst"
     printf '  would copy %s to %s (%s root:root)\n' "$2" "$real" "$mode"
@@ -434,7 +441,8 @@ install_copy() {
 
 install_unit() {
   ensure_dir "$(p "$SYSTEMD_DIR_REAL")"
-  if install_copy 0644 "$UNIT_NAME" "$UNIT_REAL"; then UNIT_CHANGED=1; fi
+  install_copy 0644 "$UNIT_NAME" "$UNIT_REAL"
+  if [[ $COPIED -eq 1 ]]; then UNIT_CHANGED=1; fi
 }
 UNIT_CHANGED=0
 
@@ -444,9 +452,9 @@ UNIT_CHANGED=0
 # "shadow-core-tls init --ip <pi-lan-ip>".
 install_tls_tools() {
   ensure_dir "$(p /usr/local/sbin)"
-  install_copy 0755 "$TLS_SCRIPT" "$TLS_BIN_REAL" || true
-  install_copy 0644 "$TLS_SERVICE" "$SYSTEMD_DIR_REAL/$TLS_SERVICE" || true
-  install_copy 0644 "$TLS_TIMER" "$SYSTEMD_DIR_REAL/$TLS_TIMER" || true
+  install_copy 0755 "$TLS_SCRIPT" "$TLS_BIN_REAL"
+  install_copy 0644 "$TLS_SERVICE" "$SYSTEMD_DIR_REAL/$TLS_SERVICE"
+  install_copy 0644 "$TLS_TIMER" "$SYSTEMD_DIR_REAL/$TLS_TIMER"
 }
 
 install_env() {
@@ -546,11 +554,17 @@ read_dropin_user() {
   DROPIN_USER="$(sed -n 's/^User=\(.*\)$/\1/p' "$file" | tail -n1)"
 }
 
-# Whether core.env enables the TLS listener (an uncommented CORE_TLS_HOST=).
+# Whether core.env enables the TLS listener: CORE_TLS_HOST is not empty after
+# the last assignment (systemd's EnvironmentFile= keeps the last one; quotes
+# removed as it does). Same parsing as env_value in shadow-core-tls.sh.
 env_enables_tls() {
-  local env
+  local env v
   env="$(p "$ENV_REAL")"
-  [[ -f "$env" ]] && grep -qE '^[[:space:]]*CORE_TLS_HOST[[:space:]]*=[[:space:]]*[^[:space:]]' "$env"
+  [[ -f "$env" ]] || return 1
+  v="$(sed -n 's/^[[:space:]]*CORE_TLS_HOST[[:space:]]*=[[:space:]]*//p' "$env" | tail -n1)"
+  v="${v%"${v##*[![:space:]]}"}"
+  if [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+  [[ -n "$v" ]]
 }
 
 credential_lines() {

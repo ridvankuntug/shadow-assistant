@@ -939,7 +939,8 @@ is not supported (open question). The subject names are plain labels
 2. **[USER ACTION]** Enable the listener in `core.env`
    (`sudoedit /etc/shadow-assistant/core.env`): uncomment `CORE_TLS_HOST=<pi-lan-ip>`
    (the same address), `CORE_TLS_PORT=<tls-port>` and
-   `CORE_TLS_CERT_FILE=/etc/shadow-assistant/tls/core.crt`.
+   `CORE_TLS_CERT_FILE=/etc/shadow-assistant/tls/core.crt` (the only path
+   the script writes; it refuses to run while core.env names another).
 
 3. **[USER ACTION]** Add the key's `LoadCredential=` line and restart:
 

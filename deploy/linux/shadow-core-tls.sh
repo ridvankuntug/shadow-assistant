@@ -159,10 +159,12 @@ put_file() {
   in_root "$dest"
   [[ ! -L "$dest" ]] || die "${dest#"$ROOT"} is a symlink; refusing"
   [[ ! -e "$dest" || -f "$dest" ]] || die "${dest#"$ROOT"} exists and is not a regular file; refusing"
-  tmp="$(mktemp "$(dirname -- "$dest")/.$(basename -- "$dest").XXXXXX")"
-  cat -- "$src" > "$tmp"
-  chmod "$mode" -- "$tmp"
-  mv -f -T -- "$tmp" "$dest"
+  tmp="$(mktemp "$(dirname -- "$dest")/.$(basename -- "$dest").XXXXXX")" || die "cannot create a temporary file next to ${dest#"$ROOT"}"
+  # Explicit checks: a short write (full disk) must never be renamed into place.
+  if ! cat -- "$src" > "$tmp" || ! chmod "$mode" -- "$tmp"; then
+    rm -f -- "$tmp"; die "cannot write ${dest#"$ROOT"}; left unchanged"
+  fi
+  mv -f -T -- "$tmp" "$dest" || { rm -f -- "$tmp"; die "cannot replace ${dest#"$ROOT"}"; }
 }
 
 WORK=""
@@ -353,11 +355,18 @@ renew_leaf() {
   fi
   info "issuing a new server certificate: $reason"
   issue_leaf "$ip"
+  restart_core "$env_ip"
+}
+
+# The certificate is always written to tls/core.crt. Another CORE_TLS_CERT_FILE
+# would pair the new key with an old certificate at the next start (the Core
+# then refuses to start), so refuse before anything is written.
+check_cert_file() {
+  local cf
   cf="$(env_value CORE_TLS_CERT_FILE)"
   if [[ -n "$cf" && "$cf" != "$TLS_DIR_REAL/core.crt" ]]; then
-    warn "core.env sets CORE_TLS_CERT_FILE=$cf, but the certificate is written to $TLS_DIR_REAL/core.crt"
+    die "$ENV_REAL sets CORE_TLS_CERT_FILE=$cf; this script writes $TLS_DIR_REAL/core.crt only: set CORE_TLS_CERT_FILE=$TLS_DIR_REAL/core.crt (nothing changed)"
   fi
-  restart_core "$env_ip"
 }
 
 # ---------------------------------------------------------------- commands
@@ -378,6 +387,7 @@ init_main() {
   if [[ -n "$env_ip" && "$env_ip" != "$IP" ]]; then
     die "$ENV_REAL sets CORE_TLS_HOST=$env_ip, not $IP: use that address or change core.env first (renewals read it from there)"
   fi
+  check_cert_file
   [[ -d "$(p /etc)" ]] || die "$(p /etc) does not exist"
   # install-core.sh owns /etc/shadow-assistant (its mode is not changed here).
   local etc
@@ -389,6 +399,9 @@ init_main() {
     die "$ETC_REAL must be owned by root and not writable by group or others; fix it and run again"
   fi
   own_dir 0755 "$(p "$TLS_DIR_REAL")"
+  # The credstore before the CA: the renewal unit cannot create it later
+  # (ProtectSystem=strict keeps /etc read-only there).
+  own_dir 0700 "$(p "$CREDSTORE_REAL")"
   take_lock
 
   state="$(ca_state)"
@@ -434,6 +447,7 @@ EOF
 renew_main() {
   local env_ip state ip cur
   [[ -d "$(p "$TLS_DIR_REAL")" ]] || die "no $TLS_DIR_REAL: create the CA first (shadow-core-tls init --ip <pi-lan-ip>)"
+  check_cert_file
   own_dir 0755 "$(p "$TLS_DIR_REAL")"
   take_lock
   state="$(ca_state)"
