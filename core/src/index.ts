@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
 import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
+import { loadCredentials } from "./credentials.js";
 import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
 import { CONFIRMED_NAMES_DIR, ConfirmedNameStore } from "./confirmed-names.js";
 import { ContinuityStore, continuityFilePath } from "./continuity.js";
@@ -105,10 +106,19 @@ export function gatewayCallTimeoutMs(cfg: CoreConfig): number {
 
 export async function main(): Promise<void> {
   const envFile = loadDotEnv();
-  const cfg = loadConfig();
+  // Pi (systemd): secrets from $CREDENTIALS_DIRECTORY into a separate env object for the Core's own
+  // consumers below; process.env (and so every child process) never holds them (T11.2). Without
+  // CREDENTIALS_DIRECTORY `env` is process.env itself, as before.
+  const creds = loadCredentials(process.env);
+  const env = creds.env;
+  if (creds.dir) {
+    logger.info(`[shadow-core] credentials: ${creds.loaded.length > 0 ? creds.loaded.join(", ") : "none"} from CREDENTIALS_DIRECTORY`);
+    if (creds.ignored.length > 0) logger.info(`[shadow-core] credentials not read by the Core (not a variable name): ${creds.ignored.join(", ")}`);
+  }
+  const cfg = loadConfig(env);
   for (const w of cfg.services.warnings) logger.warn(`[shadow-core] services.yaml: ${w}`);
 
-  const tokens = loadDeviceTokens();
+  const tokens = loadDeviceTokens(env);
   for (const name of tokens.rejected) logger.warn(`[shadow-core] ${name} ignored: shorter than 16 characters`);
   for (const device of tokens.digests.keys()) {
     if (!isUsableDeviceName(device)) {
@@ -116,7 +126,7 @@ export async function main(): Promise<void> {
     }
   }
   if (tokens.digests.size === 0) {
-    throw new Error("no device tokens configured (set at least one DEVICE_TOKEN_<NAME> in .env); refusing to start");
+    throw new Error("no device tokens configured (set at least one DEVICE_TOKEN_<NAME> in .env or as a credential); refusing to start");
   }
 
   // Vault tool is disabled without a vault dir.
@@ -162,7 +172,7 @@ export async function main(): Promise<void> {
     { readOnly: cfg.readOnly },
   );
   // One MCP client per remote service, shared by tier 0 and the gateway (one SSE connection).
-  const mcpClient = new McpDirectClient(cfg.services.services, process.env);
+  const mcpClient = new McpDirectClient(cfg.services.services, env);
   // Dev-notes (tools.json, turns.json) and the Development tab over them (docs/08 T7.w.3/T7.w.4).
   // Every writer tells the tab, which recounts the badge (coalesced) and broadcasts `dev_count`.
   // Assigned once the learned-rule store exists (below).
@@ -174,7 +184,7 @@ export async function main(): Promise<void> {
     record: (input) => turnNotes.record(input).finally(() => devTab?.changed()),
   };
   const gateway = new McpGateway({
-    sources: [...buildGatewaySources(cfg, mcpClient, memory), ...(deviceService ? [deviceService.source] : [])],
+    sources: [...buildGatewaySources(cfg, mcpClient, memory, env), ...(deviceService ? [deviceService.source] : [])],
     classifier: policy,
     devNotes: {
       recordCatalog: (service, tools, exactRules) => toolNotes.recordCatalog(service, tools, exactRules).finally(() => devTab?.changed()),
@@ -389,7 +399,7 @@ export async function main(): Promise<void> {
   // client: HA counts each rejected token as a failed login (ip_ban), so neither retries it every round.
   const haAuthGate = new AuthGate();
   // Built after the vault check above so a missing vault dir reads as disabled.
-  const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, process.env, {
+  const monitor = new HealthMonitor(buildHealthTargets(cfg.services.services, env, {
       vaultDir: cfg.vaultDir,
       ...(memory ? { memoryDir } : {}),
       authGates: new Map([["HA_CORE_TOKEN", haAuthGate]]),
@@ -413,7 +423,7 @@ export async function main(): Promise<void> {
   // off (one info line) without HA_URL / HA_CORE_TOKEN. Adoption reads the store directly.
   // CORE_REHEARSAL (T11.5): not even built, so no "ha alerts: on" line and no HA WebSocket client.
   const haAlerts = cfg.rehearsal ? undefined : createHaAlerts({
-    env: process.env,
+    env,
     notifications: {
       raise: (input) => notificationCenter.raise(input),
       resolve: (source, key) => notificationCenter.resolve(source, key),

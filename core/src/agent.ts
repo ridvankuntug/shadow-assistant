@@ -144,7 +144,11 @@ export interface PersistentOptionsRequest {
 }
 
 /**
- * Environment for the SDK subprocess: drop device tokens, HA token and empty API keys.
+ * Environment for the SDK subprocess: drop device tokens, HA token, agent token,
+ * the systemd credentials path (T11.2: the CLI and its MCP children must not be
+ * pointed at the credstore copy) and empty API keys. Credential secrets never
+ * reach process.env (credentials.ts); these names are dropped in case a `.env`
+ * or the environment sets them.
  *
  * `CORE_AGENT_SKIP_TURN_SUMMARY=1` (opt-in) sets `CLAUDE_CODE_CLASSIFIER_SUMMARY=0`:
  * the CLI then skips the end-of-turn LLM summary classifier that delays `result`
@@ -155,7 +159,7 @@ export interface PersistentOptionsRequest {
 export function subprocessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
-    if (k.startsWith("DEVICE_TOKEN_") || k === "HA_CORE_TOKEN") continue;
+    if (k.startsWith("DEVICE_TOKEN_") || k === "HA_CORE_TOKEN" || k === "CORE_AGENT_TOKEN" || k === "CREDENTIALS_DIRECTORY") continue;
     if (k === "ANTHROPIC_API_KEY" && !v) continue;
     out[k] = v;
   }
