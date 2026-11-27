@@ -864,19 +864,22 @@ optional; without them the Core binds `CORE_HOST:CORE_PORT` only, as on the PC.
 | --- | --- |
 | `CORE_EXTRA_HOSTS` | Further IP addresses of the plain listener on `CORE_PORT`, comma-separated. The Pi: `127.0.0.1` (Tailscale `serve`, the updater's health check) next to `CORE_HOST=<pi-lan-ip>`. No `0.0.0.0` / `::`, and `CORE_HOST` must then be a specific address too. |
 | `CORE_TLS_HOST`, `CORE_TLS_PORT` | The TLS listener `https://<CORE_TLS_HOST>:<CORE_TLS_PORT>/`: the UI files, `/ws`, `GET /health`. An IP address, not `0.0.0.0` / `::`; with it, `CORE_HOST` must not be a wildcard either. |
-| `CORE_TLS_CERT_FILE` | PEM certificate (chain) naming `CORE_TLS_HOST` (`subjectAltName IP:`). On the Pi: `/etc/shadow-assistant/tls/core.crt` (root, readable). |
+| `CORE_TLS_HOSTNAME` | Optional: one LAN host name of the same listener (placeholder `shadow.lan`): one lower-case DNS name with at least two labels (letters, digits, inner `-`), no wildcard, no trailing dot, not an IP. Its origin is allowed on `/ws` too; the certificate must name it (`subjectAltName DNS:`). The name must resolve to the Pi on the LAN (router DNS or the PC's hosts file; set up by the user). It is part of the CA ("HTTPS certificate"). |
+| `CORE_TLS_CERT_FILE` | PEM certificate (chain) naming `CORE_TLS_HOST` (`subjectAltName IP:`) and, when set, `CORE_TLS_HOSTNAME` (`DNS:`). On the Pi: `/etc/shadow-assistant/tls/core.crt` (root, readable). |
 | credential `tls-key` | The PEM private key: `LoadCredential=tls-key:/etc/credstore/shadow-core.tls-key` (also accepted as the ID `shadow-core.tls-key`). Read by the listener code, not as a variable (`credentials.ts` leaves IDs that are not variable names alone). |
 | `CORE_TLS_KEY_FILE` | The key as a file path, for development and tests only; never together with the credential. |
 | `CORE_UI_DIR` | The built UI; default `<release root>/ui/dist` (in the Core release package from T12.1). A relative path is taken from the release root. |
 
 What the Core refuses at start (one `[shadow-core] fatal:` line, never key
 material): a partial TLS setting (any of the TLS settings or the `tls-key`
-credential without the others), a host that is not an IP address, a wildcard
+credential without the others; `CORE_TLS_HOSTNAME` alone is one too), a host
+that is not an IP address, an invalid `CORE_TLS_HOSTNAME`, a wildcard
 address in the places above, the TLS port equal to `CORE_PORT` on the same
 address, a missing, empty, unreadable or oversized (64 KiB) certificate or
 key, an encrypted key, or a key that does not belong to the certificate. It
 warns (and starts) when the certificate expires within 14 days or has
-expired, is not yet valid, or does not name `CORE_TLS_HOST`, and when the UI
+expired, is not yet valid, or does not name `CORE_TLS_HOST` (or the set
+`CORE_TLS_HOSTNAME`), and when the UI
 folder has no `index.html` (the listener then answers 404 for the UI but
 `/ws` works).
 
@@ -890,9 +893,10 @@ On the TLS listener:
   `UiServer`. A path with `..`, `\`, `:` or NUL (also percent-encoded) is not
   served, and a file reached through a symlink must still lie in the UI
   folder.
-- `/ws` accepts only an `Origin` equal to the listener's own origin
-  (`https://<CORE_TLS_HOST>:<CORE_TLS_PORT>`, compared after normalising case
-  and default port) or no `Origin` (non-browser clients); anything else gets
+- `/ws` accepts only an `Origin` equal to one of the listener's own origins
+  (`https://<CORE_TLS_HOST>:<CORE_TLS_PORT>` and, when set,
+  `https://<CORE_TLS_HOSTNAME>:<CORE_TLS_PORT>`; compared after normalising
+  case and default port) or no `Origin` (non-browser clients); anything else gets
   `403` before the WebSocket handshake. Device tokens, sessions and shutdown
   are the same as on the plain listener.
 - Not served: `POST /device/state` and (from T13) `/agent`, which stay on the
@@ -917,14 +921,21 @@ renewal never touches the PC. `shadow-core-tls` (installed by
 | --- | --- | --- |
 | Key | EC P-256, `/etc/shadow-assistant/tls/ca.key` (root `0600`) | EC P-256, `/etc/credstore/shadow-core.tls-key` (root `0600`, credential `tls-key`); no other copy |
 | Valid | 10 years | 1 year, renewed 30 days before expiry |
-| Extensions | `basicConstraints` critical `CA:TRUE, pathlen:0`; `keyUsage` critical `keyCertSign, cRLSign`; `nameConstraints` critical, permitted `IP:<pi-lan-ip>/255.255.255.255` and `DNS:invalid` | `basicConstraints` `CA:FALSE`; `keyUsage` `digitalSignature`; `extendedKeyUsage` `serverAuth`; `subjectAltName` `IP:<pi-lan-ip>` only; random serial |
+| Extensions | `basicConstraints` critical `CA:TRUE, pathlen:0`; `keyUsage` critical `keyCertSign, cRLSign`; `nameConstraints` critical, permitted `IP:<pi-lan-ip>/255.255.255.255` and `DNS:invalid`; with a host name instead permitted `IP:<pi-lan-ip>/255.255.255.255` and `DNS:<name>`, excluded `DNS:.<name>` | `basicConstraints` `CA:FALSE`; `keyUsage` `digitalSignature`; `extendedKeyUsage` `serverAuth`; `subjectAltName` `IP:<pi-lan-ip>` only, or `IP:<pi-lan-ip>, DNS:<name>` with a host name; random serial |
 
-The name constraint limits the CA to the Pi's one address: IP names to that
-address, DNS names to the reserved `.invalid` domain (RFC 6761), which never
-resolves. An IP subtree alone does not limit DNS names, so without the second
-entry a leaked CA key could vouch for any web site. IPv4 only; a LAN host name
-is not supported (open question). The subject names are plain labels
-(`Shadow Assistant local CA`, `Shadow Assistant Core`), not addresses.
+The name constraint limits the CA to the Pi's one address (and the optional
+host name): IP names to that address; DNS names to the reserved `.invalid`
+domain (RFC 6761, never resolves) or, with a host name, to exactly that name.
+An IP subtree alone does not limit DNS names, so without a DNS entry a leaked
+CA key could vouch for any web site. A permitted DNS name also covers its
+subdomains, so the excluded `.<name>` removes them again (`x.<name>` is
+refused, `<name>` itself is not). IPv4 only. The subject names are plain
+labels (`Shadow Assistant local CA`, `Shadow Assistant Core`), not addresses.
+
+The host name is part of the CA: adding, changing or removing it needs a new
+CA (`init ... --recreate-ca`) and a new import on every PC. `renew` refuses
+(nothing changed) while `CORE_TLS_HOSTNAME` in `core.env` does not match the
+CA, and says which command to run.
 
 **On the Pi** (after "Install" above):
 
@@ -932,9 +943,13 @@ is not supported (open question). The subject names are plain labels
 
    ```sh
    sudo shadow-core-tls init --ip <pi-lan-ip>
+   # or, with the optional LAN host name (placeholder):
+   sudo shadow-core-tls init --ip <pi-lan-ip> --hostname shadow.lan
    ```
 
-   It prints the CA's SHA-1 hash (compare it on the PC below). Running it again
+   Once `core.env` has a TLS line, `--hostname` must match its
+   `CORE_TLS_HOSTNAME` (or both be absent); `init` refuses a mismatch. It
+   prints the CA's SHA-1 hash (compare it on the PC below). Running it again
    changes nothing. An existing CA is never replaced, except with
    `--recreate-ca`, which prints a warning: every PC then has to import the
    new `ca.crt`.
@@ -943,7 +958,8 @@ is not supported (open question). The subject names are plain labels
    (`sudoedit /etc/shadow-assistant/core.env`): uncomment `CORE_TLS_HOST=<pi-lan-ip>`
    (the same address), `CORE_TLS_PORT=<tls-port>` and
    `CORE_TLS_CERT_FILE=/etc/shadow-assistant/tls/core.crt` (the only path
-   the script writes; it refuses to run while core.env names another).
+   the script writes; it refuses to run while core.env names another); with a
+   host name also `CORE_TLS_HOSTNAME=<name>` (the same as `--hostname`).
 
 3. **[USER ACTION]** Add the key's `LoadCredential=` line and restart:
 
@@ -978,8 +994,9 @@ is not supported (open question). The subject names are plain labels
    certutil -user -addstore Root ca.crt
    ```
 
-3. **[USER ACTION]** Verify: open `https://<pi-lan-ip>:<tls-port>/` in Edge
-   or Chrome; the page loads without a certificate warning. The CA is listed
+3. **[USER ACTION]** Verify: open `https://<pi-lan-ip>:<tls-port>/` (and,
+   with a host name, `https://<name>:<tls-port>/`) in Edge or Chrome; the page
+   loads without a certificate warning. The CA is listed
    by `certutil -user -store Root "Shadow Assistant local CA"`.
 
 4. Remove (when the CA is replaced, or to stop trusting it): find its serial
@@ -991,21 +1008,23 @@ is not supported (open question). The subject names are plain labels
 
    The serial rather than the name: a recreated CA has the same name.
 
-Repeat the PC steps only when the CA is recreated: after 10 years, or when the
+Repeat the PC steps only when the CA is recreated: after 10 years, when the
 Pi's address changes (`sudo shadow-core-tls init --ip <new-address>
---recreate-ca`, with `CORE_TLS_HOST` changed to the new address first; then
-remove the old CA on the PC and import the new one).
+--recreate-ca`, with `CORE_TLS_HOST` changed to the new address first), or
+when the host name is added, changed or removed (`CORE_TLS_HOSTNAME` changed
+first, then `sudo shadow-core-tls init --ip <pi-lan-ip> [--hostname <name>]
+--recreate-ca`). Then remove the old CA on the PC and import the new one.
 
 **Renewal.** `shadow-core-tls-renew.timer` runs `shadow-core-tls renew`
 weekly (`Persistent=true`: a run missed while the Pi was off follows the next
 boot; up to 6 hours random delay). It issues a new server certificate when the
-current one expires within 30 days, names another address than
-`CORE_TLS_HOST`, does not verify against the CA, or its key in the credstore
+current one expires within 30 days, names other names than `CORE_TLS_HOST`
+(and `CORE_TLS_HOSTNAME`), does not verify against the CA, or its key in the credstore
 is missing or does not match; otherwise it exits without changing anything.
 After a new certificate it restarts `shadow-core` if the Core is running and
-`core.env` enables the TLS listener. The address comes from `CORE_TLS_HOST`
-in `core.env` (one setting; while that line is commented, the CA's own
-address). The service runs as root with a read-only file system except
+`core.env` enables the TLS listener. The address and host name come from
+`CORE_TLS_HOST` and `CORE_TLS_HOSTNAME` in `core.env` (one setting; while
+both lines are commented, the CA's own). The service runs as root with a read-only file system except
 `/etc/shadow-assistant/tls` and `/etc/credstore`, without network and without
 capabilities.
 
@@ -1018,9 +1037,9 @@ sudo shadow-core-tls renew --force               # new certificate now
 
 A failed renewal leaves the unit failed (`systemctl --failed`,
 `journalctl -u shadow-core-tls-renew`); the Core itself warns in its journal
-14 days before the certificate expires. Typical causes: `CORE_TLS_HOST`
-changed to an address the CA is not constrained to (recreate the CA, see
-above), or the CA expires within a year (recreate it). No phone or Core
+14 days before the certificate expires. Typical causes: `CORE_TLS_HOST` or
+`CORE_TLS_HOSTNAME` changed to a name the CA is not constrained to (recreate
+the CA, see above), or the CA expires within a year (recreate it). No phone or Core
 notification about an expiring certificate yet (open).
 
 **Backup.** The CA key is not in the backup (docs/13 section 7.6). Losing it
@@ -1034,7 +1053,9 @@ and restart the Core.
 Not yet verified on the Pi or on the PC: the commands above, the renewal unit
 under systemd (its sandbox and `systemctl restart` from it), and that Edge
 and Chrome accept a user-imported root with this name constraint and a
-certificate that names only an IP address.
+certificate that names only an IP address, and that they honour the DNS
+constraints (`DNS:invalid`; with a host name `DNS:<name>` and the excluded
+`.<name>`) as OpenSSL does (docs/13 section 4.3, "Not verified").
 
 ### Secrets
 

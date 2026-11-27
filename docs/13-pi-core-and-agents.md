@@ -576,7 +576,11 @@ T14.4a are no longer needed in their planned form (implementation map).
   address.
 - `/ws` on the TLS listener accepts only an `Origin` equal to the listener's own
   origin, or no `Origin` (non-browser clients). This blocks other web pages in
-  the PC's browser from using the stored token's session.
+  the PC's browser from using the stored token's session. The own origins are
+  `https://<pi-lan-ip>:<tls-port>` and, only when the optional LAN host name is
+  set (`CORE_TLS_HOSTNAME`, e.g. `shadow.lan`; 4.3), `https://<name>:<tls-port>`
+  (same normalisation: case-insensitive host, default port 443 dropped). No
+  other name, subdomain, scheme or port.
 - `/agent` is **not** served on the TLS listener (Q2: plain).
 
 ### 4.2 Listeners on the Pi
@@ -593,13 +597,30 @@ through `serve`.
 ### 4.3 Certificate
 
 - **Local CA on the Pi.** At install (T11) a small CA is created on the Pi:
-  EC P-256 key, valid 10 years, **name-constrained** to the Pi's LAN address
-  (`IP:<pi-lan-ip>/32`, plus an optional LAN host name). The CA key stays on
-  the Pi, root-only (`/etc/shadow-assistant/tls/ca.key`, 0600), used only to
-  sign the server certificate.
-- **Server certificate:** EC P-256, `subjectAltName = IP:<pi-lan-ip>`, valid
-  **1 year**, signed by the CA; key readable by the Core's user only, delivered
-  with `LoadCredential=`.
+  EC P-256 key, valid 10 years, **name-constrained** (critical) to the Pi's LAN
+  address and, optionally, one LAN host name (`CORE_TLS_HOSTNAME`, one
+  lower-case DNS name with at least two labels, no wildcard; e.g. `shadow.lan`).
+  The CA key stays on the Pi, root-only (`/etc/shadow-assistant/tls/ca.key`,
+  0600), used only to sign the server certificate. The constraint:
+  - without a host name: permitted `IP:<pi-lan-ip>/32` and `DNS:invalid`;
+  - with a host name: permitted `IP:<pi-lan-ip>/32` and `DNS:<name>`, excluded
+    `DNS:.<name>`.
+
+  Why a DNS subtree is always there: an IP-only constraint does not constrain
+  DNS names at all, so a leaked CA key could still issue a certificate for any
+  web site (shown in T11.6: a leaf for `DNS:www.example.com` passed
+  `openssl verify` under an IP-only CA; with `DNS:invalid` added it fails with
+  "permitted subtree violation"). `invalid` (RFC 6761) never resolves, so it
+  permits no real name. A permitted `DNS:<name>` also covers every subdomain
+  (RFC 5280), hence the excluded `.<name>`: in OpenSSL a leading dot matches
+  subdomains only, so `<name>` stays allowed and `x.<name>` is refused
+  (`openssl verify`, T11.6: leaves for the IP and `<name>` pass; `x.<name>`,
+  `a.b.<name>`, `*.<name>`, `other.lan`, `www.example.com` and another IP fail).
+- **Server certificate:** EC P-256, `subjectAltName = IP:<pi-lan-ip>` (plus
+  `DNS:<name>` with a host name), valid **1 year**, signed by the CA; key
+  readable by the Core's user only, delivered with `LoadCredential=`. The Core
+  warns at start when the certificate does not name the address or the host
+  name.
 - **Renewal:** a systemd timer (weekly) renews the server certificate 30 days
   before expiry and restarts the Core (or reloads the TLS context). Renewal does
   not touch the PC: the PC trusts the CA, not the leaf.
@@ -607,8 +628,10 @@ through `serve`.
   import it into the **current user's** "Trusted Root Certification
   Authorities" (`certutil -user -addstore Root ca.crt`); Edge and Chrome use the
   Windows store. Because of the name constraint, the CA can vouch for nothing
-  but the Pi's address even if its key leaked. Repeat only when the CA is
-  recreated (10 years, or a changed Pi address).
+  but the Pi's address (and the one host name) even if its key leaked. Repeat
+  only when the CA is recreated: 10 years, a changed Pi address, or a host name
+  added, changed or removed (the name is part of the CA's constraint; renewal
+  refuses and points to `init --recreate-ca`).
 - **Considered:** Tailscale's certificate for the box's `ts.net` name (no own
   CA, but the PC would have to reach the Pi through Tailscale and a tailnet name
   would be the UI's address); a self-signed leaf trusted directly (no renewal
@@ -635,6 +658,12 @@ the PC's UI is switched; checklist item in T23.1).
   all depend on it (Q8).
 - That Edge/Chrome on the PC honour an IP name constraint on a user-trusted root
   and accept an IP-only `subjectAltName` (expected; checked in T11).
+- That Edge/Chrome honour the DNS constraints the same way as OpenSSL:
+  permitted `DNS:invalid`/`DNS:<name>` and, with a host name, the excluded
+  `DNS:.<name>` (leading dot = subdomains only). Only `openssl verify` was
+  checked. If a browser read `.<name>` as covering `<name>` itself, it would
+  refuse the whole certificate (also by IP); then the host name is not usable
+  as built and needs a new decision. Check on the PC after the first named CA.
 - That `getUserMedia` works on the Pi origin once the certificate is trusted.
 
 ---
@@ -1231,8 +1260,8 @@ None at the time of writing; new ones are added here.
 
 Listed per section above. The ones that can change the design: tool hiding with
 the persistent SDK session (2), the source address behind the subnet router (1),
-pipe peer checks from a virtual service account (8.4), IP name constraints and
-microphone access on the Pi origin (4), lazy fetch with sparse + partial clone
+pipe peer checks from a virtual service account (8.4), IP and DNS name
+constraints in the browser and microphone access on the Pi origin (4), lazy fetch with sparse + partial clone
 (7.3), junction paths in the PC update (6.4). Each is checked first in the task
 that uses it.
 
