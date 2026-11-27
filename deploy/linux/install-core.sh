@@ -145,6 +145,7 @@ readonly LIB_DIR_REAL=/usr/local/lib/shadow-assistant
 readonly INSTALLER_COPY_REAL=/usr/local/lib/shadow-assistant/install-core.sh
 readonly PUBKEY_REAL=/etc/shadow-assistant/core-release.pub
 readonly UPDATE_DISABLED_REAL=/etc/shadow-assistant/core-update.disabled
+readonly UPDATE_STATE_REAL=/var/lib/shadow-assistant-updater
 readonly DROPIN_DIR_REAL=/etc/systemd/system/shadow-core.service.d
 readonly DROPIN_REAL=/etc/systemd/system/shadow-core.service.d/local.conf
 readonly STATE_REAL=/var/lib/shadow-assistant
@@ -828,6 +829,7 @@ install_main() {
   check_user
   check_node
   check_env_file
+  take_update_lock
   if [[ -n "$RELEASE" ]]; then
     prepare_release
   elif [[ ! -L "$(p "$CORE_REAL/current")" ]]; then
@@ -862,11 +864,32 @@ install_main() {
   next_steps
 }
 
+# install, release and switch never run next to an updater run (or each
+# other): the updater's lock. The updater sets SHADOW_CORE_UPDATE_LOCK_HELD=1
+# for its own calls (it holds the lock). Not with --dry-run.
+take_update_lock() {
+  local dir
+  [[ $DRY_RUN -eq 0 ]] || return 0
+  [[ "${SHADOW_CORE_UPDATE_LOCK_HELD:-}" != 1 ]] || return 0
+  command -v flock >/dev/null 2>&1 || die "flock not found (util-linux)"
+  dir="$(p "$UPDATE_STATE_REAL")"
+  in_root "$dir"
+  [[ ! -L "$dir" ]] || die "$UPDATE_STATE_REAL is a symlink; refusing"
+  if [[ ! -d "$dir" ]]; then
+    ensure_dir "$(p /var/lib)"
+    mkdir -m 0700 -- "$dir"
+  fi
+  [[ ! -L "$dir/lock" ]] || die "$UPDATE_STATE_REAL/lock is a symlink; refusing"
+  exec 9>>"$dir/lock"
+  flock -n 9 || die "an update run (shadow-core-update) or another install is in progress; try again in a few minutes (journalctl -u shadow-core-update)"
+}
+
 # ---------------------------------------------------------------- release, switch
 # The updater's steps (shadow-core-update, T12.2): the same copy and atomic
 # switch as install, nothing else (no unit, no core.env, no systemctl).
 release_main() {
   check_root_and_systemd
+  take_update_lock
   prepare_release
   install_release
 }
@@ -874,6 +897,7 @@ release_main() {
 switch_main() {
   local dest
   check_root_and_systemd
+  take_update_lock
   # A folder name as install creates it: <VERSION> or <VERSION>+<build>.
   [[ "$SWITCH_TO" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}(\+[0-9A-Za-z][0-9A-Za-z._-]{0,63})?$ ]] || die "'$SWITCH_TO' is not a release folder name"
   make_release_dirs

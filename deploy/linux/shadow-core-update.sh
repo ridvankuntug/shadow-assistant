@@ -323,7 +323,11 @@ list_releases() {
     if [[ $stop -eq 1 || $count -lt $PER_PAGE ]]; then break; fi
     page=$((page + 1))
   done
-  if (( page > MAX_PAGES )); then log "more than $MAX_PAGES pages of releases; looking at the newest $((MAX_PAGES * PER_PAGE)) only"; fi
+  # Without the installed version in sight a data-format marker further back
+  # could be missed: no decision on a partial list.
+  if (( page > MAX_PAGES )); then
+    die "the newest $((MAX_PAGES * PER_PAGE)) releases do not reach the installed $CUR_VERSION; not updating automatically (install the newest core-v$SERIES.<n> by hand)"
+  fi
 
   # A data-format change blocks its version and every later one (they carry it).
   for x in "${cand[@]}"; do
@@ -403,10 +407,14 @@ fetch_asset() {
 }
 
 # ---------------------------------------------------------------- install, rollback, prune
+# Every installer run: its trust check first (also on the recovery path), and
+# it skips its own lock (this process holds it; install-core.sh takes it
+# otherwise, so a manual install never runs next to an update).
 installer() {
   local args=("$@")
+  check_trusted_file "$INSTALLER_REAL"
   [[ -z "$ROOT" ]] || args+=(--root "$ROOT")
-  bash "$(p "$INSTALLER_REAL")" "${args[@]}"
+  SHADOW_CORE_UPDATE_LOCK_HELD=1 bash "$(p "$INSTALLER_REAL")" "${args[@]}"
 }
 
 restart_core() {
@@ -433,8 +441,8 @@ rollback() {
   record_failed "$bad"
   if [[ "$(current_dir)" != "$prev_dir" ]]; then
     if ! installer switch "$prev_dir"; then
-      err "could not switch current back to releases/$prev_dir; fix by hand: install-core.sh switch $prev_dir, then systemctl restart shadow-core"
-      rm -f -- "$STATE/pending"
+      # pending stays: the next run tries the rollback again.
+      err "could not switch current back to releases/$prev_dir; the next run tries again (by hand: install-core.sh switch $prev_dir, then systemctl restart shadow-core)"
       exit 1
     fi
   fi
@@ -446,7 +454,9 @@ rollback() {
     # the updater never writes the data folder): open point, see docs/05.
     log "NOTICE: güncelleme geri alındı ($bad) - no Core notification is raised (not built yet); this journal line is the record"
   else
+    # pending stays (the next run checks again); nothing is pruned.
     err "update to $bad rolled back, but the previous release $prev_v does not answer GET /health either; check: journalctl -u shadow-core"
+    exit 1
   fi
   rm -f -- "$STATE/pending"
   prune "$prev_dir" ""
@@ -472,6 +482,19 @@ recover_pending() {
   if [[ "$MODE" != now ]]; then
     log "an earlier run was interrupted while installing $new_v; the next --now run rolls it back"
     return 0
+  fi
+  local cur
+  cur="$(current_dir)"
+  if [[ "$cur" == "$prev_dir" && "$cur" != "$new_v" ]]; then
+    # Killed before the switch (download or copy): the new release never ran.
+    # Not recorded as failed; tried again below.
+    log "an earlier run was interrupted before switching to $new_v; current is unchanged"
+    rm -f -- "$f"
+    return 0
+  fi
+  if [[ "$cur" != "$new_v" ]]; then
+    err "$STATE_REAL/pending names $new_v (from $prev_dir), but current points to releases/$cur; check by hand, then remove $STATE_REAL/pending"
+    exit 1
   fi
   log "an earlier run was interrupted while installing $new_v; rolling back to releases/$prev_dir"
   rollback "$new_v" "$prev_dir" "$prev_v"
@@ -510,9 +533,9 @@ main() {
   check_root_and_tools
   prepare_state
   take_lock
+  read_core_port
   recover_pending
   read_current
-  read_core_port
   list_releases
   report_skips
   if [[ -z "$TARGET" ]]; then
@@ -535,7 +558,6 @@ main() {
   fi
 
   check_trusted_file "$PUBKEY_REAL"
-  check_trusted_file "$INSTALLER_REAL"
   download_and_verify "$TARGET"
   if [[ "$MODE" == dry-run ]]; then
     log "dry run: core-v$TARGET is downloaded and verified; would install it and restart shadow-core (nothing changed)"

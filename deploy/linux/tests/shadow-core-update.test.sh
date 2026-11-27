@@ -56,7 +56,7 @@ case "$url" in
     f="$FIX/api/page-${url##*page=}.json" ;;
   "https://github.com/"*"/releases/download/"*)
     f="$FIX/dl/${url#*/releases/download/}" ;;
-  "http://127.0.0.1:"*"/health")
+  "http://127.0.0.1:8701/health")
     cur="$FAKE_ROOT/opt/shadow-assistant/core/current"
     if [[ -e "$FAKE_STATE/core-down" || -e "$cur/BROKEN" || ! -f "$cur/VERSION" ]]; then
       printf '000'; echo "curl: (7) Failed to connect" >&2; exit 7
@@ -339,6 +339,44 @@ api core-v0.2.6 core-v0.2.5
 upd --now
 check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(failed_list)" == 0.2.6 ]]' "rc $RC current $(current) failed $(failed_list)"
 check '[[ ! -e "$R/var/lib/shadow-assistant-updater/pending" ]]' "pending left behind"
+
+fresh "interrupted before the switch: not failed, installed again" 0.2.5
+publish 0.2.6
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\n' > "$R/var/lib/shadow-assistant-updater/pending"
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 && -z "$(failed_list)" && "$(restarts)" == 1 ]]' "rc $RC current $(current) failed '$(failed_list)' restarts $(restarts)"
+
+fresh "rollback that cannot switch back keeps pending" 0.2.5
+publish 0.2.6 broken
+api core-v0.2.6 core-v0.2.5
+# An installer copy whose switch fails (e.g. a full disk).
+upd_with_failing_switch() {
+  printf '#!/usr/bin/env bash\nif [[ "$1" == switch ]]; then echo "switch refused" >&2; exit 1; fi\nexec bash %q "$@"\n' "$HERE/install-core.sh" > "$R/usr/local/lib/shadow-assistant/install-core.sh"
+  chmod 0755 "$R/usr/local/lib/shadow-assistant/install-core.sh"
+  upd --now
+}
+upd_with_failing_switch
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 && -f "$R/var/lib/shadow-assistant-updater/pending" && "$(failed_list)" == 0.2.6 ]]' "rc $RC current $(current)"
+install -m 0755 "$HERE/install-core.sh" "$R/usr/local/lib/shadow-assistant/install-core.sh"
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && ! -f "$R/var/lib/shadow-assistant-updater/pending" ]] && out_has "the Core runs 0.2.5 again"' "retry: rc $RC current $(current)"
+
+fresh "history longer than the scan: no decision" 0.2.5
+publish 0.2.600
+for pg in 1 2 3 4 5; do
+  { printf '['; for i in $(seq 1 100); do [[ $i -eq 1 ]] || printf ','; printf '{"tag_name":"core-v0.2.%d","draft":false,"prerelease":false,"body":""}' $((1000 - pg * 100 + 100 - i)); done; printf ']'; } > "$FIX/api/page-$pg.json"
+done
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(downloads)" == 0 ]] && out_has "do not reach the installed"' "rc $RC"
+
+fresh "a manual install waits for a running update (lock)" 0.2.5
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+exec 8>>"$R/var/lib/shadow-assistant-updater/lock"; flock -n 8
+PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" > "$W/out" 2>&1; RC=$?
+exec 8>&-
+check '[[ $RC -ne 0 ]] && out_has "in progress"' "rc $RC"
 
 fresh "untrusted public key (group-writable): refuse" 0.2.5
 publish 0.2.6

@@ -979,13 +979,18 @@ minutes (up to 10 minutes random delay). A run:
    (never tried again), switches `current` back (`install-core.sh switch`),
    restarts and waits for the old version. A run killed between the switch
    and the health check is rolled back the same way by the next run (the
-   `pending` file). It keeps `current` and the two newest other releases (the
+   `pending` file; a rollback that cannot complete keeps it, so the next run
+   tries again). It keeps `current` and the two newest other releases (the
    previous one always) and deletes older ones from `releases/`.
 
 No network, GitHub down or rate-limited, or a release whose files are not
 all uploaded yet: one journal line, the run ends without error and the next
 one tries again. Another run in progress (timer and a manual one): the second
-ends at once. The updater never touches the data folder, the vault clone,
+ends at once; `install-core.sh install`, `release` and `switch` take the same
+lock and stop with "in progress" while an update runs. If the newest 500
+releases do not reach the installed version, the run fails instead of
+deciding on a partial list (install the newest release by hand). A run killed
+before the switch is simply repeated; one killed after it is rolled back. The updater never touches the data folder, the vault clone,
 `core.env` or the credstore. Its state is in a root-owned folder (not in the
 Core's `/var/lib/shadow-assistant/`), so the Core's account cannot clear the
 `failed` list.
