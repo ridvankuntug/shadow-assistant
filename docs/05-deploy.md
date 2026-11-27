@@ -741,10 +741,11 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
 2. **[USER ACTION]** Build a release on the PC: the repository layout with a
    built Core and its production modules: `VERSION`, `services.yaml`,
    `router.yaml`, `pronunciations.yaml`, `core/package.json`, `core/dist/`,
-   `core/node_modules/` (`npm ci && npm run build`, then
+   `core/prompts/`, `core/node_modules/` (`npm ci && npm run build`, then
    `npm prune --omit=dev` in `core/`; modules with native parts must be
    installed for the Pi's architecture). **No `.env`** in it: the Core would
-   read it, and the script refuses such a release. Pack it as a `.tar.gz`
+   read it, and the script refuses such a release, as well as one with a
+   symlink pointing outside it. Pack it as a `.tar.gz`
    (the release at the top or in one folder) or copy the folder. Downloading
    releases is T12; the script only installs a local one.
 
@@ -785,7 +786,8 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
 
 6. **[USER ACTION]** Secrets, one at a time. The script asks twice without
    echo (or reads one line from a pipe), checks the name and the length the
-   Core needs (device token 16 characters or more, agent token 32 or more),
+   Core needs (printable ASCII without spaces; device token 16 to 1024
+   characters, agent token 32 or more),
    writes `/etc/credstore/shadow-core.<NAME>` with mode `0600` from the start
    and adds the `LoadCredential=` line to `local.conf`:
 

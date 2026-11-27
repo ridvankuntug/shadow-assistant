@@ -39,6 +39,7 @@ readonly NODE_MIN_MAJOR=22
 readonly SYSTEMD_MIN=247            # LoadCredential=
 readonly DEVICE_TOKEN_MIN=16        # core/src/auth.ts MIN_TOKEN_LENGTH
 readonly AGENT_TOKEN_MIN=32         # docs/13 section 1.2
+readonly DEVICE_TOKEN_MAX=1024      # core/src/auth.ts authenticate(): longer is never accepted
 readonly CREDENTIAL_MAX_BYTES=4096  # core/src/credentials.ts MAX_CREDENTIAL_BYTES
 # Marker of the not yet decided Claude login write path (see write_dropin).
 readonly UNDECIDED_MARK="# CLAUDE-LOGIN-WRITE-PATH: UNDECIDED"
@@ -128,9 +129,19 @@ own() { # own <owner:group> <path>...
   run chown -h "$@"
 }
 
+# With --root every path written must stay under it, also through symlinked
+# parent folders (a test root with etc -> /etc must not reach the real /etc).
+in_root() {
+  [[ -n "$ROOT" ]] || return 0
+  local r
+  r="$(realpath -m -- "$1")"
+  [[ "$r" == "$ROOT" || "$r" == "$ROOT"/* ]] || die "$1 resolves to $r, outside --root $ROOT; refusing"
+}
+
 # ensure_dir <path>: a system folder (e.g. /etc/systemd/system) that normally
 # exists; created only if missing (only with --root), its mode is not touched.
 ensure_dir() {
+  in_root "$1"
   [[ -d "$1" ]] && return 0
   if [[ $DRY_RUN -eq 1 ]]; then printf '  would create %s\n' "${1#"$ROOT"}"; return 0; fi
   mkdir -p -- "$1"
@@ -140,6 +151,7 @@ ensure_dir() {
 # missing, then its mode and owner are set (not recursive).
 own_dir() {
   local mode="$1" owner="$2" path="$3"
+  in_root "$path"
   [[ ! -L "$path" ]] || die "${path#"$ROOT"} is a symlink; refusing"
   if [[ ! -d "$path" ]]; then
     [[ ! -e "$path" ]] || die "${path#"$ROOT"} exists and is not a folder"
@@ -154,7 +166,9 @@ own_dir() {
 # root:root. Not for secrets (see set_secret).
 put_file() {
   local mode="$1" path="$2" tmp
+  in_root "$path"
   [[ ! -L "$path" ]] || die "${path#"$ROOT"} is a symlink; refusing"
+  [[ ! -e "$path" || -f "$path" ]] || die "${path#"$ROOT"} exists and is not a regular file; refusing"
   if [[ $DRY_RUN -eq 1 ]]; then
     printf '  would write %s (%s root:root):\n' "${path#"$ROOT"}" "$mode"
     sed 's/^/    | /'
@@ -294,13 +308,17 @@ prepare_release() {
   # Layout the unit and the Core expect (core/src/config.ts: files two levels above core/dist/).
   local f
   # core/package.json: "type": "module", without it Node cannot load dist/.
-  for f in VERSION core/package.json core/dist/index.js services.yaml router.yaml; do
+  # core/prompts/: read at every start (core/src/index.ts).
+  for f in VERSION core/package.json core/dist/index.js core/prompts/system.md core/prompts/tier1.md services.yaml router.yaml; do
     [[ -f "$RELEASE_SRC/$f" ]] || die "release is missing $f (expected the repository layout with a built Core)"
   done
   [[ -d "$RELEASE_SRC/core/node_modules" ]] || die "release is missing core/node_modules (run npm ci --omit=dev in core/ when building it)"
   # The Core reads <release>/.env if present: a copied PC .env would put
   # secrets into a world-readable folder and override the Pi settings.
   [[ ! -e "$RELEASE_SRC/.env" ]] || die "release contains a .env file; remove it (settings go to $ENV_REAL, secrets to the credstore)"
+  # Early check on the source; repeated on the copy (an absolute link into the
+  # source folder passes here but points outside the installed copy).
+  check_links_inside "$RELEASE_SRC"
 
   version="$(head -n1 -- "$RELEASE_SRC/VERSION" | tr -d '[:space:]')"
   [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] || die "VERSION '$version' is not a plain version string"
@@ -310,6 +328,17 @@ prepare_release() {
   else
     VERSION_DIR="$version"
   fi
+}
+
+# Every symlink in the release must resolve inside it (npm's relative .bin
+# links do): a link out of it would let code outside the root-owned release run.
+check_links_inside() {
+  local top="$1" l r
+  top="$(realpath -- "$top")"
+  while IFS= read -r -d '' l; do
+    r="$(realpath -m -- "$l")"
+    [[ "$r" == "$top" || "$r" == "$top"/* ]] || die "release symlink ${l#"$top"/} points outside the release ($(readlink -- "$l")); refusing"
+  done < <(find "$top" -type l -print0)
 }
 
 make_release_dirs() {
@@ -351,6 +380,7 @@ install_release() {
       [[ $OWN_OK -eq 0 ]] || chown -R -h root:root -- "$tmp"
       chmod -R u+rwX,go+rX,go-w,ug-s -- "$tmp"
       chmod 0755 -- "$tmp"
+      check_links_inside "$tmp"
       mv -T -- "$tmp" "$dest"
       rm -rf -- "$STAGING"; STAGING=""
     fi
@@ -402,6 +432,7 @@ install_env() {
     check_root_owned "$dst"
   else
     [[ -f "$src" ]] || die "$src not found (run the script from a copy of deploy/linux/)"
+    ! grep -qE "$SECRET_RE" "$src" || die "$src sets a secret variable; refusing to copy it to the world-readable $ENV_REAL"
     info "creating $ENV_REAL from core.env.example (fill in the <placeholders>)"
     put_file 0644 "$dst" < "$src"
   fi
@@ -445,7 +476,7 @@ install_state() {
 # the claude-login block, which is kept exactly as found. That block is the one
 # place where the open decision (which paths the Claude CLI may write) is filled
 # in; while the UNDECIDED marker is in it, the script warns.
-SECRET_NAME_RE='^(DEVICE_TOKEN_[A-Z0-9][A-Z0-9_]*|HA_CORE_TOKEN|CORE_AGENT_TOKEN)$'
+SECRET_NAME_RE='^(DEVICE_TOKEN_[A-Z0-9_]+|HA_CORE_TOKEN|CORE_AGENT_TOKEN)$'
 
 default_login_block() {
   cat <<EOF
@@ -578,10 +609,10 @@ read_secret() { # prints the value; prompts on a terminal, else reads one line f
 }
 
 set_secret() {
-  local store file value min=1 tmp
+  local store file value min=1 max=$CREDENTIAL_MAX_BYTES tmp
   [[ "$SECRET_NAME" =~ $SECRET_NAME_RE ]] || die "'$SECRET_NAME' is not a Core secret name (DEVICE_TOKEN_<NAME> in upper case, HA_CORE_TOKEN, CORE_AGENT_TOKEN)"
   case "$SECRET_NAME" in
-    DEVICE_TOKEN_*) min=$DEVICE_TOKEN_MIN ;;
+    DEVICE_TOKEN_*) min=$DEVICE_TOKEN_MIN; max=$DEVICE_TOKEN_MAX ;;
     CORE_AGENT_TOKEN) min=$AGENT_TOKEN_MIN ;;
   esac
   read_dropin_user
@@ -594,6 +625,10 @@ set_secret() {
 
   store="$(p "$CREDSTORE_REAL")"
   file="$store/shadow-core.$SECRET_NAME"
+  in_root "$file"
+  if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+    die "${file#"$ROOT"} exists and is not a regular file; refusing"
+  fi
   if [[ -e "$file" && $REPLACE -eq 0 ]]; then
     die "${file#"$ROOT"} exists; pass --replace to change it"
   fi
@@ -602,9 +637,11 @@ set_secret() {
   else
     value="$(read_secret)"
     [[ -n "$value" ]] || die "empty value; nothing written"
-    [[ "$value" != *[[:space:]]* && "$value" != *[[:cntrl:]]* ]] || die "the value contains spaces or control characters; nothing written"
+    # Printable ASCII without spaces: one byte per character, so the lengths
+    # below are the ones the Core counts.
+    [[ "$value" =~ ^[!-~]+$ ]] || die "the value may hold printable ASCII characters only (no spaces); nothing written"
     (( ${#value} >= min )) || die "$SECRET_NAME must be at least $min characters; nothing written"
-    (( $(printf '%s' "$value" | wc -c) <= CREDENTIAL_MAX_BYTES )) || die "the value is longer than $CREDENTIAL_MAX_BYTES bytes; nothing written"
+    (( ${#value} <= max )) || die "$SECRET_NAME must be at most $max characters; nothing written"
     # Folder first (0700), then the file under umask 077: never readable by others.
     ensure_dir "$(p /etc)"
     [[ ! -L "$store" ]] || die "$CREDSTORE_REAL is a symlink; refusing"
@@ -616,7 +653,7 @@ set_secret() {
       printf '%s' "$value" > "$tmp"   # printf is a builtin: the value is never in a process argv
       chmod 0600 -- "$tmp"
       [[ $OWN_OK -eq 0 ]] || chown root:root -- "$tmp"
-      mv -f -- "$tmp" "$file" )
+      mv -f -T -- "$tmp" "$file" )
     value=""
     info "wrote ${file#"$ROOT"} (0600 root:root)"
   fi
