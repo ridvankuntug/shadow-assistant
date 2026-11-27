@@ -768,10 +768,15 @@ sudo sh -c 'umask 077; python3 -I -c "import secrets; print(secrets.token_urlsaf
 **Claude login.** The unit runs as the account that owns the Claude login
 (T9.1): the CLI rewrites its login files when it refreshes the token, so they
 cannot live in the credstore. `ProtectHome=read-only` keeps the home read-only
-except the paths `local.conf` lists in `ReadWritePaths=` (`<home>/.claude`,
-`<home>/.claude.json`). Not yet verified on the Pi: that the CLI can refresh
-its login with only these two paths writable (if it replaces `.claude.json`
-through a temporary file in the home folder, it cannot).
+except the paths `local.conf` lists in `ReadWritePaths=`. **Open, decided
+before T11.1:** which paths. Listing only `<home>/.claude` and
+`<home>/.claude.json` probably breaks the token refresh: if the CLI replaces
+`.claude.json` through a temporary file and `rename()`, the temporary file
+cannot be created in the read-only home, and `rename()` over a single
+bind-mounted file fails (`EBUSY`). Alternatives: the whole home writable
+(simple, but a compromised Core could then change the account's shell start
+files), or the Claude configuration moved into one writable folder
+(`CLAUDE_CONFIG_DIR`, which changes where the T9.1 login lives).
 
 Without `local.conf` the unit refuses to start (`status=217/USER`: its
 placeholder account does not exist), so it never runs as root.

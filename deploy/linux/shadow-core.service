@@ -20,8 +20,11 @@
 #   # The account that owns the Claude login (T9.1).
 #   User=<user>
 #   # The Claude CLI rewrites its login files when it refreshes the token (T9.1),
-#   # so these two stay writable under ProtectHome=read-only.
-#   ReadWritePaths=<home>/.claude <home>/.claude.json
+#   # so they must stay writable under ProtectHome=read-only. OPEN, decided
+#   # before T11.1: listing <home>/.claude and <home>/.claude.json alone is
+#   # probably not enough (a temp file + rename() in the read-only home fails,
+#   # and rename() over a bind-mounted file gives EBUSY). See docs/05 section 7.
+#   ReadWritePaths=<to be decided>
 #   # One line per device token (the set varies per install).
 #   LoadCredential=DEVICE_TOKEN_<NAME>:/etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>
 #

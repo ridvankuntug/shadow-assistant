@@ -111,6 +111,10 @@ export async function main(): Promise<void> {
   // CREDENTIALS_DIRECTORY `env` is process.env itself, as before.
   const creds = loadCredentials(process.env);
   const env = creds.env;
+  // The credentials dir stays readable while the Core runs: no child process may learn its path.
+  // subprocessEnv drops it for the Core's own model calls, but the SDK also runs helpers (e.g.
+  // `git worktree list` in getSessionInfo) with the inherited process.env. A copy stays in `env`.
+  delete process.env.CREDENTIALS_DIRECTORY;
   if (creds.dir) {
     logger.info(`[shadow-core] credentials: ${creds.loaded.length > 0 ? creds.loaded.join(", ") : "none"} from CREDENTIALS_DIRECTORY`);
     if (creds.ignored.length > 0) logger.info(`[shadow-core] credentials not read by the Core (not a variable name): ${creds.ignored.join(", ")}`);
