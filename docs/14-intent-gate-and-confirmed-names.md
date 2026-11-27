@@ -612,7 +612,9 @@ the repeated mistake.
   already in memory.
 - **Model path, clear command.** Rule 3 is in-memory. Rule 4 adds one HA read
   only when the model used a name the user did not say; that turn already costs
-  ~2 s. The repeated-error check is one map lookup per call.
+  ~2 s. A call that carries `name` (with or without `domain`, decisions 9 and 14)
+  reads the live context once per turn (cached) for the sensitive-target check;
+  tier 0 never pays it. The repeated-error check is one map lookup per call.
 - **Measurement.** T4.5 checks call counts and the absence of `confirm_request`
   (deterministic), not wall time. `core/scripts/bench-turn.ts` is run by hand
   before and after T4.3 for a tier-0 brightness command; the `timing` record
@@ -633,7 +635,8 @@ the repeated mistake.
 | HA returns an empty or broken live context | No missing clock started or cleared |
 | Device missing, then back within 30 days | Not used while missing; used again once present, `missingSince` cleared |
 | Device back after the entry went passive | Stays passive; a new "Evet, hep bu" renews it |
-| Confirmed name points at a lock/cover etc. | Tier-0 filters refuse it (fallback to model); model path: `confirm_inputs`/`confirm` still ask |
+| Confirmed name points at a lock/cover etc. | Tier-0 filters refuse it (fallback to model); model path: `confirm_inputs`/`confirm` still ask; a call with `name` (with or without `domain`) on a lock, a non-outlet switch or a deny-name target asks (`sensitive_target`, decisions 9 and 14) |
+| Call with `name` (+ `domain`), live context unreadable | Confirm (`unverified_target`) |
 | Model repeats a failing call shape | Third call denied `repeated_error`, not sent; the model tells the user |
 | Same tool fails with two different errors | Not blocked (different normalized text); a third distinct failure is still sent |
 | Many more confirm cards than before | See risks |
@@ -730,6 +733,16 @@ the repeated mistake.
     `ui/scripts/mock-core.mjs` `names_list` / `names_delete` / `names` ve
     `remember` alanlarını bilir; `welcome.features` "names" ve `remember` için
     protokol testleri.
+
+### Ek karar (kullanıcı, 2026-11-27)
+
+14. **`name` + `domain` taşıyan çağrı (T4.13):** `{name, domain:["switch"]}`
+    çağrısına da outlet/deny-name kontrolü uygulanır. Geçit, `name` taşıyan her
+    yazma çağrısının hedefini (`domain` ve `area` ile daraltarak) canlı
+    snapshot'ta bulur ve karar 9'un hassas hedef kurallarını (kilit, outlet olmayan
+    switch, deny-name, `confirm_inputs`) uygular → kart. Snapshot okunamazsa ya da
+    ad hiçbir cihaza veya birden çok cihaza ulaşırsa kart (karar 9 ile aynı).
+    Tier 0 etkilenmez.
 
 ## Implementation tasks
 
@@ -866,6 +879,13 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] `permission` log record carries the gate reason.
   - [x] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
   - [x] Protocol tests for `welcome.features` "names" and `remember` (core and ui).
+- **T4.13 — Name + domain calls get the sensitive-target check (decision 14).** Durum: Başlandı
+  - [~] Gate: every write call that carries `name` (with or without `domain`) resolves
+    its target in the live snapshot (narrowed by `domain` / `area`) and gets the
+    decision 9 checks; unreadable snapshot -> confirm.
+  - [ ] Tests: name + `domain:["switch"]` on a non-outlet switch -> card; on a plug
+    with a neutral name -> no card; on a deny-name target -> card; a light with a
+    domain -> unchanged (no card).
 
 ## Progress log
 
@@ -879,3 +899,10 @@ protocol shape is fixed and shares no file with the Core tasks.
   known through rule 5 and runs without a card. Awaiting a decision.
 - 2026-11-25: follow-up decisions 9-13 implemented (T4.8-T4.12); the open T4.5
   item is closed by T4.8 (name-only sensitive targets always ask).
+- 2026-11-27: decision 14 (user): a call with `name` + `domain` (e.g.
+  `domain:["switch"]`) skipped the T4.8 check, so a non-outlet switch or a
+  deny-name target could be switched without a card. T4.13: every write call
+  with a `name` resolves its target in the live snapshot (narrowed by `domain` /
+  `area`) and gets the decision 9 checks; an unreadable snapshot asks. Model-path
+  calls with a name and a domain now cost one cached live-context read per turn;
+  tier 0 is unchanged.

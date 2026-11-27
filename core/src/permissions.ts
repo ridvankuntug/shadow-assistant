@@ -123,7 +123,7 @@ export class PermissionPolicy {
   /**
    * The services.yaml `confirm_inputs` value of the tool's service that `input`
    * hits (`"<arg>=<value>"`), or undefined. The write gate (docs/14 decision 9)
-   * asks it with a name-only call's resolved `domain` / `device_class`.
+   * asks it with a named call's resolved `domain` / `device_class`.
    */
   confirmInputHit(identity: ToolIdentity, input: Record<string, unknown>): string | undefined {
     const svc = identity.service ? this.byName.get(identity.service) : undefined;
@@ -324,7 +324,7 @@ function clip(s: string, max: number): string {
 
 /**
  * Why the write gate (docs/14) raised a call to `confirm`; `question_turn` wins over
- * `unknown_target`, which wins over the name-only checks of decision 9 (T4.8):
+ * `unknown_target`, which wins over the named-target checks of decisions 9 and 14 (T4.8, T4.13):
  * `sensitive_target` (a lock, a non-outlet switch, a deny-name or `confirm_inputs`
  * target) and `unverified_target` (no usable live context, or the name reaches no
  * entity or several).

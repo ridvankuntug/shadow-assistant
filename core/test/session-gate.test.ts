@@ -609,19 +609,21 @@ test("T4.9: the name the user said, fitting the whole phrase -> no card (with a 
   assert.deepEqual(two.agent.decisions.map((d) => d.behavior), ["allow", "allow"]);
 });
 
-test("T4.9: an utterance that is only the name needs no read; a failed read keeps a text match (with a domain)", async () => {
+test("T4.9/T4.13: an utterance that is only the name is known by text (one read, for the named-target check); a failed read -> card (with a domain)", async () => {
   const h = harness();
   h.ha.live = live(LAMP, LAMP2);
   h.agent.queue.push([lampOff({ domain: ["light"] })]);
   await h.say("salon lambası");
   assert.equal(h.confirms().length, 0);
-  assert.equal(h.ha.reads, 0);
+  assert.equal(h.ha.reads, 1, "T4.13: a call with a name always reads once (cached per turn)");
 
+  // T4.13 (docs/14 decision 14): with a domain, an unreadable live context asks, as for a name-only call.
   const broken = harness();
   broken.ha.live = { text: "boom", isError: true };
   broken.agent.queue.push([lampOff({ domain: ["light"] })]);
-  await broken.say("salon lambasını kapat");
-  assert.equal(broken.confirms().length, 0);
+  const req = await broken.sayAndAnswer("salon lambasını kapat", false);
+  assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.unverified_target), req.summary);
+  assert.deepEqual(broken.agent.decisions.map((d) => d.behavior), ["deny"]);
   assert.equal(broken.ha.reads, 1);
 });
 
@@ -642,19 +644,47 @@ test("T4.8: a name-only call when the live context is not usable, or the name re
   assert.match(call?.reason ?? "", /\+gate:unverified_target$/);
 });
 
-test("T4.8: a name-only call on a switch without a device class the user named -> card (sensitive); with a domain -> no T4.8 check", async () => {
-  const h = harness();
-  h.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe" });
-  h.agent.queue.push([turnOff("Bahçe Pompası")]);
-  const req = await h.sayAndAnswer("bahçe pompasını kapat", false);
-  assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), req.summary);
-  assert.equal(req.remember, undefined);
+test("T4.8/T4.13: a call on a switch without a device class the user named -> card (sensitive), with or without a domain", async () => {
+  for (const args of [{ name: "Bahçe Pompası" }, { name: "Bahçe Pompası", domain: ["switch"] }, { name: "Bahçe Pompası", domain: "switch" }]) {
+    const h = harness();
+    h.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe" });
+    h.agent.queue.push([{ tool: "intent__HassTurnOff", args }]);
+    const req = await h.sayAndAnswer("bahçe pompasını kapat", false);
+    assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), `${JSON.stringify(args)}: ${req.summary}`);
+    assert.equal(req.remember, undefined);
+    assert.deepEqual(h.agent.decisions.map((d) => d.behavior), ["deny"]);
+    const call = (await h.lines()).find((l) => l.kind === "tool_call" && l.tool === `${HA}intent__HassTurnOff`);
+    assert.match(call?.reason ?? "", /\+gate:sensitive_target$/);
+  }
+});
 
-  const d = harness();
-  d.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe" });
-  d.agent.queue.push([{ tool: "intent__HassTurnOff", args: { name: "Bahçe Pompası", domain: ["switch"] } }]);
-  await d.say("bahçe pompasını kapat");
-  assert.equal(d.confirms().length, 0);
+test("T4.13: name + domain on a plug with a neutral name -> no card; on a deny-name light or plug -> card; a light -> no card", async () => {
+  const plug = harness();
+  plug.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe", deviceClass: "outlet" });
+  plug.agent.queue.push([{ tool: "intent__HassTurnOff", args: { name: "Bahçe Pompası", domain: ["switch"] } }]);
+  await plug.say("bahçe pompasını kapat");
+  assert.equal(plug.confirms().length, 0);
+  assert.deepEqual(plug.agent.decisions.map((d) => d.behavior), ["allow"]);
+  assert.equal(plug.ha.reads, 1);
+
+  for (const [entity, domain] of [
+    [{ names: "Garaj Lambası", domain: "light", areas: "Garaj" }, "light"],
+    [{ names: "Kapı Rölesi", domain: "switch", areas: "Giriş", deviceClass: "outlet" }, "switch"],
+  ] as const) {
+    const h = harness({ gateWords: true });
+    h.ha.live = live(entity);
+    h.agent.queue.push([{ tool: "intent__HassTurnOff", args: { name: entity.names, domain: [domain] } }]);
+    const req = await h.sayAndAnswer(`${entity.names.toLocaleLowerCase("tr")} kapat`, false);
+    assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), `${entity.names}: ${req.summary}`);
+    assert.deepEqual(h.agent.decisions.map((d) => d.behavior), ["deny"]);
+  }
+
+  const lamp = harness();
+  lamp.ha.live = live(LAMP);
+  lamp.agent.queue.push([lampOff({ domain: ["light"] })]);
+  await lamp.say("salon lambasını kapat");
+  assert.equal(lamp.confirms().length, 0);
+  assert.deepEqual(lamp.agent.decisions.map((d) => d.behavior), ["allow"]);
 });
 
 test("T4.8: tier 0 does no name-only read (its hint skips the gate's target checks)", async () => {

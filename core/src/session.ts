@@ -81,7 +81,7 @@ import { clipForTts, describeVoice, SpeechServiceError, type SttClient, type Tts
 import { SpeechStream } from "./speech-stream.js";
 import { buildTurnEnvelope, ESCALATION_CONTINUE, wrapDirectNotes } from "./turn-envelope.js";
 import { cleanTurkish, fold } from "./turkish.js";
-import { isNameOnlyCall, isQuestionTurn, nameMatchNeedsSnapshot, nameOnlyTarget, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
+import { isNamedCall, isQuestionTurn, nameMatchNeedsSnapshot, namedTarget, PROVENANCE_WINDOW, targetProvenance } from "./write-gate.js";
 
 /** whisper-svc rejects > 25 MB; refuse earlier than that. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -282,7 +282,7 @@ export interface SessionDeps {
 export interface SessionGateWords {
   /** Device words per domain (`learning.keywords`): broad calls and area + device word matches. */
   domainWords?: Readonly<Record<string, readonly string[]>>;
-  /** Folded deny name words (`learning.denyNameWords`): name-only targets holding one always ask (T4.8). */
+  /** Folded deny name words (`learning.denyNameWords`): named targets holding one always ask (T4.8, T4.13). */
   denyNameWords?: Iterable<string>;
 }
 
@@ -2046,10 +2046,12 @@ export class Session {
    *                             -> the same read; the match must fit the user's whole
    *                                name phrase ("salon lambası 2" said, "Salon Lambası"
    *                                called -> `unknown_target`); a failed read keeps the match
-   *   name-only call (T4.8)     -> the same read, always; `sensitive_target` when the name
-   *                                reaches a sensitive entity (`gateSensitive`), even when
-   *                                the user named it; `unverified_target` when the read
-   *                                fails or the name reaches no entity or several
+   *   call with a `name` (T4.8 name only, T4.13 also with `domain` / `device_class`)
+   *                             -> the same read, always; `sensitive_target` when the name
+   *                                (narrowed by `area` / `domain`) reaches a sensitive
+   *                                entity (`gateSensitive`), even when the user named it;
+   *                                `unverified_target` when the read fails or the name
+   *                                reaches no entity or several
    *
    * Live-context reads happen on the model path only and share the per-turn cache.
    */
@@ -2068,9 +2070,9 @@ export class Session {
     // Device words per domain (router.yaml `learning.keywords`, also with learning off): broad calls and area + keyword matches.
     const opts = { domainWords: this.gateDomainWords };
     let p = targetProvenance(input, window, undefined, undefined, opts);
-    const nameOnly = isNameOnlyCall(input);
+    const named = isNamedCall(input);
     const recheck = (p.status === "unknown" && p.needsSnapshot) || (p.status === "known" && p.via === "text" && nameMatchNeedsSnapshot(input, window));
-    if (!recheck && !nameOnly) return p.status === "unknown" ? "unknown_target" : undefined;
+    if (!recheck && !named) return p.status === "unknown" ? "unknown_target" : undefined;
     const snapshot = identity.service !== undefined ? await untilAborted(this.gateSnapshot(turn, identity.service), signal) : undefined;
     if (snapshot && recheck) {
       // Rule 5: only active confirmed names whose fingerprint is present exactly once in this snapshot
@@ -2086,14 +2088,14 @@ export class Session {
     }
     // An unknown target keeps its reason (and the "Evet, hep bu" rules of Decision 7).
     if (p.status === "unknown") return "unknown_target";
-    if (!nameOnly) return undefined;
+    if (!named) return undefined;
     if (!snapshot) return "unverified_target";
-    const target = nameOnlyTarget(input, snapshot, (e) => this.gateSensitive(identity, e));
+    const target = namedTarget(input, snapshot, (e) => this.gateSensitive(identity, e));
     return target === "sensitive" ? "sensitive_target" : target === "unresolved" ? "unverified_target" : undefined;
   }
 
   /**
-   * Decision 9 (T4.8): an entity a name-only write must always ask for, whatever the
+   * Decisions 9 and 14 (T4.8, T4.13): an entity a write with a `name` must always ask for, whatever the
    * provenance: its `domain` / `device_class` hit the service's `confirm_inputs` (a lock,
    * a cover, a door ...), it is a switch without positive plug evidence (tier 0's
    * `staticSwitchTarget`), or a name, alias or area holds a deny name word (tier 0's

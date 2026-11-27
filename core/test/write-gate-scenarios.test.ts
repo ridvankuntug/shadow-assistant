@@ -593,6 +593,37 @@ test("a lock the user named: the model's name-only call opens a card; declined -
   assert.deepEqual(h.ha.writes.map((c) => c.args), [{ name: "Ön Kapı" }]);
 });
 
+// docs/14 decision 14 (T4.13): a call that carries `domain` next to `name` gets the same
+// sensitive-target check as a name-only call (confirm_inputs alone cannot see a plug or a deny name).
+for (const [target, said, why] of [
+  ["Röle Anahtarı", "röle anahtarını kapat", "a switch that is not an outlet"],
+  ["Kapı Rölesi", "kapı rölesini kapat", "a deny-name plug"],
+] as const) {
+  test(`name + domain:["switch"] on ${why} the user named: card (sensitive); declined -> no write`, async () => {
+    const h = await harness();
+    h.model.queue.push([{ tool: OFF, args: { name: target, domain: ["switch"] } }]);
+    const req = await h.sayAndAnswer(said, (r) => h.respond(r, false));
+    assert.equal(h.model.calls.length, 1, "tier 0 refused, the model got the turn");
+    assert.equal(req.remember, undefined);
+    assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), req.summary);
+    assert.equal(h.model.decisions.at(-1)?.behavior, "deny");
+    assert.equal(h.ha.writes.length, 0, "nothing switched");
+  });
+}
+
+test("name + domain on a plug and a light with neutral names: no card, one gate read (T4.13)", async () => {
+  const h = await harness();
+  h.model.queue.push([
+    { tool: OFF, args: { name: "Sonoff Priz", domain: ["switch"] } },
+    { tool: OFF, args: { name: "Mutfak Işık 1", domain: ["light"] } },
+  ]);
+  await h.say("sonoff priz ve mutfak ışık 1 kapansın");
+  assert.equal(h.model.calls.length, 1);
+  assert.equal(h.confirms().length, 0);
+  assert.deepEqual(h.ha.writes.map((c) => c.args.name), ["Sonoff Priz", "Mutfak Işık 1"]);
+  assert.equal(h.ha.readsBeforeWrite, 1, "the gate's one read, cached for both calls");
+});
+
 test("a name-only call on a light or a plug the user named: no card (T4.8 raises sensitive kinds only)", async () => {
   const h = await harness();
   h.model.queue.push([turnOff("Sonoff Priz"), turnOff("Mutfak Işık 1")]);

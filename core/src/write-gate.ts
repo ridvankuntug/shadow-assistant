@@ -351,8 +351,8 @@ function standsAlone(v: EntityView, u: Utterance, i: number, j: number): boolean
  *    2" said, "Salon Lambası" called).
  * Adjacent phrases and other-domain words are not looked at here: a command
  * naming two devices ("salon lambasını ve mutfak ışığını kapat") stays known.
- * A name that reaches no entity is left to HA and to the name-only check
- * (`nameOnlyTarget`): the text match stands.
+ * A name that reaches no entity is left to HA and to the named-target check
+ * (`namedTarget`): the text match stands.
  */
 function textMatchFits(
   window: readonly Utterance[],
@@ -546,35 +546,40 @@ export function targetProvenance(
   return { status: "unknown", needsSnapshot: false };
 }
 
-// ---------------------------------------------------------------- name-only targets (docs/14 decision 9)
+// ---------------------------------------------------------------- named targets (docs/14 decisions 9 and 14)
 
 /**
- * A call that names its target by `name` alone: no `domain`, no
- * `device_class` (`confirm_inputs` cannot see what kind of device it is).
+ * A call that names its target by `name`, with or without `domain` /
+ * `device_class` (T4.8 checked `name` alone; T4.13 adds `name` + `domain`:
+ * `confirm_inputs` sees the domain, but not whether a switch is a plug or
+ * whether the entity holds a deny name word).
  */
-export function isNameOnlyCall(input: Readonly<Record<string, unknown>>): boolean {
-  return present(input, "name") && !present(input, "domain") && !present(input, "device_class");
+export function isNamedCall(input: Readonly<Record<string, unknown>>): boolean {
+  return present(input, "name");
 }
 
 /** `ok`: one entity, not sensitive; `sensitive`: some entity the call can reach is; `unresolved`: none or several. */
-export type NameOnlyTarget = "ok" | "sensitive" | "unresolved";
+export type NamedTarget = "ok" | "sensitive" | "unresolved";
 
 /**
- * Decision 9 (T4.8): the entities a name-only call reaches in the live
- * snapshot (its name or alias, narrowed by `area` when given), checked with
- * `isSensitive` (the caller's `confirm_inputs` and tier-0 rules). Any
- * reachable entity being sensitive wins; otherwise the call must reach
- * exactly one entity. A `name` that is not a usable string is `unresolved`.
+ * Decisions 9 and 14 (T4.8, T4.13): the entities a call with a `name` reaches
+ * in the live snapshot (its name or alias, narrowed by `area` and `domain`
+ * when given, as HA narrows them), checked with `isSensitive` (the caller's
+ * `confirm_inputs` and tier-0 rules). Any reachable entity being sensitive
+ * wins; otherwise the call must reach exactly one entity. A `name`, `area` or
+ * `domain` that is set but not usable is `unresolved`. `device_class` does not
+ * narrow (more entities checked, never fewer).
  */
-export function nameOnlyTarget(
+export function namedTarget(
   input: Readonly<Record<string, unknown>>,
   snapshot: readonly LiveEntity[],
   isSensitive: (entity: LiveEntity) => boolean,
-): NameOnlyTarget {
+): NamedTarget {
   const name = textValue(input.name);
   const area = present(input, "area") ? textValue(input.area) : undefined;
-  if (name === undefined || (present(input, "area") && area === undefined)) return "unresolved";
-  const owners = callOwners(snapshot, name, area, undefined);
+  const domains = present(input, "domain") ? domainsOf(input.domain) : undefined;
+  if (name === undefined || (present(input, "area") && area === undefined) || (present(input, "domain") && domains === undefined)) return "unresolved";
+  const owners = callOwners(snapshot, name, area, domains);
   if (owners.some(isSensitive)) return "sensitive";
   return owners.length === 1 ? "ok" : "unresolved";
 }

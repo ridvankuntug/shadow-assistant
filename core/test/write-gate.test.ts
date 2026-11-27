@@ -8,10 +8,10 @@ import { describe, test } from "node:test";
 import type { LiveEntity } from "../src/live-context.js";
 import {
   gateWordForms,
-  isNameOnlyCall,
+  isNamedCall,
   isQuestionTurn,
   nameMatchNeedsSnapshot,
-  nameOnlyTarget,
+  namedTarget,
   PROVENANCE_WINDOW,
   targetProvenance,
   type GateConfirmedName,
@@ -372,31 +372,47 @@ describe("rule 3 against the live list (docs/14 decision 10, T4.9)", () => {
   });
 });
 
-describe("name-only targets (docs/14 decision 9, T4.8)", () => {
-  test("isNameOnlyCall: `name` without `domain` / `device_class`", () => {
-    assert.equal(isNameOnlyCall({ name: "Ön Kapı" }), true);
-    assert.equal(isNameOnlyCall({ name: "Ön Kapı", area: "Giriş" }), true);
-    assert.equal(isNameOnlyCall({ name: "Ön Kapı", domain: "lock" }), false);
-    assert.equal(isNameOnlyCall({ name: "Ön Kapı", device_class: "door" }), false);
-    assert.equal(isNameOnlyCall({ area: "Salon" }), false);
+describe("named targets (docs/14 decisions 9 and 14, T4.8, T4.13)", () => {
+  test("isNamedCall: `name`, with or without `domain` / `device_class`", () => {
+    assert.equal(isNamedCall({ name: "Ön Kapı" }), true);
+    assert.equal(isNamedCall({ name: "Ön Kapı", area: "Giriş" }), true);
+    assert.equal(isNamedCall({ name: "Ön Kapı", domain: "lock" }), true);
+    assert.equal(isNamedCall({ name: "Ön Kapı", device_class: "door" }), true);
+    assert.equal(isNamedCall({ area: "Salon" }), false);
+    assert.equal(isNamedCall({ domain: ["light"] }), false);
   });
   const sensitive = (e: LiveEntity) => e.domain === "lock";
   const snap = [entity(["Ön Kapı", "Kapı"], "lock", ["Giriş"]), entity(["Salon Lambası"], "light", ["Salon"]), entity(["Tavan"], "light", ["Salon"]), entity(["Tavan"], "light", ["Mutfak"])];
   test("one plain entity -> ok; a sensitive one (also by alias) -> sensitive", () => {
-    assert.equal(nameOnlyTarget({ name: "Salon Lambası" }, snap, sensitive), "ok");
-    assert.equal(nameOnlyTarget({ name: "ön kapı" }, snap, sensitive), "sensitive");
-    assert.equal(nameOnlyTarget({ name: "Kapı" }, snap, sensitive), "sensitive");
+    assert.equal(namedTarget({ name: "Salon Lambası" }, snap, sensitive), "ok");
+    assert.equal(namedTarget({ name: "ön kapı" }, snap, sensitive), "sensitive");
+    assert.equal(namedTarget({ name: "Kapı" }, snap, sensitive), "sensitive");
   });
   test("no entity, several, a contradicting area or a bad value -> unresolved; area narrows", () => {
-    assert.equal(nameOnlyTarget({ name: "Depo" }, snap, sensitive), "unresolved");
-    assert.equal(nameOnlyTarget({ name: "Tavan" }, snap, sensitive), "unresolved");
-    assert.equal(nameOnlyTarget({ name: "Tavan", area: "Mutfak" }, snap, sensitive), "ok");
-    assert.equal(nameOnlyTarget({ name: "Salon Lambası", area: "Mutfak" }, snap, sensitive), "unresolved");
-    assert.equal(nameOnlyTarget({ name: 42 }, snap, sensitive), "unresolved");
-    assert.equal(nameOnlyTarget({ name: "Salon Lambası", area: 7 }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Depo" }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Tavan" }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Tavan", area: "Mutfak" }, snap, sensitive), "ok");
+    assert.equal(namedTarget({ name: "Salon Lambası", area: "Mutfak" }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: 42 }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Salon Lambası", area: 7 }, snap, sensitive), "unresolved");
   });
   test("a sensitive entity among several wins", () => {
     const shared = [entity(["Giriş"], "lock"), entity(["Giriş"], "light")];
-    assert.equal(nameOnlyTarget({ name: "Giriş" }, shared, sensitive), "sensitive");
+    assert.equal(namedTarget({ name: "Giriş" }, shared, sensitive), "sensitive");
+  });
+  test("`domain` narrows like HA does; a sensitive entity in the called domain still wins (T4.13)", () => {
+    const shared = [entity(["Giriş"], "lock"), entity(["Giriş"], "light")];
+    assert.equal(namedTarget({ name: "Giriş", domain: ["light"] }, shared, sensitive), "ok");
+    assert.equal(namedTarget({ name: "Giriş", domain: "light" }, shared, sensitive), "ok");
+    assert.equal(namedTarget({ name: "Giriş", domain: ["lock"] }, shared, sensitive), "sensitive");
+    assert.equal(namedTarget({ name: "Giriş", domain: ["light", "lock"] }, shared, sensitive), "sensitive");
+    assert.equal(namedTarget({ name: "Ön Kapı", domain: ["lock"], device_class: "door" }, snap, sensitive), "sensitive");
+  });
+  test("with `domain`: no entity in that domain, several, or a bad domain -> unresolved", () => {
+    assert.equal(namedTarget({ name: "Salon Lambası", domain: ["switch"] }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Tavan", domain: ["light"] }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Tavan", domain: ["light"], area: "Mutfak" }, snap, sensitive), "ok");
+    assert.equal(namedTarget({ name: "Salon Lambası", domain: [] }, snap, sensitive), "unresolved");
+    assert.equal(namedTarget({ name: "Salon Lambası", domain: 3 }, snap, sensitive), "unresolved");
   });
 });
