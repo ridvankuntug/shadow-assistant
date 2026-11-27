@@ -566,3 +566,7 @@ export function namesErrorText(code: string, message?: string | null): string {
       return noticeText(code, message ?? undefined);
   }
 }
+
+// ------------------------------------------------ rehearsal band (T11.5, docs/02 "Features" `rehearsal`)
+
+export const REHEARSAL_BAND = "Prova kipi: bildirimler ve sesli acil uyarı kapalı";

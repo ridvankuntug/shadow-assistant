@@ -514,6 +514,14 @@ export function notificationsUnavailable(s: AssistantState): boolean {
   return notificationsAvailable(s) && s.notifications.unavailable;
 }
 
+/**
+ * The "prova" band (T11.5): connected to a Core that announces `rehearsal`.
+ * A welcome without it (e.g. after reconnecting to the live Core) removes it.
+ */
+export function rehearsalBand(s: AssistantState): boolean {
+  return s.connection.status === "connected" && hasFeature(s, "rehearsal");
+}
+
 /** The İzinler page and its count may be offered: connected to a Core with the `pc_permissions` feature. */
 export function pcPermissionsAvailable(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "pc_permissions");

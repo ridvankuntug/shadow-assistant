@@ -130,7 +130,9 @@ export type CoreFeature =
   | "notifications_suppress"
   | "ha_urgency_feedback"
   | "pc_permissions"
-  | "names";
+  | "names"
+  /** T11.5: the Core runs in rehearsal mode (notification producers and urgent speech off): the UI shows the "prova" band. */
+  | "rehearsal";
 export type WelcomeMessage = {
   type: "welcome";
   protocol: number;

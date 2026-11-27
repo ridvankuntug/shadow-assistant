@@ -14,6 +14,7 @@ import {
   memoryAvailable,
   namesAvailable,
   reducer,
+  rehearsalBand,
   shouldPlaySpeech,
   type Action,
   type AssistantState,
@@ -781,5 +782,28 @@ describe("device names panel (docs/14 Decision 8)", () => {
     expect(s.names).toMatchObject({ status: "error", errorCode: "connection" });
     const ready = run([{ type: "names_requested", id: "n2" }, srv(frame("n2"))]);
     expect(run([srv(welcome(["names"]))], ready).names).toEqual(initialState.names);
+  });
+});
+
+describe("rehearsal band (T11.5)", () => {
+  const welcome = (features?: string[]): ServerMessage =>
+    features
+      ? { type: "welcome", protocol: 1, sessionId: "s", device: "d", features }
+      : { type: "welcome", protocol: 1, sessionId: "s", device: "d" };
+
+  it("shows only while connected to a Core that announces rehearsal", () => {
+    expect(rehearsalBand(run([srv(welcome(["names", "rehearsal"]))]))).toBe(true);
+    expect(rehearsalBand(run([srv(welcome(["names"]))]))).toBe(false);
+    expect(rehearsalBand(run([srv(welcome())]))).toBe(false);
+    expect(rehearsalBand(initialState)).toBe(false);
+  });
+
+  it("goes with a welcome without the feature (reconnect to a non-rehearsal Core)", () => {
+    const rehearsal = run([srv(welcome(["rehearsal"]))]);
+    expect(rehearsalBand(rehearsal)).toBe(true);
+    const dropped = run([{ type: "status", ev: { status: "reconnecting", attempt: 1 } }], rehearsal);
+    expect(rehearsalBand(dropped)).toBe(false);
+    const live = run([{ type: "status", ev: { status: "connected", attempt: 0 } }, srv(welcome(["names"]))], dropped);
+    expect(rehearsalBand(live)).toBe(false);
   });
 });

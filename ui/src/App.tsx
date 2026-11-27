@@ -16,12 +16,14 @@ import {
   notificationsUnavailable,
   pcPermissionsAvailable,
   pcPermissionsBadgeCount,
+  rehearsalBand,
 } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
 import { PHASE_COLOR } from "./scene/phaseStyle.ts";
 import { resolveQuality, type Quality } from "./scene/quality.ts";
 import { AppMenu } from "./ui/AppMenu.tsx";
+import { Band } from "./ui/Band.tsx";
 import { ConfirmCard } from "./ui/ConfirmCard.tsx";
 import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
@@ -50,6 +52,7 @@ import {
   notificationsUnreadText,
   PC_PERMISSIONS_TITLE,
   pcPermissionsUnseenText,
+  REHEARSAL_BAND,
   resolvedText,
 } from "./ui/strings.ts";
 
@@ -414,6 +417,8 @@ export default function App({ adapter, controller }: Props) {
       <Stage phase={phase} status={status} quality={quality} active={visible} reducedMotion={reducedMotion} level={level} />
 
       <section className="chat" aria-label="Konuşma">
+        {/* Rehearsal Core (T11.5): stays while connected to it, goes with a welcome without `rehearsal`. */}
+        {rehearsalBand(state) && <Band>{REHEARSAL_BAND}</Band>}
         <Conversation messages={state.messages} />
 
         {notice && (

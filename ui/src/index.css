@@ -502,6 +502,19 @@ input:focus-visible {
   background: var(--panel);
   border-color: var(--line);
 }
+/* A persistent information band (T11.5 "prova"): quieter than .notice, never dismissed. */
+.band {
+  margin: 6px 12px 0;
+  padding: 4px 12px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  text-align: center;
+}
+.band-info {
+  background: var(--panel);
+  border: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--muted);
+}
 .resolved {
   margin: 4px 14px;
   font-size: 13px;
