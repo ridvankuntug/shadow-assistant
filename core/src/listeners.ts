@@ -7,6 +7,8 @@
  * - `CORE_EXTRA_HOSTS`: comma list of further IP addresses the plain listener
  *   binds on `CORE_PORT` (the Pi: `127.0.0.1` next to its LAN address).
  * - `CORE_TLS_HOST`, `CORE_TLS_PORT`: the TLS listener's IP address and port.
+ * - `CORE_TLS_HOSTNAME` (optional): one LAN DNS name of the same listener
+ *   (e.g. `shadow.lan`); its origin is allowed on `/ws` next to the IP's.
  * - `CORE_TLS_CERT_FILE`: PEM certificate (chain) of that address.
  * - The private key (PEM): the systemd credential `tls-key` (also accepted as
  *   `shadow-core.tls-key`), or `CORE_TLS_KEY_FILE` (development/tests); exactly
@@ -14,7 +16,8 @@
  * - `CORE_UI_DIR`: the built UI; default `<release root>/ui/dist`.
  *
  * Refused at start (ListenerConfigError, message never holds key material):
- * a partial TLS setting, a host that is not an IP address, a wildcard address
+ * a partial TLS setting, a host that is not an IP address, an invalid
+ * `CORE_TLS_HOSTNAME` (see `validTlsHostname`), a wildcard address
  * (`0.0.0.0`, `::`) for the TLS host or an extra host, a wildcard `CORE_HOST`
  * together with the TLS listener or extra hosts (docs/13 §4.2: nothing listens
  * on all interfaces on the Pi), a missing/unreadable/invalid certificate or
@@ -41,6 +44,8 @@ export class ListenerConfigError extends Error {}
 
 export interface TlsListenerConfig {
   host: string;
+  /** CORE_TLS_HOSTNAME, when set (lower-case DNS name). */
+  hostname?: string;
   port: number;
   cert: Buffer;
   key: Buffer;
@@ -93,14 +98,34 @@ export function tlsOrigin(host: string, port: number): string {
   return new URL(`https://${isIP(host) === 6 ? `[${host}]` : host}:${port}/`).origin;
 }
 
+/** The `/ws` origins of the TLS listener: its IP's and, with CORE_TLS_HOSTNAME, the name's (docs/13 §4.1). */
+export function tlsOrigins(host: string, port: number, hostname?: string): string[] {
+  return hostname ? [tlsOrigin(host, port), tlsOrigin(hostname, port)] : [tlsOrigin(host, port)];
+}
+
+/**
+ * CORE_TLS_HOSTNAME's rule (the same as shadow-core-tls.sh's): one DNS name of
+ * lower-case LDH labels (a-z, 0-9, inner '-'; 1-63 characters each), at least
+ * two labels, at most 253 characters, no wildcard, no trailing dot, and a last
+ * label that is not all digits (so never an IPv4 address).
+ */
+export function validTlsHostname(name: string): boolean {
+  if (name.length > 253) return false;
+  const labels = name.split(".");
+  if (labels.length < 2) return false;
+  if (!labels.every((l) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l))) return false;
+  return !/^[0-9]+$/.test(labels[labels.length - 1] as string);
+}
+
 /**
  * The Origin rule of the TLS listener's `/ws` (docs/13 §4.1): no `Origin`
- * header (non-browser clients), or one exactly equal to the listener's own
- * origin after normalising scheme, host case and default port. Anything else,
+ * header (non-browser clients), or one exactly equal to one of the listener's
+ * own origins (`tlsOrigins`) after normalising scheme, host case and default
+ * port. Anything else,
  * including `null`, a different scheme/host/port, a path or credentials in the
  * value, or two Origin headers joined by Node, is refused.
  */
-export function originAllowed(header: string | string[] | undefined, own: string): boolean {
+export function originAllowed(header: string | string[] | undefined, own: string | readonly string[]): boolean {
   if (header === undefined) return true;
   if (Array.isArray(header) || header.trim() === "") return false;
   const raw = header.trim();
@@ -113,7 +138,7 @@ export function originAllowed(header: string | string[] | undefined, own: string
   } catch {
     return false;
   }
-  return u.origin === own;
+  return typeof own === "string" ? u.origin === own : own.includes(u.origin);
 }
 
 function set(v: string | undefined): string | undefined {
@@ -204,13 +229,14 @@ export function loadListenerConfig(env: NodeJS.ProcessEnv, opts: ListenerConfigO
   }
 
   const tlsHost = set(env.CORE_TLS_HOST);
+  const tlsHostname = set(env.CORE_TLS_HOSTNAME);
   const tlsPort = set(env.CORE_TLS_PORT);
   const certFile = set(env.CORE_TLS_CERT_FILE);
   const keyFile = set(env.CORE_TLS_KEY_FILE);
   const uiDirRaw = set(env.CORE_UI_DIR);
   const keyCred = findKeyCredential(fs, opts.credentialsDir);
 
-  const anyTls = tlsHost ?? tlsPort ?? certFile ?? keyFile ?? uiDirRaw ?? keyCred;
+  const anyTls = tlsHost ?? tlsHostname ?? tlsPort ?? certFile ?? keyFile ?? uiDirRaw ?? keyCred;
   if (anyTls === undefined) return { extraHosts, warnings, consumedCredentials: [] };
 
   const missing = [
@@ -231,6 +257,12 @@ export function loadListenerConfig(env: NodeJS.ProcessEnv, opts: ListenerConfigO
   if (!isIP(host)) throw new ListenerConfigError("CORE_TLS_HOST must be an IP address; refusing to start");
   if (isWildcardAddress(host)) {
     throw new ListenerConfigError("CORE_TLS_HOST must not be 0.0.0.0 or :: (nothing listens on all interfaces); refusing to start");
+  }
+  // The value is not echoed: the message stays the same whatever was typed.
+  if (tlsHostname !== undefined && !validTlsHostname(tlsHostname)) {
+    throw new ListenerConfigError(
+      "CORE_TLS_HOSTNAME must be one lower-case DNS name with at least two labels (letters, digits, inner '-'; no wildcard, no trailing dot, not an IP address), e.g. shadow.lan; refusing to start",
+    );
   }
   if (isWildcardAddress(opts.host)) {
     throw new ListenerConfigError(
@@ -276,11 +308,15 @@ export function loadListenerConfig(env: NodeJS.ProcessEnv, opts: ListenerConfigO
   if (x509.checkIP(host) === undefined) {
     warnings.push("TLS certificate does not name CORE_TLS_HOST (subjectAltName IP); browsers will refuse it");
   }
+  // subjectAltName DNS only (no CN fallback, no wildcard): what shadow-core-tls issues.
+  if (tlsHostname !== undefined && x509.checkHost(tlsHostname, { subject: "never", wildcards: false }) === undefined) {
+    warnings.push("TLS certificate does not name CORE_TLS_HOSTNAME (subjectAltName DNS); browsers will refuse it under that name");
+  }
 
   const uiDir = uiDirRaw ? (isAbsolute(uiDirRaw) ? uiDirRaw : resolve(opts.repoRoot, uiDirRaw)) : join(opts.repoRoot, "ui", "dist");
   return {
     extraHosts,
-    tls: { host, port, cert, key, keySource, uiDir },
+    tls: { host, ...(tlsHostname ? { hostname: tlsHostname } : {}), port, cert, key, keySource, uiDir },
     warnings,
     consumedCredentials: keyCred ? [keyCred.id] : [],
   };

@@ -502,7 +502,7 @@ export async function main(): Promise<void> {
   for (const host of listeners.extraHosts) await server.listenPlain(cfg.port, host);
   const tls = listeners.tls;
   const tlsListening = tls
-    ? await server.listenTls({ host: tls.host, port: tls.port, cert: tls.cert, key: tls.key, uiDir: tls.uiDir })
+    ? await server.listenTls({ host: tls.host, hostname: tls.hostname, port: tls.port, cert: tls.cert, key: tls.key, uiDir: tls.uiDir })
     : undefined;
 
   logger.info(`[shadow-core] env file: ${envFile ? "loaded" : "not found (using process environment)"}`);
@@ -534,7 +534,7 @@ export async function main(): Promise<void> {
   );
   for (const host of [cfg.host, ...listeners.extraHosts]) logger.info(`[shadow-core] listening on ws://${host}:${port}/ws`);
   if (tls && tlsListening) {
-    logger.info(`[shadow-core] TLS listener on ${tlsListening.origin}/ (UI files, /ws, /health; key from ${tls.keySource})`);
+    logger.info(`[shadow-core] TLS listener on ${tlsListening.origins.map((o) => `${o}/`).join(" and ")} (UI files, /ws, /health; key from ${tls.keySource})`);
     if (!existsSync(join(tls.uiDir, "index.html"))) {
       logger.warn(`[shadow-core] UI folder ${tls.uiDir} has no index.html: the TLS listener answers 404 for the UI (set CORE_UI_DIR)`);
     } else logger.info(`[shadow-core] UI files from ${tls.uiDir}`);

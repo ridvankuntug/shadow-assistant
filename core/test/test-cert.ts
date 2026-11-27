@@ -1,6 +1,6 @@
 /**
  * TEST ONLY: a throwaway self-signed X.509 certificate (EC P-256,
- * subjectAltName IP:127.0.0.1 and DNS:localhost) built at test time, so no key
+ * subjectAltName IP:127.0.0.1 and DNS:localhost by default) built at test time, so no key
  * is committed and no `openssl` binary is needed. node:crypto signs but does
  * not build certificates, hence the small DER encoder below (just the fields
  * a v3 certificate needs).
@@ -45,6 +45,8 @@ export interface TestCertOptions {
   notAfter?: Date;
   /** subjectAltName IPv4 address; default 127.0.0.1. */
   ip?: [number, number, number, number];
+  /** subjectAltName DNS name; default localhost. */
+  dns?: string;
 }
 
 /** A fresh self-signed certificate + key (TEST ONLY). */
@@ -55,7 +57,7 @@ export function makeTestCert(opts: TestCertOptions = {}): TestCert {
   const serial = randomBytes(8);
   // Positive and minimal DER: first byte 0x01..0x7f (never a redundant leading zero).
   serial[0] = ((serial[0] ?? 0) & 0x7f) | 0x01;
-  const san = seq(tlv(0x87, Buffer.from(opts.ip ?? [127, 0, 0, 1])), tlv(0x82, Buffer.from("localhost", "ascii")));
+  const san = seq(tlv(0x87, Buffer.from(opts.ip ?? [127, 0, 0, 1])), tlv(0x82, Buffer.from(opts.dns ?? "localhost", "ascii")));
   const ski = createHash("sha1").update(spki).digest();
   const extensions = tlv(
     0xa3,

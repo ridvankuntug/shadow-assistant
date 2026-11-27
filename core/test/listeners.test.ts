@@ -10,6 +10,8 @@ import {
   TLS_KEY_CREDENTIAL,
   TLS_KEY_CREDENTIAL_PREFIXED,
   tlsOrigin,
+  tlsOrigins,
+  validTlsHostname,
   type ListenerFs,
 } from "../src/listeners.js";
 import { makeTestCert } from "./test-cert.js";
@@ -173,6 +175,66 @@ test("TLS: warnings for an expiring or expired certificate and a missing address
   assert.match(w3.warnings.join("|"), /does not name CORE_TLS_HOST/);
 });
 
+test("CORE_TLS_HOSTNAME: strict DNS name rule", () => {
+  const good = ["shadow.lan", "pi-1.home.lan", "1a.lan", "a.b1", "x.y.z", "xn--bcher-kva.lan", `${"a".repeat(63)}.lan`];
+  for (const n of good) assert.equal(validTlsHostname(n), true, n);
+  const bad = [
+    "",
+    "shadow",
+    "Shadow.lan",
+    "SHADOW.LAN",
+    "*.shadow.lan",
+    "shadow.lan.",
+    ".shadow.lan",
+    "a..lan",
+    "-a.lan",
+    "a-.lan",
+    "a_b.lan",
+    "a b.lan",
+    "shadow.lan:8743",
+    "shadow.lan,other.lan",
+    "https://shadow.lan",
+    "192.0.2.10",
+    "1.2.3",
+    "a.123",
+    "::1",
+    "[::1]",
+    "şadow.lan",
+    `${"a".repeat(64)}.lan`,
+    `${"a.".repeat(126)}lan`,
+  ];
+  for (const n of bad) assert.equal(validTlsHostname(n), false, n);
+});
+
+test("CORE_TLS_HOSTNAME: loaded with the TLS settings, checked against the certificate", () => {
+  // Without it nothing changes (IP only).
+  assert.equal(loadListenerConfig(tlsEnv, { ...base, fs: memFs(files) }).tls?.hostname, undefined);
+  const named = makeTestCert({ dns: "shadow.lan" });
+  const nf = { "/tls/core.crt": named.certPem, "/tls/core.key": named.keyPem };
+  const c = loadListenerConfig({ ...tlsEnv, CORE_TLS_HOSTNAME: " shadow.lan " }, { ...base, fs: memFs(nf) });
+  assert.equal(c.tls?.hostname, "shadow.lan");
+  assert.deepEqual(c.warnings, []);
+  // The certificate names another DNS name (localhost) only: warning, still starts.
+  const w = loadListenerConfig({ ...tlsEnv, CORE_TLS_HOSTNAME: "shadow.lan" }, { ...base, fs: memFs(files) });
+  assert.match(w.warnings.join("|"), /does not name CORE_TLS_HOSTNAME/);
+  // A subdomain of the certificate's name is not a match either.
+  const sub = loadListenerConfig({ ...tlsEnv, CORE_TLS_HOSTNAME: "x.shadow.lan" }, { ...base, fs: memFs(nf) });
+  assert.match(sub.warnings.join("|"), /does not name CORE_TLS_HOSTNAME/);
+  // Invalid names refuse the start; the value is not echoed.
+  for (const n of ["Evil.LAN", "*.evil.lan", "evilname", "192.0.2.10", "evil.lan."]) {
+    assert.throws(
+      () => loadListenerConfig({ ...tlsEnv, CORE_TLS_HOSTNAME: n }, { ...base, fs: memFs(nf) }),
+      (err: unknown) => err instanceof ListenerConfigError && /CORE_TLS_HOSTNAME must be/.test(err.message) && !err.message.includes(n),
+      n,
+    );
+  }
+  // On its own it is a partial TLS setting.
+  refuses(
+    () => loadListenerConfig({ CORE_TLS_HOSTNAME: "shadow.lan" }, { ...base, fs: memFs({}) }),
+    /partly configured; missing: CORE_TLS_HOST, CORE_TLS_PORT, CORE_TLS_CERT_FILE, the key/,
+  );
+});
+
 test("TLS: CORE_UI_DIR absolute or relative to the release root", () => {
   const abs = join(ROOT, "elsewhere", "ui");
   assert.equal(loadListenerConfig({ ...tlsEnv, CORE_UI_DIR: abs }, { ...base, fs: memFs(files) }).tls?.uiDir, abs);
@@ -184,6 +246,43 @@ test("tlsOrigin normalises default port, host case and IPv6", () => {
   assert.equal(tlsOrigin("127.0.0.1", 443), "https://127.0.0.1");
   assert.equal(tlsOrigin("::1", 8743), "https://[::1]:8743");
   assert.equal(tlsOrigin("0:0:0:0:0:0:0:1", 8743), "https://[::1]:8743");
+});
+
+test("tlsOrigins: the IP's origin, plus the host name's when set", () => {
+  assert.deepEqual(tlsOrigins("192.0.2.10", 8743), ["https://192.0.2.10:8743"]);
+  assert.deepEqual(tlsOrigins("192.0.2.10", 8743, "shadow.lan"), ["https://192.0.2.10:8743", "https://shadow.lan:8743"]);
+  assert.deepEqual(tlsOrigins("192.0.2.10", 443, "shadow.lan"), ["https://192.0.2.10", "https://shadow.lan"]);
+});
+
+test("originAllowed with a host name: the IP's and the name's origin, nothing else", () => {
+  const own = tlsOrigins("192.0.2.10", 8743, "shadow.lan");
+  const yes = [undefined, "https://192.0.2.10:8743", "https://shadow.lan:8743", "https://SHADOW.LAN:8743", "HTTPS://Shadow.Lan:8743", " https://shadow.lan:8743 "];
+  for (const o of yes) assert.equal(originAllowed(o, own), true, String(o));
+  const no = [
+    "",
+    "null",
+    "http://shadow.lan:8743",
+    "https://shadow.lan",
+    "https://shadow.lan:8700",
+    "https://x.shadow.lan:8743",
+    "https://shadow.lan.:8743",
+    "https://other.lan:8743",
+    "https://shadow.lan.evil.example:8743",
+    "https://user@shadow.lan:8743",
+    "https://shadow.lan:8743/",
+    "https://shadow.lan:8743/x/..",
+    "https://shadow.lan:8743?x=1",
+    "https://192.0.2.11:8743",
+    "https://shadow.lan:8743, https://192.0.2.10:8743",
+  ];
+  for (const o of no) assert.equal(originAllowed(o, own), false, o);
+  assert.equal(originAllowed(["https://shadow.lan:8743"], own), false);
+  const own443 = tlsOrigins("192.0.2.10", 443, "shadow.lan");
+  assert.equal(originAllowed("https://shadow.lan", own443), true);
+  assert.equal(originAllowed("https://shadow.lan:443", own443), true);
+  assert.equal(originAllowed("https://shadow.lan:8743", own443), false);
+  // Without the name (IP only) the name's origin is refused.
+  assert.equal(originAllowed("https://shadow.lan:8743", tlsOrigins("192.0.2.10", 8743)), false);
 });
 
 test("originAllowed: accept/refuse matrix", () => {

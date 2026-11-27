@@ -357,6 +357,41 @@ test("close() stops every listener and closes the TLS sessions", async () => {
   assert.equal(s.http.listening, false);
 });
 
+test("/ws over TLS with a host name: its origin is accepted too, nothing else", async () => {
+  const cert = makeTestCert({ dns: "shadow.lan" });
+  const w: string[] = [];
+  const s = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: TOKEN }),
+    logger: { info: () => {}, warn: (m: string) => void w.push(m) },
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  try {
+    const { port, origin: first, origins } = await s.listenTls({
+      host: "127.0.0.1",
+      hostname: "shadow.lan",
+      port: 0,
+      cert: Buffer.from(cert.certPem),
+      key: Buffer.from(cert.keyPem),
+      uiDir,
+    });
+    assert.equal(first, `https://127.0.0.1:${port}`);
+    assert.deepEqual(origins, [`https://127.0.0.1:${port}`, `https://shadow.lan:${port}`]);
+    for (const o of [`https://shadow.lan:${port}`, `https://SHADOW.lan:${port}`, `https://127.0.0.1:${port}`]) {
+      const ws = await openWs(`wss://127.0.0.1:${port}/ws`, { Origin: o });
+      ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN, client: "web" }));
+      await nextFrame(ws, "welcome");
+      ws.close();
+    }
+    const foreign = [`https://x.shadow.lan:${port}`, `https://other.lan:${port}`, `http://shadow.lan:${port}`, `https://shadow.lan:${port + 1}`, `https://localhost:${port}`];
+    for (const o of foreign) {
+      assert.equal(await refusedStatus(openWs(`wss://127.0.0.1:${port}/ws`, { Origin: o })), 403, o);
+    }
+    assert.equal(w.filter((m) => m.includes("Origin is not")).length, foreign.length);
+  } finally {
+    await s.close();
+  }
+});
+
 test("listenTls on a taken port rejects", async () => {
   const cert = makeTestCert();
   const s = createCoreServer({

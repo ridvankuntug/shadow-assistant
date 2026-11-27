@@ -38,7 +38,7 @@ import {
   type ServerFrame,
   type ServiceHealth,
 } from "./protocol.js";
-import { originAllowed, tlsOrigin, TLS_MIN_VERSION } from "./listeners.js";
+import { originAllowed, tlsOrigins, TLS_MIN_VERSION } from "./listeners.js";
 import type { Logger, Session, SessionInfo } from "./session.js";
 import { createStaticHandler } from "./static-files.js";
 import { readCoreVersion } from "./version.js";
@@ -110,6 +110,8 @@ export interface ServiceHealthSource {
 
 export interface TlsListenOptions {
   host: string;
+  /** CORE_TLS_HOSTNAME: its origin is allowed on `/ws` next to the IP's. */
+  hostname?: string;
   port: number;
   /** PEM certificate (chain) and private key; the key is kept in memory only. */
   cert: Buffer;
@@ -127,7 +129,7 @@ export interface CoreServer {
   /** Binds one more plain listener with the same routes (e.g. 127.0.0.1 next to the LAN address). */
   listenPlain(port: number, host: string): Promise<{ port: number }>;
   /** Binds the TLS listener (UI files, `/ws` with the Origin rule, `/health`). */
-  listenTls(opts: TlsListenOptions): Promise<{ port: number; origin: string }>;
+  listenTls(opts: TlsListenOptions): Promise<{ port: number; origin: string; origins: string[] }>;
   close(): Promise<void>;
 }
 
@@ -362,10 +364,10 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
 
   /**
    * WebSocket upgrade on any listener: only the listener's own paths; with
-   * `origin` (the TLS listener) the Origin rule is checked before the
+   * `origins` (the TLS listener) the Origin rule is checked before the
    * handshake (403), so a foreign page never reaches the hello frame.
    */
-  const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer, paths: ReadonlySet<string>, origin?: string) => {
+  const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer, paths: ReadonlySet<string>, origins?: readonly string[]) => {
     const path = (req.url ?? "/").split("?")[0] ?? "";
     if (shuttingDown) {
       refuseUpgrade(socket, "503 Service Unavailable");
@@ -375,7 +377,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
       refuseUpgrade(socket, "404 Not Found");
       return;
     }
-    if (origin !== undefined && !originAllowed(req.headers.origin, origin)) {
+    if (origins !== undefined && !originAllowed(req.headers.origin, origins)) {
       // The value itself is not logged: it is client-controlled.
       opts.logger.warn("[shadow-core] refused /ws on the TLS listener: Origin is not the listener's own");
       refuseUpgrade(socket, "403 Forbidden");
@@ -498,7 +500,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     async listenTls(t) {
       const files = createStaticHandler(t.uiDir);
       /** Set once bound (the port may be 0 in tests); no upgrade is accepted before. */
-      const bound: { origin?: string } = {};
+      const bound: { origins?: string[] } = {};
       const server = createHttpsServer({ cert: t.cert, key: t.key, minVersion: TLS_MIN_VERSION }, (req, res) => {
         const path = (req.url ?? "/").split("?")[0];
         if (serveHealth(req, res, path)) return;
@@ -508,13 +510,14 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
         });
       });
       server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-        if (bound.origin === undefined) refuseUpgrade(socket, "503 Service Unavailable");
-        else onUpgrade(req, socket, head, TLS_UPGRADE_PATHS, bound.origin);
+        if (bound.origins === undefined) refuseUpgrade(socket, "503 Service Unavailable");
+        else onUpgrade(req, socket, head, TLS_UPGRADE_PATHS, bound.origins);
       });
       servers.push(server);
       const { port } = await listenOn(server, t.port, t.host);
-      bound.origin = tlsOrigin(t.host, port);
-      return { port, origin: bound.origin };
+      const origins = tlsOrigins(t.host, port, t.hostname);
+      bound.origins = origins;
+      return { port, origin: origins[0] as string, origins: [...origins] };
     },
     async close() {
       shuttingDown = true;
