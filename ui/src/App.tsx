@@ -359,24 +359,6 @@ export default function App({ adapter, controller }: Props) {
               )}
             </button>
           )}
-          <button
-            type="button"
-            className="btn btn-icon"
-            aria-label="Son konuşmalar"
-            onClick={() => {
-              controller.requestHistory();
-              setPanel("history");
-            }}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M13 3a9 9 0 0 0-9 9H1l4 4 4-4H6a7 7 0 1 1 2.05 4.95l-1.42 1.42A9 9 0 1 0 13 3Zm-1 5v5l4.25 2.52.77-1.28-3.52-2.09V8H12Z" />
-            </svg>
-          </button>
-          <button type="button" className="btn btn-icon" aria-label="Ayarlar" onClick={openSettings}>
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3h-4l-.4 2.9a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1L11 21h4l.4-2.9a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5L19.4 13ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
-            </svg>
-          </button>
           {/* A plain sparkle, not Google's logo. */}
           {gemini && geminiOn && (
             <button
@@ -394,6 +376,16 @@ export default function App({ adapter, controller }: Props) {
           {/* Rightmost, in the corner (T16.2); more entries will join later. */}
           <AppMenu
             items={[
+              // Recent conversations and settings live here too, not as top bar icons (space on the phone).
+              {
+                id: "history",
+                label: "Son konuşmalar",
+                onSelect: () => {
+                  controller.requestHistory();
+                  setPanel("history");
+                },
+              },
+              { id: "settings", label: "Ayarlar", onSelect: openSettings },
               // Only with the Core feature `pc_permissions`; the count is the rows not yet seen (no sound, ever).
               ...(pcPermissionsOn
                 ? [
