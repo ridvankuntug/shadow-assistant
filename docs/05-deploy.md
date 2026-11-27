@@ -950,11 +950,14 @@ Design: [docs/13](13-pi-core-and-agents.md) section 6.2. `shadow-core-update`
 `shadow-core-update.timer`, 15 minutes after boot and then about every 30
 minutes (up to 10 minutes random delay). A run:
 
-1. Reads the installed version from `current/VERSION`. Only a CI release
-   `<X.Y>.<n>` is updated, and only to `core-v<X.Y>.<m>` with the same `X.Y`
-   and a larger `m`: a new `X.Y` series is installed by hand (step 4 of
-   "Install"), and so is the first CI release after a local build (whose
-   `VERSION` holds only `X.Y`).
+1. Reads the installed version from `current/VERSION`. A CI release
+   `<X.Y>.<n>` is updated to `core-v<X.Y>.<m>` with the same `X.Y` and a
+   larger `m`; a local build (`VERSION` holds only `X.Y`) is replaced by the
+   newest `core-v<X.Y>.<m>` (user decision 2026-11-28: every CI release is
+   installed). A new `X.Y` series is installed by hand (step 4 of "Install").
+   To test a local build on the Pi, turn automatic updates off first
+   (`install-core.sh install --user <user> --no-auto-update`), and on again
+   afterwards (`--auto-update`).
 2. Lists the releases of the public repository on GitHub (no token; Core
    releases are never "latest", so it reads the list, newest first). It skips
    drafts and pre-releases, versions in the `failed` list, and every version

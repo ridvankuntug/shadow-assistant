@@ -810,8 +810,9 @@ differs from or adds to the steps above:
 - Install and rollback go through `install-core.sh` (new commands `release`
   and `switch`, run from a root-owned copy in `/usr/local/lib/shadow-assistant/`),
   not a second copy of its logic.
-- The configured `X.Y` is the `X.Y` of the installed release's `VERSION`; an
-  installed version that is not `X.Y.<n>` (a local build) is not updated.
+- The configured `X.Y` is the `X.Y` of the installed release's `VERSION`; a
+  local build (`VERSION` only `X.Y`) is replaced by the newest CI release of
+  that series (user decision 2026-11-28).
 - The `failed` list is in `/var/lib/shadow-assistant-updater/failed` (root
   0700, the updater's `StateDirectory`), not under the Core's
   `/var/lib/shadow-assistant/` (owned by the Core's account, which could

@@ -260,8 +260,18 @@ read_current() {
   CUR_DIR="${link#releases/}"
   [[ -f "$cur/VERSION" ]] || die "$CORE_REAL/current/VERSION is missing"
   CUR_VERSION="$(head -n1 -- "$cur/VERSION" | tr -d '[:space:]')"
+  # A local build (VERSION holds only X.Y) is replaced by the newest CI
+  # release of its series like an older one (user decision 2026-11-28): every
+  # CI release is installed, by hand or not. To test a local build on the Pi,
+  # turn automatic updates off first (install-core.sh --no-auto-update).
+  if [[ "$CUR_VERSION" =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]; then
+    SERIES="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+    CUR_N=-1
+    log "the installed Core is a local build ('$CUR_VERSION'); the newest core-v$SERIES.<n> replaces it"
+    return 0
+  fi
   if [[ ! "$CUR_VERSION" =~ $VERSION_RE ]]; then
-    log "the installed Core is '$CUR_VERSION', not a CI release (<X.Y>.<n>); automatic updates start once a core-v release is installed by hand (install-core.sh)"
+    log "the installed Core is '$CUR_VERSION', neither a CI release (<X.Y>.<n>) nor a local build (<X.Y>); not updating automatically"
     exit 0
   fi
   SERIES="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"

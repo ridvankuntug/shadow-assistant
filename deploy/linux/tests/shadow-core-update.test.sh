@@ -317,11 +317,24 @@ echo 0.2 > "$FS/health-version"
 upd --now
 check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(downloads)" == 0 ]] && out_has "does not answer GET /health"' "rc $RC"
 
-fresh "non-CI installed version (X.Y only): skipped" 0.2
+fresh "local build (X.Y only): replaced by the newest CI release" 0.2
+publish 0.2.5
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 ]] && out_has "local build"' "rc $RC"
+
+fresh "local build of another series: not replaced" 0.3
 publish 0.2.6
 api core-v0.2.6
 upd --now
-check '[[ $RC -eq 0 && "$(current)" == releases/0.2 && "$(downloads)" == 0 ]] && out_has "not a CI release"' "rc $RC"
+check '[[ $RC -eq 0 && "$(current)" == releases/0.3 && "$(downloads)" == 0 ]]' "rc $RC"
+
+fresh "unknown installed version: skipped" 0.2.x
+publish 0.2.6
+api core-v0.2.6
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.x && "$(downloads)" == 0 ]] && out_has "neither a CI release"' "rc $RC"
 
 fresh "concurrent run: the second exits quietly" 0.2.5
 publish 0.2.6
