@@ -519,18 +519,33 @@ SECRET_NAME_RE='^(DEVICE_TOKEN_[A-Z0-9_]+|HA_CORE_TOKEN|CORE_AGENT_TOKEN)$'
 
 # A local.conf written before that decision holds a claude-login block (a
 # commented placeholder, or lines filled in by hand). The rewrite drops it;
-# lines in it other than comments are named in a warning (setting names only:
-# a value could be a secret), so that a setting put there by hand does not
-# vanish silently.
+# lines in it other than comments are reported in a warning so that a setting
+# put there by hand does not vanish silently. Never their content (a value
+# could be a secret): only the name of a "Name=value" line, and only a count
+# for anything else (continuation lines after a trailing backslash, lines
+# without "=").
+has_old_login_block() {
+  [[ -f "$1" ]] && grep -qxF "$OLD_BLOCK_BEGIN" "$1"
+}
+
 report_old_login_block() {
   local file="$1" active
-  [[ -f "$file" ]] || return 0
-  grep -qxF "$OLD_BLOCK_BEGIN" "$file" || return 0
+  has_old_login_block "$file" || return 0
   active="$(awk -v b="$OLD_BLOCK_BEGIN" -v e="$OLD_BLOCK_END" '
-    $0 == b { inb = 1; next } $0 == e { inb = 0; next }
-    inb && $0 !~ /^[[:space:]]*(#|$)/ { sub(/[[:space:]]*=.*/, ""); print }' "$file")"
+    $0 == b { inb = 1; cont = 0; next }
+    $0 == e { inb = 0; next }
+    !inb { next }
+    cont { other++; cont = /\\$/; next }
+    /^[[:space:]]*(#|;|$)/ { next }
+    { cont = /\\$/ }
+    /^[A-Za-z][A-Za-z0-9]*[[:space:]]*=/ { n = $0; sub(/[[:space:]]*=.*/, "", n); names = names (names == "" ? "" : " ") n; next }
+    { other++ }
+    END {
+      if (other > 0) names = names (names == "" ? "" : " ") "and " other " other line(s)"
+      print names
+    }' "$file")"
   if [[ -n "$active" ]]; then
-    warn "$DROPIN_REAL: the old claude-login block is dropped with its settings ($(paste -sd' ' <<<"$active"); values not shown); the Claude login now lives in $CLAUDE_DIR_REAL (CLAUDE_CONFIG_DIR of the unit). A setting that is still needed goes into: sudo systemctl edit shadow-core"
+    warn "$DROPIN_REAL: the old claude-login block is dropped with its settings ($active; values not shown); the Claude login now lives in $CLAUDE_DIR_REAL (CLAUDE_CONFIG_DIR of the unit). A setting that is still needed goes into: sudo systemctl edit shadow-core"
   else
     info "$DROPIN_REAL: dropping the old claude-login placeholder (the Claude login now lives in $CLAUDE_DIR_REAL)"
   fi
@@ -667,6 +682,12 @@ set_secret() {
   fi
   check_user
   check_env_file
+  # An install from before the CLAUDE_CONFIG_DIR decision: rewriting local.conf
+  # here would drop its claude-login block while the old unit (no
+  # CLAUDE_CONFIG_DIR, no claude/ folder) still keeps the login in the home.
+  if has_old_login_block "$(p "$DROPIN_REAL")" && ! grep -q '^Environment=CLAUDE_CONFIG_DIR=' "$(p "$UNIT_REAL")" 2>/dev/null; then
+    die "the installed unit predates the Claude login in $CLAUDE_DIR_REAL; run '$0 install --user $USER_NAME' first (docs/05 section 7 \"Claude login\"), then set-secret; nothing written"
+  fi
 
   store="$(p "$CREDSTORE_REAL")"
   file="$store/shadow-core.$SECRET_NAME"

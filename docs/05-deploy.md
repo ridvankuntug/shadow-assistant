@@ -830,7 +830,9 @@ skips `systemctl`; for testing the script only).
 `local.conf` is rewritten on every run (`User=`, `LoadCredential=` lines).
 A `local.conf` from before the `CLAUDE_CONFIG_DIR` decision still holds a
 block between `# BEGIN claude-login` and `# END claude-login`; the next run
-drops it (a warning names any setting in it, without its value).
+drops it (a warning names any setting in it, without its value). On such an
+install run `install` before `set-secret`: `set-secret` refuses to drop the
+block while the installed unit does not set `CLAUDE_CONFIG_DIR` yet.
 Every run also installs the TLS script and its renewal units and enables the
 timer (`systemctl enable --now
 shadow-core-tls-renew.timer`); the timer does nothing until the CA exists
