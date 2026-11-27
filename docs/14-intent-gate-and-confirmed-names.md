@@ -879,11 +879,11 @@ protocol shape is fixed and shares no file with the Core tasks.
   - [x] `permission` log record carries the gate reason.
   - [x] `ui/scripts/mock-core.mjs` knows `names_list` / `names_delete` / `names` and `remember`.
   - [x] Protocol tests for `welcome.features` "names" and `remember` (core and ui).
-- **T4.13 — Name + domain calls get the sensitive-target check (decision 14).** Durum: Başlandı
-  - [~] Gate: every write call that carries `name` (with or without `domain`) resolves
+- **T4.13 — Name + domain calls get the sensitive-target check (decision 14).** Durum: bitti
+  - [x] Gate: every write call that carries `name` (with or without `domain`) resolves
     its target in the live snapshot (narrowed by `domain` / `area`) and gets the
     decision 9 checks; unreadable snapshot -> confirm.
-  - [ ] Tests: name + `domain:["switch"]` on a non-outlet switch -> card; on a plug
+  - [x] Tests: name + `domain:["switch"]` on a non-outlet switch -> card; on a plug
     with a neutral name -> no card; on a deny-name target -> card; a light with a
     domain -> unchanged (no card).
 

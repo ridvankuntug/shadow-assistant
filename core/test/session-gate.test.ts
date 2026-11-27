@@ -687,6 +687,22 @@ test("T4.13: name + domain on a plug with a neutral name -> no card; on a deny-n
   assert.deepEqual(lamp.agent.decisions.map((d) => d.behavior), ["allow"]);
 });
 
+test("T4.13: name + device_class without a domain is still a named call: non-outlet switch -> card, outlet -> no card", async () => {
+  const bad = harness();
+  bad.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe" });
+  bad.agent.queue.push([{ tool: "intent__HassTurnOff", args: { name: "Bahçe Pompası", device_class: ["outlet"] } }]);
+  const req = await bad.sayAndAnswer("bahçe pompasını kapat", false);
+  assert.ok(req.summary.endsWith(GATE_SUMMARY_SUFFIX.sensitive_target), req.summary);
+  assert.deepEqual(bad.agent.decisions.map((d) => d.behavior), ["deny"]);
+
+  const ok = harness();
+  ok.ha.live = live({ names: "Bahçe Pompası", domain: "switch", areas: "Bahçe", deviceClass: "outlet" });
+  ok.agent.queue.push([{ tool: "intent__HassTurnOff", args: { name: "Bahçe Pompası", device_class: ["outlet"] } }]);
+  await ok.say("bahçe pompasını kapat");
+  assert.equal(ok.confirms().length, 0);
+  assert.deepEqual(ok.agent.decisions.map((d) => d.behavior), ["allow"]);
+});
+
 test("T4.8: tier 0 does no name-only read (its hint skips the gate's target checks)", async () => {
   const h = harness();
   await h.say("salon ışığını kapat");
