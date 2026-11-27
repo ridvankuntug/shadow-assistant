@@ -716,19 +716,132 @@ new token in the phone (`sudo cat /etc/credstore/wake-svc.token`).
 ## 7. Core on the Pi (in progress)
 
 Design: [docs/13](13-pi-core-and-agents.md) K1 and section 7.1. The install
-script (T11.1) will do the steps below; until then this section only lists
-what the unit expects. The PC Core (section 3) is unchanged.
+script `deploy/linux/install-core.sh` (T11.1) does the steps below; nothing in
+this section has been run on the Pi yet. The PC Core (section 3) is unchanged.
 
 | Path on the Pi | What | Owner, mode |
 | --- | --- | --- |
 | `/etc/systemd/system/shadow-core.service` | The unit (`deploy/linux/shadow-core.service`) | `root:root 0644` |
-| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in: `User=`, the writable path(s) for the Claude login (open, see below), one `LoadCredential=` per device token (template in the unit's header) | `root:root 0644` |
-| `/etc/shadow-assistant/core.env` | Settings, no secret (`deploy/linux/core.env.example`) | `root:root 0644` |
+| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in, written by the script: `User=`, the claude-login block (open, see "Claude login"), one `LoadCredential=` per device or agent token | `root:root 0644` |
+| `/etc/shadow-assistant/core.env` | Settings, no secret (`deploy/linux/core.env.example`); created once, never overwritten | `root:root 0644` |
 | `/etc/credstore/shadow-core.<VARIABLE>` | One secret per file: `HA_CORE_TOKEN`, `DEVICE_TOKEN_<NAME>`, later `CORE_AGENT_TOKEN` | `root:root 0600` (folder `0700`) |
-| `/opt/shadow-assistant/core/current/` | Core release (repository layout, `core/dist/index.js`) | root, read-only for the service |
+| `/opt/shadow-assistant/core/releases/<version>/`, `current` | Core releases (repository layout, `core/dist/index.js`); `current` is a symlink to one of them | root, read-only for the service |
 | `/var/lib/shadow-assistant/` | `StateDirectory`: `data/` (`SHADOW_DATA_DIR`), `vault/` (`SHADOW_VAULT_DIR`) | `<user>`, `0700` |
 
-**Secrets.** The Core reads them from systemd's `$CREDENTIALS_DIRECTORY`
+Placeholders below: `<user>` is the account on the Pi that owns (or will own)
+the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
+
+### Install
+
+1. **[USER ACTION]** On the Pi: Node.js 22 or newer at `/usr/bin/node` (the
+   unit runs that path; `/usr/bin/node --version`) and systemd 247 or newer
+   (`systemctl --version | head -1`). The script checks both and installs
+   neither.
+
+2. **[USER ACTION]** Build a release on the PC: the repository layout with a
+   built Core and its production modules: `VERSION`, `services.yaml`,
+   `router.yaml`, `pronunciations.yaml`, `core/package.json`, `core/dist/`,
+   `core/node_modules/` (`npm ci && npm run build`, then
+   `npm prune --omit=dev` in `core/`; modules with native parts must be
+   installed for the Pi's architecture). **No `.env`** in it: the Core would
+   read it, and the script refuses such a release. Pack it as a `.tar.gz`
+   (the release at the top or in one folder) or copy the folder. Downloading
+   releases is T12; the script only installs a local one.
+
+3. **[USER ACTION]** Copy the release and `deploy/linux/` (the script takes
+   the unit and `core.env.example` from its own folder) to a private folder
+   on the Pi (not `/tmp`):
+
+   ```sh
+   ssh <user>@<pi> "mkdir -p -m 0700 core-install"
+   scp -r deploy/linux <release>.tar.gz <user>@<pi>:core-install/
+   ```
+
+4. **[USER ACTION]** On the Pi, look first, then install:
+
+   ```sh
+   sudo bash ~/core-install/linux/install-core.sh install --user <user> --release ~/core-install/<release>.tar.gz --dry-run
+   sudo bash ~/core-install/linux/install-core.sh install --user <user> --release ~/core-install/<release>.tar.gz
+   ```
+
+   It copies the release to `/opt/shadow-assistant/core/releases/<VERSION>/`
+   (root-owned, nobody else can write, no setuid bits), switches `current` to
+   it atomically (old releases stay), installs the unit, creates `core.env`
+   from the example if it does not exist (with `CORE_REHEARSAL=1`, T11.5),
+   creates `/var/lib/shadow-assistant/{data,vault}` for `<user>`, writes
+   `local.conf`, runs `systemctl daemon-reload` and `enable`. It does **not
+   start** the Core (only with `--start`): the Claude login (T11.3) and the
+   write-path decision ("Claude login" below) come first. It ends with the
+   next steps and a prominent warning while the write path is undecided.
+
+   A `core.env` that sets a secret (`DEVICE_TOKEN_*`, `HA_CORE_TOKEN`,
+   `CORE_AGENT_TOKEN`) stops the script: move the value to the credstore
+   (step 6) and delete the line.
+
+5. **[USER ACTION]** Fill in every `<placeholder>` of `core.env`
+   (`sudoedit /etc/shadow-assistant/core.env`). Leave `CORE_REHEARSAL=1`
+   until the move (T23.2); the script never changes it, it only warns when it
+   is not set.
+
+6. **[USER ACTION]** Secrets, one at a time. The script asks twice without
+   echo (or reads one line from a pipe), checks the name and the length the
+   Core needs (device token 16 characters or more, agent token 32 or more),
+   writes `/etc/credstore/shadow-core.<NAME>` with mode `0600` from the start
+   and adds the `LoadCredential=` line to `local.conf`:
+
+   ```sh
+   sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN
+   sudo bash ~/core-install/linux/install-core.sh set-secret DEVICE_TOKEN_<NAME>
+   ```
+
+   A new random device token, generated on the Pi and piped in (read it once
+   for the phone with `sudo cat /etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>`):
+
+   ```sh
+   python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" | sudo bash ~/core-install/linux/install-core.sh set-secret DEVICE_TOKEN_<NAME>
+   ```
+
+   An existing secret is changed only with `--replace`. Restart the Core
+   after a change (`sudo systemctl restart shadow-core`).
+
+7. **[USER ACTION]** The Claude login (T11.3) and the write path ("Claude
+   login" below), then start and look:
+
+   ```sh
+   sudo systemctl start shadow-core
+   systemctl status shadow-core --no-pager
+   journalctl -u shadow-core -n 50
+   rm -r ~/core-install
+   ```
+
+Running the script again is safe: an identical release, the unit and
+`local.conf` are left as they are; `core.env` and existing secrets are never
+overwritten. Options: `--dry-run` (print, change nothing), `--start` (start
+or restart at the end), `--build <suffix>` (a second build of the same
+`VERSION`, e.g. `--build 20261127`; without it a different build with the
+same `VERSION` is refused), `--root <dir>` (install under a test folder,
+skips `systemctl`; for testing the script only).
+
+`local.conf` is rewritten on every run (`User=`, `LoadCredential=` lines)
+except the block between `# BEGIN claude-login` and `# END claude-login`,
+which is kept exactly as found. Other local settings (limits measured in the
+rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
+
+### Update or remove
+
+- Update: copy the new release (step 3), run step 4 with it, then
+  `sudo systemctl restart shadow-core` (or add `--start`). Back to an older
+  release: run step 4 with that release again and restart.
+- Remove: `sudo systemctl disable --now shadow-core`; delete
+  `/etc/systemd/system/shadow-core.service`, the folder
+  `/etc/systemd/system/shadow-core.service.d/`, `/opt/shadow-assistant/core/`,
+  `/etc/shadow-assistant/core.env` and `/etc/credstore/shadow-core.*`; then
+  `sudo systemctl daemon-reload`. `/var/lib/shadow-assistant/` holds the data
+  folder and the vault clone: back it up or keep it.
+
+### Secrets
+
+The Core reads them from systemd's `$CREDENTIALS_DIRECTORY`
 (`core/src/credentials.ts`), only when systemd sets that variable:
 
 - The credential ID is the variable name (`LoadCredential=HA_CORE_TOKEN:/etc/credstore/shadow-core.HA_CORE_TOKEN`);
@@ -740,17 +853,20 @@ what the unit expects. The PC Core (section 3) is unchanged.
 - A variable set in `core.env` (or the environment) **and** as a credential
   stops the Core at start: one source per secret.
 - IDs that are not upper-case variable names (a TLS key, a deploy key) are
-  left to their own readers; the Core logs their names once.
+  left to their own readers; the Core logs their names once. The script does
+  not list them in `local.conf`.
 - Secret values never enter the process environment; the Claude CLI and its
   tools also do not get `CREDENTIALS_DIRECTORY`.
 
 The unit uses `LoadCredential=` (systemd 247 or newer), not
 `ImportCredential=` (254 or newer; Raspberry Pi OS bookworm ships 252). So a
-new device token needs a file **and** a `LoadCredential=` line in `local.conf`,
-then `sudo systemctl daemon-reload` and a restart. Not yet verified on the Pi.
+new device token needs a file **and** a `LoadCredential=` line in
+`local.conf` (`set-secret` adds both), then a restart. `HA_CORE_TOKEN` has its
+line in the unit itself; the unit does not start while that file is missing
+(`status=243/CREDENTIALS`). Not yet verified on the Pi.
 
-**Create a credential file without the token in the shell history or on a
-command line** (`read -rs` does not echo; `printf` is a shell builtin):
+By hand, without the script (`read -rs` does not echo; `printf` is a shell
+builtin, so the value never appears on a command line):
 
 ```sh
 sudo install -d -m 0700 -o root -g root /etc/credstore
@@ -758,25 +874,31 @@ read -rs TOKEN && printf '%s' "$TOKEN" | sudo sh -c 'umask 077; cat > /etc/creds
 sudo ls -l /etc/credstore/shadow-core.HA_CORE_TOKEN      # -rw------- root root
 ```
 
-`systemd-ask-password -n "HA token:" | sudo sh -c 'umask 077; cat > …'` works
-the same way. A new random device token, generated on the Pi:
+A device token added by hand also needs its `LoadCredential=` line: run
+`install-core.sh install --user <user>` again (without `--release`), which
+regenerates `local.conf` from the files in `/etc/credstore`.
 
-```sh
-sudo sh -c 'umask 077; python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" > /etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>'
-```
+### Claude login
 
-**Claude login.** The unit runs as the account that owns the Claude login
-(T9.1): the CLI rewrites its login files when it refreshes the token, so they
-cannot live in the credstore. `ProtectHome=read-only` keeps the home read-only
-except the paths `local.conf` lists in `ReadWritePaths=`. **Open, decided
-before T11.1:** which paths. Listing only `<home>/.claude` and
-`<home>/.claude.json` probably breaks the token refresh: if the CLI replaces
-`.claude.json` through a temporary file and `rename()`, the temporary file
-cannot be created in the read-only home, and `rename()` over a single
-bind-mounted file fails (`EBUSY`). Alternatives: the whole home writable
-(simple, but a compromised Core could then change the account's shell start
-files), or the Claude configuration moved into one writable folder
-(`CLAUDE_CONFIG_DIR`, which changes where the T9.1 login lives).
+The unit runs as the account that owns the Claude login (T9.1): the CLI
+rewrites its login files when it refreshes the token, so they cannot live in
+the credstore. `ProtectHome=read-only` keeps the home read-only except the
+paths `local.conf` makes writable. **Open (user decision):** which paths.
+Listing only `<home>/.claude` and `<home>/.claude.json` probably breaks the
+token refresh: if the CLI replaces `.claude.json` through a temporary file and
+`rename()`, the temporary file cannot be created in the read-only home, and
+`rename()` over a single bind-mounted file fails (`EBUSY`). Options: the whole
+home writable (simple, but a compromised Core could then change the account's
+shell start files), the Claude configuration moved into one writable folder
+(`CLAUDE_CONFIG_DIR`, which changes where the T9.1 login lives), or a
+dedicated account without sudo.
+
+Until it is decided, the script writes a commented placeholder into the
+claude-login block of `local.conf`, with the line
+`# CLAUDE-LOGIN-WRITE-PATH: UNDECIDED`, and warns at the end of every
+install. Once decided: put the lines into that block, delete the UNDECIDED
+line, `sudo systemctl daemon-reload` and restart; the script keeps the block
+from then on.
 
 Without `local.conf` the unit refuses to start (`status=217/USER`: its
 placeholder account does not exist), so it never runs as root.

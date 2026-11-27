@@ -13,6 +13,7 @@ on the always-on Linux box. Full guide:
 | `backup/backup-data.ps1`, `restore-data.ps1` | Encrypted backup of the data folder to Google Drive via rclone crypt, and restore; the data folder is resolved by the Core's rule ([docs/05 "Data folder"](../docs/05-deploy.md#data-folder)) |
 | `backup/install-backup-task.ps1` | Optional daily backup task |
 | `linux/wake-svc.service`, `linux/wake-svc.env.example` | Hardened systemd unit (`DynamicUser`, token via `LoadCredential=`) and settings template for wake-svc on the always-on Linux box; LAN only, never behind the tunnel ([docs/05 section 5](../docs/05-deploy.md#5-wake-endpoint-on-the-always-on-linux-box)) |
+| `linux/install-core.sh`, `linux/shadow-core.service`, `linux/core.env.example` | Core on the Pi (in progress): install script (local release, unit, drop-in, secrets into the credstore; `--dry-run` supported), hardened systemd unit and settings template ([docs/05 section 7](../docs/05-deploy.md#7-core-on-the-pi-in-progress)) |
 
 The Core is not containerised: the Claude Agent SDK uses the Claude Code login
 in the user's Windows profile.
