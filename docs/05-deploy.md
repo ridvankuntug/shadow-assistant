@@ -806,6 +806,14 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" | sudo bash ~/core-install/linux/install-core.sh set-secret DEVICE_TOKEN_<NAME>
    ```
 
+   From a Windows PC, PowerShell ends a piped value with CR LF; the CR is
+   refused ("printable ASCII only"). Strip it on the Pi side, e.g. for a
+   value held in a user environment variable:
+
+   ```powershell
+   [Environment]::GetEnvironmentVariable('HA_CORE_TOKEN','User') | ssh <user>@<pi> "tr -d '' | sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN"
+   ```
+
    An existing secret is changed only with `--replace`. Restart the Core
    after a change (`sudo systemctl restart shadow-core`).
 
