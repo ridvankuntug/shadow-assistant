@@ -17,13 +17,15 @@
 #               `current` symlink atomically (old releases are kept); installs
 #               the unit; creates /etc/shadow-assistant/core.env from the example
 #               only if it is missing; creates /var/lib/shadow-assistant/{data,vault};
-#               writes the drop-in local.conf; daemon-reload; enable. It starts
-#               the Core only with --start.
+#               writes the drop-in local.conf; installs the TLS script
+#               (/usr/local/sbin/shadow-core-tls) and its renewal timer;
+#               daemon-reload; enable. It starts the Core only with --start.
 #   set-secret  reads one secret without echo (never from the command line) into
 #               /etc/credstore/shadow-core.<NAME> (root 0600, folder 0700) and
 #               regenerates the LoadCredential= lines of local.conf.
 # What it does not: download anything (T12), install Node, touch the Claude login
-# (T11.3), TLS (T11.6), agent:// lines (T11.4), the vault clone (T18), uninstall
+# (T11.3), create the TLS CA or certificate (shadow-core-tls init, T11.6),
+# agent:// lines (T11.4), the vault clone (T18), uninstall
 # (docs/05 section 7), or decide the Claude login write path (open, see below).
 #
 # This file holds no user names, addresses or tokens.
@@ -35,6 +37,9 @@ export LC_ALL=C
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 readonly UNIT_NAME="shadow-core.service"
+readonly TLS_SCRIPT="shadow-core-tls.sh"
+readonly TLS_SERVICE="shadow-core-tls-renew.service"
+readonly TLS_TIMER="shadow-core-tls-renew.timer"
 readonly NODE_MIN_MAJOR=22
 readonly SYSTEMD_MIN=247            # LoadCredential=
 readonly DEVICE_TOKEN_MIN=16        # core/src/auth.ts MIN_TOKEN_LENGTH
@@ -106,6 +111,9 @@ readonly ETC_REAL=/etc/shadow-assistant
 readonly ENV_REAL=/etc/shadow-assistant/core.env
 readonly CREDSTORE_REAL=/etc/credstore
 readonly UNIT_REAL=/etc/systemd/system/shadow-core.service
+readonly SYSTEMD_DIR_REAL=/etc/systemd/system
+readonly TLS_BIN_REAL=/usr/local/sbin/shadow-core-tls
+readonly TLS_KEY_ID=tls-key         # core/src/listeners.ts TLS_KEY_CREDENTIAL
 readonly DROPIN_DIR_REAL=/etc/systemd/system/shadow-core.service.d
 readonly DROPIN_REAL=/etc/systemd/system/shadow-core.service.d/local.conf
 readonly STATE_REAL=/var/lib/shadow-assistant
@@ -404,21 +412,42 @@ install_release() {
 RELEASE_SWITCHED=0
 
 # ---------------------------------------------------------------- unit, env, state
-install_unit() {
-  local src="$SCRIPT_DIR/$UNIT_NAME" dst
+# install_copy <mode> <file in this folder> <real destination>: copies it if
+# the destination differs; returns 0 if it was (re)written, 1 if up to date.
+install_copy() {
+  local mode="$1" src="$SCRIPT_DIR/$2" real="$3" dst
   [[ -f "$src" ]] || die "$src not found (run the script from a copy of deploy/linux/)"
-  ensure_dir "$(p /etc/systemd/system)"
-  dst="$(p "$UNIT_REAL")"
+  dst="$(p "$real")"
   if [[ -f "$dst" && ! -L "$dst" ]] && cmp -s -- "$src" "$dst"; then
-    info "unit $UNIT_REAL is up to date"
+    info "$real is up to date"
     check_root_owned "$dst"
-  else
-    info "installing unit $UNIT_REAL"
-    put_file 0644 "$dst" < "$src"
-    UNIT_CHANGED=1
+    return 1
   fi
+  info "installing $real"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    in_root "$dst"
+    printf '  would copy %s to %s (%s root:root)\n' "$2" "$real" "$mode"
+    return 0
+  fi
+  put_file "$mode" "$dst" < "$src"
+}
+
+install_unit() {
+  ensure_dir "$(p "$SYSTEMD_DIR_REAL")"
+  if install_copy 0644 "$UNIT_NAME" "$UNIT_REAL"; then UNIT_CHANGED=1; fi
 }
 UNIT_CHANGED=0
+
+# The TLS script and its weekly renewal timer (docs/05 section 7 "HTTPS
+# certificate"). The timer's service is skipped until the CA exists, so the
+# timer is enabled on every install; creating the CA is the separate step
+# "shadow-core-tls init --ip <pi-lan-ip>".
+install_tls_tools() {
+  ensure_dir "$(p /usr/local/sbin)"
+  install_copy 0755 "$TLS_SCRIPT" "$TLS_BIN_REAL" || true
+  install_copy 0644 "$TLS_SERVICE" "$SYSTEMD_DIR_REAL/$TLS_SERVICE" || true
+  install_copy 0644 "$TLS_TIMER" "$SYSTEMD_DIR_REAL/$TLS_TIMER" || true
+}
 
 install_env() {
   local src="$SCRIPT_DIR/core.env.example" dst
@@ -517,6 +546,13 @@ read_dropin_user() {
   DROPIN_USER="$(sed -n 's/^User=\(.*\)$/\1/p' "$file" | tail -n1)"
 }
 
+# Whether core.env enables the TLS listener (an uncommented CORE_TLS_HOST=).
+env_enables_tls() {
+  local env
+  env="$(p "$ENV_REAL")"
+  [[ -f "$env" ]] && grep -qE '^[[:space:]]*CORE_TLS_HOST[[:space:]]*=[[:space:]]*[^[:space:]]' "$env"
+}
+
 credential_lines() {
   local store f name
   store="$(p "$CREDSTORE_REAL")"
@@ -525,8 +561,19 @@ credential_lines() {
     [[ -e "$f" ]] || continue
     name="${f##*/shadow-core.}"
     case "$name" in *.new*|.*) continue ;; esac
+    if [[ "$name" == "$TLS_KEY_ID" ]]; then
+      # The Core counts the tls-key credential as part of the TLS setting: with
+      # the TLS lines of core.env still commented it would refuse to start
+      # ("partly configured"). So the line follows core.env.
+      if env_enables_tls; then
+        printf 'LoadCredential=%s:%s/shadow-core.%s\n' "$TLS_KEY_ID" "$CREDSTORE_REAL" "$TLS_KEY_ID"
+      else
+        info "credstore: ${f#"$ROOT"} (the TLS server key) is not listed in local.conf while $ENV_REAL does not set CORE_TLS_HOST; enable the TLS lines there, then run this again" >&2
+      fi
+      continue
+    fi
     if [[ ! "$name" =~ $SECRET_NAME_RE ]]; then
-      info "credstore: ${f#"$ROOT"} is not a Core secret name; not listed in local.conf" >&2
+      info "credstore: ${f#"$ROOT"} is neither a Core secret (DEVICE_TOKEN_<NAME>, HA_CORE_TOKEN, CORE_AGENT_TOKEN) nor the TLS key ($TLS_KEY_ID); not listed in local.conf" >&2
       continue
     fi
     # HA_CORE_TOKEN has its LoadCredential= in the unit itself.
@@ -568,7 +615,8 @@ User=$user
 
 $block
 
-# Device and agent tokens found in $CREDSTORE_REAL (HA_CORE_TOKEN is in the unit).
+# Device and agent tokens and the TLS key found in $CREDSTORE_REAL
+# (HA_CORE_TOKEN is in the unit).
 ${creds:-# (none yet: install-core.sh set-secret DEVICE_TOKEN_<NAME>)}"
   if [[ -f "$file" && ! -L "$file" && "$(cat -- "$file")" == "$content" ]]; then
     info "drop-in $DROPIN_REAL is up to date"
@@ -687,8 +735,10 @@ install_main() {
     warn "User= changes from $old_user to $USER_NAME; systemd re-owns $STATE_REAL at the next start"
   fi
   write_dropin "$USER_NAME"
+  install_tls_tools
   sysctl daemon-reload
   sysctl enable "$UNIT_NAME"
+  sysctl enable --now "$TLS_TIMER"
 
   if [[ $START -eq 1 ]]; then
     info "starting (or restarting) the Core (--start)"
@@ -710,6 +760,7 @@ next_steps() {
   printf '  - Fill in %s: sudoedit %s\n' "$ENV_REAL" "$ENV_REAL"
   [[ $have_ha -eq 1 ]] || printf '  - Home Assistant token (the unit does not start without it): sudo %s set-secret HA_CORE_TOKEN\n' "$0"
   [[ $have_dev -eq 1 ]] || printf '  - Device tokens: sudo %s set-secret DEVICE_TOKEN_<NAME>\n' "$0"
+  [[ -f "$store/shadow-core.$TLS_KEY_ID" ]] || printf '  - HTTPS listener for the PC browser (optional): sudo shadow-core-tls init --ip <pi-lan-ip>; docs/05 section 7 "HTTPS certificate"\n'
   [[ $START -eq 1 ]] || printf '  - Start: sudo systemctl start shadow-core; check: journalctl -u shadow-core -n 50\n'
 }
 
