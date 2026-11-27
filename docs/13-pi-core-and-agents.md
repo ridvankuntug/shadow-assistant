@@ -96,8 +96,8 @@ Checked in the code on 2026-11-27.
   (`authenticate`), then `hello.protocol` (4401 / 4400). No Origin or Host check.
 - **No server-side heartbeat** on `/ws`: clients send `ping`, the Core answers
   `pong`.
-- **Versions.** `CORE_VERSION` (`server.ts`, reported only by `GET /health`)
-  is read at startup from the root `VERSION` file (`core/src/version.ts`; env
+- **Versions.** The Core version (reported only by `GET /health`) is read
+  when the server is created from the root `VERSION` file (`core/src/version.ts`; env
   `CORE_VERSION` overrides it, `0.0.0-dev` when the file is missing; 2026-11-27,
   first step of T12.3); `welcome` carries no version. The root
   `VERSION` file holds `0.2` (T1.1). The `X.Y` warning of M3 is not implemented

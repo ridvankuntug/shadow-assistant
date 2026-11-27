@@ -33,8 +33,6 @@ import type { Logger, Session, SessionInfo } from "./session.js";
 import { readCoreVersion } from "./version.js";
 
 export const HELLO_TIMEOUT_MS = 5_000;
-/** Reported by GET /health: env `CORE_VERSION`, else the repo-root VERSION file, else a dev value (`version.ts`). */
-export const CORE_VERSION = readCoreVersion({ env: process.env });
 
 export interface CoreServerOptions {
   tokens: DeviceTokens;
@@ -43,6 +41,12 @@ export interface CoreServerOptions {
   helloTimeoutMs?: number;
   /** Optional capabilities advertised in `welcome.features`; absent = the field is left out. */
   features?: readonly ProtocolFeature[];
+  /**
+   * Version for GET /health. Default: `readCoreVersion` over `process.env` (env `CORE_VERSION`,
+   * else the repo-root VERSION file, else a dev value), resolved when the server is created,
+   * i.e. after `loadDotEnv()` in `main()`, so a `.env` override counts.
+   */
+  version?: string;
   /** Extra fields for GET /health (e.g. which services are enabled). */
   health?: () => Record<string, unknown>;
   /**
@@ -174,6 +178,7 @@ function readBodyLimited(req: IncomingMessage, limit: number, timeoutMs: number)
 
 export function createCoreServer(opts: CoreServerOptions): CoreServer {
   const now = opts.now ?? Date.now;
+  const version = opts.version ?? readCoreVersion({ env: process.env });
 
   /** The device of a valid `Authorization: Bearer` header, or null. */
   const deviceOf = (req: IncomingMessage): string | null => {
@@ -254,7 +259,7 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     if (req.method === "GET" && path === "/health") {
       const inbox = opts.inbox && isLoopbackAddress(req.socket.remoteAddress) ? { inbox: opts.inbox() } : {};
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", service: "core", version: CORE_VERSION, ...(opts.health?.() ?? {}), ...inbox }));
+      res.end(JSON.stringify({ status: "ok", service: "core", version, ...(opts.health?.() ?? {}), ...inbox }));
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });

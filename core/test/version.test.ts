@@ -7,7 +7,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { CORE_VERSION } from "../src/server.js";
+import { loadDeviceTokens } from "../src/auth.js";
+import { createCoreServer } from "../src/server.js";
 import { DEV_CORE_VERSION, readCoreVersion, VERSION_FILE } from "../src/version.js";
 
 const dir = mkdtempSync(join(tmpdir(), "shadow-version-test-"));
@@ -22,8 +23,36 @@ test("the module path reaches the repo-root VERSION file", () => {
   const base = readFileSync(VERSION_FILE, "utf8").trim();
   assert.match(base, /^\d+\.\d+$/);
   assert.equal(readCoreVersion(), base);
-  // The server constant (no CORE_VERSION in the test environment) is the same value.
-  if (!process.env.CORE_VERSION) assert.equal(CORE_VERSION, base);
+});
+
+test("GET /health reports the version given to the server, else the one resolved at server creation", async () => {
+  const quiet = { info: () => {}, warn: () => {} };
+  const health = async (version?: string): Promise<unknown> => {
+    const s = createCoreServer({
+      tokens: loadDeviceTokens({}),
+      logger: quiet,
+      createSession: () => {
+        throw new Error("must not be called");
+      },
+      ...(version !== undefined ? { version } : {}),
+    });
+    const { port } = await s.listen(0, "127.0.0.1");
+    try {
+      return ((await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { version: unknown }).version;
+    } finally {
+      await s.close();
+    }
+  };
+  assert.equal(await health("0.2.31"), "0.2.31");
+  // Read from process.env when the server is created (after main()'s loadDotEnv), not at import.
+  const before = process.env.CORE_VERSION;
+  process.env.CORE_VERSION = "9.8.7";
+  try {
+    assert.equal(await health(), "9.8.7");
+  } finally {
+    if (before === undefined) delete process.env.CORE_VERSION;
+    else process.env.CORE_VERSION = before;
+  }
 });
 
 test("VERSION file: first line, trimmed (CRLF, BOM, trailing lines)", () => {

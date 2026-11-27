@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { WebSocket } from "ws";
 import { authenticate, loadDeviceTokens } from "../src/auth.js";
-import { CORE_VERSION, createCoreServer, type CoreServer } from "../src/server.js";
+import { createCoreServer, type CoreServer } from "../src/server.js";
+import { readCoreVersion } from "../src/version.js";
 import type { Session } from "../src/session.js";
 import type { ServerFrame } from "../src/protocol.js";
 
@@ -140,7 +141,7 @@ test("GET /health", async () => {
   const body = (await res.json()) as { status: string; service: string; version: string };
   assert.equal(body.status, "ok");
   assert.equal(body.service, "core");
-  assert.equal(body.version, CORE_VERSION);
+  assert.equal(body.version, readCoreVersion({ env: process.env }));
 });
 
 test("server without tokens rejects every connection", async () => {
