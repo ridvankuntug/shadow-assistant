@@ -116,11 +116,11 @@ valid_ipv4() {
 
 # The host name rule (the same as validTlsHostname in core/src/listeners.ts):
 # lower-case LDH labels of 1-63 characters, at least two labels, at most 253
-# characters, no wildcard, no trailing dot, last label not all digits (never
-# an IPv4 address).
+# characters, no wildcard, no trailing dot, last label starts with a letter
+# (never an IPv4 address, nor a number to the URL parser such as 0x4).
 valid_hostname() {
   local l='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
-  [[ ${#1} -le 253 && "$1" =~ ^($l\.)+$l$ && ! "${1##*.}" =~ ^[0-9]+$ ]]
+  [[ ${#1} -le 253 && "$1" =~ ^($l\.)+$l$ && "${1##*.}" =~ ^[a-z] ]]
 }
 readonly HOSTNAME_RULE="one lower-case DNS name with at least two labels (letters, digits, inner '-'; no wildcard, no trailing dot, not an IP address), e.g. shadow.lan"
 

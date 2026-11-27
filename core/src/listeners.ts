@@ -107,14 +107,15 @@ export function tlsOrigins(host: string, port: number, hostname?: string): strin
  * CORE_TLS_HOSTNAME's rule (the same as shadow-core-tls.sh's): one DNS name of
  * lower-case LDH labels (a-z, 0-9, inner '-'; 1-63 characters each), at least
  * two labels, at most 253 characters, no wildcard, no trailing dot, and a last
- * label that is not all digits (so never an IPv4 address).
+ * label that starts with a letter: never an IPv4 address, also not one the URL
+ * parser reads as a number (`0x4`, so `1.2.3.0x4` would become `1.2.3.4`).
  */
 export function validTlsHostname(name: string): boolean {
   if (name.length > 253) return false;
   const labels = name.split(".");
   if (labels.length < 2) return false;
   if (!labels.every((l) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l))) return false;
-  return !/^[0-9]+$/.test(labels[labels.length - 1] as string);
+  return /^[a-z]/.test(labels[labels.length - 1] as string);
 }
 
 /**
