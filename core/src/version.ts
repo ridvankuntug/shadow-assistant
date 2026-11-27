@@ -1,9 +1,9 @@
 /**
  * The Core's version, reported by `GET /health` (docs/13 §6.1).
  *
- * The base `X.Y` comes only from the repo-root `VERSION` file. Release builds
- * (T12) will later write `X.Y.<n>` into the package; until then the Core
- * reports the base it was started from. `CORE_VERSION` in the environment
+ * The base `X.Y` comes only from the repo-root `VERSION` file. Release packages
+ * (T12.1, .github/workflows/core.yml) hold `X.Y.<n>` in their `VERSION`, so a
+ * packaged Core reports that; a checkout reports the base `X.Y`. `CORE_VERSION` in the environment
  * overrides the file (same format), so a build or a test can set it without
  * touching the file. A missing or malformed source falls back to
  * DEV_CORE_VERSION, which no release ever uses.

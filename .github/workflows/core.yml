@@ -1,0 +1,347 @@
+name: Core
+
+# Builds the Pi Core release package (docs/13 §6.1, T12.1): the repository layout
+# deploy/linux/install-core.sh accepts, built on arm64 with production modules, plus
+# SHA256SUMS signed with ECDSA P-256 (SHA256SUMS.sig). A push to main of core/, ui/ or
+# VERSION (or a manual run on main) publishes a GitHub Release `core-vX.Y.<run>`;
+# Android's tags are `vX.Y.<run>`, so the two never collide. Core releases are never
+# marked "latest": the Android app reads releases/latest (docs/10 D3).
+# The private signing key is the secret CORE_RELEASE_SIGNING_KEY; without it a release
+# run fails, it never publishes unsigned. The public key belongs in
+# deploy/linux/core-release.pub. See docs/05 §7 "Release packages (T12.1)".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "ui/**"
+      - "VERSION"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.ref }}-${{ github.event_name }}
+  # Never cancelled half-way: a run may be publishing a release.
+  cancel-in-progress: false
+
+jobs:
+  # Builds, tests and packs. Runs npm code (install scripts, tests), so it never sees
+  # the signing key and has no write access.
+  package:
+    name: Package
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+    env:
+      # Secrets cannot be used in `if:` directly; this is only "set or not".
+      HAS_SIGNING_KEY: ${{ secrets.CORE_RELEASE_SIGNING_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Full version X.Y.<run>: X.Y from the first line of VERSION, <run> = this
+      # workflow's run number. Release only on main of this repository; any other run
+      # (a manual run on another branch, a fork) builds and tests only.
+      - name: Version and release decision
+        id: version
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          IS_RELEASE: ${{ github.ref == 'refs/heads/main' && github.repository == 'ridvankuntug/shadow-assistant' }}
+        run: |
+          base="$(head -n1 VERSION | tr -d '[:space:]')"
+          if ! [[ "$base" =~ ^[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+            echo "::error::VERSION must start with X.Y (got '$base')"
+            exit 1
+          fi
+          version="$base.$RUN_NUMBER"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "Core $version (release: $IS_RELEASE)"
+          # Fail before the build, not after it: a release is never published unsigned.
+          if [ "$IS_RELEASE" = "true" ] && [ "$HAS_SIGNING_KEY" != "true" ]; then
+            echo "::error::A release needs the CORE_RELEASE_SIGNING_KEY secret (docs/05 §7 \"Release packages\")"
+            exit 1
+          fi
+
+      # Node 24, the Pi's version.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            core/package-lock.json
+            ui/package-lock.json
+
+      - name: Core tests and build
+        working-directory: core
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: UI tests and build (ui/dist)
+        working-directory: ui
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      # The layout install-core.sh checks (prepare_release), in one top-level folder.
+      # Production modules are installed fresh from the lock file (not pruned from the
+      # dev install), on this arm64 runner, so the platform packages are the Pi's.
+      - name: Assemble the package
+        env:
+          VERSION_FULL: ${{ steps.version.outputs.version }}
+        run: |
+          name="shadow-core-v$VERSION_FULL-linux-arm64"
+          root="$RUNNER_TEMP/pkg/$name"
+          mkdir -p "$root/core" "$root/ui"
+          # The package's VERSION holds X.Y.<run>: the Core reports it in GET /health
+          # (core/src/version.ts) and install-core.sh names releases/<version> after it.
+          printf '%s\n' "$VERSION_FULL" > "$root/VERSION"
+          cp services.yaml router.yaml pronunciations.yaml "$root/"
+          cp core/package.json core/package-lock.json "$root/core/"
+          cp -r core/dist core/prompts "$root/core/"
+          cp -r ui/dist "$root/ui/"
+          (cd "$root/core" && npm ci --omit=dev --no-audit --no-fund)
+          echo "PKG_NAME=$name" >> "$GITHUB_ENV"
+          echo "PKG_ROOT=$root" >> "$GITHUB_ENV"
+
+      # The same checks as install-core.sh, plus the arm64 SDK binary and the version the
+      # built Core will report.
+      - name: Check the package
+        env:
+          VERSION_FULL: ${{ steps.version.outputs.version }}
+        run: |
+          cd "$PKG_ROOT"
+          for f in VERSION core/package.json core/dist/index.js core/prompts/system.md core/prompts/tier1.md services.yaml router.yaml pronunciations.yaml ui/dist/index.html; do
+            [ -f "$f" ] || { echo "::error::package is missing $f"; exit 1; }
+          done
+          [ -d core/node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64 ] ||
+            { echo "::error::core/node_modules lacks @anthropic-ai/claude-agent-sdk-linux-arm64"; exit 1; }
+          [ ! -e core/node_modules/typescript ] || { echo "::error::dev modules in core/node_modules"; exit 1; }
+          if [ -n "$(find . -name .env -print -quit)" ]; then
+            echo "::error::package contains a .env file"
+            exit 1
+          fi
+          top="$(pwd -P)"
+          while IFS= read -r -d '' l; do
+            r="$(realpath -m -- "$l")"
+            case "$r" in
+              "$top"|"$top"/*) ;;
+              *) echo "::error::symlink $l points outside the package"; exit 1 ;;
+            esac
+          done < <(find . -type l -print0)
+          reported="$(env -u CORE_VERSION node --input-type=module -e \
+            'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); console.log(m.readCoreVersion());' \
+            "$top/core/dist/version.js")"
+          if [ "$reported" != "$VERSION_FULL" ]; then
+            echo "::error::the packaged Core reports '$reported', expected '$VERSION_FULL'"
+            exit 1
+          fi
+          echo "the packaged Core reports $reported"
+
+      # Owner root, no timestamps from the checkout order: install-core.sh extracts with
+      # --no-same-owner anyway. SHA256SUMS names the file without a path.
+      - name: Pack and checksum
+        run: |
+          out="$RUNNER_TEMP/release-files"
+          mkdir -p "$out"
+          tar -C "$RUNNER_TEMP/pkg" --owner=0 --group=0 --numeric-owner --sort=name \
+            -czf "$out/$PKG_NAME.tar.gz" "$PKG_NAME"
+          (cd "$out" && sha256sum "$PKG_NAME.tar.gz" > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-package
+          path: ${{ runner.temp }}/release-files/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Signs SHA256SUMS on a fresh runner that runs no npm code. The only job with the key;
+  # read-only. Checks out only the committed public key, to compare.
+  sign:
+    name: Sign
+    needs: package
+    if: needs.package.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy/linux
+          sparse-checkout-cone-mode: true
+          path: repo
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-package
+          path: release-files
+
+      # The key is written with mode 0600 and removed in the last step whatever happens.
+      # Nothing about the private key is printed: only the derived public key is inspected.
+      - name: Sign SHA256SUMS (ECDSA P-256)
+        env:
+          CORE_RELEASE_SIGNING_KEY: ${{ secrets.CORE_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$CORE_RELEASE_SIGNING_KEY" ]; then
+            echo "::error::The CORE_RELEASE_SIGNING_KEY secret is missing; not publishing unsigned"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/core-release.key"
+          (umask 077 && printf '%s\n' "$CORE_RELEASE_SIGNING_KEY" | tr -d '\r' > "$key")
+          if ! openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/derived.pub" 2>/dev/null; then
+            echo "::error::CORE_RELEASE_SIGNING_KEY is not a readable unencrypted PEM private key"
+            exit 1
+          fi
+          if ! openssl pkey -pubin -in "$RUNNER_TEMP/derived.pub" -noout -text | grep -q 'prime256v1'; then
+            echo "::error::CORE_RELEASE_SIGNING_KEY is not an EC P-256 (prime256v1) key"
+            exit 1
+          fi
+          committed=repo/deploy/linux/core-release.pub
+          if [ -f "$committed" ]; then
+            if ! cmp -s <(openssl pkey -pubin -in "$committed" -outform DER) <(openssl pkey -pubin -in "$RUNNER_TEMP/derived.pub" -outform DER); then
+              echo "::error::CORE_RELEASE_SIGNING_KEY does not match deploy/linux/core-release.pub"
+              exit 1
+            fi
+          else
+            echo "::warning::deploy/linux/core-release.pub is not committed yet; the updater (T12.2) needs it"
+          fi
+          cd release-files
+          openssl dgst -sha256 -sign "$key" -out SHA256SUMS.sig SHA256SUMS
+          openssl dgst -sha256 -verify "$RUNNER_TEMP/derived.pub" -signature SHA256SUMS.sig SHA256SUMS
+          sha256sum -c SHA256SUMS
+          openssl pkey -pubin -in "$RUNNER_TEMP/derived.pub" -outform DER | sha256sum | cut -d' ' -f1 > key-fingerprint.txt
+
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/core-release.key"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-signed
+          path: release-files/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publishes the GitHub Release core-vX.Y.<run> and creates its tag at the built commit.
+  # The only job with write access; it never sees the signing key.
+  release:
+    name: GitHub Release
+    needs: [package, sign]
+    if: needs.package.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: core-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-signed
+          path: release-files
+
+      # A re-run reuses the run number (= tag): never replace a published release, never
+      # attach a release to a tag that already exists, never reuse a leftover draft (the
+      # action would keep its old assets). Only a confirmed 404 counts as "absent".
+      - name: Check existing releases and write the notes
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION_FULL: ${{ needs.package.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          api() {
+            curl -sS -o "$2" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GH_REPO/$1"
+          }
+          if ! [[ "$VERSION_FULL" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+            echo "::error::Unexpected version '$VERSION_FULL'"
+            exit 1
+          fi
+          TAG="core-v$VERSION_FULL"
+          pkg="shadow-$TAG-linux-arm64.tar.gz"
+          for f in "$pkg" SHA256SUMS SHA256SUMS.sig key-fingerprint.txt; do
+            [ -f "release-files/$f" ] || { echo "::error::release-files/$f missing"; exit 1; }
+          done
+          code="$(api "releases/tags/$TAG" tag.json)"
+          if [ "$code" = "200" ]; then
+            echo "::error::Release $TAG already exists; not replacing it"
+            exit 1
+          elif [ "$code" != "404" ]; then
+            echo "::error::Could not check for an existing release (HTTP $code)"
+            exit 1
+          fi
+          code="$(api "git/ref/tags/$TAG" ref.json)"
+          if [ "$code" = "200" ]; then
+            echo "::error::Tag $TAG already exists; not attaching a release to it"
+            exit 1
+          elif [ "$code" != "404" ]; then
+            echo "::error::Could not check for an existing tag (HTTP $code)"
+            exit 1
+          fi
+          # Drafts are invisible to releases/tags: scan every page of the release list.
+          page=1
+          while :; do
+            code="$(api "releases?per_page=100&page=$page" releases.json)"
+            if [ "$code" != "200" ]; then
+              echo "::error::Could not list releases (HTTP $code)"
+              exit 1
+            fi
+            if jq -e --arg t "$TAG" 'any(.[]; .tag_name == $t)' releases.json > /dev/null; then
+              echo "::error::A draft release for $TAG already exists; delete it, then re-run"
+              exit 1
+            fi
+            [ "$(jq 'length' releases.json)" -lt 100 ] && break
+            page=$((page + 1))
+            if [ "$page" -gt 100 ]; then
+              echo "::error::Too many releases to scan for drafts"
+              exit 1
+            fi
+          done
+          fingerprint="$(cat release-files/key-fingerprint.txt)"
+          {
+            echo "Shadow Assistant Core $VERSION_FULL for the Pi (linux-arm64, Node 24)."
+            echo
+            echo "- Version: \`$VERSION_FULL\` (reported by \`GET /health\`)"
+            echo "- Commit: \`$COMMIT\`"
+            echo "- Package: \`$pkg\` (install: \`install-core.sh install --user <user> --release $pkg\`, docs/05 §7)"
+            echo "- Signing key: ECDSA P-256, SHA-256 of the DER public key \`$fingerprint\`"
+            echo
+            echo "Verify (needs the public key \`deploy/linux/core-release.pub\` from the repository):"
+            echo
+            echo '```sh'
+            echo "openssl dgst -sha256 -verify core-release.pub -signature SHA256SUMS.sig SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+          } > notes.md
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      # softprops v2: with overwrite_files false an existing asset is skipped, never
+      # deleted (the checks above already refuse that case). make_latest false: the
+      # Android updater reads releases/latest and must keep seeing its own releases.
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.existing.outputs.tag }}
+          name: Core ${{ needs.package.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: notes.md
+          files: |
+            release-files/${{ steps.existing.outputs.pkg }}
+            release-files/SHA256SUMS
+            release-files/SHA256SUMS.sig
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          make_latest: "false"

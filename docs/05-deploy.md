@@ -750,8 +750,10 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    installed for the Pi's architecture). **No `.env`** in it: the Core would
    read it, and the script refuses such a release, as well as one with a
    symlink pointing outside it. Pack it as a `.tar.gz`
-   (the release at the top or in one folder) or copy the folder. Downloading
-   releases is T12; the script only installs a local one.
+   (the release at the top or in one folder) or copy the folder. Or take the
+   package of a GitHub Release (`core-v<X.Y>.<n>`, "Release packages" below)
+   and verify it first. Downloading releases automatically is T12.2; the
+   script only installs a local one.
 
 3. **[USER ACTION]** Copy the release and `deploy/linux/` (the script takes
    the unit and `core.env.example` from its own folder) to a private folder
@@ -862,6 +864,65 @@ rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
   remove the CA on the PC, "HTTPS certificate"); then
   `sudo systemctl daemon-reload`. `/var/lib/shadow-assistant/` holds the data
   folder and the vault clone: back it up or keep it.
+
+### Release packages (T12.1)
+
+The workflow `.github/workflows/core.yml` builds the package of step 2 on an
+arm64 runner with Node 24 (the Pi's): it runs the Core and UI tests, builds
+both, installs `core/node_modules` with `npm ci --omit=dev` from the lock
+file (so `@anthropic-ai/claude-agent-sdk-linux-arm64` is the Pi's binary),
+and checks the layout the way `install-core.sh` does. A push to `main` that
+changes `core/`, `ui/` or `VERSION`, or a manual run on `main` (Actions →
+Core → Run workflow), publishes the GitHub Release `core-v<X.Y>.<n>`
+(`X.Y` from `VERSION`, `<n>` the workflow's run number; Android's tags are
+`v<X.Y>.<n>`). Assets:
+
+| File | What |
+| --- | --- |
+| `shadow-core-v<X.Y>.<n>-linux-arm64.tar.gz` | The release in one top-level folder; its `VERSION` holds `<X.Y>.<n>`, which the Core reports in `GET /health` and `install-core.sh` uses for `releases/<X.Y>.<n>/` |
+| `SHA256SUMS` | SHA-256 of the package |
+| `SHA256SUMS.sig` | ECDSA P-256 signature of `SHA256SUMS` (SHA-256, DER) |
+
+A Core release is never marked "latest" (the Android app reads the latest
+release). The workflow never publishes unsigned: without the signing key
+secret a release run fails before the build.
+
+**[USER ACTION] Signing key, once.** On the PC, in a folder outside the
+repository (Git for Windows ships `openssl`):
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out ec.pem
+openssl pkey -in ec.pem -out core-release.key
+openssl pkey -in core-release.key -pubout -out core-release.pub
+rm ec.pem
+```
+
+Then, from the repository folder:
+
+```sh
+gh secret set CORE_RELEASE_SIGNING_KEY < ../<folder>/core-release.key
+cp ../<folder>/core-release.pub deploy/linux/core-release.pub
+git add deploy/linux/core-release.pub
+git commit -m "chore(deploy): Core release public key"
+```
+
+Keep `core-release.key` offline (a password manager or an encrypted backup),
+never in the repository. The workflow checks that the secret is an
+unencrypted P-256 PEM key and, once `deploy/linux/core-release.pub` is
+committed, that it matches that file (the Pi updater, T12.2, verifies with
+it). A new key: repeat both steps; older releases then verify only with the
+old public key.
+
+**Verify a release by hand**, in a folder holding the three assets and
+`core-release.pub`:
+
+```sh
+openssl dgst -sha256 -verify core-release.pub -signature SHA256SUMS.sig SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+Both must answer `Verified OK` and `<package>: OK`. Then install it with
+step 4 of "Install" (`--release shadow-core-v<X.Y>.<n>-linux-arm64.tar.gz`).
 
 ### Listeners and the HTTPS listener (T11.6)
 

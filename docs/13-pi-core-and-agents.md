@@ -767,8 +767,9 @@ adapter), T15.3 (off / dev behaviour), T15.4 and T25.1 (latency).
   stays 1) and `agent_welcome.version`; service in `agent_hello.version`; tray
   and service in `pipe_hello` / `pipe_welcome`. The hard-coded
   `CORE_VERSION = "0.1.0"` is gone (2026-11-27): the Core reads `X.Y` from
-  `VERSION` at startup (env `CORE_VERSION` can set `X.Y.<n>`); writing the
-  build number into the package and `welcome.version` remain T12.3.
+  `VERSION` at startup (env `CORE_VERSION` can set `X.Y.<n>`). The release
+  workflow (T12.1, `.github/workflows/core.yml`) writes `X.Y.<n>` into the
+  package's `VERSION`; `welcome.version` remains T12.3.
 - **Compatibility (M3)**, the same rule on every link:
 
 | Link | Protocol field | Different protocol | Same protocol, different `X.Y` |
