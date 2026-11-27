@@ -722,11 +722,11 @@ this section has been run on the Pi yet. The PC Core (section 3) is unchanged.
 | Path on the Pi | What | Owner, mode |
 | --- | --- | --- |
 | `/etc/systemd/system/shadow-core.service` | The unit (`deploy/linux/shadow-core.service`) | `root:root 0644` |
-| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in, written by the script: `User=`, the claude-login block (open, see "Claude login"), one `LoadCredential=` per device or agent token | `root:root 0644` |
+| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in, written by the script: `User=`, one `LoadCredential=` per device or agent token | `root:root 0644` |
 | `/etc/shadow-assistant/core.env` | Settings, no secret (`deploy/linux/core.env.example`); created once, never overwritten | `root:root 0644` |
 | `/etc/credstore/shadow-core.<VARIABLE>` | One secret per file: `HA_CORE_TOKEN`, `DEVICE_TOKEN_<NAME>`, later `CORE_AGENT_TOKEN` | `root:root 0600` (folder `0700`) |
 | `/opt/shadow-assistant/core/releases/<version>/`, `current` | Core releases (repository layout, `core/dist/index.js`); `current` is a symlink to one of them | root, read-only for the service |
-| `/var/lib/shadow-assistant/` | `StateDirectory`: `data/` (`SHADOW_DATA_DIR`), `vault/` (`SHADOW_VAULT_DIR`) | `<user>`, `0700` |
+| `/var/lib/shadow-assistant/` | `StateDirectory`: `data/` (`SHADOW_DATA_DIR`), `vault/` (`SHADOW_VAULT_DIR`), `claude/` (`CLAUDE_CONFIG_DIR`: the Claude login and the CLI's state, see "Claude login") | `<user>`, `0700` |
 | `/usr/local/sbin/shadow-core-tls` | The TLS script (`deploy/linux/shadow-core-tls.sh`), see "HTTPS certificate" | `root:root 0755` |
 | `/etc/systemd/system/shadow-core-tls-renew.{service,timer}` | Weekly renewal of the server certificate | `root:root 0644` |
 | `/etc/shadow-assistant/tls/` | `ca.key` (CA key, never leaves the Pi), `ca.crt` (public, the file the PC imports), `core.crt` (server certificate); created by `shadow-core-tls init` | folder `root 0755`; `ca.key` `0600`, the certificates `0644` |
@@ -773,11 +773,10 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    (root-owned, nobody else can write, no setuid bits), switches `current` to
    it atomically (old releases stay), installs the unit, creates `core.env`
    from the example if it does not exist (with `CORE_REHEARSAL=1`, T11.5),
-   creates `/var/lib/shadow-assistant/{data,vault}` for `<user>`, writes
+   creates `/var/lib/shadow-assistant/{data,vault,claude}` for `<user>`, writes
    `local.conf`, runs `systemctl daemon-reload` and `enable`. It does **not
-   start** the Core (only with `--start`): the Claude login (T11.3) and the
-   write-path decision ("Claude login" below) come first. It ends with the
-   next steps and a prominent warning while the write path is undecided.
+   start** the Core (only with `--start`): the Claude login (T11.3, "Claude
+   login" below) comes first. It ends with the next steps.
 
    A `core.env` that sets a secret (`DEVICE_TOKEN_*`, `HA_CORE_TOKEN`,
    `CORE_AGENT_TOKEN`) stops the script: move the value to the credstore
@@ -810,8 +809,8 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    An existing secret is changed only with `--replace`. Restart the Core
    after a change (`sudo systemctl restart shadow-core`).
 
-7. **[USER ACTION]** The Claude login (T11.3) and the write path ("Claude
-   login" below), then start and look:
+7. **[USER ACTION]** The Claude login (T11.3, "Claude login" below), then
+   start and look:
 
    ```sh
    sudo systemctl start shadow-core
@@ -828,10 +827,12 @@ or restart at the end), `--build <suffix>` (a second build of the same
 same `VERSION` is refused), `--root <dir>` (install under a test folder,
 skips `systemctl`; for testing the script only).
 
-`local.conf` is rewritten on every run (`User=`, `LoadCredential=` lines)
-except the block between `# BEGIN claude-login` and `# END claude-login`,
-which is kept exactly as found. Every run also installs the TLS script and its
-renewal units and enables the timer (`systemctl enable --now
+`local.conf` is rewritten on every run (`User=`, `LoadCredential=` lines).
+A `local.conf` from before the `CLAUDE_CONFIG_DIR` decision still holds a
+block between `# BEGIN claude-login` and `# END claude-login`; the next run
+drops it (a warning names any setting in it, without its value).
+Every run also installs the TLS script and its renewal units and enables the
+timer (`systemctl enable --now
 shadow-core-tls-renew.timer`); the timer does nothing until the CA exists
 ("HTTPS certificate" below). Other local settings (limits measured in the
 rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
@@ -1075,25 +1076,42 @@ regenerates `local.conf` from the files in `/etc/credstore`.
 
 ### Claude login
 
-The unit runs as the account that owns the Claude login (T9.1): the CLI
-rewrites its login files when it refreshes the token, so they cannot live in
-the credstore. `ProtectHome=read-only` keeps the home read-only except the
-paths `local.conf` makes writable. **Open (user decision):** which paths.
-Listing only `<home>/.claude` and `<home>/.claude.json` probably breaks the
-token refresh: if the CLI replaces `.claude.json` through a temporary file and
-`rename()`, the temporary file cannot be created in the read-only home, and
-`rename()` over a single bind-mounted file fails (`EBUSY`). Options: the whole
-home writable (simple, but a compromised Core could then change the account's
-shell start files), the Claude configuration moved into one writable folder
-(`CLAUDE_CONFIG_DIR`, which changes where the T9.1 login lives), or a
-dedicated account without sudo.
+The Core's model sessions run the Claude CLI, which needs a Claude login and
+rewrites it (through a temporary file and `rename()`) when it refreshes the
+token, so the login cannot live in the credstore, nor in the home, which the
+unit keeps read-only (`ProtectHome=read-only`). The unit sets
+`CLAUDE_CONFIG_DIR=/var/lib/shadow-assistant/claude` (user decision
+2026-11-27): one writable folder in the StateDirectory, owned by `<user>`,
+`0700`, created by the script. The CLI keeps both its login
+(`.credentials.json`) and its state file (`.claude.json`) there, and its
+session files too. It lies outside `data/`, so the backup (docs/13 section
+7.6) does not carry the login; after a restore of the Pi it is made again.
 
-Until it is decided, the script writes a commented placeholder into the
-claude-login block of `local.conf`, with the line
-`# CLAUDE-LOGIN-WRITE-PATH: UNDECIDED`, and warns at the end of every
-install. Once decided: put the lines into that block, delete the UNDECIDED
-line, `sudo systemctl daemon-reload` and restart; the script keeps the block
-from then on.
+**[USER ACTION] T11.3, once on the Pi:** log in as `<user>` with the same
+`CLAUDE_CONFIG_DIR`, then start the Core (step 7):
+
+```sh
+ssh <user>@<pi>
+CLAUDE_CONFIG_DIR=/var/lib/shadow-assistant/claude claude
+# in the CLI: /login, follow the browser link, then /exit
+ls -l /var/lib/shadow-assistant/claude/.credentials.json   # -rw------- <user>
+```
+
+`claude` is the CLI installed for `<user>` (T9.1). Without one, the CLI of the
+installed release does the same:
+`/opt/shadow-assistant/core/current/core/node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64/claude`
+(the folder name follows the Pi's platform). The earlier login in the home
+(`~<user>/.claude/`, T9.1) is not used by the Core; it may stay for using
+`claude` over SSH. The script lists this step under "Next steps" until
+`.credentials.json` exists. Without it the Core starts, but its model
+sessions are not logged in (see the journal).
+
+The unit also sets `DISABLE_AUTOUPDATER=1`: the CLI comes with the release,
+and its self-updater would write under `~/.local` and `~/.cache`. A few CLI
+features that the Core does not use keep fixed paths under the home (for
+example `~/.claude/state/`); they would fail there. Not yet verified on the
+Pi: a token refresh by the running Core (watch the journal for `EROFS` or
+login errors after the first day).
 
 Without `local.conf` the unit refuses to start (`status=217/USER`: its
 placeholder account does not exist), so it never runs as root.

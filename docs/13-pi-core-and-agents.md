@@ -846,12 +846,12 @@ Deploy files in `deploy/linux/` (user decision Q4), next to wake-svc.
 | `/opt/shadow-assistant/core/releases/<version>/`, `current` | Core code and UI files (6.2) | root, read-only for the service |
 | `/etc/systemd/system/shadow-core.service` | Core unit; `User=<user>` (the account that owns the Claude login, T9.1), `StateDirectory=shadow-assistant` | root |
 | `/etc/shadow-assistant/core.env` | Non-secret settings: `SHADOW_DATA_DIR`, `SHADOW_VAULT_DIR`, listener addresses and ports (4.2), `CORE_AGENT_SOURCE`, `WHISPER_SVC_URL=agent://…`, rehearsal flag (T11.5). Read by the Core **and** the backup unit (T17.1: one source for the path). | root 0644 |
-| `/etc/shadow-assistant/tls/` | `ca.key` (0600, root), `ca.crt`, server certificate and key (4.3) | root |
+| `/etc/shadow-assistant/tls/` | `ca.key` (0600, root), `ca.crt`, server certificate `core.crt` (4.3); the server key is in the credstore (`shadow-core.tls-key`, below) | root |
 | `/etc/credstore/shadow-core.*` | HA token, device tokens, agent token, vault deploy key, TLS server key (`LoadCredential=`) | root 0600 |
 | `/etc/credstore/shadow-backup.*` | rclone config and crypt passwords (T19.1) | root 0600 |
 | `/var/lib/shadow-assistant/data/` | **Data folder** (`SHADOW_DATA_DIR`): conversations, memory, dev-notes, notifications, sessions, usage, `backup/status.json` | `<user>` |
 | `/var/lib/shadow-assistant/vault/` | **Vault clone** (`SHADOW_VAULT_DIR`), 7.3 | `<user>` |
-| `~<user>/.claude/`, `~<user>/.claude.json` | Claude login; written by the CLI when it refreshes (T9.1: credstore is not suitable) | `<user>` |
+| `/var/lib/shadow-assistant/claude/` | Claude login and CLI state (`CLAUDE_CONFIG_DIR` of the unit, user decision 2026-11-27); written by the CLI when it refreshes, so not in the credstore; outside `data/`, so not in the backup (7.6); the login is made there once by hand (T11.3) | `<user>` 0700 |
 | `/opt/shadow-assistant/wake-svc/` | Unchanged (docs/05 section 5) | root |
 
 - The data folder is set explicitly and lies **outside** the vault clone: git

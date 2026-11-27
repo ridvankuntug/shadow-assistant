@@ -9,24 +9,19 @@
 #       dir 0700): HA_CORE_TOKEN, DEVICE_TOKEN_<NAME>, later CORE_AGENT_TOKEN (T13)
 #   /etc/systemd/system/shadow-core.service.d/local.conf
 #       machine-specific drop-in (root:root 0644), see below
-#   ~<user>/.claude/, ~<user>/.claude.json         Claude login of <user> (T9.1)
 # State: /var/lib/shadow-assistant/ (StateDirectory, owned by <user>) with data/
-# (SHADOW_DATA_DIR) and vault/ (SHADOW_VAULT_DIR).
+# (SHADOW_DATA_DIR), vault/ (SHADOW_VAULT_DIR) and claude/ (CLAUDE_CONFIG_DIR:
+# the Claude login and the CLI's state, see below; the login is made there once
+# by hand, T11.3).
 #
 # This tracked file holds no user names, home paths, addresses or tokens; those
 # go into the drop-in local.conf, which the installer writes (and regenerates on
-# every run, keeping only its claude-login block; other local settings such as
-# MemoryMax= go into `systemctl edit shadow-core`, i.e. override.conf):
+# every run; other local settings such as MemoryMax= go into `systemctl edit
+# shadow-core`, i.e. override.conf):
 #
 #   [Service]
-#   # The account that owns the Claude login (T9.1).
+#   # The account the Core runs as; it owns the StateDirectory.
 #   User=<user>
-#   # The Claude CLI rewrites its login files when it refreshes the token (T9.1),
-#   # so they must stay writable under ProtectHome=read-only. OPEN, decided
-#   # before T11.1: listing <home>/.claude and <home>/.claude.json alone is
-#   # probably not enough (a temp file + rename() in the read-only home fails,
-#   # and rename() over a bind-mounted file gives EBUSY). See docs/05 section 7.
-#   ReadWritePaths=<to be decided>
 #   # One line per device token (the set varies per install).
 #   LoadCredential=DEVICE_TOKEN_<NAME>:/etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>
 #
@@ -62,6 +57,19 @@ User=shadow-core-unset
 WorkingDirectory=/opt/shadow-assistant/core/current
 ExecStart=/usr/bin/node /opt/shadow-assistant/core/current/core/dist/index.js
 EnvironmentFile=/etc/shadow-assistant/core.env
+# The Claude CLI (spawned per model session) keeps its login (.credentials.json)
+# and its state file (.claude.json) in CLAUDE_CONFIG_DIR and rewrites both
+# through a temporary file + rename() when it refreshes the token, so they live
+# in one writable folder of the StateDirectory, not in the read-only home
+# (user decision 2026-11-27). Outside data/: the data backup does not carry
+# the login (docs/13 section 7.6). Set here, not in core.env: the Core's SDK
+# and the CLI must see the same value, and it is the same on every install
+# (core.env must not set it: EnvironmentFile= would win over this line).
+Environment=CLAUDE_CONFIG_DIR=/var/lib/shadow-assistant/claude
+# The CLI comes with the Core release (root-owned); its self-updater would
+# write to ~/.local and ~/.cache, which are read-only here. Updates come with a
+# new release.
+Environment=DISABLE_AUTOUPDATER=1
 # Home Assistant token -> $CREDENTIALS_DIRECTORY/HA_CORE_TOKEN. The start fails
 # with status=243/CREDENTIALS while the file is missing. Device tokens: local.conf.
 LoadCredential=HA_CORE_TOKEN:/etc/credstore/shadow-core.HA_CORE_TOKEN
@@ -86,10 +94,13 @@ AmbientCapabilities=
 UMask=0077
 
 # --- file system
-# Everything read-only except the StateDirectory and the ReadWritePaths= of the
-# drop-in. ProtectHome=read-only (not "yes"): the Claude CLI needs the user's
-# home (login files); the drop-in makes the login path(s) writable (which
-# ones is open, see the template above).
+# Everything read-only except the StateDirectory (with the Claude login in
+# CLAUDE_CONFIG_DIR above). ProtectHome=read-only (not "yes"): the CLI still
+# reads a few files under the home (e.g. git configuration) and expects them
+# missing (ENOENT) at worst; "yes" would answer EACCES instead, which it does
+# not treat the same way everywhere. What the Core relies on is written to
+# CLAUDE_CONFIG_DIR; a few CLI features the Core does not use keep fixed paths
+# under the home and would fail there (docs/05 section 7 "Claude login").
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes

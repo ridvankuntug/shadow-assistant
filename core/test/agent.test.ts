@@ -121,6 +121,14 @@ test("subprocessEnv strips device tokens, HA token and empty API key", () => {
   assert.equal(subprocessEnv({ ANTHROPIC_API_KEY: "k" }).ANTHROPIC_API_KEY, "k");
 });
 
+test("subprocessEnv passes the unit's CLAUDE_CONFIG_DIR and DISABLE_AUTOUPDATER to the CLI (T11.1/T11.2)", () => {
+  // deploy/linux/shadow-core.service: the Claude login lives in CLAUDE_CONFIG_DIR; the CLI child
+  // must see the same folder as the Core's SDK, or it would look for the login in the read-only home.
+  const env = subprocessEnv({ CLAUDE_CONFIG_DIR: "/var/lib/shadow-assistant/claude", DISABLE_AUTOUPDATER: "1" });
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/var/lib/shadow-assistant/claude");
+  assert.equal(env.DISABLE_AUTOUPDATER, "1");
+});
+
 test("TurnStream folds deltas, tool events and usage", () => {
   const deltas: string[] = [];
   const tools: string[] = [];

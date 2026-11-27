@@ -16,7 +16,7 @@
 #               /opt/shadow-assistant/core/releases/<version>/ and switches the
 #               `current` symlink atomically (old releases are kept); installs
 #               the unit; creates /etc/shadow-assistant/core.env from the example
-#               only if it is missing; creates /var/lib/shadow-assistant/{data,vault};
+#               only if it is missing; creates /var/lib/shadow-assistant/{data,vault,claude};
 #               writes the drop-in local.conf; installs the TLS script
 #               (/usr/local/sbin/shadow-core-tls) and its renewal timer;
 #               daemon-reload; enable. It starts the Core only with --start.
@@ -24,9 +24,10 @@
 #               /etc/credstore/shadow-core.<NAME> (root 0600, folder 0700) and
 #               regenerates the LoadCredential= lines of local.conf.
 # What it does not: download anything (T12), install Node, touch the Claude login
-# (T11.3), create the TLS CA or certificate (shadow-core-tls init, T11.6),
-# agent:// lines (T11.4), the vault clone (T18), uninstall
-# (docs/05 section 7), or decide the Claude login write path (open, see below).
+# (T11.3: done once by hand into /var/lib/shadow-assistant/claude, the unit's
+# CLAUDE_CONFIG_DIR), create the TLS CA or certificate (shadow-core-tls init,
+# T11.6), agent:// lines (T11.4), the vault clone (T18), uninstall
+# (docs/05 section 7).
 #
 # This file holds no user names, addresses or tokens.
 
@@ -46,10 +47,10 @@ readonly DEVICE_TOKEN_MIN=16        # core/src/auth.ts MIN_TOKEN_LENGTH
 readonly AGENT_TOKEN_MIN=32         # docs/13 section 1.2
 readonly DEVICE_TOKEN_MAX=1024      # core/src/auth.ts authenticate(): longer is never accepted
 readonly CREDENTIAL_MAX_BYTES=4096  # core/src/credentials.ts MAX_CREDENTIAL_BYTES
-# Marker of the not yet decided Claude login write path (see write_dropin).
-readonly UNDECIDED_MARK="# CLAUDE-LOGIN-WRITE-PATH: UNDECIDED"
-readonly BLOCK_BEGIN="# BEGIN claude-login (install-core.sh keeps this block as it is)"
-readonly BLOCK_END="# END claude-login"
+# Lines around the claude-login block that local.conf held before the
+# CLAUDE_CONFIG_DIR decision; the block is dropped when local.conf is rewritten.
+readonly OLD_BLOCK_BEGIN="# BEGIN claude-login (install-core.sh keeps this block as it is)"
+readonly OLD_BLOCK_END="# END claude-login"
 
 # ---------------------------------------------------------------- options
 CMD=""
@@ -117,6 +118,8 @@ readonly TLS_KEY_ID=tls-key         # core/src/listeners.ts TLS_KEY_CREDENTIAL
 readonly DROPIN_DIR_REAL=/etc/systemd/system/shadow-core.service.d
 readonly DROPIN_REAL=/etc/systemd/system/shadow-core.service.d/local.conf
 readonly STATE_REAL=/var/lib/shadow-assistant
+# The unit's CLAUDE_CONFIG_DIR: the Claude login and the CLI's state (T11.3).
+readonly CLAUDE_DIR_REAL=/var/lib/shadow-assistant/claude
 readonly NODE_REAL=/usr/bin/node
 p() { printf '%s%s' "$ROOT" "$1"; }   # on-disk path of a real path
 
@@ -218,7 +221,6 @@ passwd_entry() {
 
 USER_UID=""
 USER_GID=""
-USER_HOME=""
 check_user() {
   local entry
   [[ -n "$USER_NAME" ]] || die "--user <name> is required: the account that owns the Claude login (T9.1)"
@@ -229,7 +231,6 @@ check_user() {
   [[ -n "$entry" ]] || die "account '$USER_NAME' does not exist"
   USER_UID="$(cut -d: -f3 <<<"$entry")"
   USER_GID="$(cut -d: -f4 <<<"$entry")"
-  USER_HOME="$(cut -d: -f6 <<<"$entry")"
   [[ "$USER_UID" != 0 ]] || die "account '$USER_NAME' has uid 0; the Core must not run as root"
 }
 
@@ -485,17 +486,19 @@ install_env() {
 
 # StateDirectory= creates /var/lib/shadow-assistant (owner User=, 0700) at
 # start; the same owner and mode here, so nothing conflicts. data/ and vault/
-# are created now because the Core treats a missing SHADOW_VAULT_DIR as "no vault".
+# are created now because the Core treats a missing SHADOW_VAULT_DIR as "no
+# vault"; claude/ (the unit's CLAUDE_CONFIG_DIR) so that the login (T11.3) can
+# go there before the first start.
 install_state() {
   local base d owner
   base="$(p "$STATE_REAL")"
   owner="$USER_UID:$USER_GID"
   ensure_dir "$(p /var/lib)"
-  for d in "$base" "$base/data" "$base/vault"; do
+  for d in "$base" "$base/data" "$base/vault" "$(p "$CLAUDE_DIR_REAL")"; do
     if [[ -e "$d" || -L "$d" ]]; then
       [[ -d "$d" && ! -L "$d" ]] || die "$d exists and is not a folder"
       if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$d")" != "$USER_UID" ]]; then
-        warn "${d#"$ROOT"} is owned by $(file_owner "$d"), not $USER_NAME; systemd re-owns $STATE_REAL at start (StateDirectory=), check data/ and vault/ then"
+        warn "${d#"$ROOT"} is owned by $(file_owner "$d"), not $USER_NAME; systemd re-owns $STATE_REAL at start (StateDirectory=), check data/, vault/ and claude/ then"
       fi
     else
       if [[ $DRY_RUN -eq 1 ]]; then
@@ -509,39 +512,27 @@ install_state() {
 }
 
 # ---------------------------------------------------------------- drop-in
-# local.conf is regenerated on every run (User=, LoadCredential= lines) except
-# the claude-login block, which is kept exactly as found. That block is the one
-# place where the open decision (which paths the Claude CLI may write) is filled
-# in; while the UNDECIDED marker is in it, the script warns.
+# local.conf is regenerated on every run (User=, LoadCredential= lines). The
+# Claude login needs no line here: the unit sets CLAUDE_CONFIG_DIR to a folder
+# of its StateDirectory (docs/05 section 7 "Claude login").
 SECRET_NAME_RE='^(DEVICE_TOKEN_[A-Z0-9_]+|HA_CORE_TOKEN|CORE_AGENT_TOKEN)$'
 
-default_login_block() {
-  cat <<EOF
-$BLOCK_BEGIN
-$UNDECIDED_MARK
-# OPEN USER DECISION (docs/05 section 7 "Claude login"): which path(s) the
-# Claude CLI may write when it refreshes the login of User= (ProtectHome=
-# read-only keeps the home read-only otherwise). Options under discussion:
-# the whole home writable; CLAUDE_CONFIG_DIR pointing to one writable folder;
-# a dedicated account without sudo. Until this is filled in, the Core's token
-# refresh may fail. Put the decided lines here (e.g. ReadWritePaths=...) and
-# delete the UNDECIDED line above; install-core.sh keeps this block.
-#ReadWritePaths=<to be decided>
-$BLOCK_END
-EOF
-}
-
-# Prints the kept block of an existing local.conf, or the default one.
-login_block() {
-  local file="$1" state
-  if [[ -f "$file" ]] && grep -qxF "$BLOCK_BEGIN" "$file"; then
-    state="$(awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
-      $0 == b { inb = 1; nb++ } inb { print } $0 == e && inb { inb = 0; ne++ }
-      END { if (nb != 1 || ne != 1 || inb) exit 3 }' "$file")" \
-      || die "$DROPIN_REAL: the claude-login block is not closed by '$BLOCK_END' (or appears twice); fix it by hand"
-    printf '%s\n' "$state"
+# A local.conf written before that decision holds a claude-login block (a
+# commented placeholder, or lines filled in by hand). The rewrite drops it;
+# lines in it other than comments are named in a warning (setting names only:
+# a value could be a secret), so that a setting put there by hand does not
+# vanish silently.
+report_old_login_block() {
+  local file="$1" active
+  [[ -f "$file" ]] || return 0
+  grep -qxF "$OLD_BLOCK_BEGIN" "$file" || return 0
+  active="$(awk -v b="$OLD_BLOCK_BEGIN" -v e="$OLD_BLOCK_END" '
+    $0 == b { inb = 1; next } $0 == e { inb = 0; next }
+    inb && $0 !~ /^[[:space:]]*(#|$)/ { sub(/[[:space:]]*=.*/, ""); print }' "$file")"
+  if [[ -n "$active" ]]; then
+    warn "$DROPIN_REAL: the old claude-login block is dropped with its settings ($(paste -sd' ' <<<"$active"); values not shown); the Claude login now lives in $CLAUDE_DIR_REAL (CLAUDE_CONFIG_DIR of the unit). A setting that is still needed goes into: sudo systemctl edit shadow-core"
   else
-    default_login_block
+    info "$DROPIN_REAL: dropping the old claude-login placeholder (the Claude login now lives in $CLAUDE_DIR_REAL)"
   fi
 }
 
@@ -611,23 +602,21 @@ check_credstore() {
 }
 
 write_dropin() {
-  local user="$1" dir file block creds content
+  local user="$1" dir file creds content
   dir="$(p "$DROPIN_DIR_REAL")"
   file="$(p "$DROPIN_REAL")"
   ensure_dir "$(p /etc/systemd/system)"
   own_dir 0755 root:root "$dir"
-  block="$(login_block "$file")"
   creds="$(credential_lines)"
   content="# Machine-specific drop-in for shadow-core.service, written by
 # deploy/linux/install-core.sh (T11.1). Rewritten on every run of the script
-# (install, set-secret) except the claude-login block below.
+# (install, set-secret).
 # Other local settings (limits from the rehearsal, ...): sudo systemctl edit
 # shadow-core (writes override.conf next to this file).
 [Service]
-# The account that owns the Claude login (T9.1).
+# The account the Core runs as; it owns $STATE_REAL, the Claude
+# login in $CLAUDE_DIR_REAL included.
 User=$user
-
-$block
 
 # Device and agent tokens and the TLS key found in $CREDSTORE_REAL
 # (HA_CORE_TOKEN is in the unit).
@@ -636,19 +625,13 @@ ${creds:-# (none yet: install-core.sh set-secret DEVICE_TOKEN_<NAME>)}"
     info "drop-in $DROPIN_REAL is up to date"
     check_root_owned "$file"
   else
+    report_old_login_block "$file"
     info "writing drop-in $DROPIN_REAL"
     printf '%s\n' "$content" | put_file 0644 "$file"
     DROPIN_CHANGED=1
   fi
 }
 DROPIN_CHANGED=0
-
-login_undecided() {
-  local file
-  file="$(p "$DROPIN_REAL")"
-  # With --dry-run on a fresh system the file does not exist yet: undecided.
-  [[ ! -f "$file" ]] || grep -qxF "$UNDECIDED_MARK" "$file"
-}
 
 # ---------------------------------------------------------------- systemctl
 sysctl() {
@@ -770,7 +753,7 @@ next_steps() {
   [[ -f "$store/shadow-core.HA_CORE_TOKEN" ]] && have_ha=1
   compgen -G "$store/shadow-core.DEVICE_TOKEN_*" >/dev/null && have_dev=1
   printf '\nNext steps (docs/05 section 7):\n'
-  [[ -d "$ROOT$USER_HOME/.claude" ]] || printf '  - Sign in to Claude Code as %s on the Pi (T11.3): ssh to the Pi as %s, run claude.\n' "$USER_NAME" "$USER_NAME"
+  [[ -f "$(p "$CLAUDE_DIR_REAL")/.credentials.json" ]] || printf '  - Claude login for the Core (T11.3, once): ssh to the Pi as %s and run: CLAUDE_CONFIG_DIR=%s claude, then /login (docs/05 section 7 "Claude login"; the login in the home is not used by the Core)\n' "$USER_NAME" "$CLAUDE_DIR_REAL"
   printf '  - Fill in %s: sudoedit %s\n' "$ENV_REAL" "$ENV_REAL"
   [[ $have_ha -eq 1 ]] || printf '  - Home Assistant token (the unit does not start without it): sudo %s set-secret HA_CORE_TOKEN\n' "$0"
   [[ $have_dev -eq 1 ]] || printf '  - Device tokens: sudo %s set-secret DEVICE_TOKEN_<NAME>\n' "$0"
@@ -779,20 +762,6 @@ next_steps() {
 }
 
 final_warnings() {
-  if [[ "$CMD" == install ]] && login_undecided; then
-    cat >&2 <<EOF
-
-**********************************************************************
-WARNING: the Claude login write path is NOT DECIDED (open user decision).
-The Core runs as $USER_NAME with a read-only home (ProtectHome=read-only),
-and local.conf gives the Claude login no writable path yet. The Core may
-run, but the Claude CLI's token refresh may fail until this is set. Fill in
-the claude-login block of $DROPIN_REAL
-(docs/05 section 7 "Claude login"), then:
-  sudo systemctl daemon-reload && sudo systemctl restart shadow-core
-**********************************************************************
-EOF
-  fi
   if [[ ${#WARNINGS[@]} -gt 0 ]]; then
     printf '\n%d warning(s):\n' "${#WARNINGS[@]}" >&2
     printf '  - %s\n' "${WARNINGS[@]}" >&2
