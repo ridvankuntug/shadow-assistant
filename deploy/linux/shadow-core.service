@@ -86,7 +86,8 @@ UMask=0077
 # --- file system
 # Everything read-only except the StateDirectory and the ReadWritePaths= of the
 # drop-in. ProtectHome=read-only (not "yes"): the Claude CLI needs the user's
-# home (login files); the drop-in makes only those two paths writable.
+# home (login files); the drop-in makes the login path(s) writable (which
+# ones is open, see the template above).
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes

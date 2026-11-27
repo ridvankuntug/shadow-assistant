@@ -722,7 +722,7 @@ what the unit expects. The PC Core (section 3) is unchanged.
 | Path on the Pi | What | Owner, mode |
 | --- | --- | --- |
 | `/etc/systemd/system/shadow-core.service` | The unit (`deploy/linux/shadow-core.service`) | `root:root 0644` |
-| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in: `User=`, the two writable Claude login paths, one `LoadCredential=` per device token (template in the unit's header) | `root:root 0644` |
+| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in: `User=`, the writable path(s) for the Claude login (open, see below), one `LoadCredential=` per device token (template in the unit's header) | `root:root 0644` |
 | `/etc/shadow-assistant/core.env` | Settings, no secret (`deploy/linux/core.env.example`) | `root:root 0644` |
 | `/etc/credstore/shadow-core.<VARIABLE>` | One secret per file: `HA_CORE_TOKEN`, `DEVICE_TOKEN_<NAME>`, later `CORE_AGENT_TOKEN` | `root:root 0600` (folder `0700`) |
 | `/opt/shadow-assistant/core/current/` | Core release (repository layout, `core/dist/index.js`) | root, read-only for the service |
