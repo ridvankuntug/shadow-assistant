@@ -1201,7 +1201,7 @@ security test).
 
 ## Decisions and open questions
 
-### Decisions (user, 2026-11-27)
+### Decisions (user, 2026-11-27; Q8-Q13 the same day, second round)
 
 | # | Question | Decision |
 |---|---|---|
@@ -1212,17 +1212,16 @@ security test).
 | Q5 | Release and update of the service and the tray? | CI release and a PC updater like Android and the Core (6.4). |
 | Q6 | Who adds the `.gitignore` line for `Assistant/daily/`? | The user, once, from the PC (7.3, T18.6). |
 | Q7 | Development mode across a Pi restart? | In memory on the Pi; accepted (2.3). |
+| Q8 | Is the Pi's LAN address reserved in DHCP? | Yes, reserved (user). |
+| Q9 | Device token for the PC's browser on the Pi? | Today's browser device; the token is re-entered once on the new origin. |
+| Q10 | Phone's home address on the TLS listener? | Not in v0.2; plain `ws://` at home stays (4.4). |
+| Q11 | Tray hotkey and wake word (T41, T42) without a client connection? | The tray opens or focuses the Pi's UI with `#ptt` and the UI starts recording (T41). |
+| Q12 | T25.2 short path without the tray's audio path? | Re-design only if T25.1 shows the 2.5 s target is missed. |
+| Q13 | PC release signature? | ECDSA-signed `SHA256SUMS` (6.4). |
 
-### Open questions (Kullanıcı kararı gerekli)
+### Open questions
 
-| # | Question | Proposal |
-|---|---|---|
-| Q8 | Is the Pi's LAN address reserved in DHCP? The certificate, the service's Pi address and the phone's home address depend on it. | Reserve it before T11 (user action on the router); T9.4 covered only the PC. |
-| Q9 | Which device token does the PC's browser use on the Pi: today's browser token (re-entered once on the new origin) or a new device name for the PC? | Keep today's browser device; a new name only if the PC browser should get different rights than other browsers. |
-| Q10 | Should the phone's home address later use the TLS listener too (needs the CA in the app's trust config)? | Not in v0.2; plain `ws://` at home stays (4.4). |
-| Q11 | Tray hotkey and wake word (T41, T42) start push-to-talk, but the tray has no client connection any more. | The tray opens or focuses the Pi's UI with a `#ptt` hash and the UI starts recording; designed in T41. |
-| Q12 | T25.2 (short path: PC audio recognised on the PC, only text to the Pi) assumed the tray's audio path. With the browser as the client, the page would call the local whisper-svc directly (`http://127.0.0.1` from an `https` page: browser private-network rules). | Re-design only if T25.1 shows the 2.5 s target is missed. |
-| Q13 | PC release signature: ECDSA-signed `SHA256SUMS` (proposed) or Authenticode? | ECDSA (6.4); Authenticode only if a certificate is wanted anyway. |
+None at the time of writing; new ones are added here.
 
 ## Not verified (summary)
 
