@@ -727,6 +727,10 @@ this section has been run on the Pi yet. The PC Core (section 3) is unchanged.
 | `/etc/credstore/shadow-core.<VARIABLE>` | One secret per file: `HA_CORE_TOKEN`, `DEVICE_TOKEN_<NAME>`, later `CORE_AGENT_TOKEN` | `root:root 0600` (folder `0700`) |
 | `/opt/shadow-assistant/core/releases/<version>/`, `current` | Core releases (repository layout, `core/dist/index.js`); `current` is a symlink to one of them | root, read-only for the service |
 | `/var/lib/shadow-assistant/` | `StateDirectory`: `data/` (`SHADOW_DATA_DIR`), `vault/` (`SHADOW_VAULT_DIR`) | `<user>`, `0700` |
+| `/usr/local/sbin/shadow-core-tls` | The TLS script (`deploy/linux/shadow-core-tls.sh`), see "HTTPS certificate" | `root:root 0755` |
+| `/etc/systemd/system/shadow-core-tls-renew.{service,timer}` | Weekly renewal of the server certificate | `root:root 0644` |
+| `/etc/shadow-assistant/tls/` | `ca.key` (CA key, never leaves the Pi), `ca.crt` (public, the file the PC imports), `core.crt` (server certificate); created by `shadow-core-tls init` | folder `root 0755`; `ca.key` `0600`, the certificates `0644` |
+| `/etc/credstore/shadow-core.tls-key` | The server certificate's key (credential `tls-key`) | `root:root 0600` |
 
 Placeholders below: `<user>` is the account on the Pi that owns (or will own)
 the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
@@ -826,7 +830,10 @@ skips `systemctl`; for testing the script only).
 
 `local.conf` is rewritten on every run (`User=`, `LoadCredential=` lines)
 except the block between `# BEGIN claude-login` and `# END claude-login`,
-which is kept exactly as found. Other local settings (limits measured in the
+which is kept exactly as found. Every run also installs the TLS script and its
+renewal units and enables the timer (`systemctl enable --now
+shadow-core-tls-renew.timer`); the timer does nothing until the CA exists
+("HTTPS certificate" below). Other local settings (limits measured in the
 rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
 
 ### Update or remove
@@ -837,7 +844,11 @@ rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
 - Remove: `sudo systemctl disable --now shadow-core`; delete
   `/etc/systemd/system/shadow-core.service`, the folder
   `/etc/systemd/system/shadow-core.service.d/`, `/opt/shadow-assistant/core/`,
-  `/etc/shadow-assistant/core.env` and `/etc/credstore/shadow-core.*`; then
+  `/etc/shadow-assistant/core.env` and `/etc/credstore/shadow-core.*`; for
+  the HTTPS listener also `sudo systemctl disable --now
+  shadow-core-tls-renew.timer`, the two `shadow-core-tls-renew.*` units,
+  `/usr/local/sbin/shadow-core-tls` and `/etc/shadow-assistant/tls/` (and
+  remove the CA on the PC, "HTTPS certificate"); then
   `sudo systemctl daemon-reload`. `/var/lib/shadow-assistant/` holds the data
   folder and the vault clone: back it up or keep it.
 
@@ -885,14 +896,141 @@ On the TLS listener:
   plain listener.
 - TLS 1.2 or newer.
 
-A renewed certificate takes effect at the next Core start: the renewal (T11.6
-part B) restarts the Core (`systemctl restart shadow-core`); there is no
-reload of the TLS context while it runs.
+A renewed certificate takes effect at the next Core start: the renewal
+("HTTPS certificate" below) restarts the Core (`systemctl restart
+shadow-core`); there is no reload of the TLS context while it runs.
 
-Until part B (the local CA, the certificate and its renewal timer, the
-`tls-key` credential in `local.conf`, importing the CA on the PC) is in, keep
-the TLS lines of `core.env` commented. Not yet verified on the Pi or in a
-browser.
+Keep the TLS lines of `core.env` commented until the certificate exists
+(next section). Not yet verified on the Pi or in a browser.
+
+### HTTPS certificate (T11.6)
+
+Design: [docs/13](13-pi-core-and-agents.md) section 4.3. A small CA on the Pi
+signs the Core's server certificate; the PC trusts the CA once, so the yearly
+renewal never touches the PC. `shadow-core-tls` (installed by
+`install-core.sh`) does the Pi side:
+
+| | CA (`ca.crt`) | Server certificate (`core.crt`) |
+| --- | --- | --- |
+| Key | EC P-256, `/etc/shadow-assistant/tls/ca.key` (root `0600`) | EC P-256, `/etc/credstore/shadow-core.tls-key` (root `0600`, credential `tls-key`); no other copy |
+| Valid | 10 years | 1 year, renewed 30 days before expiry |
+| Extensions | `basicConstraints` critical `CA:TRUE, pathlen:0`; `keyUsage` critical `keyCertSign, cRLSign`; `nameConstraints` critical, permitted `IP:<pi-lan-ip>/255.255.255.255` and `DNS:invalid` | `basicConstraints` `CA:FALSE`; `keyUsage` `digitalSignature`; `extendedKeyUsage` `serverAuth`; `subjectAltName` `IP:<pi-lan-ip>` only; random serial |
+
+The name constraint limits the CA to the Pi's one address: IP names to that
+address, DNS names to the reserved `.invalid` domain (RFC 6761), which never
+resolves. An IP subtree alone does not limit DNS names, so without the second
+entry a leaked CA key could vouch for any web site. IPv4 only; a LAN host name
+is not supported (open question). The subject names are plain labels
+(`Shadow Assistant local CA`, `Shadow Assistant Core`), not addresses.
+
+**On the Pi** (after "Install" above):
+
+1. **[USER ACTION]** Create the CA and the server certificate:
+
+   ```sh
+   sudo shadow-core-tls init --ip <pi-lan-ip>
+   ```
+
+   It prints the CA's SHA-1 hash (compare it on the PC below). Running it again
+   changes nothing. An existing CA is never replaced, except with
+   `--recreate-ca`, which prints a warning: every PC then has to import the
+   new `ca.crt`.
+
+2. **[USER ACTION]** Enable the listener in `core.env`
+   (`sudoedit /etc/shadow-assistant/core.env`): uncomment `CORE_TLS_HOST=<pi-lan-ip>`
+   (the same address), `CORE_TLS_PORT=<tls-port>` and
+   `CORE_TLS_CERT_FILE=/etc/shadow-assistant/tls/core.crt`.
+
+3. **[USER ACTION]** Add the key's `LoadCredential=` line and restart:
+
+   ```sh
+   sudo bash ~/core-install/linux/install-core.sh install --user <user>
+   sudo systemctl restart shadow-core
+   journalctl -u shadow-core -n 50
+   ```
+
+   `install-core.sh` lists `LoadCredential=tls-key:/etc/credstore/shadow-core.tls-key`
+   in `local.conf` only while `core.env` sets `CORE_TLS_HOST`: the Core
+   refuses to start with the key but without the other TLS settings.
+
+**On the PC, once per CA** (by the user; nothing is automated on Windows):
+
+1. **[USER ACTION]** Copy the public CA certificate (never `ca.key`) and check
+   it is the Pi's: the `Cert Hash(sha1)` line must hold the same hex digits
+   as the SHA-1 printed by `init` (ignore colons and case; on the Pi again:
+   `openssl x509 -in /etc/shadow-assistant/tls/ca.crt -noout -fingerprint
+   -sha1`):
+
+   ```powershell
+   scp <user>@<pi>:/etc/shadow-assistant/tls/ca.crt .
+   certutil -dump ca.crt
+   ```
+
+2. **[USER ACTION]** Import it into the current user's "Trusted Root
+   Certification Authorities" (Windows asks for confirmation; no
+   administrator rights needed). Edge and Chrome use this store:
+
+   ```powershell
+   certutil -user -addstore Root ca.crt
+   ```
+
+3. **[USER ACTION]** Verify: open `https://<pi-lan-ip>:<tls-port>/` in Edge
+   or Chrome; the page loads without a certificate warning. The CA is listed
+   by `certutil -user -store Root "Shadow Assistant local CA"`.
+
+4. Remove (when the CA is replaced, or to stop trusting it): find its serial
+   number with the `-store` command above, then
+
+   ```powershell
+   certutil -user -delstore Root <serial>
+   ```
+
+   The serial rather than the name: a recreated CA has the same name.
+
+Repeat the PC steps only when the CA is recreated: after 10 years, or when the
+Pi's address changes (`sudo shadow-core-tls init --ip <new-address>
+--recreate-ca`, with `CORE_TLS_HOST` changed to the new address first; then
+remove the old CA on the PC and import the new one).
+
+**Renewal.** `shadow-core-tls-renew.timer` runs `shadow-core-tls renew`
+weekly (`Persistent=true`: a run missed while the Pi was off follows the next
+boot; up to 6 hours random delay). It issues a new server certificate when the
+current one expires within 30 days, names another address than
+`CORE_TLS_HOST`, does not verify against the CA, or its key in the credstore
+is missing or does not match; otherwise it exits without changing anything.
+After a new certificate it restarts `shadow-core` if the Core is running and
+`core.env` enables the TLS listener. The address comes from `CORE_TLS_HOST`
+in `core.env` (one setting; while that line is commented, the CA's own
+address). The service runs as root with a read-only file system except
+`/etc/shadow-assistant/tls` and `/etc/credstore`, without network and without
+capabilities.
+
+```sh
+systemctl list-timers shadow-core-tls-renew.timer
+sudo systemctl start shadow-core-tls-renew       # run it now
+journalctl -u shadow-core-tls-renew -n 20
+sudo shadow-core-tls renew --force               # new certificate now
+```
+
+A failed renewal leaves the unit failed (`systemctl --failed`,
+`journalctl -u shadow-core-tls-renew`); the Core itself warns in its journal
+14 days before the certificate expires. Typical causes: `CORE_TLS_HOST`
+changed to an address the CA is not constrained to (recreate the CA, see
+above), or the CA expires within a year (recreate it). No phone or Core
+notification about an expiring certificate yet (open).
+
+**Backup.** The CA key is not in the backup (docs/13 section 7.6). Losing it
+means a new CA (`init --ip <pi-lan-ip> --recreate-ca`) and a new import on
+the PC.
+
+**Turning the listener off:** comment the TLS lines of `core.env`, run
+`install-core.sh install --user <user>` again (it drops the `tls-key` line)
+and restart the Core.
+
+Not yet verified on the Pi or on the PC: the commands above, the renewal unit
+under systemd (its sandbox and `systemctl restart` from it), and that Edge
+and Chrome accept a user-imported root with this name constraint and a
+certificate that names only an IP address.
 
 ### Secrets
 
@@ -908,8 +1046,9 @@ The Core reads them from systemd's `$CREDENTIALS_DIRECTORY`
 - A variable set in `core.env` (or the environment) **and** as a credential
   stops the Core at start: one source per secret.
 - IDs that are not upper-case variable names (a TLS key, a deploy key) are
-  left to their own readers; the Core logs their names once. The script does
-  not list them in `local.conf`.
+  left to their own readers; the Core logs their names once. The script lists
+  only `tls-key` among them in `local.conf` (while `core.env` sets
+  `CORE_TLS_HOST`, see "HTTPS certificate").
 - Secret values never enter the process environment; the Claude CLI and its
   tools also do not get `CREDENTIALS_DIRECTORY`.
 
