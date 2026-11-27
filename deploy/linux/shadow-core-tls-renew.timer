@@ -1,0 +1,16 @@
+# shadow-core-tls-renew.timer: weekly run of shadow-core-tls-renew.service
+# (docs/13 section 4.3: renew 30 days before expiry). Enabled by
+# install-core.sh; the service is skipped until the CA exists.
+# Check: systemctl list-timers shadow-core-tls-renew.timer
+
+[Unit]
+Description=Weekly renewal check of the Shadow Assistant Core TLS certificate
+
+[Timer]
+OnCalendar=weekly
+# A run missed while the Pi was off happens soon after the next boot.
+Persistent=true
+RandomizedDelaySec=6h
+
+[Install]
+WantedBy=timers.target

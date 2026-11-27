@@ -1,0 +1,67 @@
+# shadow-core-tls-renew: renews the TLS server certificate of the Core's HTTPS
+# listener (docs/13-pi-core-and-agents.md section 4.3; docs/05-deploy.md
+# section 7 "HTTPS certificate"). Started weekly by shadow-core-tls-renew.timer;
+# installed by install-core.sh with the script /usr/local/sbin/shadow-core-tls.
+#
+# "shadow-core-tls renew" exits 0 and changes nothing while the certificate is
+# valid for more than 30 days and names CORE_TLS_HOST (core.env). Otherwise it
+# issues a new one, writes the key to /etc/credstore/shadow-core.tls-key and
+# restarts shadow-core if it is running with the TLS listener enabled. A failure
+# (e.g. CORE_TLS_HOST outside the CA's name constraint) leaves the unit failed:
+# systemctl --failed, journalctl -u shadow-core-tls-renew. Run it by hand:
+# sudo systemctl start shadow-core-tls-renew (or sudo shadow-core-tls renew).
+
+[Unit]
+Description=Renew the Shadow Assistant Core TLS certificate
+# Nothing to renew before "shadow-core-tls init" has created the CA: the run is
+# skipped (not failed) until then.
+ConditionPathExists=/etc/shadow-assistant/tls/ca.key
+# The Pi has no clock battery: after the time sync (where one is tracked, e.g.
+# systemd-time-wait-sync), so the validity dates are right.
+After=time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shadow-core-tls renew
+# The restart of shadow-core waits for its stop (TimeoutStopSec=20s) and start.
+TimeoutStartSec=5min
+SyslogIdentifier=shadow-core-tls
+
+# --- privileges: root (it reads ca.key and writes the credstore, both root-only)
+User=root
+NoNewPrivileges=yes
+# Every file it touches is root's own (no DAC override needed); it calls no
+# privileged system call. "systemctl restart" talks to PID 1 over its local
+# socket as uid 0, which needs no capability.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# --- file system: read-only except the two folders it writes
+ProtectSystem=strict
+ReadWritePaths=/etc/shadow-assistant/tls
+# "-": the credstore may not exist yet (the script creates it, 0700).
+ReadWritePaths=-/etc/credstore
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+
+# --- kernel interfaces: no network at all; AF_UNIX for journald and systemctl
+# (file-system sockets stay reachable in a private network namespace).
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
