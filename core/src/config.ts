@@ -65,6 +65,12 @@ export interface CoreConfig {
   quietHours: QuietHours | null;
   /** Set when CORE_QUIET_HOURS was invalid and the default is used; the Core logs it at startup. */
   quietHoursWarning?: string;
+  /**
+   * CORE_REHEARSAL (T11.5, default off): the rehearsal Core next to the live one
+   * (docs/13). On: the notification producers are not started and no urgent item
+   * is spoken; the inbox itself keeps working. See `parseRehearsal`.
+   */
+  rehearsal: boolean;
 }
 
 export interface MemoryConfig {
@@ -142,6 +148,19 @@ export function parseQuietHours(v: string | undefined): { quietHours: QuietHours
     }
   }
   return { quietHours: DEFAULT_QUIET_HOURS, warning: "CORE_QUIET_HOURS is not HH:MM-HH:MM (or 'off'); using the default 00:00-09:00" };
+}
+
+/**
+ * CORE_REHEARSAL (T11.5): strict on/off. Unset or blank = off (the existing
+ * installs are unchanged); `1|true|yes|on` = on, `0|false|no|off` = off (any
+ * case). Anything else throws: a typo must not silently turn the rehearsal off
+ * and duplicate every notification next to the live Core.
+ */
+export function parseRehearsal(v: string | undefined): boolean {
+  const s = v?.trim() ?? "";
+  if (s === "" || /^(0|false|no|off)$/i.test(s)) return false;
+  if (/^(1|true|yes|on)$/i.test(s)) return true;
+  throw new Error("CORE_REHEARSAL must be on or off (1/0, true/false, yes/no)");
 }
 
 function positiveInt(name: string, v: string | undefined, def: number): number {
@@ -294,6 +313,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoreConfig {
     devDevices: parseDeviceList(env.CORE_DEV_DEVICES),
     pcPermissionDevices: parseDeviceList(env.CORE_PC_PERMISSION_DEVICES),
     ...quiet,
+    rehearsal: parseRehearsal(env.CORE_REHEARSAL),
   };
 }
 

@@ -2599,6 +2599,13 @@ export interface NotificationCenterOptions {
   /** Clock for the quiet-hours check (tests: a fake). Default: the real local time. */
   now?: () => Date;
   /**
+   * Urgent speech at all (T11.5). Default true. False (the Core: CORE_REHEARSAL on): no socket
+   * is ever asked to speak, nothing is kept pending (`speechOn()` speaks nothing); items are
+   * still raised, broadcast and listed. In rehearsal the producers are not started either: this
+   * is the second guard, so that no item reaching the inbox there is spoken next to the live Core.
+   */
+  urgentSpeech?: boolean;
+  /**
    * "Tekrar gösterme" records (T7.w.11.7, docs/09). Absent: no suppression (the
    * `suppress` action then deletes like `delete` and records nothing).
    */
@@ -2655,6 +2662,9 @@ export function notificationInfo(item: NotificationItem): NotificationInfo {
  * is empty, so each is spoken once, on one socket. Read, delete and resolve
  * cancel it. Nothing else speaks: a `notifications` list never carries
  * `speak`, and an item already spoken is not spoken on a reconnect.
+ *
+ * Rehearsal (T11.5, `urgentSpeech: false`): no urgent item is spoken and none
+ * is kept pending; the inbox works as always.
  *
  * Quiet hours (T7.w.11.9, `quietHours`): inside the window an urgent item is
  * raised and broadcast but no socket gets `speak: true`; it is pending speech,
@@ -2755,7 +2765,7 @@ export class NotificationCenter {
         else await this.settle();
         return r;
       }
-      const speak = r.item.urgency === "urgent" && (r.created || input.renotify === true);
+      const speak = this.o.urgentSpeech !== false && r.item.urgency === "urgent" && (r.created || input.renotify === true);
       const speaker = speak ? this.speaker() : undefined;
       if (speak && !speaker) this.pendingSpeech.add(r.item.id);
       else if (speaker) this.pendingSpeech.delete(r.item.id); // spoken now; an older pending entry is used up
@@ -2797,7 +2807,7 @@ export class NotificationCenter {
    * While the file cannot be read the ids stay pending. Never rejects.
    */
   speechOn(listener: NotificationListener): Promise<void> {
-    if (this.pendingSpeech.size === 0) return Promise.resolve();
+    if (this.o.urgentSpeech === false || this.pendingSpeech.size === 0) return Promise.resolve();
     return this.serial(async () => {
       for (const id of [...this.pendingSpeech]) {
         // Checked again after each read: the socket may close or turn speech off meanwhile.

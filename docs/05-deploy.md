@@ -294,6 +294,10 @@ All optional, set in `.env` (defaults in `.env.example`; details in
   `CORE_COMPACT_AT_TOKENS`.
 - Notifications: `CORE_QUIET_HOURS` (default `00:00-09:00`, `off` disables):
   urgent notifications are shown but not spoken in this window (docs/09).
+- Rehearsal: `CORE_REHEARSAL` (default off; T11.5, docs/13): on = the
+  notification producers are not started and no urgent notification is
+  spoken (one startup warn line says so); the inbox still works. An invalid
+  value stops the Core.
 - `SHADOW_PRONUNCIATIONS_FILE`: alternative pronunciation lexicon.
 
 Data lives in the data folder (see "Data folder" above):

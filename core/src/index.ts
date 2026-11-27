@@ -36,6 +36,7 @@ import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { PC_DIR, PcPermissionStore } from "./pc/permissions.js";
 import { checkRouterServices } from "./router-config.js";
+import { startNotificationProducers } from "./rehearsal.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
@@ -344,6 +345,8 @@ export async function main(): Promise<void> {
     quietHours: cfg.quietHours,
     suppressions: notificationSuppressions,
     urgencyFeedback: haUrgencyFeedback(haUrgency),
+    // CORE_REHEARSAL (T11.5): no urgent speech next to the live Core (second guard; producers below are not started).
+    urgentSpeech: !cfg.rehearsal,
   });
   await notificationCenter.refresh(); // the first unread count, for /health `inbox`
   // The PC permission list (docs/11 D3, T17.2): read once; a corrupt or unreadable file leaves it
@@ -408,7 +411,8 @@ export async function main(): Promise<void> {
   });
   // HA alerts producer (docs/09 (c)): HA's persistent notifications over a read-only WebSocket client;
   // off (one info line) without HA_URL / HA_CORE_TOKEN. Adoption reads the store directly.
-  const haAlerts = createHaAlerts({
+  // CORE_REHEARSAL (T11.5): not even built, so no "ha alerts: on" line and no HA WebSocket client.
+  const haAlerts = cfg.rehearsal ? undefined : createHaAlerts({
     env: process.env,
     notifications: {
       raise: (input) => notificationCenter.raise(input),
@@ -505,9 +509,8 @@ export async function main(): Promise<void> {
   );
   logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
   monitor.start();
-  backupProducer.start();
-  serviceProducer.start();
-  haAlerts?.start();
+  // CORE_REHEARSAL (T11.5): none started; one warn line says what is off.
+  startNotificationProducers(cfg.rehearsal, [backupProducer, serviceProducer, haAlerts], logger);
   // List the remote services once now, so the first session gets their tools and instructions.
   void gateway.warm();
   logger.info(`[shadow-core] mcp gateway: ${gateway.services.join(", ") || "no services"}`);
