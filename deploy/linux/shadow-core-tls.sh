@@ -4,24 +4,28 @@
 # docs/05-deploy.md section 7 "HTTPS certificate"). install-core.sh installs it
 # as /usr/local/sbin/shadow-core-tls; the renewal timer runs "renew". Run as root.
 #
-#   shadow-core-tls init --ip <pi-lan-ip> [--recreate-ca]
+#   shadow-core-tls init --ip <pi-lan-ip> [--hostname <lan-name>] [--recreate-ca]
 #   shadow-core-tls renew [--days <n>] [--force]
 #   shadow-core-tls --help
 # Common option: --root <dir> (prefix every path, for tests; skips systemctl).
 #
 # init   creates the CA if there is none (EC P-256, 10 years, name-constrained
-#        to the one IPv4 address), then issues the server certificate as renew
-#        does. An existing CA is never replaced, except with --recreate-ca
-#        (then every PC must import the new ca.crt again).
+#        to the one IPv4 address and, with --hostname, that one DNS name),
+#        then issues the server certificate as renew does. An existing CA is
+#        never replaced, except with --recreate-ca (then every PC must import
+#        the new ca.crt again); another address or host name needs that.
 # renew  issues a new server certificate (EC P-256, 1 year, subjectAltName
-#        IP:<address>) when there is none, it expires within --days (default
-#        30), it names another address, it is not signed by the current CA, its
-#        key in the credstore is missing or does not match, or with --force.
-#        Then it restarts shadow-core if it is running and core.env enables the
-#        TLS listener. Nothing to do: exit 0, nothing changed.
-# The address: CORE_TLS_HOST in /etc/shadow-assistant/core.env (the one
-# setting); while that line is commented, the CA's own address. IPv4 only; a
-# LAN host name is not supported (open question, docs/05 section 7).
+#        IP:<address>, plus DNS:<name> with a host name) when there is none,
+#        it expires within --days (default 30), it names anything else, it is
+#        not signed by the current CA, its key in the credstore is missing or
+#        does not match, or with --force. Then it restarts shadow-core if it is
+#        running and core.env enables the TLS listener. Nothing to do: exit 0,
+#        nothing changed. It refuses (nothing changed) when core.env asks for
+#        another address or host name than the CA is constrained to.
+# The address and host name: CORE_TLS_HOST and CORE_TLS_HOSTNAME in
+# /etc/shadow-assistant/core.env (the one setting); while both lines are
+# commented, the CA's own. IPv4 only. The host name is optional: one
+# lower-case DNS name with at least two labels (e.g. shadow.lan), no wildcard.
 #
 # Files: /etc/shadow-assistant/tls/ca.key (root 0600, never leaves the Pi, not
 # in the backup), ca.crt (public, 0644: the file the PC imports), core.crt
@@ -50,6 +54,7 @@ readonly LEAF_CN="Shadow Assistant Core"
 
 CMD=""
 IP=""
+NAME=""   # --hostname (not HOSTNAME: bash sets that one)
 RECREATE_CA=0
 DAYS=30
 FORCE=0
@@ -71,6 +76,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ip) [[ "$CMD" == init ]] || die "--ip is for init (renew reads CORE_TLS_HOST from $ENV_REAL)"; need_value "$@"; IP="$2"; shift 2 ;;
+      --hostname) [[ "$CMD" == init ]] || die "--hostname is for init (renew reads CORE_TLS_HOSTNAME from $ENV_REAL)"; need_value "$@"; NAME="$2"; shift 2 ;;
       --recreate-ca) [[ "$CMD" == init ]] || die "--recreate-ca is for init"; RECREATE_CA=1; shift ;;
       --days) [[ "$CMD" == renew ]] || die "--days is for renew"; need_value "$@"; DAYS="$2"; shift 2 ;;
       --force) [[ "$CMD" == renew ]] || die "--force is for renew"; FORCE=1; shift ;;
@@ -107,6 +113,16 @@ valid_ipv4() {
   local o='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
   [[ "$1" =~ ^$o\.$o\.$o\.$o$ && "$1" != 0.0.0.0 && "$1" != 255.255.255.255 ]]
 }
+
+# The host name rule (the same as validTlsHostname in core/src/listeners.ts):
+# lower-case LDH labels of 1-63 characters, at least two labels, at most 253
+# characters, no wildcard, no trailing dot, last label not all digits (never
+# an IPv4 address).
+valid_hostname() {
+  local l='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+  [[ ${#1} -le 253 && "$1" =~ ^($l\.)+$l$ && ! "${1##*.}" =~ ^[0-9]+$ ]]
+}
+readonly HOSTNAME_RULE="one lower-case DNS name with at least two labels (letters, digits, inner '-'; no wildcard, no trailing dot, not an IP address), e.g. shadow.lan"
 
 # The value of a setting in core.env (last uncommented line; surrounding
 # quotes removed as systemd's EnvironmentFile= does), or empty.
@@ -190,12 +206,37 @@ work_dir() {
 }
 
 # ---------------------------------------------------------------- CA
-# The address the CA is constrained to (its one permitted IP subtree), or empty.
-ca_ip() {
+# The CA's name constraint, one subtree per line: "permitted IP:<a>/<mask>",
+# "permitted DNS:<n>", "excluded DNS:<n>" (other kinds keep OpenSSL's label
+# and make ca_state refuse the CA).
+ca_subtrees() {
   local crt
   crt="$(p "$TLS_DIR_REAL")/ca.crt"
-  openssl x509 -in "$crt" -noout -ext nameConstraints 2>/dev/null \
-    | sed -n 's|^[[:space:]]*IP:\([0-9.]*\)/255\.255\.255\.255[[:space:]]*$|\1|p'
+  openssl x509 -in "$crt" -noout -ext nameConstraints 2>/dev/null | awk '
+    /^[[:space:]]*Permitted:[[:space:]]*$/ { k = "permitted"; next }
+    /^[[:space:]]*Excluded:[[:space:]]*$/ { k = "excluded"; next }
+    k != "" && NF { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print k " " $0 }'
+}
+
+# The subtrees create_ca writes: the IP, and the host name with its
+# subdomains excluded, or the DNS name "invalid" when there is no host name.
+nc_subtrees() { # nc_subtrees <ip> <name or empty>
+  printf 'permitted IP:%s/255.255.255.255\n' "$1"
+  if [[ -n "$2" ]]; then
+    printf 'permitted DNS:%s\nexcluded DNS:.%s\n' "$2" "$2"
+  else
+    printf 'permitted DNS:invalid\n'
+  fi
+}
+
+# The address the CA is constrained to (its one permitted IP subtree), or empty.
+ca_ip() {
+  ca_subtrees | sed -n 's|^permitted IP:\([0-9.]*\)/255\.255\.255\.255$|\1|p'
+}
+
+# The host name the CA is constrained to, or empty (DNS:invalid: no host name).
+ca_name() {
+  ca_subtrees | sed -n 's|^permitted DNS:||p' | grep -vx invalid || true
 }
 
 # Prints the state of the CA files: none, ok, or a reason they cannot be used.
@@ -212,6 +253,10 @@ ca_state() {
   fi
   n="$(ca_ip | grep -c . || true)"
   [[ "$n" == 1 ]] || { echo "ca.crt is not constrained to exactly one IPv4 address (not made by this script?)"; return; }
+  # Exactly the set create_ca writes: nothing else permitted, nothing else excluded.
+  n="$(ca_name)"
+  if [[ -n "$n" ]] && ! valid_hostname "$n"; then echo "ca.crt is not constrained to one valid host name (not made by this script?)"; return; fi
+  [[ "$(ca_subtrees)" == "$(nc_subtrees "$(ca_ip)" "$n")" ]] || { echo "ca.crt has a name constraint this script does not write (not made by this script?)"; return; }
   echo ok
 }
 
@@ -223,14 +268,20 @@ check_ca_key_mode() {
 }
 
 create_ca() {
-  local ip="$1" dir serial
+  local ip="$1" name="$2" dir serial nc
   dir="$(p "$TLS_DIR_REAL")"
   work_dir
   # pathlen:0: this CA signs server certificates only, never another CA.
   # Name constraint: the permitted IP subtree limits IP names to the Pi's one
-  # address; the permitted DNS subtree "invalid" (RFC 6761, never resolves)
-  # keeps DNS names out as well, which an IP subtree alone does not constrain.
+  # address. An IP subtree alone does not constrain DNS names at all (a leaf
+  # for www.example.com would verify), so there is always a DNS subtree too:
+  # - with a host name: permitted DNS:<name>. A permitted DNS subtree also
+  #   covers every subdomain (RFC 5280), so excluded DNS:.<name> takes those
+  #   out again (OpenSSL: ".<name>" matches subdomains only, not <name>);
+  # - without one: permitted DNS:invalid (RFC 6761, never resolves).
   # Together the CA cannot vouch for any real web site even if its key leaked.
+  nc="critical, permitted;IP:$ip/255.255.255.255"
+  if [[ -n "$name" ]]; then nc+=", permitted;DNS:$name, excluded;DNS:.$name"; else nc+=", permitted;DNS:invalid"; fi
   cat > "$WORK/ca.cnf" <<EOF
 [req]
 distinguished_name = dn
@@ -241,7 +292,7 @@ CN = $CA_CN
 basicConstraints = critical, CA:TRUE, pathlen:0
 keyUsage = critical, keyCertSign, cRLSign
 subjectKeyIdentifier = hash
-nameConstraints = critical, permitted;IP:$ip/255.255.255.255, permitted;DNS:invalid
+nameConstraints = $nc
 EOF
   serial="0x$(openssl rand -hex 16)"
   ossl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$WORK/ca.key" \
@@ -253,13 +304,16 @@ EOF
   put_file 0600 "$dir/ca.key" "$WORK/ca.key"
   put_file 0644 "$dir/ca.crt" "$WORK/ca.crt"
   rm -f -- "$WORK/ca.key"
-  info "created the CA for $ip (valid $CA_DAYS days): ${TLS_DIR_REAL}/ca.crt"
+  info "created the CA for $(names_text "$ip" "$name") (valid $CA_DAYS days): ${TLS_DIR_REAL}/ca.crt"
 }
 
+# "IP <ip>" or "IP <ip> and DNS name <name>", for messages.
+names_text() { printf 'IP %s%s' "$1" "${2:+ and DNS name $2}"; }
+
 # ---------------------------------------------------------------- server certificate
-# Prints why the server certificate must be (re)issued for <ip>, or nothing.
+# Prints why the server certificate must be (re)issued for <ip> [<name>], or nothing.
 leaf_reason() {
-  local ip="$1" dir crt key san
+  local ip="$1" name="$2" dir crt key san
   dir="$(p "$TLS_DIR_REAL")"; crt="$dir/core.crt"; key="$(p "$KEY_REAL")"
   [[ -f "$crt" && ! -L "$crt" ]] || { echo "there is no server certificate"; return; }
   [[ -f "$key" && ! -L "$key" ]] || { echo "there is no server key in $KEY_REAL"; return; }
@@ -268,7 +322,7 @@ leaf_reason() {
     echo "it expires within $DAYS days ($(openssl x509 -in "$crt" -noout -enddate | cut -d= -f2))"; return
   fi
   san="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null | sed -n '2,$p' | tr -d ' ')"
-  [[ "$san" == "IPAddress:$ip" ]] || { echo "it names ${san:-nothing}, not IP Address:$ip"; return; }
+  [[ "$san" == "IPAddress:$ip${name:+,DNS:$name}" ]] || { echo "it names ${san:-nothing}, not IP Address:$ip${name:+, DNS:$name}"; return; }
   if ! openssl verify -x509_strict -purpose sslserver -CAfile "$dir/ca.crt" "$crt" >/dev/null 2>&1; then
     echo "it does not verify against the current CA"; return
   fi
@@ -278,11 +332,11 @@ leaf_reason() {
 }
 
 issue_leaf() {
-  local ip="$1" dir store serial
+  local ip="$1" name="$2" dir store serial
   dir="$(p "$TLS_DIR_REAL")"; store="$(p "$CREDSTORE_REAL")"
   # The CA must outlive the new certificate (browsers reject the chain once the CA expires).
   if ! openssl x509 -in "$dir/ca.crt" -noout -checkend $(( (LEAF_DAYS + 1) * 86400 )) >/dev/null 2>&1; then
-    die "the CA expires on $(openssl x509 -in "$dir/ca.crt" -noout -enddate | cut -d= -f2), before a new certificate would: recreate it (init --ip <pi-lan-ip> --recreate-ca) and import the new ca.crt on the PC"
+    die "the CA expires on $(openssl x509 -in "$dir/ca.crt" -noout -enddate | cut -d= -f2), before a new certificate would: recreate it (init --ip <pi-lan-ip> [--hostname <lan-name>] --recreate-ca) and import the new ca.crt on the PC"
   fi
   work_dir
   cat > "$WORK/leaf.cnf" <<EOF
@@ -290,7 +344,7 @@ issue_leaf() {
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature
 extendedKeyUsage = serverAuth
-subjectAltName = IP:$ip
+subjectAltName = IP:$ip${name:+, DNS:$name}
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always
 EOF
@@ -313,7 +367,7 @@ EOF
   put_file 0600 "$(p "$KEY_REAL")" "$WORK/leaf.key"
   rm -f -- "$WORK/leaf.key"
   put_file 0644 "$dir/core.crt" "$WORK/leaf.crt"
-  info "issued the server certificate for IP $ip, valid until $(openssl x509 -in "$dir/core.crt" -noout -enddate | cut -d= -f2) (key: $KEY_REAL)"
+  info "issued the server certificate for $(names_text "$ip" "$name"), valid until $(openssl x509 -in "$dir/core.crt" -noout -enddate | cut -d= -f2) (key: $KEY_REAL)"
 }
 
 # ---------------------------------------------------------------- systemctl
@@ -344,17 +398,17 @@ restart_core() {
   systemctl restart "$CORE_UNIT" || die "systemctl restart $CORE_UNIT failed: journalctl -u shadow-core -n 50"
 }
 
-# renew_leaf <ip> <env_ip> <force>: issues the certificate if needed, restarts.
+# renew_leaf <ip> <name> <env_ip> <force>: issues the certificate if needed, restarts.
 renew_leaf() {
-  local ip="$1" env_ip="$2" force="$3" reason cf
-  reason="$(leaf_reason "$ip")"
+  local ip="$1" name="$2" env_ip="$3" force="$4" reason
+  reason="$(leaf_reason "$ip" "$name")"
   if [[ $force -eq 1 ]]; then reason="${reason:-forced}"; fi
   if [[ -z "$reason" ]]; then
-    info "server certificate for $ip is valid until $(openssl x509 -in "$(p "$TLS_DIR_REAL")/core.crt" -noout -enddate | cut -d= -f2); nothing to do"
+    info "server certificate for $(names_text "$ip" "$name") is valid until $(openssl x509 -in "$(p "$TLS_DIR_REAL")/core.crt" -noout -enddate | cut -d= -f2); nothing to do"
     return 0
   fi
   info "issuing a new server certificate: $reason"
-  issue_leaf "$ip"
+  issue_leaf "$ip" "$name"
   restart_core "$env_ip"
 }
 
@@ -381,11 +435,21 @@ print_ca_info() {
 }
 
 init_main() {
-  local env_ip state cur recreated=0
-  valid_ipv4 "$IP" || die "--ip '$IP' is not an IPv4 address (dotted, no leading zeros; not 0.0.0.0); IPv6 and host names are not supported"
+  local env_ip env_name state cur cur_name recreated=0
+  valid_ipv4 "$IP" || die "--ip '$IP' is not an IPv4 address (dotted, no leading zeros; not 0.0.0.0); IPv6 is not supported, a host name goes to --hostname"
+  [[ -z "$NAME" ]] || valid_hostname "$NAME" || die "--hostname '$NAME' is not valid: $HOSTNAME_RULE"
   env_ip="$(env_value CORE_TLS_HOST)"
+  env_name="$(env_value CORE_TLS_HOSTNAME)"
   if [[ -n "$env_ip" && "$env_ip" != "$IP" ]]; then
     die "$ENV_REAL sets CORE_TLS_HOST=$env_ip, not $IP: use that address or change core.env first (renewals read it from there)"
+  fi
+  # core.env is the one setting: once it has a TLS line, --hostname must say the same.
+  [[ -z "$env_name" ]] || valid_hostname "$env_name" || die "CORE_TLS_HOSTNAME=$env_name in $ENV_REAL is not valid: $HOSTNAME_RULE"
+  if [[ -n "$env_name" && "$env_name" != "$NAME" ]]; then
+    die "$ENV_REAL sets CORE_TLS_HOSTNAME=$env_name, not ${NAME:-(none)}: pass --hostname $env_name or change core.env first (renewals read it from there)"
+  fi
+  if [[ -n "$env_ip" && -z "$env_name" && -n "$NAME" ]]; then
+    die "$ENV_REAL enables the TLS listener without CORE_TLS_HOSTNAME: add CORE_TLS_HOSTNAME=$NAME there first, or run init without --hostname (renewals read it from there)"
   fi
   check_cert_file
   [[ -d "$(p /etc)" ]] || die "$(p /etc) does not exist"
@@ -406,11 +470,11 @@ init_main() {
 
   state="$(ca_state)"
   if [[ "$state" == ok ]]; then
-    cur="$(ca_ip)"
+    cur="$(ca_ip)"; cur_name="$(ca_name)"
     if [[ $RECREATE_CA -eq 0 ]]; then
       check_ca_key_mode
-      [[ "$cur" == "$IP" ]] || die "the CA is constrained to $cur, not $IP; to replace it pass --recreate-ca (every PC must then import the new ca.crt again)"
-      info "CA for $IP exists; kept"
+      [[ "$cur" == "$IP" && "$cur_name" == "$NAME" ]] || die "the CA is constrained to $(names_text "$cur" "$cur_name"), not $(names_text "$IP" "$NAME"); to replace it pass --recreate-ca (every PC must then import the new ca.crt again)"
+      info "CA for $(names_text "$IP" "$NAME") exists; kept"
     fi
   elif [[ "$state" != none && $RECREATE_CA -eq 0 ]]; then
     die "the CA in $TLS_DIR_REAL cannot be used: $state; to replace it pass --recreate-ca (every PC must then import the new ca.crt again)"
@@ -430,14 +494,15 @@ Root Certification Authorities and import the new ca.crt
 
 EOF
     fi
-    create_ca "$IP"
+    create_ca "$IP" "$NAME"
     recreated=1
   fi
 
-  renew_leaf "$IP" "$env_ip" "$recreated"
+  renew_leaf "$IP" "$NAME" "$env_ip" "$recreated"
   print_ca_info
   printf '\nNext steps (docs/05 section 7 "HTTPS certificate"):\n'
   [[ -n "$env_ip" ]] || printf '  - Enable the TLS lines in %s (CORE_TLS_HOST=%s, CORE_TLS_PORT, CORE_TLS_CERT_FILE=%s)\n' "$ENV_REAL" "$IP" "$TLS_DIR_REAL/core.crt"
+  [[ -z "$NAME" || -n "$env_name" ]] || printf '  - Also set CORE_TLS_HOSTNAME=%s there; the name must resolve to %s on the LAN (router DNS or the PC hosts file)\n' "$NAME" "$IP"
   printf '  - Run install-core.sh install --user <user> again (adds LoadCredential=tls-key), then: sudo systemctl restart shadow-core\n'
   if [[ $recreated -eq 1 ]]; then
     printf '  - On the PC (once per CA): copy %s and run: certutil -user -addstore Root ca.crt\n' "$TLS_DIR_REAL/ca.crt"
@@ -445,7 +510,7 @@ EOF
 }
 
 renew_main() {
-  local env_ip state ip cur
+  local env_ip env_name state ip cur name cur_name
   [[ -d "$(p "$TLS_DIR_REAL")" ]] || die "no $TLS_DIR_REAL: create the CA first (shadow-core-tls init --ip <pi-lan-ip>)"
   check_cert_file
   own_dir 0755 "$(p "$TLS_DIR_REAL")"
@@ -454,8 +519,9 @@ renew_main() {
   [[ "$state" != none ]] || die "no CA in $TLS_DIR_REAL: create it first (shadow-core-tls init --ip <pi-lan-ip>)"
   [[ "$state" == ok ]] || die "the CA in $TLS_DIR_REAL cannot be used: $state (shadow-core-tls init --ip <pi-lan-ip> --recreate-ca replaces it)"
   check_ca_key_mode
-  cur="$(ca_ip)"
+  cur="$(ca_ip)"; cur_name="$(ca_name)"
   env_ip="$(env_value CORE_TLS_HOST)"
+  env_name="$(env_value CORE_TLS_HOSTNAME)"
   if [[ -n "$env_ip" ]]; then
     valid_ipv4 "$env_ip" || die "CORE_TLS_HOST=$env_ip in $ENV_REAL is not an IPv4 address; this script supports IPv4 only"
     ip="$env_ip"
@@ -463,8 +529,20 @@ renew_main() {
     ip="$cur"
     info "CORE_TLS_HOST is not set in $ENV_REAL: using the CA's address $ip"
   fi
-  [[ "$ip" == "$cur" ]] || die "CORE_TLS_HOST=$ip, but the CA is constrained to $cur: a certificate for $ip would not be trusted. Recreate the CA (shadow-core-tls init --ip $ip --recreate-ca) and import the new ca.crt on the PC"
-  renew_leaf "$ip" "$env_ip" "$FORCE"
+  # With either TLS line set, core.env decides the host name (none while its line is commented).
+  if [[ -n "$env_ip" || -n "$env_name" ]]; then
+    [[ -z "$env_name" ]] || valid_hostname "$env_name" || die "CORE_TLS_HOSTNAME=$env_name in $ENV_REAL is not valid: $HOSTNAME_RULE"
+    name="$env_name"
+  else
+    name="$cur_name"
+    [[ -z "$name" ]] || info "CORE_TLS_HOSTNAME is not set in $ENV_REAL: using the CA's host name $name"
+  fi
+  [[ "$ip" == "$cur" ]] || die "CORE_TLS_HOST=$ip, but the CA is constrained to $cur: a certificate for $ip would not be trusted. Recreate the CA (shadow-core-tls init --ip $ip${name:+ --hostname $name} --recreate-ca) and import the new ca.crt on the PC"
+  # The host name is part of the CA's name constraint: adding, changing or removing it needs a new CA.
+  if [[ "$name" != "$cur_name" ]]; then
+    die "$ENV_REAL asks for host name ${name:-(none)}, but the CA is constrained to ${cur_name:-no host name}; the name is part of the CA, so this needs a new CA (nothing changed): shadow-core-tls init --ip $ip${name:+ --hostname $name} --recreate-ca, then import the new ca.crt on the PC (docs/05 section 7)"
+  fi
+  renew_leaf "$ip" "$name" "$env_ip" "$FORCE"
 }
 
 main() {
