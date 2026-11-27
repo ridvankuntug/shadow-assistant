@@ -522,8 +522,8 @@ SECRET_NAME_RE='^(DEVICE_TOKEN_[A-Z0-9_]+|HA_CORE_TOKEN|CORE_AGENT_TOKEN)$'
 # lines in it other than comments are reported in a warning so that a setting
 # put there by hand does not vanish silently. Never their content (a value
 # could be a secret): only the name of a "Name=value" line, and only a count
-# for anything else (continuation lines after a trailing backslash, lines
-# without "=").
+# for anything else (continuation lines after a trailing backslash, also past
+# a comment or blank line in between, as systemd reads them; lines without "=").
 has_old_login_block() {
   [[ -f "$1" ]] && grep -qxF "$OLD_BLOCK_BEGIN" "$1"
 }
@@ -535,8 +535,8 @@ report_old_login_block() {
     $0 == b { inb = 1; cont = 0; next }
     $0 == e { inb = 0; next }
     !inb { next }
-    cont { other++; cont = /\\$/; next }
     /^[[:space:]]*(#|;|$)/ { next }
+    cont { other++; cont = /\\$/; next }
     { cont = /\\$/ }
     /^[A-Za-z][A-Za-z0-9]*[[:space:]]*=/ { n = $0; sub(/[[:space:]]*=.*/, "", n); names = names (names == "" ? "" : " ") n; next }
     { other++ }
