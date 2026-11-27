@@ -312,22 +312,6 @@ export default function App({ adapter, controller }: Props) {
         <nav className="topbar-actions">
           {/* Only while connected: after a disconnect the last list is stale. */}
           {connected && <ServiceIndicator services={state.services} />}
-          {/* Development badge: a count only, never a notification or a sound. */}
-          {devCount > 0 && (
-            <button
-              type="button"
-              className="btn btn-icon dev-badge"
-              aria-label={`Geliştirme: ${devOpenText(devCount)}`}
-              onClick={() => openDev("none")}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M9.4 16.6 4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4Zm5.2 0 4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4Z" />
-              </svg>
-              <span className="dev-count" aria-hidden="true">
-                {devCount > 99 ? "99+" : devCount}
-              </span>
-            </button>
-          )}
           {/* Inbox: always reachable with the Core feature; the count only while something is unread. */}
           {notificationsOn && (
             <button
@@ -386,6 +370,19 @@ export default function App({ adapter, controller }: Props) {
                 },
               },
               { id: "settings", label: "Ayarlar", onSelect: openSettings },
+              // Development: only while something is open (also reachable from Ayarlar); its count joins the
+              // "⋮" badge. A count only, never a notification or a sound.
+              ...(devCount > 0
+                ? [
+                    {
+                      id: "dev",
+                      label: "Geliştirme",
+                      onSelect: () => openDev("none"),
+                      count: devCount,
+                      countLabel: devOpenText(devCount),
+                    },
+                  ]
+                : []),
               // Only with the Core feature `pc_permissions`; the count is the rows not yet seen (no sound, ever).
               ...(pcPermissionsOn
                 ? [
