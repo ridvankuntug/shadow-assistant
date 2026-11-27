@@ -13,7 +13,9 @@ if (!rootElement) {
 }
 
 const { adapter } = selectAdapter(window as unknown as AndroidWindow, { web: createWebAdapter });
-const controller = new AssistantController({ adapter, clientVersion: __APP_VERSION__ });
+// hello.clientVersion (T12.3): inside the Android shell the installed app's versionName (X.Y.<n>,
+// the bundled UI ships with it), else this build's version.
+const controller = new AssistantController({ adapter, clientVersion: adapter.app?.versionName ?? __APP_VERSION__ });
 
 createRoot(rootElement).render(
   <StrictMode>

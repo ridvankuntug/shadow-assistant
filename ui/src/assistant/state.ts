@@ -217,6 +217,10 @@ export type AssistantState = {
   sessionId: string | null;
   /** `welcome.features` of the connected Core (empty for an older Core). */
   features: string[];
+  /** `welcome.version` of the connected Core (T12.3); null for an older Core. */
+  coreVersion: string | null;
+  /** `welcome.warnings` of this connection (T12.3); empty when none. */
+  warnings: string[];
   serverState: ServerState;
   capture: CaptureState;
   /**
@@ -305,6 +309,8 @@ export const initialState: AssistantState = {
   connection: { status: "closed", attempt: 0 },
   sessionId: null,
   features: [],
+  coreVersion: null,
+  warnings: [],
   serverState: "idle",
   capture: "off",
   playing: null,
@@ -520,6 +526,14 @@ export function notificationsUnavailable(s: AssistantState): boolean {
  */
 export function rehearsalBand(s: AssistantState): boolean {
   return s.connection.status === "connected" && hasFeature(s, "rehearsal");
+}
+
+/**
+ * The version band (T12.3, docs/13 §6.1 M3): connected to a Core that flagged
+ * `version_base` (another X.Y than this client). A welcome without it removes it.
+ */
+export function versionBaseBand(s: AssistantState): boolean {
+  return s.connection.status === "connected" && s.warnings.includes("version_base");
 }
 
 /** The İzinler page and its count may be offered: connected to a Core with the `pc_permissions` feature. */
@@ -906,6 +920,8 @@ function reduceServer(s: AssistantState, msg: ServerMessage): AssistantState {
         ...s,
         sessionId: msg.sessionId,
         features: msg.features ?? [],
+        coreVersion: msg.version ?? null,
+        warnings: msg.warnings ?? [],
         serverState: "idle",
         activeTurn: null,
         queuedTurn: null,

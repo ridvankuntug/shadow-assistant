@@ -41,7 +41,7 @@ import {
 import { originAllowed, tlsOrigins, TLS_MIN_VERSION } from "./listeners.js";
 import type { Logger, Session, SessionInfo } from "./session.js";
 import { createStaticHandler } from "./static-files.js";
-import { readCoreVersion } from "./version.js";
+import { readCoreVersion, versionBaseDiffers } from "./version.js";
 
 export const HELLO_TIMEOUT_MS = 5_000;
 
@@ -452,6 +452,9 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
           sessionId,
           device,
           ...(opts.features && opts.features.length > 0 ? { features: [...opts.features] } : {}),
+          version,
+          // M3 (docs/13 §6.1): another X.Y is accepted, only flagged; patch numbers are never compared.
+          ...(versionBaseDiffers(version, hello.clientVersion) ? { warnings: ["version_base" as const] } : {}),
         });
         send({ type: "state", state: "idle" });
         const items = opts.serviceHealth?.snapshot();

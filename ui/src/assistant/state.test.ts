@@ -16,6 +16,7 @@ import {
   reducer,
   rehearsalBand,
   shouldPlaySpeech,
+  versionBaseBand,
   type Action,
   type AssistantState,
 } from "./state.ts";
@@ -805,5 +806,34 @@ describe("rehearsal band (T11.5)", () => {
     expect(rehearsalBand(dropped)).toBe(false);
     const live = run([{ type: "status", ev: { status: "connected", attempt: 0 } }, srv(welcome(["names"]))], dropped);
     expect(rehearsalBand(live)).toBe(false);
+  });
+});
+
+describe("version band (T12.3)", () => {
+  const welcome = (extra: { version?: string; warnings?: string[] } = {}): ServerMessage => ({
+    type: "welcome",
+    protocol: 1,
+    sessionId: "s",
+    device: "d",
+    ...extra,
+  });
+
+  it("keeps the Core version and shows only while connected with a version_base warning", () => {
+    const warned = run([srv(welcome({ version: "0.3.4", warnings: ["version_base"] }))]);
+    expect(warned.coreVersion).toBe("0.3.4");
+    expect(versionBaseBand(warned)).toBe(true);
+    expect(versionBaseBand(run([srv(welcome({ version: "0.2.61" }))]))).toBe(false);
+    expect(versionBaseBand(run([srv(welcome({ warnings: ["other"] }))]))).toBe(false);
+    expect(versionBaseBand(initialState)).toBe(false);
+    const dropped = run([{ type: "status", ev: { status: "reconnecting", attempt: 1 } }], warned);
+    expect(versionBaseBand(dropped)).toBe(false);
+  });
+
+  it("an older Core's welcome clears the version and the warning", () => {
+    const warned = run([srv(welcome({ version: "0.3.4", warnings: ["version_base"] }))]);
+    const old = run([srv(welcome())], warned);
+    expect(old.coreVersion).toBeNull();
+    expect(old.warnings).toEqual([]);
+    expect(versionBaseBand(old)).toBe(false);
   });
 });

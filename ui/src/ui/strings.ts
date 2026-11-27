@@ -570,3 +570,15 @@ export function namesErrorText(code: string, message?: string | null): string {
 // ------------------------------------------------ rehearsal band (T11.5, docs/02 "Features" `rehearsal`)
 
 export const REHEARSAL_BAND = "Prova kipi: bildirimler ve sesli acil uyarı kapalı";
+
+// ------------------------------------------------ version band (T12.3, docs/13 §6.1 M3 `version_base`)
+
+/** `X.Y` of `X.Y` / `X.Y.Z`; anything else is shown as "?" (only the bases differ, patches are never compared). */
+function shownBase(version: string | null): string {
+  const m = /^(\d+)\.(\d+)(?:\.\d+)?$/.exec(version?.trim() ?? "");
+  return m ? `${Number(m[1])}.${Number(m[2])}` : "?";
+}
+
+export function versionBaseBandText(uiVersion: string, coreVersion: string | null): string {
+  return `Sürüm uyuşmuyor: arayüz ${shownBase(uiVersion)}, çekirdek ${shownBase(coreVersion)} — güncelleyin`;
+}

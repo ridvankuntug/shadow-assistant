@@ -73,6 +73,25 @@ it is why clients must ignore unknown frames and fields.
 Patch numbers are never compared: they come from different CI counters (the
 Android app and the Core are released by separate workflows).
 
+**On `/ws` (T12.3, docs/13 §6.1 M3).** A different `hello.protocol` is refused
+(close 4400). Otherwise the Core always accepts and its `welcome` carries
+(both optional, added in protocol 1 without a version bump):
+
+- `version`: the Core's release version (`X.Y`, or `X.Y.<n>` in a release
+  package; `0.0.0-dev` when the Core has no usable `VERSION`).
+- `warnings` (array of strings, absent = none): `version_base` when the `X.Y`
+  of `hello.clientVersion` differs from the Core's `X.Y`. A missing or
+  unparseable `clientVersion` (anything but `X.Y` / `X.Y.Z`), or a Core on
+  `0.0.0-dev`, gives no warning; a version difference never refuses the
+  connection. Clients ignore warning names they do not know.
+
+`hello.clientVersion` is the client's `X.Y[.<n>]`: the browser UI sends the
+version its build took from the root `VERSION` (env `UI_VERSION` may set
+`X.Y.<n>`), the UI inside the Android shell sends the app's `versionName`
+(`X.Y.<n>`, from the bridge's `getInfo().appVersion`). On `version_base` the UI
+shows a non-blocking band "Sürüm uyuşmuyor: arayüz X.Y, çekirdek A.B —
+güncelleyin" while that connection lasts.
+
 **Agent channel:** the device agent channel (`/agent`) keeps its own number,
 starting at `agentProtocol: 1`, and follows the same rule independently of
 the client protocol above.
@@ -107,7 +126,7 @@ the client protocol above.
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions","names","rehearsal"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled, `rehearsal` only while CORE_REHEARSAL is on). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions","names","rehearsal"],"version"?:"0.2.61","warnings"?:["version_base"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled, `rehearsal` only while CORE_REHEARSAL is on). `version`, `warnings`: see *Protocol versioning* (T12.3). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |

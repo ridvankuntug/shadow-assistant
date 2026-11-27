@@ -140,6 +140,10 @@ export type WelcomeMessage = {
   device: string;
   /** Absent on older Cores (= no optional features). Only string entries are kept; unknown names are unused. */
   features?: string[];
+  /** The Core's release version (T12.3); absent on older Cores. Kept only if a string. */
+  version?: string;
+  /** T12.3 non-fatal notes, e.g. `version_base` (another X.Y than this client). Only string entries are kept. */
+  warnings?: string[];
 };
 export type StateMessage = { type: "state"; state: ServerState };
 export type TranscriptMessage = { type: "transcript"; id: string; text: string };
@@ -704,9 +708,12 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "welcome": {
       if (!num(o, "protocol") || !str(o, "sessionId")) return null;
       // A malformed `features` must not cost the connection: it means "none".
-      const { features, ...rest } = o;
+      // Same for `version` and `warnings` (T12.3).
+      const { features, version, warnings, ...rest } = o;
       const welcome = rest as WelcomeMessage;
       if (Array.isArray(features)) welcome.features = features.filter((f): f is string => typeof f === "string");
+      if (typeof version === "string") welcome.version = version;
+      if (Array.isArray(warnings)) welcome.warnings = warnings.filter((w): w is string => typeof w === "string");
       return welcome;
     }
     case "state":

@@ -375,6 +375,18 @@ describe("parseServerMessage protocol additions (speech_stream, memory, usage_li
     });
   });
 
+  it("welcome (T12.3): keeps a string version and the string warnings, drops malformed ones", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "d", version: "0.2.61", warnings: ["version_base", 3, "x"] }),
+      ),
+    ).toEqual({ type: "welcome", protocol: 1, sessionId: "s", device: "d", version: "0.2.61", warnings: ["version_base", "x"] });
+    const bad = parseServerMessage(
+      JSON.stringify({ type: "welcome", protocol: 1, sessionId: "s", device: "d", version: 2, warnings: "version_base" }),
+    );
+    expect(bad).toEqual({ type: "welcome", protocol: 1, sessionId: "s", device: "d" });
+  });
+
   it("welcome: keeps only string features, ignores a malformed features field and unknown fields", () => {
     expect(
       parseServerMessage(

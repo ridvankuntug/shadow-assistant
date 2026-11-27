@@ -265,6 +265,11 @@ export class AssistantController {
 
   getState = (): AssistantState => this.state;
 
+  /** The `hello.clientVersion` this controller sends (T12.3: shown in the version band). */
+  get clientVersion(): string {
+    return this.deps.clientVersion;
+  }
+
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

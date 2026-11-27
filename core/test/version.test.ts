@@ -7,9 +7,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { WebSocket } from "ws";
 import { loadDeviceTokens } from "../src/auth.js";
 import { createCoreServer } from "../src/server.js";
-import { DEV_CORE_VERSION, readCoreVersion, VERSION_FILE } from "../src/version.js";
+import type { ServerFrame } from "../src/protocol.js";
+import type { Session } from "../src/session.js";
+import { DEV_CORE_VERSION, readCoreVersion, VERSION_FILE, versionBase, versionBaseDiffers } from "../src/version.js";
 
 const dir = mkdtempSync(join(tmpdir(), "shadow-version-test-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -75,4 +78,62 @@ test("env CORE_VERSION overrides the file; a blank or malformed value is ignored
   assert.equal(readCoreVersion({ env: { CORE_VERSION: "" }, file: f }), "0.2");
   assert.equal(readCoreVersion({ env: { CORE_VERSION: "latest" }, file: f }), "0.2");
   assert.equal(readCoreVersion({ env: { CORE_VERSION: "0.2.31" }, file: join(dir, "missing") }), "0.2.31");
+});
+
+test("versionBase: X.Y of X.Y / X.Y.Z, null for anything else", () => {
+  assert.equal(versionBase("0.2"), "0.2");
+  assert.equal(versionBase("0.2.61"), "0.2");
+  assert.equal(versionBase(" 1.10.3 "), "1.10");
+  assert.equal(versionBase("01.02"), "1.2");
+  for (const v of [undefined, "", "0", "v0.2", "0.2-beta", "0.2.3.4", DEV_CORE_VERSION, "test"]) {
+    assert.equal(versionBase(v), null, String(v));
+  }
+});
+
+test("versionBaseDiffers: only two parseable versions with another X.Y; patch numbers never count", () => {
+  assert.equal(versionBaseDiffers("0.2.61", "0.3.1"), true);
+  assert.equal(versionBaseDiffers("0.2", "1.2"), true);
+  assert.equal(versionBaseDiffers("0.2.61", "0.2.7"), false);
+  assert.equal(versionBaseDiffers("0.2", "0.2.7"), false);
+  assert.equal(versionBaseDiffers("0.2.61", undefined), false);
+  assert.equal(versionBaseDiffers("0.2.61", "0.0.0-dev"), false);
+  assert.equal(versionBaseDiffers(DEV_CORE_VERSION, "0.3.1"), false);
+});
+
+test("welcome (T12.3): carries the Core version and warns on another X.Y, never refuses", async () => {
+  const token = "browser-token-0123456789abcdef";
+  const s = createCoreServer({
+    tokens: loadDeviceTokens({ DEVICE_TOKEN_BROWSER: token }),
+    logger: { info: () => {}, warn: () => {} },
+    version: "0.2.61",
+    createSession: (info) => ({ info, handle: async () => {}, close: async () => {} }) as unknown as Session,
+  });
+  const { port } = await s.listen(0, "127.0.0.1");
+  const welcome = (clientVersion?: string) =>
+    new Promise<ServerFrame>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      ws.on("open", () =>
+        ws.send(JSON.stringify({ type: "hello", protocol: 1, token, client: "web", ...(clientVersion !== undefined ? { clientVersion } : {}) })),
+      );
+      ws.on("message", (d) => {
+        const f = JSON.parse(d.toString()) as ServerFrame;
+        ws.close();
+        resolve(f);
+      });
+      ws.on("error", reject);
+    });
+  try {
+    const other = await welcome("0.3.4");
+    assert.equal(other.type, "welcome");
+    assert.equal(other.type === "welcome" && other.version, "0.2.61");
+    assert.deepEqual(other.type === "welcome" && other.warnings, ["version_base"]);
+    for (const v of ["0.2.9", "0.2", undefined, "garbage"]) {
+      const w = await welcome(v);
+      assert.equal(w.type, "welcome", String(v));
+      assert.equal(w.type === "welcome" && w.version, "0.2.61");
+      assert.equal(w.type === "welcome" && "warnings" in w, false, String(v));
+    }
+  } finally {
+    await s.close();
+  }
 });

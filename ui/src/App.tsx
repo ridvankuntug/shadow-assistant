@@ -17,6 +17,7 @@ import {
   pcPermissionsAvailable,
   pcPermissionsBadgeCount,
   rehearsalBand,
+  versionBaseBand,
 } from "./assistant/state.ts";
 import type { AssistantController } from "./assistant/controller.ts";
 import { STORAGE_KEYS, type PlatformAdapter } from "./platform/types.ts";
@@ -54,6 +55,7 @@ import {
   pcPermissionsUnseenText,
   REHEARSAL_BAND,
   resolvedText,
+  versionBaseBandText,
 } from "./ui/strings.ts";
 
 type Props = { adapter: PlatformAdapter; controller: AssistantController };
@@ -408,6 +410,8 @@ export default function App({ adapter, controller }: Props) {
       <section className="chat" aria-label="Konuşma">
         {/* Rehearsal Core (T11.5): stays while connected to it, goes with a welcome without `rehearsal`. */}
         {rehearsalBand(state) && <Band>{REHEARSAL_BAND}</Band>}
+        {/* Another X.Y than the Core (T12.3): informs only, the connection stays; a welcome without `version_base` removes it. */}
+        {versionBaseBand(state) && <Band>{versionBaseBandText(controller.clientVersion, state.coreVersion)}</Band>}
         <Conversation messages={state.messages} />
 
         {notice && (

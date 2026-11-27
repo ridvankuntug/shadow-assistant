@@ -99,9 +99,10 @@ Checked in the code on 2026-11-27.
 - **Versions.** The Core version (reported only by `GET /health`) is read
   when the server is created from the root `VERSION` file (`core/src/version.ts`; env
   `CORE_VERSION` overrides it, `0.0.0-dev` when the file is missing; 2026-11-27,
-  first step of T12.3); `welcome` carries no version. The root
-  `VERSION` file holds `0.2` (T1.1). The `X.Y` warning of M3 is not implemented
-  (T12.3).
+  first step of T12.3). Since T12.3 (2026-11-28) `welcome.version` carries it and
+  `welcome.warnings:["version_base"]` flags another `X.Y` in
+  `hello.clientVersion` (docs/02 *Protocol versioning*). The root
+  `VERSION` file holds `0.2` (T1.1).
 - **Speech.** `WhisperClient` / the TTS client in `core/src/speech.ts` call
   `POST <url>/transcribe?language=tr`, `POST <url>/synthesize` and
   `GET <url>/health` through an injectable `fetchFn`. `audio` frames carry one
@@ -769,7 +770,16 @@ adapter), T15.3 (off / dev behaviour), T15.4 and T25.1 (latency).
   `CORE_VERSION = "0.1.0"` is gone (2026-11-27): the Core reads `X.Y` from
   `VERSION` at startup (env `CORE_VERSION` can set `X.Y.<n>`). The release
   workflow (T12.1, `.github/workflows/core.yml`) writes `X.Y.<n>` into the
-  package's `VERSION`; `welcome.version` remains T12.3.
+  package's `VERSION`.
+- **T12.3 (2026-11-28) covers the client `/ws` row below on today's parties:**
+  the Core sends `welcome.version` and, when the `X.Y` of `hello.clientVersion`
+  differs, `welcome.warnings:["version_base"]` (an unparseable or missing
+  `clientVersion` gives no warning; never a refusal). The UI sends the `X.Y`
+  of the root `VERSION` taken at build time (env `UI_VERSION` may set
+  `X.Y.<n>`); inside the Android shell it sends the app's `versionName`
+  (`X.Y.<n>`, already passed by the bridge, no Kotlin change). The UI shows a
+  non-blocking band on `version_base`. Still open: `agent_welcome` (T14.9),
+  the tray / pipe (T16.6).
 - **Compatibility (M3)**, the same rule on every link:
 
 | Link | Protocol field | Different protocol | Same protocol, different `X.Y` |

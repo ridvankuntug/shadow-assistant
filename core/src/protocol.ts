@@ -257,6 +257,13 @@ export type ErrorCode =
   | "internal";
 
 /**
+ * Non-fatal notes in `welcome.warnings` (T12.3). `version_base`: the client's
+ * `hello.clientVersion` has another `X.Y` than the Core (docs/13 §6.1, M3:
+ * accepted with a warning). Clients must ignore names they do not know.
+ */
+export type ProtocolWarning = "version_base";
+
+/**
  * Optional capabilities a Core lists in `welcome.features`. Clients must
  * ignore names they do not know; a missing name means the feature is off.
  */
@@ -544,6 +551,10 @@ export type ServerFrame =
       device: string;
       /** Optional capabilities; absent on older Cores (= none). */
       features?: ProtocolFeature[];
+      /** The Core's release version (`X.Y` or `X.Y.<n>`, T12.3); absent on older Cores. */
+      version?: string;
+      /** T12.3 (M3): non-fatal notes on this connection; absent = none. */
+      warnings?: ProtocolWarning[];
     }
   | { type: "state"; state: ServerState }
   | { type: "transcript"; id: string; text: string }

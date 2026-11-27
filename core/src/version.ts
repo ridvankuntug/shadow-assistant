@@ -38,3 +38,20 @@ export function readCoreVersion(src: CoreVersionSource = {}): string {
   }
   return DEV_CORE_VERSION;
 }
+
+/** `X.Y` of a release version (`X.Y` or `X.Y.Z`); null when it is not one (e.g. DEV_CORE_VERSION, a free-form string). */
+export function versionBase(version: string | undefined): string | null {
+  const m = /^(\d+)\.(\d+)(?:\.\d+)?$/.exec(version?.trim() ?? "");
+  return m ? `${Number(m[1])}.${Number(m[2])}` : null;
+}
+
+/**
+ * The M3 base check (docs/13 §6.1): true only when both versions parse and
+ * their `X.Y` differ. Patch numbers are never compared; a missing or
+ * unparseable side gives no warning, and a version difference never refuses.
+ */
+export function versionBaseDiffers(core: string | undefined, client: string | undefined): boolean {
+  const a = versionBase(core);
+  const b = versionBase(client);
+  return a !== null && b !== null && a !== b;
+}
