@@ -334,7 +334,7 @@ check '[[ $RC -eq 0 && "$(current)" == releases/0.2.5 ]] && out_has "in progress
 
 fresh "interrupted run is rolled back by the next run" 0.2.5 0.2.6
 mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
-printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\n' > "$R/var/lib/shadow-assistant-updater/pending"
+printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\nstage=installing\n' > "$R/var/lib/shadow-assistant-updater/pending"
 api core-v0.2.6 core-v0.2.5
 upd --now
 check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(failed_list)" == 0.2.6 ]]' "rc $RC current $(current) failed $(failed_list)"
@@ -343,7 +343,7 @@ check '[[ ! -e "$R/var/lib/shadow-assistant-updater/pending" ]]' "pending left b
 fresh "interrupted before the switch: not failed, installed again" 0.2.5
 publish 0.2.6
 mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
-printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\n' > "$R/var/lib/shadow-assistant-updater/pending"
+printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\nstage=installing\n' > "$R/var/lib/shadow-assistant-updater/pending"
 api core-v0.2.6 core-v0.2.5
 upd --now
 check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 && -z "$(failed_list)" && "$(restarts)" == 1 ]]' "rc $RC current $(current) failed '$(failed_list)' restarts $(restarts)"
@@ -362,6 +362,34 @@ check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 && -f "$R/var/lib/shadow-a
 install -m 0755 "$HERE/install-core.sh" "$R/usr/local/lib/shadow-assistant/install-core.sh"
 upd --now
 check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && ! -f "$R/var/lib/shadow-assistant-updater/pending" ]] && out_has "the Core runs 0.2.5 again"' "retry: rc $RC current $(current)"
+
+fresh "rollback whose old Core stays down is repeated by the next run" 0.2.5
+publish 0.2.6 broken
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(failed_list)" == 0.2.6 ]]' "first: rc $RC current $(current)"
+touch "$FS/core-down"
+mkdir -p "$R/var/lib/shadow-assistant-updater"
+printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\nstage=rolling_back\n' > "$R/var/lib/shadow-assistant-updater/pending"
+: > "$FS/systemctl.log"
+upd --now
+check '[[ $RC -eq 1 && "$(restarts)" == 1 && -f "$R/var/lib/shadow-assistant-updater/pending" ]] && grep -q "^stage=rolling_back$" "$R/var/lib/shadow-assistant-updater/pending" && out_has "rollback of 0.2.6 did not finish" && out_has "does not answer GET /health either"' "repeat while down: rc $RC restarts $(restarts)"
+: > "$FS/systemctl.log"
+upd --now
+check '[[ $RC -eq 1 && "$(restarts)" == 1 && -f "$R/var/lib/shadow-assistant-updater/pending" ]]' "second repeat while down: rc $RC restarts $(restarts)"
+rm -f "$FS/core-down"; : > "$FS/systemctl.log"
+upd --now
+check '[[ $RC -eq 1 && "$(restarts)" == 1 && ! -f "$R/var/lib/shadow-assistant-updater/pending" && "$(current)" == releases/0.2.5 ]] && out_has "the Core runs 0.2.5 again"' "recovered: rc $RC restarts $(restarts)"
+upd --now
+check '[[ $RC -eq 0 ]] && out_has "up to date"' "after recovery: rc $RC"
+
+fresh "killed during the rollback (current already back): rollback repeated" 0.2.5 0.2.6
+ln -sfn releases/0.2.5 "$R/opt/shadow-assistant/core/current"
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+printf 'prev_dir=0.2.5\nprev_version=0.2.5\nnew_version=0.2.6\nstage=rolling_back\n' > "$R/var/lib/shadow-assistant-updater/pending"
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(restarts)" == 1 && "$(failed_list)" == 0.2.6 && ! -f "$R/var/lib/shadow-assistant-updater/pending" ]] && out_has "the Core runs 0.2.5 again"' "rc $RC restarts $(restarts) failed '$(failed_list)'"
 
 fresh "history longer than the scan: no decision" 0.2.5
 publish 0.2.600

@@ -428,16 +428,21 @@ current_dir() {
 }
 
 # The pending file is written before `current` is switched and removed after
-# the health check or the rollback: a run killed in between is rolled back by
-# the next run.
+# the health check or a completed rollback: a run killed in between is rolled
+# back by the next run. stage=installing: written before the install (current
+# may or may not be switched yet); stage=rolling_back: written as the first
+# step of a rollback (the failed release did run; the rollback is repeated
+# until the previous release answers).
+# write_pending <prev dir> <prev version> <new version> <stage>
 write_pending() {
-  printf 'prev_dir=%s\nprev_version=%s\nnew_version=%s\n' "$1" "$2" "$3" > "$STATE/pending.new"
+  printf 'prev_dir=%s\nprev_version=%s\nnew_version=%s\nstage=%s\n' "$1" "$2" "$3" "$4" > "$STATE/pending.new"
   mv -f -T -- "$STATE/pending.new" "$STATE/pending"
 }
 
 # rollback <failed version> <previous release folder> <previous version>
 rollback() {
   local bad="$1" prev_dir="$2" prev_v="$3"
+  write_pending "$prev_dir" "$prev_v" "$bad" rolling_back
   record_failed "$bad"
   if [[ "$(current_dir)" != "$prev_dir" ]]; then
     if ! installer switch "$prev_dir"; then
@@ -466,22 +471,29 @@ rollback() {
 # A run that was killed between the switch and the health check: its release
 # counts as failed; back to the previous one.
 recover_pending() {
-  local f="$STATE/pending" prev_dir="" prev_v="" new_v="" k val
+  local f="$STATE/pending" prev_dir="" prev_v="" new_v="" stage="" k val
   [[ -f "$f" ]] || return 0
   while IFS='=' read -r k val; do
     case "$k" in
       prev_dir) prev_dir="$val" ;;
       prev_version) prev_v="$val" ;;
       new_version) new_v="$val" ;;
+      stage) stage="$val" ;;
     esac
   done < "$f"
-  if [[ ! "$new_v" =~ $VERSION_RE || ! "$prev_dir" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,128}$ || ! "$prev_v" =~ ^[0-9A-Za-z._+-]{1,64}$ ]]; then
+  if [[ ! "$new_v" =~ $VERSION_RE || ! "$prev_dir" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,128}$ || ! "$prev_v" =~ ^[0-9A-Za-z._+-]{1,64}$ || ( "$stage" != installing && "$stage" != rolling_back ) ]]; then
     err "$STATE_REAL/pending is not readable; remove it after checking $CORE_REAL/current by hand"
     exit 1
   fi
   if [[ "$MODE" != now ]]; then
-    log "an earlier run was interrupted while installing $new_v; the next --now run rolls it back"
+    log "an earlier run was interrupted (stage $stage, release $new_v); the next --now run finishes it"
     return 0
+  fi
+  if [[ "$stage" == rolling_back ]]; then
+    # The failed release ran; the rollback did not finish (killed, or the
+    # previous release did not answer): switch (if needed), restart, health.
+    log "an earlier rollback of $new_v did not finish; repeating it (releases/$prev_dir)"
+    rollback "$new_v" "$prev_dir" "$prev_v"
   fi
   local cur
   cur="$(current_dir)"
@@ -566,7 +578,7 @@ main() {
 
   local prev_dir="$CUR_DIR" prev_v="$CUR_VERSION"
   log "installing core-v$TARGET (from $prev_v)"
-  write_pending "$prev_dir" "$prev_v" "$TARGET"
+  write_pending "$prev_dir" "$prev_v" "$TARGET" installing
   if ! installer release --release "$PKG"; then
     if [[ "$(current_dir)" == "$prev_dir" ]]; then
       rm -f -- "$STATE/pending"
