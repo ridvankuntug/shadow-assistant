@@ -25,6 +25,7 @@ import { AppMenu } from "./ui/AppMenu.tsx";
 import { ConfirmCard } from "./ui/ConfirmCard.tsx";
 import { Composer } from "./ui/Composer.tsx";
 import { ConnectScreen } from "./ui/ConnectScreen.tsx";
+import { defaultCoreUrl } from "./ui/coreAddress.ts";
 import { Conversation } from "./ui/Conversation.tsx";
 import { DevPanel } from "./ui/DevPanel.tsx";
 import { MemoryPanel } from "./ui/MemoryPanel.tsx";
@@ -270,6 +271,7 @@ export default function App({ adapter, controller }: Props) {
       <ConnectScreen
         initialUrl={coreUrl}
         initialToken={token}
+        defaultUrl={defaultCoreUrl(adapter.clientKind, typeof window !== "undefined" ? window.location : undefined)}
         error={unauthorized ? noticeText("unauthorized") : undefined}
         onSubmit={saveConnection}
         onCancel={coreUrl && token && !unauthorized ? () => setPanel("none") : undefined}

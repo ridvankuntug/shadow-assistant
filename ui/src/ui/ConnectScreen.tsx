@@ -1,12 +1,13 @@
 import { useId, useState, type FormEvent } from "react";
 import { normalizeCoreUrl } from "../protocol/client.ts";
+import { DEFAULT_CORE_URL } from "./coreAddress.ts";
 import { ADDRESSES_HINT } from "./strings.ts";
-
-export const DEFAULT_CORE_URL = "ws://localhost:8700/ws";
 
 type Props = {
   initialUrl: string;
   initialToken: string;
+  /** Prefilled address when none is stored (`defaultCoreUrl`); default DEFAULT_CORE_URL. */
+  defaultUrl?: string;
   /** Shown above the form, e.g. after the Core rejected the token. */
   error?: string;
   onSubmit: (url: string, token: string) => void;
@@ -16,8 +17,8 @@ type Props = {
 };
 
 /** Core URL + device token entry. Values are persisted by the caller through the adapter. */
-export function ConnectScreen({ initialUrl, initialToken, error, onSubmit, onCancel, onOpenAddresses }: Props) {
-  const [url, setUrl] = useState(initialUrl || DEFAULT_CORE_URL);
+export function ConnectScreen({ initialUrl, initialToken, defaultUrl = DEFAULT_CORE_URL, error, onSubmit, onCancel, onOpenAddresses }: Props) {
+  const [url, setUrl] = useState(initialUrl || defaultUrl);
   const [token, setToken] = useState(initialToken);
   const [showToken, setShowToken] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -57,7 +58,7 @@ export function ConnectScreen({ initialUrl, initialToken, error, onSubmit, onCan
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
-          placeholder={DEFAULT_CORE_URL}
+          placeholder={defaultUrl}
           value={url}
           onChange={(e) => setUrl(e.target.value)}
         />
