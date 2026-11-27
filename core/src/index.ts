@@ -38,7 +38,7 @@ import { buildOneShotOptions } from "./one-shot.js";
 import { PermissionPolicy } from "./permissions.js";
 import { PC_DIR, PcPermissionStore } from "./pc/permissions.js";
 import { checkRouterServices } from "./router-config.js";
-import { startNotificationProducers } from "./rehearsal.js";
+import { rehearsalFeatures, startNotificationProducers } from "./rehearsal.js";
 import { PassthroughRouter, TieredRouter, type Router, type TieredRouterOptions } from "./router.js";
 import type { ProtocolFeature } from "./protocol.js";
 import { createCoreServer } from "./server.js";
@@ -493,6 +493,7 @@ export async function main(): Promise<void> {
       "ha_urgency_feedback",
       "pc_permissions",
       "names",
+      ...rehearsalFeatures(cfg.rehearsal),
     ],
     serviceHealth: monitor,
     deviceState,

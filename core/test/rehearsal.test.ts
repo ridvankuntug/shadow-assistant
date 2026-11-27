@@ -13,7 +13,7 @@ import { after, test } from "node:test";
 import { loadConfig, parseRehearsal } from "../src/config.js";
 import { NotificationStore } from "../src/notifications.js";
 import type { ServerFrame } from "../src/protocol.js";
-import { REHEARSAL_DISABLED, startNotificationProducers } from "../src/rehearsal.js";
+import { REHEARSAL_DISABLED, rehearsalFeatures, startNotificationProducers } from "../src/rehearsal.js";
 import { NotificationCenter, type NotificationListener } from "../src/session.js";
 
 const dir = mkdtempSync(join(tmpdir(), "shadow-rehearsal-test-"));
@@ -65,6 +65,11 @@ test("startNotificationProducers: rehearsal starts none and logs one line naming
   assert.equal(warns.length, 1);
   assert.match(warns[0] ?? "", /REHEARSAL/);
   assert.ok(warns[0]?.includes(REHEARSAL_DISABLED));
+});
+
+test("rehearsalFeatures: on announces `rehearsal` in welcome.features, off adds nothing", () => {
+  assert.deepEqual(rehearsalFeatures(true), ["rehearsal"]);
+  assert.deepEqual(rehearsalFeatures(false), []);
 });
 
 let homes = 0;

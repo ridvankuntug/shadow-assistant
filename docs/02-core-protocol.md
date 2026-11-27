@@ -107,7 +107,7 @@ the client protocol above.
 
 | Frame | Meaning |
 |---|---|
-| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions","names"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled). |
+| `{"type":"welcome","protocol":1,"sessionId":"…","device":"browser","features"?:["speech_stream","usage_limit","memory","dev","notifications","notifications_suppress","ha_urgency_feedback","pc_permissions","names","rehearsal"]}` | Authenticated. `features`: see *Features* (`memory` only while memory is enabled, `rehearsal` only while CORE_REHEARSAL is on). |
 | `{"type":"state","state":"idle"\|"thinking"\|"awaiting_confirm"}` | Server-side state. `listening` and `speaking` are client-local states. |
 | `{"type":"transcript","id":"t2","text":"…"}` | Result of speech-to-text for an `audio` frame. |
 | `{"type":"assistant_delta","id":"t1","text":"<chunk>"}` | Streaming answer chunk. |
@@ -153,6 +153,7 @@ The protocol number stays 1.
 | `ha_urgency_feedback` | Learned urgency of Home Assistant alerts (T7.w.11.10): `notification_action` also accepts `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") on `source:"ha"` items, and the Development tab may list `kind:"ha_urgency"` suggestions that take `dev_action` `accept` ("Kabul") or `ignore` ("Yok say"). Without it clients offer neither (an older Core answers both actions with `bad_request`). |
 | `pc_permissions` | The PC permission list (T17.2, docs/11 D3): `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` are answered and `pc_permissions_count` is sent. Without it clients hide the İzinler page and its count. |
 | `names` | Confirmed device names (T4.4b, docs/14 Decisions 6-8): `names_list` / `names_delete` are answered with `names`. Without it clients hide the "Cihaz adları" panel. (`confirm_request.remember` needs no feature: it is optional and old clients ignore it.) |
+| `rehearsal` | The Core runs in rehearsal mode (T11.5, CORE_REHEARSAL on): its notification producers are not started and urgent notifications are not spoken; the inbox still works. Clients show a "prova" band while it is listed. Old clients ignore it. |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.

@@ -272,7 +272,9 @@ export type ProtocolFeature =
   /** T17.2: the PC permission list (`pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen`, `pc_permissions_count`). */
   | "pc_permissions"
   /** T4.4b: confirmed device names (`names_list` / `names_delete` → `names`; docs/14 Decision 8). */
-  | "names";
+  | "names"
+  /** T11.5: the Core runs with CORE_REHEARSAL on (notification producers and urgent speech off); clients show a "prova" band. */
+  | "rehearsal";
 
 export interface HistoryItem {
   id: string;

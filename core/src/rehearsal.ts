@@ -6,6 +6,7 @@
  * (NotificationCenter `urgentSpeech: false`, the second guard). The inbox
  * itself (list, read, delete) keeps working.
  */
+import type { ProtocolFeature } from "./protocol.js";
 import type { Logger } from "./session.js";
 
 /** What CORE_REHEARSAL turns off; the startup line lists it. */
@@ -31,4 +32,12 @@ export function startNotificationProducers(
     return;
   }
   for (const p of producers) p?.start();
+}
+
+/**
+ * The `welcome.features` entry announcing rehearsal: `rehearsal` while the flag
+ * is on (clients show a "prova" band), nothing otherwise (docs/02 "Features").
+ */
+export function rehearsalFeatures(rehearsal: boolean): ProtocolFeature[] {
+  return rehearsal ? ["rehearsal"] : [];
 }
