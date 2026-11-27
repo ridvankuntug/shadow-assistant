@@ -16,6 +16,7 @@ import { DirectUnavailableError, type RemoteMcpClient, type RemoteToolDef, type 
 import {
   GATEWAY_MESSAGES,
   McpGateway,
+  modelSchema,
   redactEndpoints,
   serviceSecrets,
   type GatewayGate,
@@ -140,6 +141,28 @@ test("mirror: same names, descriptions and schemas; instructions cached; no URL 
   assert.equal(local[0]?.name, "echo");
   assert.equal((local[0]?.inputSchema as { type?: string }).type, "object");
   assert.equal("$schema" in (local[0]?.inputSchema ?? {}), false);
+});
+
+test("mirror: GetLiveContext is offered without `name` (T6); other tools keep it", async () => {
+  const { gw, ha } = makeGateway();
+  const i = ha.tools.findIndex((t) => t.name === "homeassistant__GetLiveContext");
+  ha.tools[i] = {
+    name: "homeassistant__GetLiveContext",
+    description: "Live context",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, area: { type: "string" } }, required: ["name"] },
+  };
+  const tools = await gw.listTools(HA);
+  const live = tools.find((t) => t.name === "homeassistant__GetLiveContext");
+  assert.deepEqual(live?.inputSchema, { type: "object", properties: { area: { type: "string" } }, required: [] });
+  const on = tools.find((t) => t.name === "intent__HassTurnOn");
+  assert.ok("name" in ((on?.inputSchema.properties as Record<string, unknown>) ?? {}));
+});
+
+test("modelSchema: no properties or no `name` → the same object", () => {
+  const a = { type: "object" };
+  const b = { type: "object", properties: { area: { type: "string" } } };
+  assert.equal(modelSchema("homeassistant__GetLiveContext", a), a);
+  assert.equal(modelSchema("homeassistant__GetLiveContext", b), b);
 });
 
 test("call: the Core gate sees the qualified name, then the call is forwarded with the gate's input", async () => {

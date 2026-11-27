@@ -27,6 +27,7 @@ import { z } from "zod";
 import type { CatalogEntry, DevNotes, TurnNotes } from "./dev-notes.js";
 import { DirectUnavailableError, untilAborted, type RemoteMcpClient } from "./mcp-direct.js";
 import type { PermissionCallback } from "./model-provider.js";
+import { LIVE_CONTEXT_TOOL } from "./router-config.js";
 
 /** One tool as the gateway offers it. */
 export interface GatewayTool {
@@ -216,6 +217,23 @@ export function redactEndpoints(t: string, secrets?: ServiceSecrets): string {
     .replace(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.local\b/gi, "[address]");
 }
 
+/**
+ * Mirrored schema as the model sees it. `GetLiveContext` loses its `name`
+ * property (T6): a name filter made HA return errors, and taking the field out
+ * of the schema stops the model from sending it at all, which an instruction
+ * cannot guarantee. Other tools are mirrored unchanged.
+ */
+export function modelSchema(tool: string, schema: Record<string, unknown>): Record<string, unknown> {
+  if (tool !== LIVE_CONTEXT_TOOL) return schema;
+  const props = schema.properties;
+  if (!props || typeof props !== "object" || !("name" in props)) return schema;
+  const rest = { ...(props as Record<string, unknown>) };
+  delete rest.name;
+  const out: Record<string, unknown> = { ...schema, properties: rest };
+  if (Array.isArray(schema.required)) out.required = schema.required.filter((r) => r !== "name");
+  return out;
+}
+
 function text(t: string, isError: boolean): GatewayToolResult {
   return { content: [{ type: "text", text: t }], isError };
 }
@@ -379,7 +397,7 @@ export class McpGateway {
     const tools: GatewayTool[] = list.tools.map((t) => ({
       name: t.name,
       ...(t.description !== undefined ? { description: t.description } : {}),
-      inputSchema: t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" },
+      inputSchema: modelSchema(t.name, t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" }),
       ...(t.annotations ? { annotations: t.annotations } : {}),
     }));
     const entry: RemoteCache = {

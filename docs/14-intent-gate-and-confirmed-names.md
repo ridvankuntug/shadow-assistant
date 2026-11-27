@@ -554,8 +554,8 @@ device, so rule 3 makes the target known and no card appears. An answer that doe
 not repeat the name ("ikincisi") gets a two-option card (no known words).
 
 The prompt lowers how often the gate fires; it is not the safety mechanism.
-How to call `GetLiveContext` (no `name` filter) is T6's job and is not written
-here.
+How to call `GetLiveContext` (no `name` filter) is T6's job: the gateway mirrors
+its schema without the `name` property (`modelSchema` in `core/src/mcp-gateway.ts`).
 
 ## Decision 10: repeated-error stop (T4.7, user decision 8)
 
@@ -657,7 +657,7 @@ the repeated mistake.
 
 ## Out of scope and related
 
-- **T6** (`GetLiveContext` schema without `name`, plan decision O8b, T6.2): stops
+- **T6** (done; `GetLiveContext` schema without `name`, plan decision O8b, T6.2): stops
   the failing reads of the incident at the source. T4 does not depend on it: the
   gate blocks the wrong write and T4.7 stops the third failing call even if the
   model keeps calling with bad filters.
