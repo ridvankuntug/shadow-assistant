@@ -1,0 +1,126 @@
+# shadow-core: the Shadow Assistant Core on the Pi (docs/13-pi-core-and-agents.md
+# K1, section 7.1; install steps: docs/05-deploy.md section 7 "Core on the Pi").
+#
+# Files this unit expects (created by the installer, T11.1):
+#   /opt/shadow-assistant/core/current/            Core release (symlink to
+#       releases/<version>/; root:root, read-only for the service)
+#   /etc/shadow-assistant/core.env                 settings, no secret (root:root 0644)
+#   /etc/credstore/shadow-core.<VARIABLE>          one secret per file (root:root 0600,
+#       dir 0700): HA_CORE_TOKEN, DEVICE_TOKEN_<NAME>, later CORE_AGENT_TOKEN (T13)
+#   /etc/systemd/system/shadow-core.service.d/local.conf
+#       machine-specific drop-in (root:root 0644), see below
+#   ~<user>/.claude/, ~<user>/.claude.json         Claude login of <user> (T9.1)
+# State: /var/lib/shadow-assistant/ (StateDirectory, owned by <user>) with data/
+# (SHADOW_DATA_DIR) and vault/ (SHADOW_VAULT_DIR).
+#
+# This tracked file holds no user names, home paths, addresses or tokens; those
+# go into the drop-in local.conf, which the installer writes:
+#
+#   [Service]
+#   # The account that owns the Claude login (T9.1).
+#   User=<user>
+#   # The Claude CLI rewrites its login files when it refreshes the token (T9.1),
+#   # so these two stay writable under ProtectHome=read-only.
+#   ReadWritePaths=<home>/.claude <home>/.claude.json
+#   # One line per device token (the set varies per install).
+#   LoadCredential=DEVICE_TOKEN_<NAME>:/etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>
+#
+# Secrets reach the Core only through LoadCredential= (read by the Core from
+# $CREDENTIALS_DIRECTORY, core/src/credentials.ts): never in core.env, on a
+# command line or in this file. A secret that is also set in core.env stops the
+# Core at start. LoadCredential= (systemd >= 247) is used rather than
+# ImportCredential=shadow-core.* (>= 254; Raspberry Pi OS bookworm ships 252),
+# so a new device needs a new LoadCredential= line in local.conf. The Core also
+# accepts the "shadow-core." prefix in a credential ID, so a later switch to
+# ImportCredential= needs no code change.
+
+[Unit]
+Description=Shadow Assistant Core
+# The plain listener binds the Pi's LAN address (CORE_HOST); binding fails until
+# the interface has it. Outbound: Anthropic API, Home Assistant.
+Wants=network-online.target
+After=network-online.target
+# Never give up restarting (as wake-svc): after a power cut the Pi can boot
+# before the router hands out its address. A bad configuration then repeats one
+# "[shadow-core] fatal: ..." journal line every 15 s (journalctl -u shadow-core).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Fail-safe placeholder: this account does not exist, so without the drop-in's
+# User= the start fails with status=217/USER instead of running as root. (It is
+# a syntactically valid name on purpose: systemd skips an invalid User= value
+# and would then run the service as root.)
+User=shadow-core-unset
+# The release layout mirrors the repository: the Core finds services.yaml,
+# router.yaml and VERSION two levels above core/dist/ (core/src/config.ts).
+WorkingDirectory=/opt/shadow-assistant/core/current
+ExecStart=/usr/bin/node /opt/shadow-assistant/core/current/core/dist/index.js
+EnvironmentFile=/etc/shadow-assistant/core.env
+# Home Assistant token -> $CREDENTIALS_DIRECTORY/HA_CORE_TOKEN. The start fails
+# with status=243/CREDENTIALS while the file is missing. Device tokens: local.conf.
+LoadCredential=HA_CORE_TOKEN:/etc/credstore/shadow-core.HA_CORE_TOKEN
+Restart=on-failure
+RestartSec=15s
+# The Core's own graceful stop is bounded by 5 s (core/src/shutdown.ts); the
+# model sessions (Claude CLI children) are in the same cgroup and are stopped
+# with it (default KillMode=control-group).
+TimeoutStopSec=20s
+SyslogIdentifier=shadow-core
+
+# --- state: /var/lib/shadow-assistant, owned by User=, kept across restarts
+StateDirectory=shadow-assistant
+StateDirectoryMode=0700
+
+# --- identity and privileges
+NoNewPrivileges=yes
+# Listeners use ports > 1023 and outbound connections need nothing: no
+# capability at all. Keep CORE_PORT above 1023.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# --- file system
+# Everything read-only except the StateDirectory and the ReadWritePaths= of the
+# drop-in. ProtectHome=read-only (not "yes"): the Claude CLI needs the user's
+# home (login files); the drop-in makes only those two paths writable.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# ProcSubset=pid is NOT set: it hides /proc/stat and /proc/cpuinfo, which
+# Node's os.cpus() (and so the Claude CLI) reads.
+RemoveIPC=yes
+
+# --- kernel interfaces
+# AF_INET/AF_INET6: listeners and outbound HTTPS. AF_UNIX: journald and the
+# local IPC of Node/the Claude CLI. AF_NETLINK is left out: glibc's
+# getaddrinfo falls back when it cannot open a netlink socket (unverified on
+# the Pi; add AF_NETLINK only if name resolution or os.networkInterfaces()
+# fails with EAFNOSUPPORT).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute=yes is NOT set: it breaks V8's JIT (Node and the
+# Claude CLI).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# ~@resources (as in wake-svc) is left out: Node and the Claude CLI may call
+# setrlimit/setpriority; a denied call there would fail in odd places.
+SystemCallErrorNumber=EPERM
+
+# No MemoryMax/TasksMax yet: each model session holds about 250 MB (docs/07);
+# set limits from the rehearsal's measurements (T11.5), in local.conf.
+
+[Install]
+WantedBy=multi-user.target

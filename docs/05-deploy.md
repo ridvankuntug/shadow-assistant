@@ -15,6 +15,7 @@ its own.
 | Core | Tray app started by a scheduled task at sign-in, your user, not elevated | `deploy/windows/` |
 | Backup | Script (optionally a daily scheduled task), your user | `deploy/backup/` |
 | wake-svc | systemd unit on the always-on Linux box, throw-away user (`DynamicUser`), LAN address only | `deploy/linux/` |
+| Core on the Pi (in progress, docs/13) | systemd unit, the account that owns the Claude login (section 7) | `deploy/linux/` |
 
 ## 1. Prerequisites
 
@@ -711,3 +712,66 @@ new token in the phone (`sudo cat /etc/credstore/wake-svc.token`).
 | wake-svc does not start, journal: "cannot listen on ..." | `WAKE_BIND` is not an address of the box, or the port is in use (`ss -ltnp`). At boot the LAN address may come up late; the unit retries every 15 s. Give the box a fixed address (section 5, step 4). |
 | wake-svc fails with `status=243/CREDENTIALS` | `/etc/credstore/wake-svc.token` is missing or not at the path in the unit's `LoadCredential=` (section 5, step 5). |
 | wake-svc answers `202` but the PC stays off | Wake-on-LAN enabled in the PC's BIOS/UEFI and on the wired adapter, the wired MAC in `WAKE_MAC`, packet seen on the PC (docs/12, D3 checklist). |
+
+## 7. Core on the Pi (in progress)
+
+Design: [docs/13](13-pi-core-and-agents.md) K1 and section 7.1. The install
+script (T11.1) will do the steps below; until then this section only lists
+what the unit expects. The PC Core (section 3) is unchanged.
+
+| Path on the Pi | What | Owner, mode |
+| --- | --- | --- |
+| `/etc/systemd/system/shadow-core.service` | The unit (`deploy/linux/shadow-core.service`) | `root:root 0644` |
+| `/etc/systemd/system/shadow-core.service.d/local.conf` | Machine-specific drop-in: `User=`, the two writable Claude login paths, one `LoadCredential=` per device token (template in the unit's header) | `root:root 0644` |
+| `/etc/shadow-assistant/core.env` | Settings, no secret (`deploy/linux/core.env.example`) | `root:root 0644` |
+| `/etc/credstore/shadow-core.<VARIABLE>` | One secret per file: `HA_CORE_TOKEN`, `DEVICE_TOKEN_<NAME>`, later `CORE_AGENT_TOKEN` | `root:root 0600` (folder `0700`) |
+| `/opt/shadow-assistant/core/current/` | Core release (repository layout, `core/dist/index.js`) | root, read-only for the service |
+| `/var/lib/shadow-assistant/` | `StateDirectory`: `data/` (`SHADOW_DATA_DIR`), `vault/` (`SHADOW_VAULT_DIR`) | `<user>`, `0700` |
+
+**Secrets.** The Core reads them from systemd's `$CREDENTIALS_DIRECTORY`
+(`core/src/credentials.ts`), only when systemd sets that variable:
+
+- The credential ID is the variable name (`LoadCredential=HA_CORE_TOKEN:/etc/credstore/shadow-core.HA_CORE_TOKEN`);
+  an ID starting with `shadow-core.` has the prefix removed (the IDs
+  `ImportCredential=shadow-core.*` would give, systemd 254 or newer).
+- One trailing newline is removed. An empty file, a second line, a file over
+  4096 bytes or an unreadable file stops the Core at start (the message names
+  the credential, never its value).
+- A variable set in `core.env` (or the environment) **and** as a credential
+  stops the Core at start: one source per secret.
+- IDs that are not upper-case variable names (a TLS key, a deploy key) are
+  left to their own readers; the Core logs their names once.
+- Secret values never enter the process environment; the Claude CLI and its
+  tools also do not get `CREDENTIALS_DIRECTORY`.
+
+The unit uses `LoadCredential=` (systemd 247 or newer), not
+`ImportCredential=` (254 or newer; Raspberry Pi OS bookworm ships 252). So a
+new device token needs a file **and** a `LoadCredential=` line in `local.conf`,
+then `sudo systemctl daemon-reload` and a restart. Not yet verified on the Pi.
+
+**Create a credential file without the token in the shell history or on a
+command line** (`read -rs` does not echo; `printf` is a shell builtin):
+
+```sh
+sudo install -d -m 0700 -o root -g root /etc/credstore
+read -rs TOKEN && printf '%s' "$TOKEN" | sudo sh -c 'umask 077; cat > /etc/credstore/shadow-core.HA_CORE_TOKEN'; unset TOKEN
+sudo ls -l /etc/credstore/shadow-core.HA_CORE_TOKEN      # -rw------- root root
+```
+
+`systemd-ask-password -n "HA token:" | sudo sh -c 'umask 077; cat > …'` works
+the same way. A new random device token, generated on the Pi:
+
+```sh
+sudo sh -c 'umask 077; python3 -I -c "import secrets; print(secrets.token_urlsafe(32))" > /etc/credstore/shadow-core.DEVICE_TOKEN_<NAME>'
+```
+
+**Claude login.** The unit runs as the account that owns the Claude login
+(T9.1): the CLI rewrites its login files when it refreshes the token, so they
+cannot live in the credstore. `ProtectHome=read-only` keeps the home read-only
+except the paths `local.conf` lists in `ReadWritePaths=` (`<home>/.claude`,
+`<home>/.claude.json`). Not yet verified on the Pi: that the CLI can refresh
+its login with only these two paths writable (if it replaces `.claude.json`
+through a temporary file in the home folder, it cannot).
+
+Without `local.conf` the unit refuses to start (`status=217/USER`: its
+placeholder account does not exist), so it never runs as root.
