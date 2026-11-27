@@ -53,7 +53,8 @@ export function makeTestCert(opts: TestCertOptions = {}): TestCert {
   const spki = publicKey.export({ type: "spki", format: "der" });
   const ecdsaSha256 = seq(oid("1.2.840.10045.4.3.2"));
   const serial = randomBytes(8);
-  serial[0] = (serial[0] ?? 0) & 0x7f;
+  // Positive and minimal DER: first byte 0x01..0x7f (never a redundant leading zero).
+  serial[0] = ((serial[0] ?? 0) & 0x7f) | 0x01;
   const san = seq(tlv(0x87, Buffer.from(opts.ip ?? [127, 0, 0, 1])), tlv(0x82, Buffer.from("localhost", "ascii")));
   const ski = createHash("sha1").update(spki).digest();
   const extensions = tlv(

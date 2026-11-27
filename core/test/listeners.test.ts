@@ -188,7 +188,7 @@ test("tlsOrigin normalises default port, host case and IPv6", () => {
 
 test("originAllowed: accept/refuse matrix", () => {
   const own = tlsOrigin("192.0.2.10", 8743);
-  const yes = [undefined, "https://192.0.2.10:8743", " https://192.0.2.10:8743 ", "HTTPS://192.0.2.10:8743", "https://192.0.2.10:8743/"];
+  const yes = [undefined, "https://192.0.2.10:8743", " https://192.0.2.10:8743 ", "HTTPS://192.0.2.10:8743"];
   for (const o of yes) assert.equal(originAllowed(o, own), true, String(o));
   const no = [
     "",
@@ -201,6 +201,11 @@ test("originAllowed: accept/refuse matrix", () => {
     "https://192.0.2.10:8743.evil.example",
     "https://user@192.0.2.10:8743",
     "https://192.0.2.10:8743/path",
+    "https://192.0.2.10:8743/",
+    "https://192.0.2.10:8743/x/..",
+    "https://192.0.2.10:8743/%2e%2e",
+    "https://192.0.2.10:8743#",
+    "https://192.0.2.10:8743\\",
     "https://192.0.2.10:8743?x=1",
     "https://192.0.2.10:8743, https://192.0.2.10:8743",
     "file://",

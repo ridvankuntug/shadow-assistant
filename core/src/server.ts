@@ -151,6 +151,9 @@ function listenOn(server: Server, port: number, host: string): Promise<{ port: n
  * TLS socket destroyed right after write() would drop the pending record).
  */
 function refuseUpgrade(socket: Duplex, status: string): void {
+  // Upgrade sockets have no error listener of Node's or ws's here: a peer reset during the
+  // answer must not become an unhandled 'error' (process crash).
+  socket.on("error", () => socket.destroy());
   socket.once("finish", () => socket.destroy());
   socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }

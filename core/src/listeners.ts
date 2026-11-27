@@ -103,13 +103,16 @@ export function tlsOrigin(host: string, port: number): string {
 export function originAllowed(header: string | string[] | undefined, own: string): boolean {
   if (header === undefined) return true;
   if (Array.isArray(header) || header.trim() === "") return false;
+  const raw = header.trim();
+  // A bare serialized origin only (scheme://host[:port]), checked on the raw value: URL parsing
+  // would normalise a path such as "/x/.." away. No path (not even "/"), query, fragment, userinfo.
+  if (!/^[a-z][a-z0-9+.-]*:\/\/[^/?#@\\\s]+$/i.test(raw)) return false;
   let u: URL;
   try {
-    u = new URL(header.trim());
+    u = new URL(raw);
   } catch {
     return false;
   }
-  if (u.username || u.password || u.search || u.hash || u.pathname !== "/") return false;
   return u.origin === own;
 }
 

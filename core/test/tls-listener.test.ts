@@ -7,11 +7,13 @@
  * is tested here is the routing, not the trust chain.
  */
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { connect as tlsConnect } from "node:tls";
 import { WebSocket } from "ws";
 import { loadDeviceTokens } from "../src/auth.js";
 import { createCoreServer, type CoreServer } from "../src/server.js";
@@ -283,6 +285,32 @@ test("/ws over TLS: a foreign Origin is refused with 403 before the handshake", 
   }
   assert.equal(warnings.length - before, foreign.length);
   assert.ok(warnings.slice(before).every((w) => !w.includes("evil")), "Origin value is not logged");
+});
+
+// Smoke test: the peer-reset race of refuseUpgrade/static downloads is timing-dependent and not
+// reproduced reliably here; this only checks that abrupt clients leave the listener working.
+test("clients that leave during a refused upgrade or a download leave the listener working", async () => {
+  const wsKey = randomBytes(16).toString("base64");
+  const bad = [
+    `GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${wsKey}\r\nSec-WebSocket-Version: 13\r\nOrigin: https://evil.example\r\n\r\n`,
+    `GET /agent HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${wsKey}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    `GET /assets/app-1234.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`,
+  ];
+  for (let i = 0; i < 10; i++) {
+    for (const text of bad) {
+      await new Promise<void>((resolve) => {
+        const s = tlsConnect({ host: "127.0.0.1", port: tlsPort, rejectUnauthorized: false }, () => {
+          s.write(text);
+          // Gone at once, before or while the answer is written.
+          s.destroy();
+          resolve();
+        });
+        s.on("error", () => resolve());
+      });
+    }
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await get("/health")).status, 200);
 });
 
 test("/agent and other paths never upgrade on the TLS listener", async () => {

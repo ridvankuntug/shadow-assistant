@@ -19,6 +19,7 @@ import { createReadStream } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, join, sep } from "node:path";
+import { pipeline } from "node:stream";
 
 /**
  * Sent with every static answer (also 404/405). Only headers that cannot
@@ -138,8 +139,10 @@ export function createStaticHandler(root: string): StaticHandler {
       res.end();
       return;
     }
-    const stream = createReadStream(file);
-    stream.on("error", () => res.destroy());
-    stream.pipe(res);
+    // Client gone during the lookups: open nothing.
+    if (res.destroyed || req.socket.destroyed) return;
+    // pipeline destroys both sides on an error or an early close, so an aborted download
+    // never keeps its file handle open.
+    pipeline(createReadStream(file), res, () => {});
   };
 }
