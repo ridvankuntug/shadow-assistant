@@ -2,13 +2,13 @@
  * Shadow Assistant Core entry point: loads config, wires the Agent SDK,
  * permission gate, MCP services, speech clients and the WebSocket server.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getSessionInfo, query } from "@anthropic-ai/claude-agent-sdk";
 import { SdkAgentRunner, subprocessEnv } from "./agent.js";
 import { loadDeviceTokens } from "./auth.js";
 import { loadCredentials } from "./credentials.js";
-import { loadConfig, loadDotEnv, loadPronunciationsFile, type CoreConfig } from "./config.js";
+import { loadConfig, loadDotEnv, loadPronunciationsFile, REPO_ROOT, type CoreConfig } from "./config.js";
 import { CONFIRMED_NAMES_DIR, ConfirmedNameStore } from "./confirmed-names.js";
 import { ContinuityStore, continuityFilePath } from "./continuity.js";
 import { ConversationLog } from "./conversation-log.js";
@@ -22,6 +22,7 @@ import { AuthGate } from "./auth-gate.js";
 import { createHaAlerts } from "./ha-producer.js";
 import { buildHealthTargets, HealthMonitor, publicServiceHealth } from "./health.js";
 import { learnPolicy, learnTargetFilter } from "./learn/extract.js";
+import { loadListenerConfig } from "./listeners.js";
 import { LEARNED_RULES_DIR, LearnedRuleStore } from "./learn/store.js";
 import { MemoryExtractor } from "./memory/extractor.js";
 import { DeviceMaintenance, formatBrief, formatLessons } from "./memory/lifecycle.js";
@@ -117,9 +118,13 @@ export async function main(): Promise<void> {
   delete process.env.CREDENTIALS_DIRECTORY;
   if (creds.dir) {
     logger.info(`[shadow-core] credentials: ${creds.loaded.length > 0 ? creds.loaded.join(", ") : "none"} from CREDENTIALS_DIRECTORY`);
-    if (creds.ignored.length > 0) logger.info(`[shadow-core] credentials not read by the Core (not a variable name): ${creds.ignored.join(", ")}`);
   }
   const cfg = loadConfig(env);
+  // Extra plain addresses and the TLS listener (T11.6); refuses a partial or invalid setting before anything starts.
+  const listeners = loadListenerConfig(env, { host: cfg.host, port: cfg.port, credentialsDir: creds.dir, repoRoot: REPO_ROOT });
+  // The TLS key credential is read by loadListenerConfig, not by credentials.ts.
+  const notRead = creds.ignored.filter((id) => !listeners.consumedCredentials.includes(id));
+  if (notRead.length > 0) logger.info(`[shadow-core] credentials not read by the Core (not a variable name): ${notRead.join(", ")}`);
   for (const w of cfg.services.warnings) logger.warn(`[shadow-core] services.yaml: ${w}`);
 
   const tokens = loadDeviceTokens(env);
@@ -493,6 +498,11 @@ export async function main(): Promise<void> {
     deviceState,
   });
   const { port } = await server.listen(cfg.port, cfg.host);
+  for (const host of listeners.extraHosts) await server.listenPlain(cfg.port, host);
+  const tls = listeners.tls;
+  const tlsListening = tls
+    ? await server.listenTls({ host: tls.host, port: tls.port, cert: tls.cert, key: tls.key, uiDir: tls.uiDir })
+    : undefined;
 
   logger.info(`[shadow-core] env file: ${envFile ? "loaded" : "not found (using process environment)"}`);
   // The backup script must resolve the same folder (docs/05, "Data folder"); backup.log shows its side.
@@ -521,7 +531,14 @@ export async function main(): Promise<void> {
   logger.info(
     `[shadow-core] pc permission list: ${pcPermissions.available ? `${pcPermissions.unseen} new` : "unavailable (PC commands refused)"}; switching ${cfg.pcPermissionDevices.length > 0 ? `for ${cfg.pcPermissionDevices.join(",")}` : "off (CORE_PC_PERMISSION_DEVICES not set)"}`,
   );
-  logger.info(`[shadow-core] listening on ws://${cfg.host}:${port}/ws`);
+  for (const host of [cfg.host, ...listeners.extraHosts]) logger.info(`[shadow-core] listening on ws://${host}:${port}/ws`);
+  if (tls && tlsListening) {
+    logger.info(`[shadow-core] TLS listener on ${tlsListening.origin}/ (UI files, /ws, /health; key from ${tls.keySource})`);
+    if (!existsSync(join(tls.uiDir, "index.html"))) {
+      logger.warn(`[shadow-core] UI folder ${tls.uiDir} has no index.html: the TLS listener answers 404 for the UI (set CORE_UI_DIR)`);
+    } else logger.info(`[shadow-core] UI files from ${tls.uiDir}`);
+  }
+  for (const w of listeners.warnings) logger.warn(`[shadow-core] ${w}`);
   monitor.start();
   // CORE_REHEARSAL (T11.5): none started; one warn line says what is off.
   startNotificationProducers(cfg.rehearsal, [backupProducer, serviceProducer, haAlerts], logger);

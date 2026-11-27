@@ -2,6 +2,13 @@
  * HTTP + WebSocket server: `GET /health`, `POST /device/state` (T11, see
  * `handleDeviceState`) and the `/ws` endpoint.
  *
+ * Listeners (docs/13 §4.2, T11.6): `listen` binds the first plain listener
+ * (`http`), `listenPlain` further plain addresses with the same routes, and
+ * `listenTls` the optional TLS listener: `/ws`, `GET /health` and the UI's
+ * static files only (no `/device/state`, never `/agent`), with the Origin
+ * rule on `/ws` (`originAllowed`). Every listener shares the same sessions,
+ * auth and shutdown.
+ *
  * `GET /health` has no auth; its `inbox` counts (T7.w.4, for the tray) are
  * added only for requests from a loopback address.
  *
@@ -12,6 +19,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import type { Duplex } from "node:stream";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { authenticate, type DeviceTokens } from "./auth.js";
 import {
@@ -29,7 +38,9 @@ import {
   type ServerFrame,
   type ServiceHealth,
 } from "./protocol.js";
+import { originAllowed, tlsOrigin, TLS_MIN_VERSION } from "./listeners.js";
 import type { Logger, Session, SessionInfo } from "./session.js";
+import { createStaticHandler } from "./static-files.js";
 import { readCoreVersion } from "./version.js";
 
 export const HELLO_TIMEOUT_MS = 5_000;
@@ -97,11 +108,51 @@ export interface ServiceHealthSource {
   subscribe(listener: (items: ServiceHealth[]) => void): () => void;
 }
 
+export interface TlsListenOptions {
+  host: string;
+  port: number;
+  /** PEM certificate (chain) and private key; the key is kept in memory only. */
+  cert: Buffer;
+  key: Buffer;
+  /** Folder of the built UI served as static files. */
+  uiDir: string;
+}
+
 export interface CoreServer {
+  /** The first plain listener (`listen`). */
   http: Server;
   wss: WebSocketServer;
+  /** Binds the first plain listener. */
   listen(port: number, host: string): Promise<{ port: number }>;
+  /** Binds one more plain listener with the same routes (e.g. 127.0.0.1 next to the LAN address). */
+  listenPlain(port: number, host: string): Promise<{ port: number }>;
+  /** Binds the TLS listener (UI files, `/ws` with the Origin rule, `/health`). */
+  listenTls(opts: TlsListenOptions): Promise<{ port: number; origin: string }>;
   close(): Promise<void>;
+}
+
+/** Upgrade paths per listener kind. `/agent` (T13) is added to PLAIN_UPGRADE_PATHS only (docs/13 §4.1: never on TLS). */
+export const PLAIN_UPGRADE_PATHS: ReadonlySet<string> = new Set(["/ws"]);
+export const TLS_UPGRADE_PATHS: ReadonlySet<string> = new Set(["/ws"]);
+
+function listenOn(server: Server, port: number, host: string): Promise<{ port: number }> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      const addr = server.address();
+      resolve({ port: typeof addr === "object" && addr ? addr.port : port });
+    });
+  });
+}
+
+/**
+ * Answers a refused upgrade and closes the socket once the answer is out (a
+ * TLS socket destroyed right after write() would drop the pending record).
+ */
+function refuseUpgrade(socket: Duplex, status: string): void {
+  socket.once("finish", () => socket.destroy());
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
 function rawToString(data: RawData): string {
@@ -246,6 +297,15 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     res.end();
   }
 
+  /** `GET /health`; true when it answered. */
+  const serveHealth = (req: IncomingMessage, res: ServerResponse, path: string | undefined): boolean => {
+    if (req.method !== "GET" || path !== "/health") return false;
+    const inbox = opts.inbox && isLoopbackAddress(req.socket.remoteAddress) ? { inbox: opts.inbox() } : {};
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", service: "core", version, ...(opts.health?.() ?? {}), ...inbox }));
+    return true;
+  };
+
   const onRequest = (req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? "/").split("?")[0];
     if (path === DEVICE_STATE_PATH && opts.deviceState) {
@@ -256,25 +316,27 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
       });
       return;
     }
-    if (req.method === "GET" && path === "/health") {
-      const inbox = opts.inbox && isLoopbackAddress(req.socket.remoteAddress) ? { inbox: opts.inbox() } : {};
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", service: "core", version, ...(opts.health?.() ?? {}), ...inbox }));
-      return;
-    }
+    if (serveHealth(req, res, path)) return;
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "not_found" }));
   };
-  const http = createServer(onRequest);
-  // `Expect: 100-continue`: Node would ask for the body at once; for the
-  // device-state path the token is checked first, so an unauthenticated
-  // client is answered 401 without being invited to send its body.
-  http.on("checkContinue", (req: IncomingMessage, res: ServerResponse) => {
-    const path = (req.url ?? "/").split("?")[0];
-    const refuseFirst = path === DEVICE_STATE_PATH && opts.deviceState !== undefined && (req.method !== "POST" || !deviceOf(req));
-    if (!refuseFirst) res.writeContinue();
-    onRequest(req, res);
-  });
+  /** Every listener, for close(). */
+  const servers: Server[] = [];
+  const createPlain = (): Server => {
+    const server = createServer(onRequest);
+    // `Expect: 100-continue`: Node would ask for the body at once; for the
+    // device-state path the token is checked first, so an unauthenticated
+    // client is answered 401 without being invited to send its body.
+    server.on("checkContinue", (req: IncomingMessage, res: ServerResponse) => {
+      const path = (req.url ?? "/").split("?")[0];
+      const refuseFirst = path === DEVICE_STATE_PATH && opts.deviceState !== undefined && (req.method !== "POST" || !deviceOf(req));
+      if (!refuseFirst) res.writeContinue();
+      onRequest(req, res);
+    });
+    server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => onUpgrade(req, socket, head, PLAIN_UPGRADE_PATHS));
+    servers.push(server);
+    return server;
+  };
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
   /** Open sessions; close() waits for their records to be flushed. */
@@ -295,20 +357,31 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     for (const send of authed) send({ type: "pc_permissions_count", unseen });
   });
 
-  http.on("upgrade", (req: IncomingMessage, socket, head) => {
-    const path = (req.url ?? "/").split("?")[0];
+  /**
+   * WebSocket upgrade on any listener: only the listener's own paths; with
+   * `origin` (the TLS listener) the Origin rule is checked before the
+   * handshake (403), so a foreign page never reaches the hello frame.
+   */
+  const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer, paths: ReadonlySet<string>, origin?: string) => {
+    const path = (req.url ?? "/").split("?")[0] ?? "";
     if (shuttingDown) {
-      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
-      socket.destroy();
+      refuseUpgrade(socket, "503 Service Unavailable");
       return;
     }
-    if (path !== "/ws") {
-      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-      socket.destroy();
+    if (!paths.has(path)) {
+      refuseUpgrade(socket, "404 Not Found");
+      return;
+    }
+    if (origin !== undefined && !originAllowed(req.headers.origin, origin)) {
+      // The value itself is not logged: it is client-controlled.
+      opts.logger.warn("[shadow-core] refused /ws on the TLS listener: Origin is not the listener's own");
+      refuseUpgrade(socket, "403 Forbidden");
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  });
+  };
+
+  const http = createPlain();
 
   wss.on("connection", (ws: WebSocket) => {
     const send = (frame: ServerFrame) => {
@@ -414,14 +487,31 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
     http,
     wss,
     listen(port, host) {
-      return new Promise((resolve, reject) => {
-        http.once("error", reject);
-        http.listen(port, host, () => {
-          http.off("error", reject);
-          const addr = http.address();
-          resolve({ port: typeof addr === "object" && addr ? addr.port : port });
+      return listenOn(http, port, host);
+    },
+    listenPlain(port, host) {
+      return listenOn(createPlain(), port, host);
+    },
+    async listenTls(t) {
+      const files = createStaticHandler(t.uiDir);
+      /** Set once bound (the port may be 0 in tests); no upgrade is accepted before. */
+      const bound: { origin?: string } = {};
+      const server = createHttpsServer({ cert: t.cert, key: t.key, minVersion: TLS_MIN_VERSION }, (req, res) => {
+        const path = (req.url ?? "/").split("?")[0];
+        if (serveHealth(req, res, path)) return;
+        files(req, res).catch(() => {
+          if (!res.headersSent) res.writeHead(500).end();
+          else res.destroy();
         });
       });
+      server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+        if (bound.origin === undefined) refuseUpgrade(socket, "503 Service Unavailable");
+        else onUpgrade(req, socket, head, TLS_UPGRADE_PATHS, bound.origin);
+      });
+      servers.push(server);
+      const { port } = await listenOn(server, t.port, t.host);
+      bound.origin = tlsOrigin(t.host, port);
+      return { port, origin: bound.origin };
     },
     async close() {
       shuttingDown = true;
@@ -434,7 +524,8 @@ export function createCoreServer(opts: CoreServerOptions): CoreServer {
       // Peers that never answered the close handshake would keep http.close() waiting.
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
-      await new Promise<void>((resolve) => http.close(() => resolve()));
+      // A listener that never bound (listen failed or was not called) has nothing to close.
+      await Promise.all(servers.map((s) => (s.listening ? new Promise<void>((resolve) => s.close(() => resolve())) : undefined)));
     },
   };
 }

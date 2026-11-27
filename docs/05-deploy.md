@@ -841,6 +841,59 @@ rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
   `sudo systemctl daemon-reload`. `/var/lib/shadow-assistant/` holds the data
   folder and the vault clone: back it up or keep it.
 
+### Listeners and the HTTPS listener (T11.6)
+
+Design: [docs/13](13-pi-core-and-agents.md) section 4. All settings are
+optional; without them the Core binds `CORE_HOST:CORE_PORT` only, as on the PC.
+
+| Setting | Meaning |
+| --- | --- |
+| `CORE_EXTRA_HOSTS` | Further IP addresses of the plain listener on `CORE_PORT`, comma-separated. The Pi: `127.0.0.1` (Tailscale `serve`, the updater's health check) next to `CORE_HOST=<pi-lan-ip>`. No `0.0.0.0` / `::`, and `CORE_HOST` must then be a specific address too. |
+| `CORE_TLS_HOST`, `CORE_TLS_PORT` | The TLS listener `https://<CORE_TLS_HOST>:<CORE_TLS_PORT>/`: the UI files, `/ws`, `GET /health`. An IP address, not `0.0.0.0` / `::`; with it, `CORE_HOST` must not be a wildcard either. |
+| `CORE_TLS_CERT_FILE` | PEM certificate (chain) naming `CORE_TLS_HOST` (`subjectAltName IP:`). On the Pi: `/etc/shadow-assistant/tls/core.crt` (root, readable). |
+| credential `tls-key` | The PEM private key: `LoadCredential=tls-key:/etc/credstore/shadow-core.tls-key` (also accepted as the ID `shadow-core.tls-key`). Read by the listener code, not as a variable (`credentials.ts` leaves IDs that are not variable names alone). |
+| `CORE_TLS_KEY_FILE` | The key as a file path, for development and tests only; never together with the credential. |
+| `CORE_UI_DIR` | The built UI; default `<release root>/ui/dist` (in the Core release package from T12.1). A relative path is taken from the release root. |
+
+What the Core refuses at start (one `[shadow-core] fatal:` line, never key
+material): a partial TLS setting (any of the TLS settings or the `tls-key`
+credential without the others), a host that is not an IP address, a wildcard
+address in the places above, the TLS port equal to `CORE_PORT` on the same
+address, a missing, empty, unreadable or oversized (64 KiB) certificate or
+key, an encrypted key, or a key that does not belong to the certificate. It
+warns (and starts) when the certificate expires within 14 days or has
+expired, is not yet valid, or does not name `CORE_TLS_HOST`, and when the UI
+folder has no `index.html` (the listener then answers 404 for the UI but
+`/ws` works).
+
+On the TLS listener:
+
+- Static files: GET/HEAD only (405 otherwise), `X-Content-Type-Options:
+  nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'`; no directory listing, no
+  dot files, no unknown file types, no fallback page; `index.html` for `/`
+  (revalidated on every load, assets cached for an hour), like the tray's
+  `UiServer`. A path with `..`, `\`, `:` or NUL (also percent-encoded) is not
+  served, and a file reached through a symlink must still lie in the UI
+  folder.
+- `/ws` accepts only an `Origin` equal to the listener's own origin
+  (`https://<CORE_TLS_HOST>:<CORE_TLS_PORT>`, compared after normalising case
+  and default port) or no `Origin` (non-browser clients); anything else gets
+  `403` before the WebSocket handshake. Device tokens, sessions and shutdown
+  are the same as on the plain listener.
+- Not served: `POST /device/state` and (from T13) `/agent`, which stay on the
+  plain listener.
+- TLS 1.2 or newer.
+
+A renewed certificate takes effect at the next Core start: the renewal (T11.6
+part B) restarts the Core (`systemctl restart shadow-core`); there is no
+reload of the TLS context while it runs.
+
+Until part B (the local CA, the certificate and its renewal timer, the
+`tls-key` credential in `local.conf`, importing the CA on the PC) is in, keep
+the TLS lines of `core.env` commented. Not yet verified on the Pi or in a
+browser.
+
 ### Secrets
 
 The Core reads them from systemd's `$CREDENTIALS_DIRECTORY`
