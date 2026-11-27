@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { WebSocket } from "ws";
 import { authenticate, loadDeviceTokens } from "../src/auth.js";
-import { createCoreServer, type CoreServer } from "../src/server.js";
+import { CORE_VERSION, createCoreServer, type CoreServer } from "../src/server.js";
 import type { Session } from "../src/session.js";
 import type { ServerFrame } from "../src/protocol.js";
 
@@ -137,9 +137,10 @@ test("other paths do not upgrade", async () => {
 test("GET /health", async () => {
   const res = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { status: string; service: string };
+  const body = (await res.json()) as { status: string; service: string; version: string };
   assert.equal(body.status, "ok");
   assert.equal(body.service, "core");
+  assert.equal(body.version, CORE_VERSION);
 });
 
 test("server without tokens rejects every connection", async () => {

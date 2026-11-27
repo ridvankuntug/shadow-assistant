@@ -30,9 +30,11 @@ import {
   type ServiceHealth,
 } from "./protocol.js";
 import type { Logger, Session, SessionInfo } from "./session.js";
+import { readCoreVersion } from "./version.js";
 
 export const HELLO_TIMEOUT_MS = 5_000;
-export const CORE_VERSION = "0.1.0";
+/** Reported by GET /health: env `CORE_VERSION`, else the repo-root VERSION file, else a dev value (`version.ts`). */
+export const CORE_VERSION = readCoreVersion({ env: process.env });
 
 export interface CoreServerOptions {
   tokens: DeviceTokens;
