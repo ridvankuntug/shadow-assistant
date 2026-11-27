@@ -1,0 +1,17 @@
+# shadow-core-update.timer: runs shadow-core-update.service about every 30 min
+# (docs/13 section 6.2, T12.2). Enabled by install-core.sh unless automatic
+# updates are off (install-core.sh install --no-auto-update; the marker
+# /etc/shadow-assistant/core-update.disabled also makes the service skip).
+# Check: systemctl list-timers shadow-core-update.timer
+
+[Unit]
+Description=Check for a new Shadow Assistant Core release about every 30 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+# Spread the requests (unauthenticated GitHub API: 60 per hour and address).
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

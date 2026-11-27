@@ -5,7 +5,10 @@
 # unit and core.env.example are taken from this script's folder).
 #
 #   install-core.sh install --user <name> [--release <dir|tarball>] [--build <suffix>] [--start]
+#                           [--no-auto-update | --auto-update]
 #   install-core.sh set-secret <NAME> [--user <name>] [--replace]
+#   install-core.sh release --release <dir|tarball>   (the updater's step, T12.2)
+#   install-core.sh switch <release folder name>       (the updater's rollback)
 #   install-core.sh --help
 # Common options: --dry-run (print, change nothing), --root <dir> (prefix every
 # system path, for tests; skips systemctl).
@@ -18,12 +21,20 @@
 #               the unit; creates /etc/shadow-assistant/core.env from the example
 #               only if it is missing; creates /var/lib/shadow-assistant/{data,vault,claude};
 #               writes the drop-in local.conf; installs the TLS script
-#               (/usr/local/sbin/shadow-core-tls) and its renewal timer;
-#               daemon-reload; enable. It starts the Core only with --start.
+#               (/usr/local/sbin/shadow-core-tls) and its renewal timer; installs
+#               the updater (/usr/local/sbin/shadow-core-update, its units, the
+#               release public key and a copy of this script) and enables its
+#               timer unless automatic updates are off (--no-auto-update, kept
+#               in /etc/shadow-assistant/core-update.disabled until
+#               --auto-update); daemon-reload; enable. It starts the Core only
+#               with --start.
+#   release     only copies a release and switches `current` (as install does);
+#               the releases/ folder must exist already. No unit, no restart.
+#   switch      only switches `current` to an installed releases/<name>/.
 #   set-secret  reads one secret without echo (never from the command line) into
 #               /etc/credstore/shadow-core.<NAME> (root 0600, folder 0700) and
 #               regenerates the LoadCredential= lines of local.conf.
-# What it does not: download anything (T12), install Node, touch the Claude login
+# What it does not: download anything (shadow-core-update does, T12.2), install Node, touch the Claude login
 # (T11.3: done once by hand into /var/lib/shadow-assistant/claude, the unit's
 # CLAUDE_CONFIG_DIR), create the TLS CA or certificate (shadow-core-tls init,
 # T11.6), agent:// lines (T11.4), the vault clone (T18), uninstall
@@ -62,9 +73,11 @@ DRY_RUN=0
 ROOT=""
 SECRET_NAME=""
 REPLACE=0
+AUTO_UPDATE=""   # "", on, off
+SWITCH_TO=""
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() { printf 'install-core: error: %s\n' "$*" >&2; exit 1; }
@@ -77,27 +90,35 @@ need_value() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value
 parse_args() {
   [[ $# -gt 0 ]] || { usage; exit 2; }
   case "$1" in
-    install|set-secret) CMD="$1"; shift ;;
+    install|set-secret|release|switch) CMD="$1"; shift ;;
     -h|--help|help) usage; exit 0 ;;
-    *) die "unknown command '$1' (install, set-secret, --help)" ;;
+    *) die "unknown command '$1' (install, set-secret, release, switch, --help)" ;;
   esac
   if [[ "$CMD" == set-secret ]]; then
     [[ $# -gt 0 && "$1" != --* ]] || die "set-secret needs a secret name, e.g. set-secret DEVICE_TOKEN_PHONE"
     SECRET_NAME="$1"; shift
   fi
+  if [[ "$CMD" == switch ]]; then
+    [[ $# -gt 0 && "$1" != --* ]] || die "switch needs the name of an installed release folder, e.g. switch 0.2.5"
+    SWITCH_TO="$1"; shift
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) need_value "$@"; USER_NAME="$2"; shift 2 ;;
-      --release) [[ "$CMD" == install ]] || die "--release is for install"; need_value "$@"; RELEASE="$2"; shift 2 ;;
+      --release) [[ "$CMD" == install || "$CMD" == release ]] || die "--release is for install and release"; need_value "$@"; RELEASE="$2"; shift 2 ;;
       --build) [[ "$CMD" == install ]] || die "--build is for install"; need_value "$@"; BUILD="$2"; shift 2 ;;
       --start) [[ "$CMD" == install ]] || die "--start is for install"; START=1; shift ;;
       --replace) [[ "$CMD" == set-secret ]] || die "--replace is for set-secret"; REPLACE=1; shift ;;
+      --no-auto-update) [[ "$CMD" == install ]] || die "--no-auto-update is for install"; [[ "$AUTO_UPDATE" != on ]] || die "--no-auto-update and --auto-update exclude each other"; AUTO_UPDATE=off; shift ;;
+      --auto-update) [[ "$CMD" == install ]] || die "--auto-update is for install"; [[ "$AUTO_UPDATE" != off ]] || die "--no-auto-update and --auto-update exclude each other"; AUTO_UPDATE=on; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --root) need_value "$@"; ROOT="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option '$1'" ;;
     esac
   done
+  if [[ "$CMD" == release && -z "$RELEASE" ]]; then die "release needs --release <dir|tarball>"; fi
+  if [[ -n "$USER_NAME" && ( "$CMD" == release || "$CMD" == switch ) ]]; then die "--user is not used by $CMD"; fi
   if [[ -n "$ROOT" ]]; then
     [[ -d "$ROOT" ]] || die "--root $ROOT is not a folder"
     ROOT="$(cd -- "$ROOT" && pwd -P)"
@@ -115,6 +136,15 @@ readonly UNIT_REAL=/etc/systemd/system/shadow-core.service
 readonly SYSTEMD_DIR_REAL=/etc/systemd/system
 readonly TLS_BIN_REAL=/usr/local/sbin/shadow-core-tls
 readonly TLS_KEY_ID=tls-key         # core/src/listeners.ts TLS_KEY_CREDENTIAL
+# The updater (T12.2, docs/05 section 7 "Automatic updates").
+readonly UPDATE_SCRIPT="shadow-core-update.sh"
+readonly UPDATE_SERVICE="shadow-core-update.service"
+readonly UPDATE_TIMER="shadow-core-update.timer"
+readonly UPDATE_BIN_REAL=/usr/local/sbin/shadow-core-update
+readonly LIB_DIR_REAL=/usr/local/lib/shadow-assistant
+readonly INSTALLER_COPY_REAL=/usr/local/lib/shadow-assistant/install-core.sh
+readonly PUBKEY_REAL=/etc/shadow-assistant/core-release.pub
+readonly UPDATE_DISABLED_REAL=/etc/shadow-assistant/core-update.disabled
 readonly DROPIN_DIR_REAL=/etc/systemd/system/shadow-core.service.d
 readonly DROPIN_REAL=/etc/systemd/system/shadow-core.service.d/local.conf
 readonly STATE_REAL=/var/lib/shadow-assistant
@@ -353,6 +383,18 @@ check_links_inside() {
 }
 
 make_release_dirs() {
+  # release/switch (the updater, whose sandbox may write only
+  # /opt/shadow-assistant/core) never create or re-own these folders: the
+  # first install is a manual "install". They must exist and be root's.
+  if [[ "$CMD" != install ]]; then
+    local d
+    for d in "$OPT_REAL" "$CORE_REAL" "$CORE_REAL/releases"; do
+      [[ -d "$(p "$d")" && ! -L "$(p "$d")" ]] || die "$d is missing or not a folder; run 'install' first"
+      if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$(p "$d")")" != 0 ]]; then die "$d is not owned by root; refusing"; fi
+      if (( (8#$(file_mode "$(p "$d")") & 8#022) != 0 )); then die "$d is writable by group or others; refusing"; fi
+    done
+    return 0
+  fi
   ensure_dir "$(p /opt)"
   own_dir 0755 root:root "$(p "$OPT_REAL")"
   own_dir 0755 root:root "$(p "$CORE_REAL")"
@@ -360,7 +402,7 @@ make_release_dirs() {
 }
 
 install_release() {
-  local releases dest cur link_tmp
+  local releases dest
   releases="$(p "$CORE_REAL/releases")"
   dest="$releases/$VERSION_DIR"
   make_release_dirs
@@ -397,22 +439,28 @@ install_release() {
     fi
   fi
 
-  # Atomic switch of `current`: new symlink under a temp name, then rename over.
+  switch_current "$VERSION_DIR"
+}
+RELEASE_SWITCHED=0
+
+# Atomic switch of `current` to releases/<name>: new symlink under a temp name,
+# then rename over it (install, release, and the updater's rollback: switch).
+switch_current() {
+  local name="$1" cur link_tmp
   cur="$(p "$CORE_REAL/current")"
   if [[ -e "$cur" && ! -L "$cur" ]]; then die "${cur#"$ROOT"} exists and is not a symlink"; fi
-  if [[ -L "$cur" && "$(readlink -- "$cur")" == "releases/$VERSION_DIR" ]]; then
-    info "current already points to releases/$VERSION_DIR"
+  if [[ -L "$cur" && "$(readlink -- "$cur")" == "releases/$name" ]]; then
+    info "current already points to releases/$name"
   else
     link_tmp="$(p "$CORE_REAL/.current.new")"
     run rm -f -- "$link_tmp"
-    run ln -s -- "releases/$VERSION_DIR" "$link_tmp"
+    run ln -s -- "releases/$name" "$link_tmp"
     own root:root "$link_tmp"
     run mv -T -- "$link_tmp" "$cur"
-    info "current -> releases/$VERSION_DIR"
+    info "current -> releases/$name"
     RELEASE_SWITCHED=1
   fi
 }
-RELEASE_SWITCHED=0
 
 # ---------------------------------------------------------------- unit, env, state
 # install_copy <mode> <file in this folder> <real destination>: copies it if
@@ -456,6 +504,50 @@ install_tls_tools() {
   install_copy 0755 "$TLS_SCRIPT" "$TLS_BIN_REAL"
   install_copy 0644 "$TLS_SERVICE" "$SYSTEMD_DIR_REAL/$TLS_SERVICE"
   install_copy 0644 "$TLS_TIMER" "$SYSTEMD_DIR_REAL/$TLS_TIMER"
+}
+
+# The updater (T12.2): its script, units, the release public key it verifies
+# with, and a copy of this script (it runs "release" and "switch" from there).
+# Called after install_env (the public key goes into /etc/shadow-assistant).
+install_updater() {
+  ensure_dir "$(p /usr/local/sbin)"
+  install_copy 0755 "$UPDATE_SCRIPT" "$UPDATE_BIN_REAL"
+  ensure_dir "$(p /usr/local/lib)"
+  own_dir 0755 root:root "$(p "$LIB_DIR_REAL")"
+  install_copy 0755 "install-core.sh" "$INSTALLER_COPY_REAL"
+  install_copy 0644 "core-release.pub" "$PUBKEY_REAL"
+  install_copy 0644 "$UPDATE_SERVICE" "$SYSTEMD_DIR_REAL/$UPDATE_SERVICE"
+  install_copy 0644 "$UPDATE_TIMER" "$SYSTEMD_DIR_REAL/$UPDATE_TIMER"
+}
+
+# The updater's timer: on unless automatic updates are off. "Off" is kept in a
+# marker file (the service also skips its runs while it exists), so a later
+# install without an option does not turn the timer back on.
+update_timer() {
+  local marker off=0
+  marker="$(p "$UPDATE_DISABLED_REAL")"
+  in_root "$marker"
+  case "$AUTO_UPDATE" in
+    off)
+      off=1
+      if [[ ! -e "$marker" ]]; then
+        info "automatic Core updates: off (writing $UPDATE_DISABLED_REAL)"
+        printf '# Automatic Core updates are off (install-core.sh --no-auto-update).\n# On again: install-core.sh install --user <user> --auto-update\n' | put_file 0644 "$marker"
+      fi ;;
+    on)
+      if [[ -e "$marker" || -L "$marker" ]]; then
+        info "automatic Core updates: on again (removing $UPDATE_DISABLED_REAL)"
+        run rm -f -- "$marker"
+      fi ;;
+    *)
+      if [[ -e "$marker" || -L "$marker" ]]; then off=1; fi ;;
+  esac
+  if [[ $off -eq 1 ]]; then
+    info "automatic Core updates are off ($UPDATE_DISABLED_REAL): the updater timer stays disabled"
+    sysctl disable --now "$UPDATE_TIMER"
+  else
+    sysctl enable --now "$UPDATE_TIMER"
+  fi
 }
 
 install_env() {
@@ -754,9 +846,11 @@ install_main() {
   fi
   write_dropin "$USER_NAME"
   install_tls_tools
+  install_updater
   sysctl daemon-reload
   sysctl enable "$UNIT_NAME"
   sysctl enable --now "$TLS_TIMER"
+  update_timer
 
   if [[ $START -eq 1 ]]; then
     info "starting (or restarting) the Core (--start)"
@@ -766,6 +860,26 @@ install_main() {
   fi
 
   next_steps
+}
+
+# ---------------------------------------------------------------- release, switch
+# The updater's steps (shadow-core-update, T12.2): the same copy and atomic
+# switch as install, nothing else (no unit, no core.env, no systemctl).
+release_main() {
+  check_root_and_systemd
+  prepare_release
+  install_release
+}
+
+switch_main() {
+  local dest
+  check_root_and_systemd
+  # A folder name as install creates it: <VERSION> or <VERSION>+<build>.
+  [[ "$SWITCH_TO" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}(\+[0-9A-Za-z][0-9A-Za-z._-]{0,63})?$ ]] || die "'$SWITCH_TO' is not a release folder name"
+  make_release_dirs
+  dest="$(p "$CORE_REAL/releases/$SWITCH_TO")"
+  [[ -d "$dest" && ! -L "$dest" ]] || die "$CORE_REAL/releases/$SWITCH_TO is not an installed release"
+  switch_current "$SWITCH_TO"
 }
 
 next_steps() {
@@ -794,6 +908,8 @@ main() {
   [[ $DRY_RUN -eq 0 ]] || info "dry run: nothing is changed"
   case "$CMD" in
     install) install_main ;;
+    release) release_main ;;
+    switch) switch_main ;;
     set-secret)
       if [[ -z "$ROOT" && $EUID -ne 0 && $DRY_RUN -eq 0 ]]; then die "run as root (sudo $0 ...)"; fi
       [[ $EUID -eq 0 ]] || OWN_OK=0

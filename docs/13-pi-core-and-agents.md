@@ -797,6 +797,42 @@ The updater never touches the data folder or the vault clone. A release that
 changes the data format must say so in its notes and is not installed by the
 timer without a manual step.
 
+**Built (T12.2, 2026-11-28; not yet run on the Pi).** `deploy/linux/shadow-core-update.sh`
+with `shadow-core-update.{service,timer}`, installed by `install-core.sh`;
+user steps and commands in docs/05 section 7 "Automatic updates". Where it
+differs from or adds to the steps above:
+
+- Signature first (as on the PC, 6.4): `SHA256SUMS.sig` (ECDSA P-256) is
+  verified with the committed `deploy/linux/core-release.pub` (installed as
+  `/etc/shadow-assistant/core-release.pub`, root 0644) before anything in
+  `SHA256SUMS` is used; then the package checksum and the package's `VERSION`.
+  Unsigned or bad: nothing is installed.
+- Install and rollback go through `install-core.sh` (new commands `release`
+  and `switch`, run from a root-owned copy in `/usr/local/lib/shadow-assistant/`),
+  not a second copy of its logic.
+- The configured `X.Y` is the `X.Y` of the installed release's `VERSION`; an
+  installed version that is not `X.Y.<n>` (a local build) is not updated.
+- The `failed` list is in `/var/lib/shadow-assistant-updater/failed` (root
+  0700, the updater's `StateDirectory`), not under the Core's
+  `/var/lib/shadow-assistant/` (owned by the Core's account, which could
+  otherwise clear it).
+- It updates only a running Core that answers `/health` with the installed
+  version (a failed check after the update must mean the new release).
+- Data-format marker: `data-format-change` anywhere in the release notes; it
+  blocks that version and every later one until the manual install. The notes
+  are written by the workflow, so the marker comes after publishing (docs/05:
+  turn automatic updates off before such a change).
+- Opt-out: `install-core.sh install --no-auto-update` (marker file
+  `/etc/shadow-assistant/core-update.disabled`), back with `--auto-update`.
+- Lock (one run at a time), a `pending` file so a killed run is rolled back
+  by the next one, offline or GitHub errors end the run quietly, manual
+  `--check` / `--dry-run` / `--now`.
+- **Open:** the Core notification "güncelleme geri alındı (<version>)". The
+  Core has no local way to raise one without a new endpoint or a write into
+  the data folder; the updater logs `NOTICE: güncelleme geri alındı (<version>)`
+  to the journal and leaves its unit failed. Needs a small Core feature (a
+  later task).
+
 ### 6.3 Two different "go back" rules
 
 - **Updater rollback (M4, T12.2, and 6.4 for the PC):** a failed release goes
@@ -1318,3 +1354,5 @@ that uses it.
   release and updater); new section 8 (service hardening); `deploy/linux/`;
   decisions table; new open questions Q8-Q13; implementation map lists changed
   and proposed tasks. Awaiting T10.6.
+- 2026-11-28: T12.2 built (section 6.2 "Built"): the Pi updater, its units and
+  offline scenario tests; the rollback notification stays open.

@@ -1,0 +1,76 @@
+# shadow-core-update: the Pi Core updater (docs/13-pi-core-and-agents.md section
+# 6.2, T12.2; docs/05-deploy.md section 7 "Automatic updates"). Started about
+# every 30 min by shadow-core-update.timer; installed by install-core.sh with
+# the script /usr/local/sbin/shadow-core-update, the release public key
+# /etc/shadow-assistant/core-release.pub and a copy of install-core.sh in
+# /usr/local/lib/shadow-assistant/.
+#
+# A run asks the GitHub release list for a newer core-v<X.Y>.<n> of the
+# installed X.Y, verifies the signature of SHA256SUMS and the package checksum,
+# installs it (install-core.sh release), restarts shadow-core and waits 90 s for
+# GET /health with the new version; on failure it switches back and restarts.
+# Offline or nothing new: exits 0. A rejected download, a failed pre-check or a
+# rollback leaves the unit failed: systemctl --failed,
+# journalctl -u shadow-core-update. By hand: sudo shadow-core-update --check
+# (or --dry-run, --now).
+
+[Unit]
+Description=Update the Shadow Assistant Core from signed GitHub releases
+# Automatic updates off (install-core.sh install --no-auto-update): skipped.
+ConditionPathExists=!/etc/shadow-assistant/core-update.disabled
+# Nothing to update before the first install.
+ConditionPathIsSymbolicLink=/opt/shadow-assistant/core/current
+Wants=network-online.target
+# The Pi has no clock battery: HTTPS certificate checks need the synced time.
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shadow-core-update --now
+# Download over Wi-Fi + install + 90 s health check (+ a rollback).
+TimeoutStartSec=45min
+SyslogIdentifier=shadow-core-update
+
+# --- privileges: root (writes the root-owned releases, restarts shadow-core)
+User=root
+NoNewPrivileges=yes
+# Every file it writes is root's own (no DAC override needed; chown to root of
+# root's files needs no CAP_CHOWN); it calls no privileged system call.
+# "systemctl restart" talks to PID 1 over its local socket as uid 0, which
+# needs no capability.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# --- state: failed list, lock, pending rollback, downloads. Root-owned, so the
+# Core's account cannot clear the failed list (it owns /var/lib/shadow-assistant).
+StateDirectory=shadow-assistant-updater
+StateDirectoryMode=0700
+
+# --- file system: read-only except the Core releases and its own state; the
+# data folder and the vault clone (/var/lib/shadow-assistant) stay read-only.
+ProtectSystem=strict
+ReadWritePaths=/opt/shadow-assistant/core
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+
+# --- kernel interfaces: AF_INET/AF_INET6 for GitHub and the local health
+# check, AF_UNIX for journald and systemctl.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute=yes is NOT set: the script reads JSON with Node, whose
+# JIT needs writable+executable memory (as in shadow-core.service).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

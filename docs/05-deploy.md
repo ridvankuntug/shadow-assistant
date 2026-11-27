@@ -731,6 +731,12 @@ this section has been run on the Pi yet. The PC Core (section 3) is unchanged.
 | `/etc/systemd/system/shadow-core-tls-renew.{service,timer}` | Weekly renewal of the server certificate | `root:root 0644` |
 | `/etc/shadow-assistant/tls/` | `ca.key` (CA key, never leaves the Pi), `ca.crt` (public, the file the PC imports), `core.crt` (server certificate); created by `shadow-core-tls init` | folder `root 0755`; `ca.key` `0600`, the certificates `0644` |
 | `/etc/credstore/shadow-core.tls-key` | The server certificate's key (credential `tls-key`) | `root:root 0600` |
+| `/usr/local/sbin/shadow-core-update` | The updater (`deploy/linux/shadow-core-update.sh`), see "Automatic updates" | `root:root 0755` |
+| `/etc/systemd/system/shadow-core-update.{service,timer}` | The updater's run about every 30 minutes | `root:root 0644` |
+| `/usr/local/lib/shadow-assistant/install-core.sh` | A copy of the install script; the updater runs its `release` and `switch` | `root:root 0755` (folder `0755`) |
+| `/etc/shadow-assistant/core-release.pub` | The release public key (`deploy/linux/core-release.pub`) the updater verifies with | `root:root 0644` |
+| `/etc/shadow-assistant/core-update.disabled` | Present only while automatic updates are off (`--no-auto-update`) | `root:root 0644` |
+| `/var/lib/shadow-assistant-updater/` | The updater's state: `failed` (versions never tried again), `lock`, `pending`, downloads | `root:root 0700` |
 
 Placeholders below: `<user>` is the account on the Pi that owns (or will own)
 the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
@@ -752,8 +758,8 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    symlink pointing outside it. Pack it as a `.tar.gz`
    (the release at the top or in one folder) or copy the folder. Or take the
    package of a GitHub Release (`core-v<X.Y>.<n>`, "Release packages" below)
-   and verify it first. Downloading releases automatically is T12.2; the
-   script only installs a local one.
+   and verify it first. The script only installs a local release; after the
+   first install the updater ("Automatic updates" below) downloads new ones.
 
 3. **[USER ACTION]** Copy the release and `deploy/linux/` (the script takes
    the unit and `core.env.example` from its own folder) to a private folder
@@ -846,14 +852,22 @@ block while the installed unit does not set `CLAUDE_CONFIG_DIR` yet.
 Every run also installs the TLS script and its renewal units and enables the
 timer (`systemctl enable --now
 shadow-core-tls-renew.timer`); the timer does nothing until the CA exists
-("HTTPS certificate" below). Other local settings (limits measured in the
+("HTTPS certificate" below). It also installs the updater, its units, the
+release public key and a copy of itself, and enables the updater timer
+unless automatic updates are off ("Automatic updates" below: `--no-auto-update`,
+`--auto-update`). Other local settings (limits measured in the
 rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
 
 ### Update or remove
 
-- Update: copy the new release (step 3), run step 4 with it, then
+- Update: automatic ("Automatic updates" below). By hand: copy the new
+  release (step 3), run step 4 with it, then
   `sudo systemctl restart shadow-core` (or add `--start`). Back to an older
-  release: run step 4 with that release again and restart.
+  release: run step 4 with that release again and restart, or
+  `sudo bash /usr/local/lib/shadow-assistant/install-core.sh switch <version>`
+  for one still in `releases/`, then restart. A release installed by hand
+  that is older than the newest `core-v<X.Y>.<n>` is replaced by the next
+  updater run; to stay on it, turn automatic updates off first.
 - Remove: `sudo systemctl disable --now shadow-core`; delete
   `/etc/systemd/system/shadow-core.service`, the folder
   `/etc/systemd/system/shadow-core.service.d/`, `/opt/shadow-assistant/core/`,
@@ -861,7 +875,12 @@ rehearsal, T11.5) go into `sudo systemctl edit shadow-core` (`override.conf`).
   the HTTPS listener also `sudo systemctl disable --now
   shadow-core-tls-renew.timer`, the two `shadow-core-tls-renew.*` units,
   `/usr/local/sbin/shadow-core-tls` and `/etc/shadow-assistant/tls/` (and
-  remove the CA on the PC, "HTTPS certificate"); then
+  remove the CA on the PC, "HTTPS certificate"); for the updater
+  `sudo systemctl disable --now shadow-core-update.timer`, the two
+  `shadow-core-update.*` units, `/usr/local/sbin/shadow-core-update`,
+  `/usr/local/lib/shadow-assistant/`, `/etc/shadow-assistant/core-release.pub`,
+  `/etc/shadow-assistant/core-update.disabled` and
+  `/var/lib/shadow-assistant-updater/`; then
   `sudo systemctl daemon-reload`. `/var/lib/shadow-assistant/` holds the data
   folder and the vault clone: back it up or keep it.
 
@@ -923,6 +942,98 @@ sha256sum -c SHA256SUMS
 
 Both must answer `Verified OK` and `<package>: OK`. Then install it with
 step 4 of "Install" (`--release shadow-core-v<X.Y>.<n>-linux-arm64.tar.gz`).
+
+### Automatic updates (T12.2)
+
+Design: [docs/13](13-pi-core-and-agents.md) section 6.2. `shadow-core-update`
+(installed by `install-core.sh`) is run as root by
+`shadow-core-update.timer`, 15 minutes after boot and then about every 30
+minutes (up to 10 minutes random delay). A run:
+
+1. Reads the installed version from `current/VERSION`. Only a CI release
+   `<X.Y>.<n>` is updated, and only to `core-v<X.Y>.<m>` with the same `X.Y`
+   and a larger `m`: a new `X.Y` series is installed by hand (step 4 of
+   "Install"), and so is the first CI release after a local build (whose
+   `VERSION` holds only `X.Y`).
+2. Lists the releases of the public repository on GitHub (no token; Core
+   releases are never "latest", so it reads the list, newest first). It skips
+   drafts and pre-releases, versions in the `failed` list, and every version
+   from the first one whose release notes contain `data-format-change` (see
+   below). It takes the newest one left.
+3. Updates only while `shadow-core` is running and answers `GET /health` on
+   `127.0.0.1:<CORE_PORT>` with the installed version (`CORE_EXTRA_HOSTS=127.0.0.1`
+   in `core.env`, the default of the example; `core.env` must not set
+   `CORE_VERSION`). Otherwise a failed health check after the update could not
+   be told from a setup problem: with the Core stopped the run just ends, with
+   a Core that answers wrongly it fails.
+4. Downloads `SHA256SUMS` and `SHA256SUMS.sig` and verifies the signature with
+   `/etc/shadow-assistant/core-release.pub` first; then downloads the package
+   and compares its SHA-256 with the signed list, and checks that the
+   package's `VERSION` is the release's version. A bad or missing signature,
+   a wrong checksum or a wrong `VERSION`: nothing is installed, the run fails.
+5. Installs the package with `install-core.sh release` (the same copy into
+   `releases/<X.Y>.<n>/` and atomic `current` switch as step 4 of "Install";
+   unit, `core.env`, secrets and `local.conf` are not touched), restarts
+   `shadow-core` and waits up to 90 s for `GET /health` with the new version.
+6. On failure: writes the version to `/var/lib/shadow-assistant-updater/failed`
+   (never tried again), switches `current` back (`install-core.sh switch`),
+   restarts and waits for the old version. A run killed between the switch
+   and the health check is rolled back the same way by the next run (the
+   `pending` file). It keeps `current` and the two newest other releases (the
+   previous one always) and deletes older ones from `releases/`.
+
+No network, GitHub down or rate-limited, or a release whose files are not
+all uploaded yet: one journal line, the run ends without error and the next
+one tries again. Another run in progress (timer and a manual one): the second
+ends at once. The updater never touches the data folder, the vault clone,
+`core.env` or the credstore. Its state is in a root-owned folder (not in the
+Core's `/var/lib/shadow-assistant/`), so the Core's account cannot clear the
+`failed` list.
+
+Look at it:
+
+```sh
+systemctl list-timers shadow-core-update.timer
+journalctl -u shadow-core-update -n 50
+sudo shadow-core-update --check     # what it would install; changes nothing
+sudo shadow-core-update --dry-run   # also downloads and verifies; installs nothing
+sudo shadow-core-update --now       # update now (ignores the off switch below)
+sudo cat /var/lib/shadow-assistant-updater/failed
+```
+
+A rejected download, a pre-check that fails or a rollback leaves the unit
+failed (`systemctl --failed`). To allow a failed version again, delete its
+line from `failed`.
+
+**Off and on.** `sudo bash ~/core-install/linux/install-core.sh install --user <user> --no-auto-update`
+disables the timer and writes `/etc/shadow-assistant/core-update.disabled`;
+later installs keep it off (the service also skips while the file exists),
+until `install ... --auto-update`. `shadow-core-update --now` by hand still
+works while it is off.
+
+**Data-format change.** A release that changes the format of the data
+folder must not be installed by the timer. Mark it by writing
+`data-format-change` (any case) anywhere in its GitHub release notes; the
+updater then skips it **and every later release** (they carry the change
+too) until the marked release has been installed by hand: verify it ("Verify
+a release by hand" above), back up, then step 4 of "Install". The workflow
+writes the notes itself, so the marker can only be added after the release
+is published, and a timer run can come first: before pushing such a change,
+turn automatic updates off (above) and turn them on after the manual step.
+
+**Rollback notification (open).** docs/13 section 6.2 asks for a Core
+notification "güncelleme geri alındı (<version>)" after a rollback. The Core
+has no local way in for one yet (no endpoint, and the updater does not write
+the data folder), so for now the rollback is only in the journal (`NOTICE:
+güncelleme geri alındı (<version>)`) and the unit is left failed.
+
+**Tests.** `deploy/linux/tests/shadow-core-update.test.sh` runs offline
+scenarios (fake `curl` and `systemctl`, a test root, a throw-away key pair):
+update, same version, other series, signature and checksum rejects, failed
+and data-format skips, health failure with rollback, interrupted run, prune,
+offline, lock, `--check`, `--dry-run`, and the installer's `release`,
+`switch` and timer options. It needs Linux with `openssl`, `node` and `flock`
+(the header shows a Docker command). Not yet run on the Pi.
 
 ### Listeners and the HTTPS listener (T11.6)
 
