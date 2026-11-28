@@ -563,8 +563,11 @@ check '[[ "$(stat -c %a "$R/usr/local/sbin/shadow-core-update")" == 755 && "$(st
 check '[[ "$(stat -c %u "$R/usr/local/sbin/shadow-core-update")" == 0 ]]' "owner"
 check '[[ "$(stat -c %i "$R/usr/local/sbin/shadow-core-update")" != "$ino_before" ]]' "the updater was rewritten in place, not replaced by a rename"
 check '[[ "$(snapshot_etc)" == "$etc_before" ]] && cmp -s "$W/keys/good.pub" "$R/etc/shadow-assistant/core-release.pub"' "core.env, the public key or local.conf changed"
-check 'out_has "skipped: systemctl daemon-reload" && out_has "skipped: systemctl reenable shadow-core-tls-renew.timer"' "no daemon-reload / TLS timer not re-enabled"
-check '! out_has "reenable shadow-core-update.timer" && out_has "shadow-core-update.timer is not enabled; it stays off"' "a disabled timer was enabled"
+check 'out_has "skipped: systemctl daemon-reload" && out_has "skipped: systemctl enable shadow-core-tls-renew.timer"' "no daemon-reload / TLS timer not re-enabled"
+# One step only: reenable (disable + enable) killed in between would leave
+# the timer off, and the next run would keep it off.
+check '! out_has "reenable" && ! out_has "systemctl disable"' "a timer was disabled on the way (reenable / disable)"
+check '! out_has "enable shadow-core-update.timer" && out_has "shadow-core-update.timer is not enabled; it stays off"' "a disabled timer was enabled"
 check 'out_has "shadow-core.service changed; it takes effect at the next restart" && [[ "$(restarts)" == 1 ]]' "unit change note / extra restart"
 check '! ls -a "$R/usr/local/sbin" "$R/etc/systemd/system" "$R/usr/local/lib/shadow-assistant" | grep -q "^\.\(shadow\|install\)"' "temporary files left behind"
 upd --now
@@ -576,7 +579,7 @@ for e in "${DEPLOY_MAP[@]}"; do cp -- "$HERE/${e%%|*}" "$R/${e#*|}"; done
 PKG_DEPLOY=1 publish 0.2.6
 api core-v0.2.6 core-v0.2.5
 upd --now
-check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 ]] && deploy_is_new && out_has "skipped: systemctl daemon-reload" && out_has "skipped: systemctl reenable shadow-core-tls-renew.timer" && ! out_has "shadow-core.service changed"' "rc $RC"
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 ]] && deploy_is_new && out_has "skipped: systemctl daemon-reload" && out_has "skipped: systemctl enable shadow-core-tls-renew.timer" && ! out_has "reenable" && ! out_has "shadow-core.service changed"' "rc $RC"
 
 fresh "release without deploy files (up to 0.2.4): refresh skipped" 0.2.5
 old_deploy
@@ -628,6 +631,16 @@ api core-v0.2.6 core-v0.2.5
 upd --now
 check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 ]] && deploy_is_old && out_has "/usr/local/lib is missing, not a folder or a symlink"' "rc $RC"
 
+fresh "enabled updater timer: enabled again in one step, never disabled on the way" 0.2.5
+old_deploy
+ln -s /etc/systemd/system/shadow-core-update.timer "$R/etc/systemd/system/timers.target.wants/shadow-core-update.timer"
+PKG_DEPLOY=1 publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 ]] && deploy_is_new && out_has "skipped: systemctl enable shadow-core-update.timer" && [[ -L "$R/etc/systemd/system/timers.target.wants/shadow-core-update.timer" ]]' "rc $RC"
+check '! out_has "reenable" && ! out_has "systemctl disable"' "the updater timer went through disabled (a kill there leaves it off)"
+
+
 fresh "group-writable destination folder: nothing installed" 0.2.5
 old_deploy
 chmod 0775 "$R/etc/systemd/system"
@@ -643,7 +656,7 @@ printf '# off\n' > "$R/etc/shadow-assistant/core-update.disabled"
 PKG_DEPLOY=1 publish 0.2.6
 api core-v0.2.6 core-v0.2.5
 upd --now
-check '[[ $RC -eq 0 ]] && deploy_is_new && out_has "automatic updates are off" && ! out_has "reenable shadow-core-update.timer" && out_has "reenable shadow-core-tls-renew.timer"' "rc $RC"
+check '[[ $RC -eq 0 ]] && deploy_is_new && out_has "automatic updates are off" && ! out_has "enable shadow-core-update.timer" && out_has "skipped: systemctl enable shadow-core-tls-renew.timer"' "rc $RC"
 
 fresh "deploy-files by hand: untrusted source refused, nothing created" 0.2.5
 old_deploy

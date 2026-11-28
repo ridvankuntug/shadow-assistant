@@ -1014,13 +1014,22 @@ deploy_files_main() {
   # is completed by the next one, although the files are equal by then.
   sysctl daemon-reload
   for u in "$TLS_TIMER" "$UPDATE_TIMER"; do
-    # A changed [Install] section takes effect only through re-enabling; a
+    # A changed [Install] section takes effect only through enabling again; a
     # timer that is off stays off, and the updater's timer stays off while
     # automatic updates are off (core-update.disabled).
+    # Plain "enable", not "reenable": reenable is disable + enable in two
+    # steps, and a run killed in between would leave the timer disabled,
+    # which the next run takes for "off by choice" (automatic updates
+    # silently off). enable is one step and only adds the symlinks of the
+    # current [Install] section (an existing one is left alone), so an
+    # interrupted run never turns a timer off. Not --force (only replaces
+    # conflicting symlinks) nor preset (follows the preset policy, which may
+    # disable). Cost: a symlink of a WantedBy= the new unit dropped stays
+    # until "systemctl reenable" by hand; the timers use timers.target.
     if [[ "$u" == "$UPDATE_TIMER" && ( -e "$(p "$UPDATE_DISABLED_REAL")" || -L "$(p "$UPDATE_DISABLED_REAL")" ) ]]; then
       info "$u: automatic updates are off ($UPDATE_DISABLED_REAL): not re-enabled"
     elif timer_enabled "$u"; then
-      sysctl reenable "$u"
+      sysctl enable "$u"
     else
       info "$u is not enabled; it stays off"
     fi
