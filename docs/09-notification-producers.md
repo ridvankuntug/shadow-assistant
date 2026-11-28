@@ -432,7 +432,10 @@ wired in `index.ts`; tests in `core/test/claude-login.test.ts`.
 
 - **Signals (no model call).** (1) A model turn whose SDK assistant message
   carries the structured error `authentication_failed` (not logged in, expired
-  or revoked token, invalid credentials): down at once. Other SDK errors
+  or revoked token, invalid credentials): down at once. Chat turns and the
+  background one-shot calls (memory extraction, compaction summaries;
+  `ClaudeSdkProvider.oneShot`) report the same way; background calls post no
+  chat message. Other SDK errors
   (`rate_limit`, `overloaded`, `server_error`, `billing_error`, …) are not
   login problems. (2) Every 5 min the CLI's `.credentials.json` in
   `CLAUDE_CONFIG_DIR` (default `~/.claude`) is read: missing, unreadable, not
@@ -441,8 +444,9 @@ wired in `index.ts`; tests in `core/test/claude-login.test.ts`.
   with `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` set and on macOS
   (Keychain); turn errors still count.
 - **Back.** The file check passes and no turn error is pending. A turn error is
-  cleared by a later successful turn, or by the credentials file being
-  rewritten since the error (a new `/login` or a successful token refresh).
+  cleared by a later successful turn (chat or background call), or by the
+  credentials file being rewritten since the error (a new `/login` or a
+  successful token refresh).
 - **Item.** Source `claude-login`, key `login`, normal, one per outage (fixed
   Turkish text pointing to the T11.3 step of docs/05 "Claude login"),
   resolved when the login is back. Startup reconcile, "Tekrar gösterme" and

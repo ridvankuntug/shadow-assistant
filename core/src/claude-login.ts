@@ -12,6 +12,8 @@
  *   `TurnResult.errorKind = "login"` and the session calls `turnFailed()`.
  *   Rate limits, overload, network and API errors carry other values and are
  *   not login problems. A later successful turn calls `turnSucceeded()`.
+ *   Background one-shot calls (memory; device-agent.ts `ClaudeSdkProvider.oneShot`)
+ *   report the same way, without a chat message.
  * - **Regular check** every `CLAUDE_LOGIN_INTERVAL_MS`: the CLI's
  *   `.credentials.json` in `CLAUDE_CONFIG_DIR` (default `~/.claude`) is
  *   missing, unreadable, not JSON, or holds no refresh token → login down.
@@ -134,7 +136,7 @@ export interface LoginNotificationPort {
   suppressed?(): Promise<ReadonlyArray<{ source: string; key: string }>>;
 }
 
-/** The session's side (session.ts `SessionDeps.modelLogin`). */
+/** The reporting side: session.ts `SessionDeps.modelLogin` and device-agent.ts `ClaudeSdkProviderOptions.modelLogin`. */
 export interface ModelLoginWatch {
   /** A model turn failed because the login was rejected. */
   turnFailed(): void;

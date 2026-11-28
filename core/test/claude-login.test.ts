@@ -107,6 +107,8 @@ class FakeCenter implements LoginNotificationPort {
   suppressedKeys: Array<{ source: string; key: string }> = [];
   failRaise = false;
   unreadable = false;
+  /** suppressed.json unreadable: `suppressed()` rejects. */
+  suppressedUnreadable = false;
   async raise(input: RaiseInput): Promise<RaiseResult> {
     if (this.failRaise) throw new Error("disk");
     this.raises.push(input);
@@ -128,6 +130,7 @@ class FakeCenter implements LoginNotificationPort {
     });
   }
   async suppressed() {
+    if (this.suppressedUnreadable) throw new Error("unreadable");
     return this.suppressedKeys;
   }
 }
@@ -372,6 +375,28 @@ test("a failed raise is retried after 60 s; an unreadable inbox at startup too",
   await b.m.checkNow();
   assert.equal(c2.raises.length, 1);
   await b.m.close();
+});
+
+test("an unreadable suppression list is re-read after 60 s (one warn line); then a suppressed key is adopted and resolved", async () => {
+  const f = join(credDir(), ".credentials.json");
+  writeLogin(f);
+  const center = new FakeCenter();
+  center.suppressedKeys = [{ source: CLAUDE_LOGIN_SOURCE, key: CLAUDE_LOGIN_KEY }];
+  center.suppressedUnreadable = true;
+  const { m, timers, logs } = monitor(f, center);
+  m.start();
+  await m.idle();
+  assert.equal(timers.delay, 60_000, "retry, not the regular interval");
+  assert.deepEqual(center.resolves, [], "the suppressed key is not known yet");
+  await m.checkNow();
+  assert.equal(timers.delay, 60_000, "still unreadable: still the retry");
+  assert.equal(logs.filter((l) => l.includes("suppression list")).length, 1, "one warn line, not one per retry");
+  center.suppressedUnreadable = false;
+  await m.checkNow();
+  assert.deepEqual(center.resolves, [ITEM], "adopted as open, so the working login resolves it");
+  assert.deepEqual(center.suppressedKeys, []);
+  assert.equal(timers.delay, CLAUDE_LOGIN_INTERVAL_MS);
+  await m.close();
 });
 
 test("close stops the timer; checks after close do nothing", async () => {

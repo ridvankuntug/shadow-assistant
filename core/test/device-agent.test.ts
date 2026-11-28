@@ -450,6 +450,42 @@ test("T20: assistant authentication_failed → status error with errorKind login
   agent.close();
 });
 
+test("T20: the login flag is dropped for a usage limit, a timeout and a cancel (only an error outcome carries it)", async () => {
+  // Usage limit: an authentication_failed message, then a rejected rate limit and an error result.
+  const f = new FakeSdk();
+  f.reply = (_m, ff) => {
+    ff.assistant([{ type: "text", text: "Not logged in" }], { error: "authentication_failed" });
+    ff.push({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: 1_767_340_800 } });
+    ff.result({ result: "You've hit your limit · resets 5pm", is_error: true });
+  };
+  const agent = makeAgent(f);
+  const lim = await agent.runAttempt(attempt("1")).settled;
+  assert.equal(lim.status, "usage_limit");
+  assert.equal(lim.errorKind, undefined);
+  agent.close();
+
+  // Timeout: the message arrives, no result before the turn timeout.
+  const g = new FakeSdk();
+  g.reply = (_m, ff) => ff.assistant([{ type: "text", text: "Not logged in" }], { error: "authentication_failed" });
+  const slow = makeAgent(g, { turnTimeoutMs: 20 });
+  const to = await slow.runAttempt(attempt("2")).settled;
+  assert.equal(to.status, "timeout");
+  assert.equal(to.errorKind, undefined);
+  slow.close();
+
+  // Cancel: the message arrives, then the user interrupts.
+  const c = new FakeSdk();
+  c.reply = (_m, ff) => ff.assistant([{ type: "text", text: "Not logged in" }], { error: "authentication_failed" });
+  const cancelled = makeAgent(c);
+  const h = cancelled.runAttempt(attempt("3"));
+  await tick();
+  await cancelled.interrupt();
+  const cr = await h.settled;
+  assert.equal(cr.status, "cancelled");
+  assert.equal(cr.errorKind, undefined);
+  cancelled.close();
+});
+
 test("usage limit from the result error text alone; other errors stay errors", async () => {
   const f = new FakeSdk();
   f.reply = (_m, ff) => {
@@ -849,6 +885,55 @@ test("ClaudeSdkProvider: openSession builds a DeviceAgent; oneShot returns text,
   const ac = new AbortController();
   ac.abort();
   assert.equal((await provider.oneShot({ model: "haiku", prompt: "özetle", maxTokens: 100, signal: ac.signal })).status, "cancelled");
+});
+
+test("T20: ClaudeSdkProvider.oneShot reports to the login watch like a chat turn (error → failed, ok → succeeded, limit/cancel → nothing)", async () => {
+  type Step = { error?: string; rateLimited?: boolean; result: Record<string, unknown> } | "abort";
+  const steps: Step[] = [
+    { error: "authentication_failed", result: { subtype: "success", is_error: true, result: "Not logged in · Please run /login" } },
+    { result: { result: "özet" } },
+    { error: "overloaded", result: { subtype: "success", is_error: true, result: "busy" } },
+    { error: "authentication_failed", rateLimited: true, result: { subtype: "success", is_error: true, result: "You've hit your limit" } },
+    "abort",
+  ];
+  let call = 0;
+  const ac = new AbortController();
+  const queryFn = ({ prompt }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }): Query => {
+    const step = steps[call++];
+    async function* gen(): AsyncGenerator<SDKMessage, void> {
+      for await (const m of prompt) {
+        assert.equal(m.message.content, "özetle");
+        if (step === "abort") {
+          yield msg({ type: "assistant", parent_tool_use_id: null, error: "authentication_failed", message: { model: "m", content: [{ type: "text", text: "Not logged in" }] } });
+          ac.abort();
+          throw new Error("aborted");
+        }
+        if (step?.rateLimited) yield msg({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: 1_767_340_800 } });
+        yield msg({ type: "assistant", parent_tool_use_id: null, ...(step?.error ? { error: step.error } : {}), message: { model: "m", content: [{ type: "text", text: "x" }] } });
+        yield msg({ type: "result", subtype: "success", is_error: false, duration_ms: 1, usage: { input_tokens: 1, output_tokens: 1 }, ...step?.result });
+        return;
+      }
+    }
+    return Object.assign(gen(), { close: () => {} }) as unknown as Query;
+  };
+  const calls: string[] = [];
+  const provider = new ClaudeSdkProvider({
+    queryFn,
+    buildOptions: (p) => ({ model: p.model }),
+    buildOneShotOptions: (p) => ({ model: p.model }),
+    modelLogin: { turnFailed: () => calls.push("failed"), turnSucceeded: () => calls.push("ok") },
+  });
+  const run = (signal?: AbortSignal) => provider.oneShot({ model: "haiku", prompt: "özetle", maxTokens: 100, ...(signal ? { signal } : {}) });
+
+  const a = await run();
+  assert.equal(a.status, "error");
+  assert.deepEqual(calls, ["failed"]);
+  assert.equal((await run()).status, "ok");
+  assert.deepEqual(calls, ["failed", "ok"]);
+  assert.equal((await run()).status, "error", "another SDK error is no login problem");
+  assert.equal((await run()).status, "usage_limit");
+  assert.equal((await run(ac.signal)).status, "cancelled");
+  assert.deepEqual(calls, ["failed", "ok"], "no report for a non-login error, a limit or a cancel");
 });
 
 test("gate dispatcher bindTurn carries the attempt's turn id; tool result error text is forwarded (T7.w.10j)", async () => {

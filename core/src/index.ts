@@ -218,6 +218,22 @@ export async function main(): Promise<void> {
     stderr: (line) => logger.warn(`[shadow-core] sdk: ${line.trimEnd()}`),
   });
 
+  // Claude login check (T20, docs/09 (d)): the CLI's credentials file every few minutes (no model call)
+  // and login errors of model turns (sessions and the provider's one-shot calls report them).
+  // Runs in rehearsal too (rehearsal.ts). Built before the provider so background calls at
+  // startup are not lost; the notification port below is only used after `start()` (producers,
+  // further down), when notificationCenter / notificationStore exist. Before that, reports only set state.
+  const loginFileOff = fileCheckOff(process.env);
+  const claudeLogin = new ClaudeLoginMonitor({
+    notifications: {
+      raise: (input) => notificationCenter.raise(input),
+      resolve: (source, key) => notificationCenter.resolve(source, key),
+      list: () => notificationStore.list(),
+      suppressed: () => notificationCenter.suppressed(),
+    },
+    logger,
+    credentialsFile: loginFileOff ? undefined : credentialsFile(process.env),
+  });
   // The model provider: live sessions (persistent mode) and one-shot background calls (memory).
   // No MCP freshness check: the CLI only has in-process gateway servers; the
   // remote connection is the Core's own and reconnects on demand (mcp-direct.ts).
@@ -225,6 +241,7 @@ export async function main(): Promise<void> {
     queryFn: query,
     buildOptions: (p) => agent.buildPersistentOptions(p),
     buildOneShotOptions: buildOneShotOptions(agentCwd, agentEnv),
+    modelLogin: claudeLogin,
     session: {
       idleMs: cfg.agent.idleMin * 60_000,
       turnTimeoutMs: cfg.agent.turnTimeoutMs,
@@ -428,19 +445,6 @@ export async function main(): Promise<void> {
       suppressed: () => notificationCenter.suppressed(),
     },
     logger,
-  });
-  // Claude login check (T20, docs/09 (d)): the CLI's credentials file every few minutes (no model call)
-  // and login errors of model turns (sessions report them). Runs in rehearsal too (rehearsal.ts).
-  const loginFileOff = fileCheckOff(process.env);
-  const claudeLogin = new ClaudeLoginMonitor({
-    notifications: {
-      raise: (input) => notificationCenter.raise(input),
-      resolve: (source, key) => notificationCenter.resolve(source, key),
-      list: () => notificationStore.list(),
-      suppressed: () => notificationCenter.suppressed(),
-    },
-    logger,
-    credentialsFile: loginFileOff ? undefined : credentialsFile(process.env),
   });
   // HA alerts producer (docs/09 (c)): HA's persistent notifications over a read-only WebSocket client;
   // off (one info line) without HA_URL / HA_CORE_TOKEN. Adoption reads the store directly.

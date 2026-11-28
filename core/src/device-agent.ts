@@ -37,6 +37,7 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { TurnStream, type TurnCallbacks } from "./agent.js";
+import { isLoginError, type ModelLoginWatch } from "./claude-login.js";
 import type { BoundGate, GatewayGate } from "./mcp-gateway.js";
 import {
   SessionBusyError,
@@ -929,6 +930,11 @@ export interface ClaudeSdkProviderOptions {
     maxTokens: number;
     abortController: AbortController;
   }) => Omit<Options, "prompt">;
+  /**
+   * The login watch (T20, claude-login.ts): one-shot calls report a login rejection and a
+   * normal answer the same way chat turns do (session.ts). No chat message comes from here.
+   */
+  modelLogin?: ModelLoginWatch;
   /** Defaults for every live session (timeouts, MCP freshness, log). */
   session?: Pick<
     DeviceAgentOptions,
@@ -962,6 +968,7 @@ export class ClaudeSdkProvider implements ModelProvider {
     let rejected = false;
     let resetsAt: number | undefined;
     let failure: string | undefined;
+    let loginError = false;
     try {
       const options = this.o.buildOneShotOptions({
         model: req.model,
@@ -975,6 +982,8 @@ export class ClaudeSdkProvider implements ModelProvider {
       for await (const m of q) {
         if (m.type === "assistant" && !m.parent_tool_use_id) {
           if (m.message?.model) model = m.message.model;
+          // The structured SDK error, never the message text (as agent.ts TurnStream).
+          if (isLoginError(m.error)) loginError = true;
           for (const b of m.message?.content ?? []) if (b.type === "text") assistantText += b.text;
         } else if (m.type === "rate_limit_event" && m.rate_limit_info.status === "rejected") {
           rejected = true;
@@ -996,6 +1005,13 @@ export class ClaudeSdkProvider implements ModelProvider {
       req.signal?.removeEventListener("abort", onAbort);
     }
     if (ac.signal.aborted) return { ...base, model, status: "cancelled" };
+    // Same semantics as session.ts: a login rejection only counts for an `error` outcome (not a
+    // limit or cancel), and only a normal answer says the login works.
+    const report = (r: OneShotResult): OneShotResult => {
+      if (r.status === "error" && loginError) this.o.modelLogin?.turnFailed();
+      else if (r.status === "ok" && !loginError) this.o.modelLogin?.turnSucceeded();
+      return r;
+    };
     const u = (res?.usage ?? {}) as unknown as Record<string, number | undefined>;
     const usage = {
       inputTokens: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0),
@@ -1008,7 +1024,7 @@ export class ClaudeSdkProvider implements ModelProvider {
       return { ...base, ...usage, model, status: "usage_limit", error: "usage limit reached", ...(retryAt !== undefined ? { retryAt } : {}) };
     }
     if (!res || res.subtype !== "success" || res.is_error) {
-      return { ...base, ...usage, model, status: "error", error: failure ?? (resultText || "no result") };
+      return report({ ...base, ...usage, model, status: "error", error: failure ?? (resultText || "no result") });
     }
     const text = res.result || assistantText;
     let json: unknown;
@@ -1018,11 +1034,11 @@ export class ClaudeSdkProvider implements ModelProvider {
         try {
           json = JSON.parse(text);
         } catch {
-          return { ...base, ...usage, text, model, status: "error", error: "no structured output" };
+          return report({ ...base, ...usage, text, model, status: "error", error: "no structured output" });
         }
       }
     }
-    return { ...base, ...usage, text, model, status: "ok", ...(json !== undefined ? { json } : {}) };
+    return report({ ...base, ...usage, text, model, status: "ok", ...(json !== undefined ? { json } : {}) });
   }
 }
 
