@@ -149,12 +149,44 @@ prepare_state() {
     [[ ! -e "$STATE" ]] || die "$STATE_REAL exists and is not a folder"
     mkdir -m 0700 -- "$STATE"
   fi
+  if [[ $OWN_CHECK -eq 1 && "$(stat -c '%u' -- "$STATE")" != 0 ]]; then die "$STATE_REAL is not owned by root (uid $(stat -c '%u' -- "$STATE")); refusing (check its files, then: chown -R root:root $STATE_REAL)"; fi
   chmod 0700 -- "$STATE"
-  if [[ $OWN_CHECK -eq 1 && "$(stat -c '%u' -- "$STATE")" != 0 ]]; then die "$STATE_REAL is not owned by root; refusing"; fi
+  check_state_files
+}
+
+# The files the updater reads or writes in its state folder. One not owned by
+# root was written while the folder was open to another account (that account
+# could have cleared `failed` or planted `pending`): refused, not repaired, so
+# the content is checked by hand first. A symlink is refused too (every write
+# here would follow it). Loose modes of root's own files are only tightened.
+readonly STATE_FILES=(lock failed pending pending.new releases.json health.json download)
+check_state_files() {
+  local name f mode
+  for name in "${STATE_FILES[@]}"; do
+    f="$STATE/$name"
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ ! -L "$f" ]] || die "$STATE_REAL/$name is a symlink; refusing (remove it after checking it)"
+    if [[ $OWN_CHECK -eq 1 && "$(stat -c '%u' -- "$f")" != 0 ]]; then
+      die "$STATE_REAL/$name is not owned by root (uid $(stat -c '%u' -- "$f")); refusing (check its content, then: chown root:root $STATE_REAL/$name)"
+    fi
+    if [[ "$name" == download ]]; then
+      [[ -d "$f" ]] || die "$STATE_REAL/download is not a folder; refusing"
+      continue
+    fi
+    [[ -f "$f" ]] || die "$STATE_REAL/$name is not a regular file; refusing"
+    mode="$(stat -c '%a' -- "$f")"
+    if (( (8#$mode & 8#077) != 0 )); then
+      log "$STATE_REAL/$name had mode $mode; set to 600"
+      chmod 0600 -- "$f"
+    fi
+  done
 }
 
 # One run at a time (timer and a manual run). The lock is released when the
-# process exits, also when it is killed.
+# process exits, also when it is killed. fd 9 stays open (and locked) for the
+# whole run; install-core.sh, started by installer(), inherits it and checks
+# that it really is this lock (SHADOW_CORE_UPDATE_LOCK_HELD alone is not
+# trusted).
 take_lock() {
   local lock="$STATE/lock"
   [[ ! -L "$lock" ]] || die "$STATE_REAL/lock is a symlink; refusing"
@@ -163,6 +195,33 @@ take_lock() {
     log "another update run is in progress; nothing to do"
     exit 0
   fi
+}
+
+# An install killed between its mktemp and the final rename (install-core.sh
+# release/install, SIGKILL or power loss: its EXIT trap never ran) leaves
+# releases/.staging.<random>. Every install holds the lock, so with it held
+# such a folder is a leftover. Only names mktemp makes, directly in releases/,
+# real folders only (a symlink is left alone; rm -rf never follows links
+# inside).
+clean_staging() {
+  local releases d name
+  releases="$(p "$CORE_REAL/releases")"
+  [[ -d "$releases" && ! -L "$releases" ]] || return 0
+  if [[ $OWN_CHECK -eq 1 && "$(stat -c '%u' -- "$releases")" != 0 ]]; then
+    log "$CORE_REAL/releases is not owned by root; leftover .staging folders are not removed"
+    return 0
+  fi
+  for d in "$releases"/.staging.*; do
+    [[ -e "$d" || -L "$d" ]] || continue
+    name="${d##*/}"
+    [[ "$name" =~ ^\.staging\.[0-9A-Za-z]{1,64}$ ]] || continue
+    if [[ -L "$d" || ! -d "$d" ]]; then
+      log "releases/$name is not a folder; left alone"
+      continue
+    fi
+    log "removing releases/$name (left by an interrupted install)"
+    rm -rf -- "${releases:?}/$name"
+  done
 }
 
 readonly VERSION_RE='^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$'
@@ -555,6 +614,7 @@ main() {
   check_root_and_tools
   prepare_state
   take_lock
+  [[ "$MODE" != now ]] || clean_staging
   read_core_port
   recover_pending
   read_current

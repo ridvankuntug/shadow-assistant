@@ -997,7 +997,16 @@ deciding on a partial list (install the newest release by hand). A run killed
 before the switch is simply repeated; one killed after it is rolled back. The updater never touches the data folder, the vault clone,
 `core.env` or the credstore. Its state is in a root-owned folder (not in the
 Core's `/var/lib/shadow-assistant/`), so the Core's account cannot clear the
-`failed` list.
+`failed` list. Every run checks it first: the folder and its files (`lock`,
+`failed`, `pending`, `download`, ...) must be root's and not symlinks, or the
+run fails without touching anything (check the content, then `chown
+root:root`); looser modes of root's own files are tightened to `0600`. The
+lock is held for the whole run; `install-core.sh` started by the updater
+inherits it and checks that it really holds it (the
+`SHADOW_CORE_UPDATE_LOCK_HELD` variable alone does not skip the lock). An
+install killed half-way leaves `releases/.staging.<random>`; the next `--now`
+run removes such folders (only real folders with that name pattern directly
+in `releases/`).
 
 Look at it:
 
@@ -1040,7 +1049,7 @@ güncelleme geri alındı (<version>)`) and the unit is left failed.
 scenarios (fake `curl` and `systemctl`, a test root, a throw-away key pair):
 update, same version, other series, signature and checksum rejects, failed
 and data-format skips, health failure with rollback, interrupted run, prune,
-offline, lock, `--check`, `--dry-run`, and the installer's `release`,
+offline, lock, state-folder ownership, `.staging` cleanup, `--check`, `--dry-run`, and the installer's `release`,
 `switch` and timer options. It needs Linux with `openssl`, `node` and `flock`
 (the header shows a Docker command). Not yet run on the Pi.
 

@@ -419,6 +419,63 @@ PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" > "$W/
 exec 8>&-
 check '[[ $RC -ne 0 ]] && out_has "in progress"' "rc $RC"
 
+fresh "the lock variable alone does not skip the lock" 0.2.5 0.2.6
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+exec 8>>"$R/var/lib/shadow-assistant-updater/lock"; flock -n 8
+SHADOW_CORE_UPDATE_LOCK_HELD=1 PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 && "$(current)" == releases/0.2.6 ]] && out_has "in progress"' "rc $RC current $(current)"
+# fd 9 open on another file: not taken for the lock either.
+SHADOW_CORE_UPDATE_LOCK_HELD=1 PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" 9>>"$W/other-lock" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 && "$(current)" == releases/0.2.6 ]] && out_has "in progress"' "fd 9 elsewhere: rc $RC current $(current)"
+exec 8>&-
+# Lock free: the variable is harmless, the switch takes the lock itself.
+SHADOW_CORE_UPDATE_LOCK_HELD=1 PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.5 ]]' "free lock: rc $RC current $(current)"
+
+fresh "state file not owned by root: refuse, failed list kept" 0.2.5
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+: > "$R/var/lib/shadow-assistant-updater/failed"; chown 65534:65534 "$R/var/lib/shadow-assistant-updater/failed"
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(downloads)" == 0 ]] && out_has "failed is not owned by root"' "rc $RC current $(current)"
+
+fresh "state folder not owned by root: refuse" 0.2.5
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chown 65534:65534 "$R/var/lib/shadow-assistant-updater"
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(downloads)" == 0 ]] && out_has "shadow-assistant-updater is not owned by root"' "rc $RC current $(current)"
+
+fresh "planted pending symlink: refuse" 0.2.5
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0700 "$R/var/lib/shadow-assistant-updater"
+ln -s "$W/elsewhere" "$R/var/lib/shadow-assistant-updater/pending"
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && ! -e "$W/elsewhere" ]] && out_has "pending is a symlink"' "rc $RC"
+
+fresh "loose mode of a root state file is tightened" 0.2.5
+api core-v0.2.5
+mkdir -p "$R/var/lib/shadow-assistant-updater"; chmod 0777 "$R/var/lib/shadow-assistant-updater"
+echo 0.2.4 > "$R/var/lib/shadow-assistant-updater/failed"; chmod 0666 "$R/var/lib/shadow-assistant-updater/failed"
+upd --now
+check '[[ $RC -eq 0 && "$(stat -c %a "$R/var/lib/shadow-assistant-updater/failed")" == 600 && "$(stat -c %a "$R/var/lib/shadow-assistant-updater")" == 700 ]] && out_has "had mode 666"' "rc $RC"
+
+fresh "leftover .staging folders are removed, nothing else" 0.2.5
+api core-v0.2.5
+rel="$R/opt/shadow-assistant/core/releases"
+mkdir -p "$rel/.staging.AbC123/x/core" "$W/outside/keep"
+ln -s "$W/outside" "$rel/.staging.link01"
+ln -s "$W/outside" "$rel/.staging.AbC123/x/core/link"
+mkdir "$rel/.staging.bad-name" "$rel/.stagingX"
+upd --now
+check '[[ $RC -eq 0 && ! -e "$rel/.staging.AbC123" && -d "$W/outside/keep" && -L "$rel/.staging.link01" ]] && out_has "removing releases/.staging.AbC123"' "rc $RC"
+check '[[ -d "$rel/.staging.bad-name" && -d "$rel/.stagingX" && -d "$rel/0.2.5" ]]' "removed more than the leftovers"
+mkdir "$rel/.staging.Zz9999"
+upd --check
+check '[[ $RC -eq 0 && -d "$rel/.staging.Zz9999" ]]' "--check removed a folder"
+
 fresh "untrusted public key (group-writable): refuse" 0.2.5
 publish 0.2.6
 api core-v0.2.6 core-v0.2.5

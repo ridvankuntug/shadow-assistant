@@ -865,12 +865,15 @@ install_main() {
 }
 
 # install, release and switch never run next to an updater run (or each
-# other): the updater's lock. The updater sets SHADOW_CORE_UPDATE_LOCK_HELD=1
-# for its own calls (it holds the lock). Not with --dry-run.
+# other): the updater's lock. Not with --dry-run. The updater calls this
+# script with SHADOW_CORE_UPDATE_LOCK_HELD=1 and its locked fd 9 inherited:
+# the variable alone is not trusted (a root shell that has it set must not
+# skip the lock); fd 9 must be this lock file, and flock on it must succeed
+# (it does for the same open file the updater locked, not while another
+# process holds the lock). Otherwise the lock is taken as usual.
 take_update_lock() {
   local dir
   [[ $DRY_RUN -eq 0 ]] || return 0
-  [[ "${SHADOW_CORE_UPDATE_LOCK_HELD:-}" != 1 ]] || return 0
   command -v flock >/dev/null 2>&1 || die "flock not found (util-linux)"
   dir="$(p "$UPDATE_STATE_REAL")"
   in_root "$dir"
@@ -879,7 +882,13 @@ take_update_lock() {
     ensure_dir "$(p /var/lib)"
     mkdir -m 0700 -- "$dir"
   fi
+  # Root-owned like the updater requires: another account owning it could
+  # swap the lock file.
+  if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$dir")" != 0 ]]; then die "$UPDATE_STATE_REAL is not owned by root; refusing"; fi
   [[ ! -L "$dir/lock" ]] || die "$UPDATE_STATE_REAL/lock is a symlink; refusing"
+  if [[ "${SHADOW_CORE_UPDATE_LOCK_HELD:-}" == 1 && -f "$dir/lock" ]]     && [[ "$(stat -L -c '%d:%i' /proc/self/fd/9 2>/dev/null)" == "$(stat -c '%d:%i' -- "$dir/lock")" ]]     && flock -n 9; then
+    return 0
+  fi
   exec 9>>"$dir/lock"
   flock -n 9 || die "an update run (shadow-core-update) or another install is in progress; try again in a few minutes (journalctl -u shadow-core-update)"
 }
