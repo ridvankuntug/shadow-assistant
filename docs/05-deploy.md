@@ -820,8 +820,7 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    value held in a user environment variable:
 
    ```powershell
-   [Environment]::GetEnvironmentVariable('HA_CORE_TOKEN','User') | ssh <user>@<pi> "tr -d '
-' | sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN"
+   [Environment]::GetEnvironmentVariable('HA_CORE_TOKEN','User') | ssh <user>@<pi> "tr -d '' | sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN"
    ```
 
    An existing secret is changed only with `--replace`. Restart the Core

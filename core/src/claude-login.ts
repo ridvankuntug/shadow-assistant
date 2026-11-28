@@ -174,6 +174,8 @@ export class ClaudeLoginMonitor implements ModelLoginWatch {
   private turnDown = false;
   /** The file's mtime seen first after the turn error (null: no file then); undefined = not yet seen. */
   private turnMtime: number | null | undefined;
+  /** Counts `turnFailed()` calls: a probe started before the latest one cannot be its reference. */
+  private turnGen = 0;
   /** The item is in the inbox (or suppressed): the recovery must resolve it. */
   private open = false;
   /** Last logged state, for one log line per change. */
@@ -208,6 +210,7 @@ export class ClaudeLoginMonitor implements ModelLoginWatch {
 
   turnFailed(): void {
     this.turnDown = true;
+    this.turnGen++;
     this.turnMtime = undefined; // the next check records the file as it is now
     if (this.started) void this.checkNow();
   }
@@ -261,10 +264,15 @@ export class ClaudeLoginMonitor implements ModelLoginWatch {
     let retry: number | undefined;
     if (!this.suppressedAdopted && !(await this.adoptSuppressed())) retry = this.now() + RETRY_MS;
 
+    const gen = this.turnGen;
     const probe = this.o.credentialsFile !== undefined ? await probeCredentials(this.o.credentialsFile, this.o.fs) : undefined;
     if (this.turnDown && probe) {
       const mtime = probe.mtimeMs ?? null;
-      if (this.turnMtime === undefined) this.turnMtime = mtime;
+      // A turn error that arrived while this probe ran: the file may have changed before it,
+      // so this (older) look is no reference; the rerun (`again`) records one.
+      if (this.turnMtime === undefined) {
+        if (gen === this.turnGen) this.turnMtime = mtime;
+      }
       else if (probe.state === "ok" && mtime !== this.turnMtime) {
         // Rewritten since the error: a new login or a successful refresh by the CLI.
         this.turnDown = false;

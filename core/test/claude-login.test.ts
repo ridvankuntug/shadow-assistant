@@ -228,6 +228,54 @@ test("after a turn login error, a rewritten credentials file (new login or refre
   await m.close();
 });
 
+test("a turn error during a running probe: the older look is no reference, so a rewrite before the error does not clear it", async () => {
+  let mtime = 1_000;
+  let hold: Promise<void> | undefined;
+  let entered: (() => void) | undefined;
+  const fs = {
+    stat: async () => {
+      const seen = mtime;
+      if (hold) {
+        entered?.();
+        await hold;
+      }
+      return { mtimeMs: seen };
+    },
+    readFile: async () => JSON.stringify({ claudeAiOauth: { refreshToken: SECRET } }),
+  };
+  const center = new FakeCenter();
+  const m = new ClaudeLoginMonitor({
+    notifications: center,
+    logger: { info: () => {}, warn: () => {} },
+    credentialsFile: "/x/.credentials.json",
+    timers: new FakeTimers(),
+    now: () => 1_700_000_000_000,
+    fs,
+  });
+  m.start();
+  await m.idle();
+  // A regular check reads the old mtime and waits; the CLI rewrites the file; then the turn fails.
+  let release!: () => void;
+  hold = new Promise<void>((r) => (release = r));
+  const inProbe = new Promise<void>((r) => (entered = r));
+  const check = m.checkNow();
+  await inProbe;
+  hold = undefined;
+  mtime = 2_000;
+  m.turnFailed();
+  release();
+  await check;
+  await m.idle();
+  assert.equal(m.down, true, "still down: the file did not change after the error");
+  await m.checkNow();
+  assert.equal(m.down, true);
+  assert.equal(center.resolves.length, 0);
+  mtime = 3_000; // rewritten after the error
+  await m.checkNow();
+  assert.equal(m.down, false);
+  await m.close();
+});
+
 test("file check off: only turns count (a turn error stays down until a successful turn)", async () => {
   const { m, center, timers } = monitor(undefined);
   m.start();
