@@ -41,7 +41,7 @@ jobs:
       # Secrets cannot be used in `if:` directly; this is only "set or not".
       HAS_SIGNING_KEY: ${{ secrets.CORE_RELEASE_SIGNING_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Full version X.Y.<run>: X.Y from the first line of VERSION, <run> = this
       # workflow's run number. Release only on main of this repository; any other run
@@ -68,7 +68,7 @@ jobs:
           fi
 
       # Node 24, the Pi's version.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -155,7 +155,7 @@ jobs:
             -czf "$out/$PKG_NAME.tar.gz" "$PKG_NAME"
           (cd "$out" && sha256sum "$PKG_NAME.tar.gz" > SHA256SUMS && cat SHA256SUMS)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: core-package
           path: ${{ runner.temp }}/release-files/
@@ -171,13 +171,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: deploy/linux
           sparse-checkout-cone-mode: true
           path: repo
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: core-package
           path: release-files
@@ -221,7 +221,7 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/core-release.key"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: core-signed
           path: release-files/
@@ -242,7 +242,7 @@ jobs:
       group: core-release
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: core-signed
           path: release-files
@@ -332,7 +332,7 @@ jobs:
       # deleted (the checks above already refuse that case). make_latest false: the
       # Android updater reads releases/latest and must keep seeing its own releases.
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.existing.outputs.tag }}
           name: Core ${{ needs.package.outputs.version }}
