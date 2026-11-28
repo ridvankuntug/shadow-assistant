@@ -370,6 +370,11 @@ export class TurnStream {
         this.durationMs = msg.duration_ms;
         if (msg.subtype === "success" && !msg.is_error) {
           this.finalText = msg.result;
+          // A successful result decides the turn, as in device-agent.ts (settleFromResult: status
+          // "ok") and its oneShot: an earlier assistant-message error, also authentication_failed,
+          // does not make it a failed or login-rejected turn (T20).
+          this.error = undefined;
+          this.errorKind = undefined;
         } else {
           const detail = msg.subtype === "success" ? msg.result : (msg.errors ?? []).join("; ");
           this.error = `${msg.subtype}${detail ? `: ${detail}` : ""}`;

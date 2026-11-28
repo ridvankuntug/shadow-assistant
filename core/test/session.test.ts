@@ -8,8 +8,8 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
+import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { TurnStream, type AgentRunner, type TurnCallbacks, type TurnRequest, type TurnResult } from "../src/agent.js";
 import { CLAUDE_LOGIN_TURN_MESSAGE, type ModelLoginWatch } from "../src/claude-login.js";
 import { ConversationLog } from "../src/conversation-log.js";
 import { PermissionPolicy } from "../src/permissions.js";
@@ -407,6 +407,22 @@ test("T20 legacy path: errorKind login → error model_login (Turkish text) and 
   await h.send({ type: "user_text", id: "t2", text: "y" });
   assert.deepEqual(calls, ["failed", "ok"]);
   assert.equal(h.of("state").at(-1)?.state, "idle");
+});
+
+test("T20 legacy path: authentication_failed then a successful result is a success (as the persistent path)", async () => {
+  const calls: string[] = [];
+  const modelLogin: ModelLoginWatch = { turnFailed: () => calls.push("failed"), turnSucceeded: () => calls.push("ok") };
+  // The real TurnStream of SdkAgentRunner.runTurn, fed the SDK messages of such a turn.
+  const h = harness(async (_req, cb) => {
+    const s = new TurnStream(cb);
+    s.consume({ type: "assistant", parent_tool_use_id: null, session_id: "s1", error: "authentication_failed", message: { content: [] } } as unknown as SDKMessage);
+    s.consume({ type: "result", subtype: "success", is_error: false, result: "Tamam.", session_id: "s1", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } } as unknown as SDKMessage);
+    return s.result(0);
+  }, { modelLogin });
+  await h.send({ type: "user_text", id: "t1", text: "x" });
+  assert.deepEqual(calls, ["ok"]);
+  assert.equal(h.of("error").length, 0);
+  assert.equal(h.of("assistant_done")[0]?.text, "Tamam.");
 });
 
 test("audio turn: transcript then handled like user_text", async () => {

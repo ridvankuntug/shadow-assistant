@@ -188,6 +188,31 @@ test("TurnStream: no partials → final text; error results surface", () => {
   assert.equal(e.result(0).errorKind, undefined, "a result error alone is not a login error");
 });
 
+test("TurnStream: authentication_failed then a successful result is a successful turn (as the persistent path)", () => {
+  const s = new TurnStream({ onDelta: () => {} });
+  s.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s6", error: "authentication_failed", message: { content: [] } }));
+  s.consume(msg({ type: "result", subtype: "success", is_error: false, result: "Tamam.", session_id: "s6", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  const r = s.result(0);
+  assert.equal(r.error, undefined);
+  assert.equal(r.errorKind, undefined);
+  assert.equal(r.text, "Tamam.");
+
+  // A failed result after it still carries the login flag.
+  const f = new TurnStream({ onDelta: () => {} });
+  f.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s7", error: "authentication_failed", message: { content: [] } }));
+  f.consume(msg({ type: "result", subtype: "success", is_error: true, result: "Not logged in", session_id: "s7", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  assert.match(f.result(0).error ?? "", /Not logged in/);
+  assert.equal(f.result(0).errorKind, "login");
+
+  // An SDK failure after the successful result still fails the turn (not a login error).
+  const t = new TurnStream({ onDelta: () => {} });
+  t.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s8", error: "authentication_failed", message: { content: [] } }));
+  t.consume(msg({ type: "result", subtype: "success", is_error: false, result: "x", session_id: "s8", duration_ms: 5, usage: { input_tokens: 1, output_tokens: 1 } }));
+  t.fail("process exited");
+  assert.equal(t.result(0).error, "process exited");
+  assert.equal(t.result(0).errorKind, undefined);
+});
+
 test("persistent options: one static prompt with tier1.md, all MCP servers, no tier/fork inputs", () => {
   const runner = new SdkAgentRunner({
     systemPrompt: "sys",
