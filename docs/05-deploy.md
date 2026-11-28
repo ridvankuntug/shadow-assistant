@@ -1033,14 +1033,31 @@ until `install ... --auto-update`. `shadow-core-update --now` by hand still
 works while it is off.
 
 **Data-format change.** A release that changes the format of the data
-folder must not be installed by the timer. Mark it by writing
-`data-format-change` (any case) anywhere in its GitHub release notes; the
-updater then skips it **and every later release** (they carry the change
-too) until the marked release has been installed by hand: verify it ("Verify
-a release by hand" above), back up, then step 4 of "Install". The workflow
-writes the notes itself, so the marker can only be added after the release
-is published, and a timer run can come first: before pushing such a change,
-turn automatic updates off (above) and turn them on after the manual step.
+folder must not be installed by the timer. The updater skips a release whose
+GitHub release notes contain `data-format-change` (any case) **and every
+later release** (they carry the change too) until the marked release has
+been installed by hand: verify it ("Verify a release by hand" above), back
+up, then step 4 of "Install".
+
+The workflow writes that marker itself from a commit trailer. Put this line
+in the trailer block of the commit (the last paragraph, next to
+`Co-Authored-By:`):
+
+```text
+Data-Format-Change: <short reason, e.g. conversations move to data/conv>
+```
+
+Every commit since the previous `core-v*` tag counts (merged branches too),
+so a marked commit pushed together with others, or one whose own run did not
+publish, still marks the next release. Each one adds a line
+`data-format-change: <reason> (<commit>)` to the notes
+(`.github/scripts/core-release-notes.sh`, tests in
+`.github/scripts/tests/core-release-notes.test.sh`; the first release, with
+no earlier tag, checks only its own commit). A line in the commit body that
+is not in the trailer block does not count (git's trailer rules). A marker
+can also be typed into the notes of a published release by hand, but a
+timer run can come first; with the trailer the release is marked from the
+start.
 
 **Rollback notification (open).** docs/13 section 6.2 asks for a Core
 notification "güncelleme geri alındı (<version>)" after a rollback. The Core

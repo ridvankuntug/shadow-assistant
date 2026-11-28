@@ -246,6 +246,14 @@ jobs:
       group: core-release
       cancel-in-progress: false
     steps:
+      # Full history and tags: the notes look for Data-Format-Change trailers in every
+      # commit since the previous core-v* tag (.github/scripts/core-release-notes.sh).
+      # No npm code runs in this job; the token is not kept in the clone.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - uses: actions/download-artifact@v7
         with:
           name: core-signed
@@ -314,21 +322,10 @@ jobs:
             fi
           done
           fingerprint="$(cat release-files/key-fingerprint.txt)"
-          {
-            echo "Shadow Assistant Core $VERSION_FULL for the Pi (linux-arm64, Node 24)."
-            echo
-            echo "- Version: \`$VERSION_FULL\` (reported by \`GET /health\`)"
-            echo "- Commit: \`$COMMIT\`"
-            echo "- Package: \`$pkg\` (install: \`install-core.sh install --user <user> --release $pkg\`, docs/05 §7)"
-            echo "- Signing key: ECDSA P-256, SHA-256 of the DER public key \`$fingerprint\`"
-            echo
-            echo "Verify (needs the public key \`deploy/linux/core-release.pub\` from the repository):"
-            echo
-            echo '```sh'
-            echo "openssl dgst -sha256 -verify core-release.pub -signature SHA256SUMS.sig SHA256SUMS"
-            echo "sha256sum -c SHA256SUMS"
-            echo '```'
-          } > notes.md
+          # Adds "data-format-change: <reason>" lines (the Pi updater's marker) for
+          # Data-Format-Change trailers since the previous core-v* tag (docs/05 §7).
+          bash .github/scripts/core-release-notes.sh "$VERSION_FULL" "$COMMIT" "$pkg" "$fingerprint" > notes.md
+          cat notes.md
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
 
