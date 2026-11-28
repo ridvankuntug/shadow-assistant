@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline scenario tests for shadow-core-update.sh (T12.2) and the parts of
-# install-core.sh it uses (release, switch) or that install it. No network, no
+# install-core.sh it uses (release, switch, deploy-files) or that install it. No network, no
 # systemd: curl and systemctl are fakes on PATH, every system path lives under
 # a test root (--root). A real signing key pair is made for each run.
 #
@@ -10,7 +10,7 @@
 # Exit 0 when every scenario passes.
 
 # check takes its condition in single quotes on purpose (evaluated later).
-# shellcheck disable=SC2016,SC2012
+# shellcheck disable=SC2016,SC2012,SC2034
 set -uo pipefail
 export LC_ALL=C
 
@@ -98,7 +98,26 @@ release_tree() {
   echo "routes: []" > "$d/router.yaml"
   echo "module.exports = 1" > "$d/core/node_modules/x/index.js"
   [[ "${3:-}" != broken ]] || touch "$d/BROKEN"
+  # PKG_DEPLOY=1: deploy/linux/ as .github/scripts/core-package-deploy.sh packs it.
+  if [[ "${PKG_DEPLOY:-0}" == 1 ]]; then
+    mkdir -p "$d/deploy/linux"
+    local f
+    for f in "${DEPLOY_SRC[@]}" core.env.example core-release.pub; do cp -- "$HERE/$f" "$d/deploy/linux/$f"; done
+  fi
 }
+# The deploy files deploy-files installs: "<file in deploy/linux>|<destination>".
+DEPLOY_MAP=(
+  "shadow-core.service|etc/systemd/system/shadow-core.service"
+  "shadow-core-tls.sh|usr/local/sbin/shadow-core-tls"
+  "shadow-core-tls-renew.service|etc/systemd/system/shadow-core-tls-renew.service"
+  "shadow-core-tls-renew.timer|etc/systemd/system/shadow-core-tls-renew.timer"
+  "shadow-core-update.sh|usr/local/sbin/shadow-core-update"
+  "install-core.sh|usr/local/lib/shadow-assistant/install-core.sh"
+  "shadow-core-update.service|etc/systemd/system/shadow-core-update.service"
+  "shadow-core-update.timer|etc/systemd/system/shadow-core-update.timer"
+)
+DEPLOY_SRC=()
+for e in "${DEPLOY_MAP[@]}"; do DEPLOY_SRC+=("${e%%|*}"); done
 
 # publish <version> [broken|badsig|badsum|badversion|nosig]: the three assets.
 publish() {
@@ -109,6 +128,7 @@ publish() {
   rm -rf -- "$dir" "$stage"; mkdir -p "$dir" "$stage"
   [[ "$how" != badversion ]] || pv="9.9.9"
   release_tree "$stage/$name" "$pv" "$( [[ "$how" == broken ]] && echo broken )"
+  [[ -z "${PKG_HOOK:-}" ]] || (cd "$stage/$name" && eval "$PKG_HOOK")
   tar -C "$stage" -czf "$dir/$name.tar.gz" "$name"
   (cd "$dir" && sha256sum "$name.tar.gz" > SHA256SUMS)
   local key="$W/keys/good.key"
@@ -502,6 +522,129 @@ fresh "--root needs the test switch" 0.2.5
 PATH="$W/bin:$PATH" bash "$HERE/shadow-core-update.sh" --root "$R" --check > "$W/out" 2>&1; RC=$?
 check '[[ $RC -eq 1 ]] && out_has "deploy tests only"' "rc $RC"
 
+# ---------------------------------------------------------------- deploy files
+# old_deploy: the installed deploy files of an older install ("old <name>"),
+# except the installer copy (the update itself runs it); the TLS timer is
+# enabled, the updater's timer is not.
+old_deploy() {
+  local e name dst
+  mkdir -p "$R/etc/systemd/system/timers.target.wants" "$R/usr/local/sbin" "$R/etc/systemd/system/shadow-core.service.d"
+  for e in "${DEPLOY_MAP[@]}"; do
+    name="${e%%|*}"; dst="$R/${e#*|}"
+    [[ "$name" == install-core.sh ]] && continue
+    printf 'old %s\n' "$name" > "$dst"; chmod 0644 "$dst"
+  done
+  ln -s /etc/systemd/system/shadow-core-tls-renew.timer "$R/etc/systemd/system/timers.target.wants/shadow-core-tls-renew.timer"
+  echo "[Service]" > "$R/etc/systemd/system/shadow-core.service.d/local.conf"
+}
+deploy_is_new() { # every destination equals the repository's file
+  local e
+  for e in "${DEPLOY_MAP[@]}"; do cmp -s -- "$HERE/${e%%|*}" "$R/${e#*|}" || return 1; done
+}
+deploy_is_old() { # every destination but the installer copy is still "old"
+  local e
+  for e in "${DEPLOY_MAP[@]}"; do
+    [[ "${e%%|*}" == install-core.sh ]] && continue
+    [[ "$(cat -- "$R/${e#*|}")" == "old ${e%%|*}" ]] || return 1
+  done
+}
+snapshot_etc() { (cd "$R/etc" && find . -path ./systemd -prune -o -type f -print0 | sort -z | xargs -0 sha256sum; cat systemd/system/shadow-core.service.d/local.conf); }
+
+fresh "deploy files refreshed from the release after a successful update" 0.2.5
+old_deploy
+ino_before="$(stat -c %i "$R/usr/local/sbin/shadow-core-update")"
+etc_before="$(snapshot_etc)"
+PKG_DEPLOY=1 publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 && "$(restarts)" == 1 ]]' "rc $RC current $(current) restarts $(restarts)"
+check 'deploy_is_new' "a deploy file was not refreshed"
+check '[[ "$(stat -c %a "$R/usr/local/sbin/shadow-core-update")" == 755 && "$(stat -c %a "$R/usr/local/sbin/shadow-core-tls")" == 755 && "$(stat -c %a "$R/etc/systemd/system/shadow-core.service")" == 644 ]]' "modes"
+check '[[ "$(stat -c %u "$R/usr/local/sbin/shadow-core-update")" == 0 ]]' "owner"
+check '[[ "$(stat -c %i "$R/usr/local/sbin/shadow-core-update")" != "$ino_before" ]]' "the updater was rewritten in place, not replaced by a rename"
+check '[[ "$(snapshot_etc)" == "$etc_before" ]] && cmp -s "$W/keys/good.pub" "$R/etc/shadow-assistant/core-release.pub"' "core.env, the public key or local.conf changed"
+check 'out_has "skipped: systemctl daemon-reload" && out_has "skipped: systemctl reenable shadow-core-tls-renew.timer"' "no daemon-reload / TLS timer not re-enabled"
+check '! out_has "reenable shadow-core-update.timer" && out_has "shadow-core-update.timer changed; it is not enabled"' "a disabled timer was enabled"
+check 'out_has "shadow-core.service changed; it takes effect at the next restart" && [[ "$(restarts)" == 1 ]]' "unit change note / extra restart"
+check '! ls -a "$R/usr/local/sbin" "$R/etc/systemd/system" "$R/usr/local/lib/shadow-assistant" | grep -q "^\.\(shadow\|install\)"' "temporary files left behind"
+upd --now
+check '[[ $RC -eq 0 ]] && out_has "up to date" && ! out_has "deploy files"' "second run: rc $RC"
+
+fresh "deploy files up to date: no daemon-reload" 0.2.5
+old_deploy
+for e in "${DEPLOY_MAP[@]}"; do cp -- "$HERE/${e%%|*}" "$R/${e#*|}"; done
+PKG_DEPLOY=1 publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 ]] && out_has "units are up to date" && ! out_has "systemctl daemon-reload"' "rc $RC"
+
+fresh "release without deploy files (up to 0.2.4): refresh skipped" 0.2.5
+old_deploy
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 ]] && deploy_is_old && out_has "core-v0.2.6 has no deploy files"' "rc $RC"
+check '! out_has "systemctl daemon-reload"' "daemon-reload without a change"
+
+fresh "rolled-back release leaves the old deploy files" 0.2.5
+old_deploy
+PKG_DEPLOY=1 publish 0.2.6 broken
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.5 && "$(failed_list)" == 0.2.6 ]]' "rc $RC current $(current)"
+check 'deploy_is_old && ! out_has "systemctl daemon-reload" && ! out_has "refreshing"' "deploy files of the failed release installed"
+
+fresh "planted destination symlink: nothing installed, run fails, update kept" 0.2.5
+old_deploy
+mkdir -p "$W/elsewhere"; echo keep > "$W/elsewhere/tls"
+rm -f "$R/usr/local/sbin/shadow-core-tls"; ln -s "$W/elsewhere/tls" "$R/usr/local/sbin/shadow-core-tls"
+PKG_DEPLOY=1 publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 && "$(cat "$W/elsewhere/tls")" == keep && -L "$R/usr/local/sbin/shadow-core-tls" ]]' "rc $RC current $(current)"
+check '[[ "$(cat "$R/etc/systemd/system/shadow-core.service")" == "old shadow-core.service" ]] && out_has "shadow-core-tls is a symlink; nothing installed" && out_has "the Core update itself succeeded"' "a file was installed before the check"
+check '[[ -z "$(failed_list)" && ! -e "$R/var/lib/shadow-assistant-updater/pending" ]]' "the good release was marked failed"
+rm -rf "$W/elsewhere"
+
+fresh "symlink inside the release's deploy folder: refused" 0.2.5
+old_deploy
+PKG_DEPLOY=1 PKG_HOOK='rm deploy/linux/shadow-core-tls.sh && ln -s shadow-core-update.sh deploy/linux/shadow-core-tls.sh' publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 ]] && deploy_is_old && out_has "shadow-core-tls.sh is missing or not a regular file"' "rc $RC"
+
+fresh "release deploy folder is a symlink: refused" 0.2.5
+old_deploy
+PKG_DEPLOY=1 PKG_HOOK='mv deploy/linux deploy/real && ln -s real deploy/linux' publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 1 && "$(current)" == releases/0.2.6 ]] && deploy_is_old && out_has "deploy/linux is not a folder"' "rc $RC"
+
+fresh "updater timer stays off while automatic updates are off" 0.2.5
+old_deploy
+ln -s /etc/systemd/system/shadow-core-update.timer "$R/etc/systemd/system/timers.target.wants/shadow-core-update.timer"
+printf '# off\n' > "$R/etc/shadow-assistant/core-update.disabled"
+PKG_DEPLOY=1 publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+upd --now
+check '[[ $RC -eq 0 ]] && deploy_is_new && out_has "automatic updates are off" && ! out_has "reenable shadow-core-update.timer" && out_has "reenable shadow-core-tls-renew.timer"' "rc $RC"
+
+fresh "deploy-files by hand: untrusted source refused, nothing created" 0.2.5
+old_deploy
+mkdir -p "$W/src"; for f in "${DEPLOY_SRC[@]}"; do cp -- "$HERE/$f" "$W/src/"; done; chmod 0755 "$W/src"; chmod -R go-w "$W/src"
+chown 65534:65534 "$W/src/shadow-core-update.sh"
+PATH="$W/bin:$PATH" bash "$W/src/install-core.sh" deploy-files --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 ]] && deploy_is_old && out_has "shadow-core-update.sh is not owned by root"' "foreign-owned file: rc $RC"
+chown 0:0 "$W/src/shadow-core-update.sh"; chmod 0775 "$W/src"
+PATH="$W/bin:$PATH" bash "$W/src/install-core.sh" deploy-files --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 ]] && deploy_is_old && out_has "writable by group or others"' "group-writable folder: rc $RC"
+chmod 0755 "$W/src"; rm -rf "$R/usr/local/lib/shadow-assistant"
+PATH="$W/bin:$PATH" bash "$W/src/install-core.sh" deploy-files --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 && ! -e "$R/usr/local/lib/shadow-assistant" ]] && deploy_is_old && out_has "run '"'"'install'"'"' first"' "missing folder created: rc $RC"
+PATH="$W/bin:$PATH" bash "$W/src/install-core.sh" deploy-files --user pi --root "$R" > "$W/out" 2>&1; RC=$?
+check '[[ $RC -ne 0 ]] && out_has "--user is not used by deploy-files"' "--user accepted: rc $RC"
+rm -rf "$W/src"
+
 # ---------------------------------------------------------------- install-core.sh
 fresh "install-core.sh switch: atomic switch, refuses unknown names" 0.2.5 0.2.6
 PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" switch 0.2.5 --root "$R" > "$W/out" 2>&1; RC=$?
@@ -532,6 +675,7 @@ check '[[ $RC -eq 0 ]]' "rc $RC"
 check '[[ -x "$R/usr/local/sbin/shadow-core-update" && -f "$R/usr/local/lib/shadow-assistant/install-core.sh" ]]' "scripts not installed"
 check 'cmp -s "$HERE/core-release.pub" "$R/etc/shadow-assistant/core-release.pub"' "public key not installed"
 check '[[ -f "$R/etc/systemd/system/shadow-core-update.service" && -f "$R/etc/systemd/system/shadow-core-update.timer" ]]' "units not installed"
+check 'deploy_is_new && cmp -s "$HERE/core.env.example" "$R/etc/shadow-assistant/core.env"' "install did not put every deploy file in place"
 check 'out_has "skipped: systemctl enable --now shadow-core-update.timer"' "timer not enabled"
 check '[[ "$(stat -c %a "$R/etc/shadow-assistant/core-release.pub")" == 644 && "$(stat -c %a "$R/usr/local/sbin/shadow-core-update")" == 755 ]]' "modes"
 PATH="$W/bin:$PATH" bash "$HERE/install-core.sh" install --user pi --no-auto-update --root "$R" > "$W/out" 2>&1; RC=$?

@@ -9,6 +9,9 @@
 # installed X.Y, verifies the signature of SHA256SUMS and the package checksum,
 # installs it (install-core.sh release), restarts shadow-core and waits 90 s for
 # GET /health with the new version; on failure it switches back and restarts.
+# After a successful update it installs the new release's scripts and units
+# (install-core.sh deploy-files: itself, the installer copy, the TLS script,
+# the five units; daemon-reload if one changed). Never the public key.
 # Offline or nothing new: exits 0. A rejected download, a failed pre-check or a
 # rollback leaves the unit failed: systemctl --failed,
 # journalctl -u shadow-core-update. By hand: sudo shadow-core-update --check
@@ -47,10 +50,17 @@ UMask=0077
 StateDirectory=shadow-assistant-updater
 StateDirectoryMode=0700
 
-# --- file system: read-only except the Core releases and its own state; the
-# data folder and the vault clone (/var/lib/shadow-assistant) stay read-only.
+# --- file system: read-only except the Core releases, its own state and the
+# folders of the deploy files it refreshes (/usr/local/sbin: the updater and
+# the TLS script; /usr/local/lib/shadow-assistant: the installer copy;
+# /etc/systemd/system: the units). Write access to the units means this
+# service can change what runs as root anyway: the files it writes come only
+# from a signed, verified release (docs/05 section 7 "Automatic updates").
+# The data folder and the vault clone (/var/lib/shadow-assistant), core.env,
+# the public key and the credstore (/etc) stay read-only.
 ProtectSystem=strict
 ReadWritePaths=/opt/shadow-assistant/core
+ReadWritePaths=/usr/local/sbin -/usr/local/lib/shadow-assistant /etc/systemd/system
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

@@ -9,6 +9,7 @@
 #   install-core.sh set-secret <NAME> [--user <name>] [--replace]
 #   install-core.sh release --release <dir|tarball>   (the updater's step, T12.2)
 #   install-core.sh switch <release folder name>       (the updater's rollback)
+#   install-core.sh deploy-files                       (the updater's step after an update)
 #   install-core.sh --help
 # Common options: --dry-run (print, change nothing), --root <dir> (prefix every
 # system path, for tests; skips systemctl).
@@ -31,6 +32,14 @@
 #   release     only copies a release and switches `current` (as install does);
 #               the releases/ folder must exist already. No unit, no restart.
 #   switch      only switches `current` to an installed releases/<name>/.
+#   deploy-files
+#               only installs the scripts and units of this script's folder
+#               (the updater, this script's copy, the TLS script, the five
+#               units; never core.env, local.conf, the credstore or the
+#               public key); daemon-reload if a unit changed. The updater runs
+#               it from the deploy/linux/ folder of a release it has just
+#               installed; this folder and its files must be root's and not
+#               writable by others. No restart, no timer enabled.
 #   set-secret  reads one secret without echo (never from the command line) into
 #               /etc/credstore/shadow-core.<NAME> (root 0600, folder 0700) and
 #               regenerates the LoadCredential= lines of local.conf.
@@ -77,7 +86,7 @@ AUTO_UPDATE=""   # "", on, off
 SWITCH_TO=""
 
 usage() {
-  sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() { printf 'install-core: error: %s\n' "$*" >&2; exit 1; }
@@ -90,9 +99,9 @@ need_value() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value
 parse_args() {
   [[ $# -gt 0 ]] || { usage; exit 2; }
   case "$1" in
-    install|set-secret|release|switch) CMD="$1"; shift ;;
+    install|set-secret|release|switch|deploy-files) CMD="$1"; shift ;;
     -h|--help|help) usage; exit 0 ;;
-    *) die "unknown command '$1' (install, set-secret, release, switch, --help)" ;;
+    *) die "unknown command '$1' (install, set-secret, release, switch, deploy-files, --help)" ;;
   esac
   if [[ "$CMD" == set-secret ]]; then
     [[ $# -gt 0 && "$1" != --* ]] || die "set-secret needs a secret name, e.g. set-secret DEVICE_TOKEN_PHONE"
@@ -118,7 +127,7 @@ parse_args() {
     esac
   done
   if [[ "$CMD" == release && -z "$RELEASE" ]]; then die "release needs --release <dir|tarball>"; fi
-  if [[ -n "$USER_NAME" && ( "$CMD" == release || "$CMD" == switch ) ]]; then die "--user is not used by $CMD"; fi
+  if [[ -n "$USER_NAME" && ( "$CMD" == release || "$CMD" == switch || "$CMD" == deploy-files ) ]]; then die "--user is not used by $CMD"; fi
   if [[ -n "$ROOT" ]]; then
     [[ -d "$ROOT" ]] || die "--root $ROOT is not a folder"
     ROOT="$(cd -- "$ROOT" && pwd -P)"
@@ -384,7 +393,7 @@ check_links_inside() {
 }
 
 make_release_dirs() {
-  # release/switch (the updater, whose sandbox may write only
+  # release/switch (the updater, whose sandbox may write under /opt only in
   # /opt/shadow-assistant/core) never create or re-own these folders: the
   # first install is a manual "install". They must exist and be root's.
   if [[ "$CMD" != install ]]; then
@@ -489,36 +498,51 @@ install_copy() {
   put_file "$mode" "$dst" < "$src"
 }
 
-install_unit() {
-  ensure_dir "$(p "$SYSTEMD_DIR_REAL")"
-  install_copy 0644 "$UNIT_NAME" "$UNIT_REAL"
-  if [[ $COPIED -eq 1 ]]; then UNIT_CHANGED=1; fi
-}
-UNIT_CHANGED=0
+# The scripts and units of this folder that install and deploy-files put in
+# place: "<mode>|<file in this folder>|<real destination>". Not core.env
+# (created once from the example), not local.conf (written), not the public
+# key (install only: an update never replaces its own trust root).
+readonly DEPLOY_FILES=(
+  "0644|$UNIT_NAME|$UNIT_REAL"
+  "0755|$TLS_SCRIPT|$TLS_BIN_REAL"
+  "0644|$TLS_SERVICE|$SYSTEMD_DIR_REAL/$TLS_SERVICE"
+  "0644|$TLS_TIMER|$SYSTEMD_DIR_REAL/$TLS_TIMER"
+  "0755|$UPDATE_SCRIPT|$UPDATE_BIN_REAL"
+  "0755|install-core.sh|$INSTALLER_COPY_REAL"
+  "0644|$UPDATE_SERVICE|$SYSTEMD_DIR_REAL/$UPDATE_SERVICE"
+  "0644|$UPDATE_TIMER|$SYSTEMD_DIR_REAL/$UPDATE_TIMER"
+)
+# The folders they go to (install creates the last one).
+readonly DEPLOY_DIRS_REAL=("$SYSTEMD_DIR_REAL" /usr/local/sbin "$LIB_DIR_REAL")
 
+# copy_deploy_files: install_copy of every DEPLOY_FILES entry. Sets
+# UNIT_CHANGED (shadow-core.service) and CHANGED_UNITS (every unit copied).
 # The TLS script and its weekly renewal timer (docs/05 section 7 "HTTPS
-# certificate"). The timer's service is skipped until the CA exists, so the
+# certificate"): the timer's service is skipped until the CA exists, so the
 # timer is enabled on every install; creating the CA is the separate step
-# "shadow-core-tls init --ip <pi-lan-ip>".
-install_tls_tools() {
-  ensure_dir "$(p /usr/local/sbin)"
-  install_copy 0755 "$TLS_SCRIPT" "$TLS_BIN_REAL"
-  install_copy 0644 "$TLS_SERVICE" "$SYSTEMD_DIR_REAL/$TLS_SERVICE"
-  install_copy 0644 "$TLS_TIMER" "$SYSTEMD_DIR_REAL/$TLS_TIMER"
+# "shadow-core-tls init --ip <pi-lan-ip>". The updater (T12.2) runs "release"
+# and "switch" from the copy of this script.
+UNIT_CHANGED=0
+CHANGED_UNITS=()
+copy_deploy_files() {
+  local e mode name real
+  for e in "${DEPLOY_FILES[@]}"; do
+    IFS='|' read -r mode name real <<<"$e"
+    install_copy "$mode" "$name" "$real"
+    [[ $COPIED -eq 1 ]] || continue
+    case "$name" in
+      *.service|*.timer) CHANGED_UNITS+=("$name") ;;
+    esac
+    [[ "$name" != "$UNIT_NAME" ]] || UNIT_CHANGED=1
+  done
 }
 
-# The updater (T12.2): its script, units, the release public key it verifies
-# with, and a copy of this script (it runs "release" and "switch" from there).
-# Called after install_env (the public key goes into /etc/shadow-assistant).
-install_updater() {
+# The folders of DEPLOY_FILES for install (created if missing).
+make_deploy_dirs() {
+  ensure_dir "$(p "$SYSTEMD_DIR_REAL")"
   ensure_dir "$(p /usr/local/sbin)"
-  install_copy 0755 "$UPDATE_SCRIPT" "$UPDATE_BIN_REAL"
   ensure_dir "$(p /usr/local/lib)"
   own_dir 0755 root:root "$(p "$LIB_DIR_REAL")"
-  install_copy 0755 "install-core.sh" "$INSTALLER_COPY_REAL"
-  install_copy 0644 "core-release.pub" "$PUBKEY_REAL"
-  install_copy 0644 "$UPDATE_SERVICE" "$SYSTEMD_DIR_REAL/$UPDATE_SERVICE"
-  install_copy 0644 "$UPDATE_TIMER" "$SYSTEMD_DIR_REAL/$UPDATE_TIMER"
 }
 
 # The updater's timer: on unless automatic updates are off. "Off" is kept in a
@@ -837,7 +861,7 @@ install_main() {
   fi
 
   if [[ -n "$RELEASE" ]]; then install_release; else info "no --release: keeping $(readlink -- "$(p "$CORE_REAL/current")")"; fi
-  install_unit
+  make_deploy_dirs
   install_env
   install_state
   check_credstore
@@ -847,8 +871,10 @@ install_main() {
     warn "User= changes from $old_user to $USER_NAME; systemd re-owns $STATE_REAL at the next start"
   fi
   write_dropin "$USER_NAME"
-  install_tls_tools
-  install_updater
+  copy_deploy_files
+  # The release public key the updater verifies with (after install_env:
+  # it goes into /etc/shadow-assistant).
+  install_copy 0644 "core-release.pub" "$PUBKEY_REAL"
   sysctl daemon-reload
   sysctl enable "$UNIT_NAME"
   sysctl enable --now "$TLS_TIMER"
@@ -915,6 +941,93 @@ switch_main() {
   switch_current "$SWITCH_TO"
 }
 
+# ---------------------------------------------------------------- deploy-files
+# The updater's step after a successful update (shadow-core-update, run from
+# releases/<version>/deploy/linux/ of the release it has just installed): the
+# scripts and units of this folder replace the installed ones. Everything is
+# checked before the first file is written; each file is replaced atomically
+# (put_file: temp file + rename, never written in place, so a running copy of
+# the updater or of this script keeps reading its old file). Symlinks are
+# refused, as sources and as destinations or their folders.
+check_deploy_sources() {
+  local e mode name real f
+  check_trusted_dir "$SCRIPT_DIR"
+  for e in "${DEPLOY_FILES[@]}"; do
+    IFS='|' read -r mode name real <<<"$e"
+    f="$SCRIPT_DIR/$name"
+    [[ -f "$f" && ! -L "$f" ]] || die "$f is missing or not a regular file; nothing installed"
+    if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$f")" != 0 ]]; then die "$f is not owned by root; nothing installed"; fi
+    (( (8#$(file_mode "$f") & 8#022) == 0 )) || die "$f is writable by group or others; nothing installed"
+  done
+}
+
+# check_trusted_dir <path>: a real folder, root's, not writable by others.
+check_trusted_dir() {
+  [[ -d "$1" && ! -L "$1" ]] || die "$1 is not a folder; nothing installed"
+  if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$1")" != 0 ]]; then die "$1 is not owned by root; nothing installed (to install from a checkout use 'install')"; fi
+  (( (8#$(file_mode "$1") & 8#022) == 0 )) || die "$1 is writable by group or others; nothing installed"
+}
+
+check_deploy_targets() {
+  local d e mode name real dst
+  # deploy-files never creates folders (the updater's sandbox may write only
+  # into these): they exist since the first install.
+  for d in "${DEPLOY_DIRS_REAL[@]}"; do
+    in_root "$(p "$d")"
+    [[ -d "$(p "$d")" && ! -L "$(p "$d")" ]] || die "$d is missing, not a folder or a symlink; nothing installed (run 'install' first)"
+  done
+  for e in "${DEPLOY_FILES[@]}"; do
+    IFS='|' read -r mode name real <<<"$e"
+    dst="$(p "$real")"
+    [[ ! -L "$dst" ]] || die "$real is a symlink; nothing installed (check it, then remove it)"
+    in_root "$dst"
+    [[ ! -e "$dst" || -f "$dst" ]] || die "$real exists and is not a regular file; nothing installed"
+  done
+}
+
+# Enabled = has its [Install] symlink. Under --root (no systemctl) the
+# symlink of its WantedBy=timers.target is looked at.
+timer_enabled() {
+  if [[ -n "$ROOT" ]]; then
+    [[ -L "$(p "$SYSTEMD_DIR_REAL/timers.target.wants/$1")" ]]
+  else
+    systemctl is-enabled --quiet "$1" 2>/dev/null
+  fi
+}
+
+deploy_files_main() {
+  local u
+  check_root_and_systemd
+  take_update_lock
+  check_deploy_sources
+  check_deploy_targets
+  info "installing the scripts and units from $SCRIPT_DIR"
+  copy_deploy_files
+  if [[ ${#CHANGED_UNITS[@]} -eq 0 ]]; then
+    info "the units are up to date; no daemon-reload"
+    return 0
+  fi
+  sysctl daemon-reload
+  for u in "${CHANGED_UNITS[@]}"; do
+    [[ "$u" == *.timer ]] || continue
+    # A changed [Install] section takes effect only through re-enabling; a
+    # timer that is off stays off, and the updater's timer stays off while
+    # automatic updates are off (core-update.disabled).
+    if [[ "$u" == "$UPDATE_TIMER" && ( -e "$(p "$UPDATE_DISABLED_REAL")" || -L "$(p "$UPDATE_DISABLED_REAL")" ) ]]; then
+      info "$u changed; automatic updates are off ($UPDATE_DISABLED_REAL): not re-enabled"
+    elif timer_enabled "$u"; then
+      sysctl reenable "$u"
+    else
+      info "$u changed; it is not enabled, so it stays off"
+    fi
+  done
+  if [[ $UNIT_CHANGED -eq 1 ]]; then
+    # Not restarted here: the new unit takes effect at the Core's next
+    # (re)start (next update, reboot, or by hand).
+    info "$UNIT_NAME changed; it takes effect at the next restart of the Core (sudo systemctl restart shadow-core)"
+  fi
+}
+
 next_steps() {
   local have_ha=0 have_dev=0 store
   store="$(p "$CREDSTORE_REAL")"
@@ -943,6 +1056,7 @@ main() {
     install) install_main ;;
     release) release_main ;;
     switch) switch_main ;;
+    deploy-files) deploy_files_main ;;
     set-secret)
       if [[ -z "$ROOT" && $EUID -ne 0 && $DRY_RUN -eq 0 ]]; then die "run as root (sudo $0 ...)"; fi
       [[ $EUID -eq 0 ]] || OWN_OK=0

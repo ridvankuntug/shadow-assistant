@@ -838,6 +838,16 @@ differs from or adds to the steps above:
 - Lock (one run at a time), a `pending` file so a killed run is rolled back
   by the next one, offline or GitHub errors end the run quietly, manual
   `--check` / `--dry-run` / `--now`.
+- Self-update (2026-11-28): the release package carries `deploy/linux/`
+  (the updater, `install-core.sh`, the TLS script, the five units; covered by
+  the signed `SHA256SUMS`). After a successful health check the updater runs
+  the new release's `install-core.sh deploy-files`: atomic replace, no
+  symlinks, `daemon-reload` on a unit change, timers re-enabled only if they
+  were enabled. Never the public key (no release replaces its own trust
+  root; rotation by hand), `core.env`, `local.conf` or the credstore. A
+  rolled-back release never reaches this step. A changed
+  `shadow-core.service` takes effect at the Core's next restart. docs/05
+  section 7 "Automatic updates" step 7.
 - **Open:** the Core notification "güncelleme geri alındı (<version>)". The
   Core has no local way to raise one without a new endpoint or a write into
   the data folder; the updater logs `NOTICE: güncelleme geri alındı (<version>)`

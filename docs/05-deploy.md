@@ -892,8 +892,9 @@ arm64 runner with Node 24 (the Pi's): it runs the Core and UI tests, builds
 both, installs `core/node_modules` with `npm ci --omit=dev` from the lock
 file (so `@anthropic-ai/claude-agent-sdk-linux-arm64` is the Pi's binary),
 and checks the layout the way `install-core.sh` does. A push to `main` that
-changes `core/`, `ui/` or `VERSION`, or a manual run on `main` (Actions →
-Core → Run workflow), publishes the GitHub Release `core-v<X.Y>.<n>`
+changes `core/`, `ui/`, `VERSION` or one of the packed deploy files (below),
+or a manual run on `main` (Actions → Core → Run workflow), publishes the
+GitHub Release `core-v<X.Y>.<n>`
 (`X.Y` from `VERSION`, `<n>` the workflow's run number; Android's tags are
 `v<X.Y>.<n>`). The UI in the package is built with `UI_VERSION=<X.Y>.<n>`,
 so it sends the release's exact version as `hello.clientVersion` (the Android
@@ -905,6 +906,19 @@ only `X.Y`. Assets:
 | `shadow-core-v<X.Y>.<n>-linux-arm64.tar.gz` | The release in one top-level folder; its `VERSION` holds `<X.Y>.<n>`, which the Core reports in `GET /health` and `install-core.sh` uses for `releases/<X.Y>.<n>/` |
 | `SHA256SUMS` | SHA-256 of the package |
 | `SHA256SUMS.sig` | ECDSA P-256 signature of `SHA256SUMS` (SHA-256, DER) |
+
+The package holds `VERSION`, `services.yaml`, `router.yaml`,
+`pronunciations.yaml`, `core/` (built, with production `node_modules`),
+`ui/dist/` and (releases after 0.2.4) `deploy/linux/`: `install-core.sh`,
+`shadow-core-update.sh`, `shadow-core-tls.sh`, the units
+`shadow-core.service`, `shadow-core-tls-renew.{service,timer}`,
+`shadow-core-update.{service,timer}`, plus `core.env.example` and
+`core-release.pub` (so the folder can also run a first `install`; the
+updater never installs those two). They are inside the package, so the
+signed `SHA256SUMS` covers them (`.github/scripts/core-package-deploy.sh`,
+tests in `.github/scripts/tests/core-package-deploy.test.sh`). The updater
+installs the scripts and units from there after an update ("Automatic
+updates" step 7).
 
 A Core release is never marked "latest" (the Android app reads the latest
 release). The workflow never publishes unsigned: without the signing key
@@ -934,7 +948,15 @@ never in the repository. The workflow checks that the secret is an
 unencrypted P-256 PEM key and, once `deploy/linux/core-release.pub` is
 committed, that it matches that file (the Pi updater, T12.2, verifies with
 it). A new key: repeat both steps; older releases then verify only with the
-old public key.
+old public key. The Pi keeps its own copy
+(`/etc/shadow-assistant/core-release.pub`), and no update replaces it (a
+signed release must not be able to swap its own trust root): after a key
+change, install the new public key on the Pi by hand **before** the first
+release signed with the new key, by running step 4 of "Install" again from a
+checkout that has the new `deploy/linux/core-release.pub`
+(`sudo bash ~/core-install/linux/install-core.sh install --user <user>`).
+Until then the updater rejects the new releases ("signature ... does not
+verify").
 
 **Verify a release by hand**, in a folder holding the three assets and
 `core-release.pub`:
@@ -989,6 +1011,36 @@ minutes (up to 10 minutes random delay). A run:
    `pending` file; a rollback that cannot complete keeps it, so the next run
    tries again). It keeps `current` and the two newest other releases (the
    previous one always) and deletes older ones from `releases/`.
+7. After a successful update only (health check passed): installs the
+   scripts and units of the new release from its `deploy/linux/` with that
+   release's own `install-core.sh deploy-files`: `/usr/local/sbin/shadow-core-update`
+   (the updater itself), the copy `/usr/local/lib/shadow-assistant/install-core.sh`,
+   `/usr/local/sbin/shadow-core-tls` and the five units in
+   `/etc/systemd/system/`. Everything is checked first (sources and
+   destinations regular files, no symlinks, sources root's and not writable
+   by others, the folders exist); then each file is replaced atomically
+   (temporary file + rename, so the running updater keeps reading its old
+   file). A changed unit: `systemctl daemon-reload`; a changed timer is
+   re-enabled only if it was enabled (the updater's timer never while
+   automatic updates are off). Never touched: the public key, `core.env`,
+   `local.conf`, the credstore. A release without `deploy/linux/` (up to
+   0.2.4): one journal line, nothing refreshed. A failure here keeps the
+   Core update (it passed its health check) but leaves the unit failed;
+   repeat by hand with
+   `sudo bash /opt/shadow-assistant/core/current/deploy/linux/install-core.sh deploy-files`.
+
+   Rollback: a release that fails its health check never gets this far, so
+   its deploy files are never installed. **A change to `shadow-core.service`**
+   is not applied by the update's restart (that happened before step 7): it
+   takes effect at the Core's next restart (the next update, a reboot, or
+   `sudo systemctl restart shadow-core`). A unit change must therefore work
+   with the previous Core as well; a release whose Core needs the new unit
+   at its first start is installed by hand (step 4 of "Install"). To make
+   room for step 7, the updater's sandbox may also write `/usr/local/sbin`,
+   `/usr/local/lib/shadow-assistant` and `/etc/systemd/system`: with write
+   access to the units it can change what runs as root, so a release signed
+   with the key can too (it could already replace the Core code). The
+   signing key protects all of it.
 
 No network, GitHub down or rate-limited, or a release whose files are not
 all uploaded yet: one journal line, the run ends without error and the next
@@ -1025,6 +1077,14 @@ sudo cat /var/lib/shadow-assistant-updater/failed
 A rejected download, a pre-check that fails or a rollback leaves the unit
 failed (`systemctl --failed`). To allow a failed version again, delete its
 line from `failed`.
+
+**[USER ACTION] Once, for an updater installed before step 7.** An older
+updater neither refreshes itself nor may its sandbox write the deploy
+folders. Run step 4 of "Install" once from a checkout with step 7
+(`sudo bash ~/core-install/linux/install-core.sh install --user <user>`,
+without `--release`: it keeps the installed Core and installs the new
+updater, its units and the installer copy); from then on the updater keeps
+them current itself.
 
 **Off and on.** `sudo bash ~/core-install/linux/install-core.sh install --user <user> --no-auto-update`
 disables the timer and writes `/etc/shadow-assistant/core-update.disabled`;
@@ -1069,8 +1129,11 @@ güncelleme geri alındı (<version>)`) and the unit is left failed.
 scenarios (fake `curl` and `systemctl`, a test root, a throw-away key pair):
 update, same version, other series, signature and checksum rejects, failed
 and data-format skips, health failure with rollback, interrupted run, prune,
-offline, lock, state-folder ownership, `.staging` cleanup, `--check`, `--dry-run`, and the installer's `release`,
-`switch` and timer options. It needs Linux with `openssl`, `node` and `flock`
+offline, lock, state-folder ownership, `.staging` cleanup, `--check`, `--dry-run`, the
+deploy-file refresh (refreshed after success, skipped for a release without
+them, kept on rollback, planted symlinks refused, daemon-reload only on a
+change, a disabled timer stays disabled), and the installer's `release`,
+`switch`, `deploy-files` and timer options. It needs Linux with `openssl`, `node` and `flock`
 (the header shows a Docker command). Not yet run on the Pi.
 
 ### Listeners and the HTTPS listener (T11.6)

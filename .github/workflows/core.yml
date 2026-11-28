@@ -2,8 +2,10 @@ name: Core
 
 # Builds the Pi Core release package (docs/13 §6.1, T12.1): the repository layout
 # deploy/linux/install-core.sh accepts, built on arm64 with production modules, plus
-# SHA256SUMS signed with ECDSA P-256 (SHA256SUMS.sig). A push to main of core/, ui/ or
-# VERSION (or a manual run on main) publishes a GitHub Release `core-vX.Y.<run>`;
+# SHA256SUMS signed with ECDSA P-256 (SHA256SUMS.sig). The package also carries the Pi
+# deploy files (deploy/linux/: the updater installs its scripts and units from there after
+# an update). A push to main of core/, ui/, VERSION or those deploy files (or a manual
+# run on main) publishes a GitHub Release `core-vX.Y.<run>`;
 # Android's tags are `vX.Y.<run>`, so the two never collide. Core releases are never
 # marked "latest": the Android app reads releases/latest (docs/10 D3).
 # The private signing key is the secret CORE_RELEASE_SIGNING_KEY; without it a release
@@ -17,6 +19,12 @@ on:
       - "core/**"
       - "ui/**"
       - "VERSION"
+      # The deploy files of the package (.github/scripts/core-package-deploy.sh).
+      - "deploy/linux/install-core.sh"
+      - "deploy/linux/shadow-core*"
+      - "deploy/linux/core.env.example"
+      - "deploy/linux/core-release.pub"
+      - ".github/scripts/core-package-deploy.sh"
   workflow_dispatch:
 
 permissions:
@@ -111,6 +119,8 @@ jobs:
           cp core/package.json core/package-lock.json "$root/core/"
           cp -r core/dist core/prompts "$root/core/"
           cp -r ui/dist "$root/ui/"
+          # deploy/linux/: the updater's scripts and units (docs/05 §7 "Automatic updates").
+          bash .github/scripts/core-package-deploy.sh deploy/linux "$root"
           (cd "$root/core" && npm ci --omit=dev --no-audit --no-fund)
           echo "PKG_NAME=$name" >> "$GITHUB_ENV"
           echo "PKG_ROOT=$root" >> "$GITHUB_ENV"
@@ -122,7 +132,7 @@ jobs:
           VERSION_FULL: ${{ steps.version.outputs.version }}
         run: |
           cd "$PKG_ROOT"
-          for f in VERSION core/package.json core/dist/index.js core/prompts/system.md core/prompts/tier1.md services.yaml router.yaml pronunciations.yaml ui/dist/index.html; do
+          for f in VERSION core/package.json core/dist/index.js core/prompts/system.md core/prompts/tier1.md services.yaml router.yaml pronunciations.yaml ui/dist/index.html deploy/linux/install-core.sh deploy/linux/shadow-core-update.sh; do
             [ -f "$f" ] || { echo "::error::package is missing $f"; exit 1; }
           done
           [ -d core/node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64 ] ||

@@ -34,9 +34,15 @@
 #      (never retried), switches `current` back (install-core.sh switch),
 #      restarts and waits for the old Core. Keeps `current` and the two newest
 #      other releases (the previous one always), deletes older ones.
+#   7. After a successful update only: installs the scripts and units of the
+#      new release (its deploy/linux/: this updater, the copy of
+#      install-core.sh, the TLS script, the five units) with that release's
+#      install-core.sh deploy-files; daemon-reload if a unit changed. Never
+#      the public key, core.env, local.conf or the credstore. A release
+#      without deploy/linux/ (up to 0.2.4): skipped with a log line.
 # Offline, GitHub down or rate-limited, assets not uploaded yet: one log line,
 # exit 0, the next timer run tries again. Never touches the data folder, the
-# vault clone, core.env or the credstore.
+# vault clone, core.env, the credstore or the public key.
 #
 # This file holds no user names, addresses or tokens.
 
@@ -613,6 +619,35 @@ prune() {
   done < <(printf '%s\n' "${names[@]}" | sort -rV)
 }
 
+# ---------------------------------------------------------------- deploy files
+# refresh_deploy_files <release folder>: after the health check of that
+# release (so a rolled-back release never leaves its files). Runs the
+# release's own install-core.sh (signed with the release, installed root-owned
+# by install-core.sh release): each release installs its deploy files the way
+# it knows. This script's own file is replaced by a rename: the running bash
+# keeps reading the old one. A failure here leaves the Core update in place
+# (it passed its health check) but fails the run, so it is seen.
+refresh_deploy_files() {
+  local name="$1" rel d
+  rel="$CORE_REAL/releases/$name"
+  for d in "$rel" "$rel/deploy" "$rel/deploy/linux"; do
+    if [[ -L "$(p "$d")" || ( -e "$(p "$d")" && ! -d "$(p "$d")" ) ]]; then
+      die "$d is not a folder; the deploy files were not refreshed (the Core update itself succeeded)"
+    fi
+    if [[ ! -e "$(p "$d")" ]]; then
+      log "core-v$name has no deploy files ($d missing; releases up to 0.2.4); the updater, its units and the TLS script are left as they are"
+      return 0
+    fi
+  done
+  check_trusted_file "$rel/deploy/linux/install-core.sh"
+  local args=(deploy-files)
+  [[ -z "$ROOT" ]] || args+=(--root "$ROOT")
+  log "refreshing the updater, install-core.sh, the TLS script and the units from core-v$name"
+  if ! SHADOW_CORE_UPDATE_LOCK_HELD=1 bash "$(p "$rel/deploy/linux/install-core.sh")" "${args[@]}"; then
+    die "refreshing the deploy files from core-v$name failed (the Core update itself succeeded); by hand: sudo bash $rel/deploy/linux/install-core.sh deploy-files"
+  fi
+}
+
 # ---------------------------------------------------------------- main
 main() {
   parse_args "$@"
@@ -670,6 +705,7 @@ main() {
   rm -f -- "$STATE/pending"
   log "updated: the Core runs $TARGET (was $prev_v)"
   prune "$(current_dir)" "$prev_dir"
+  refresh_deploy_files "$(current_dir)"
 }
 
 main "$@"
