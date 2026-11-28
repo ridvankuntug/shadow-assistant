@@ -241,6 +241,8 @@ export type ErrorCode =
   | "stt_unavailable"
   | "tts_unavailable"
   | "model_error"
+  /** T20: the model turn failed because the Core's Claude login was rejected (not logged in, expired, revoked); `message` is a Turkish text to show. */
+  | "model_login"
   | "busy"
   | "usage_limit"
   /** Development: the `itemId` is not (or no longer) listed. Notifications: the `notificationId` is unknown (or deleted). */

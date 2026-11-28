@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 // Type-only: agent.ts loads the provider SDK, which session.ts must never do.
 import type { AgentRunner, TurnResult } from "./agent.js";
+import { CLAUDE_LOGIN_TURN_MESSAGE, type ModelLoginWatch } from "./claude-login.js";
 import type { ConversationLog, SessionLog } from "./conversation-log.js";
 import {
   classifyToolError,
@@ -276,6 +277,11 @@ export interface SessionDeps {
    * no device words and the built-in deny name words only.
    */
   gateWords?: SessionGateWords;
+  /**
+   * The Claude login watch (T20, claude-login.ts): told about every model turn
+   * that failed on the login and every one that succeeded. Absent = not told.
+   */
+  modelLogin?: ModelLoginWatch;
 }
 
 /** router.yaml words the write gate uses (index.ts passes `CompiledRouterConfig.learning`). */
@@ -448,6 +454,23 @@ export class Session {
 
   private error(code: ErrorCode, message: string, id?: string): void {
     this.emit(id === undefined ? { type: "error", code, message } : { type: "error", id, code, message });
+  }
+
+  /**
+   * A failed model turn: `model_error`, or `model_login` with a Turkish text
+   * when the provider rejected its login (T20; the login watch is told). `why`
+   * is the turn's error string (SDK subtypes and codes, no token).
+   */
+  private turnFailed(id: string, why: string, kind: TurnResult["errorKind"]): void {
+    this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${why}`);
+    if (kind === "login") {
+      void this.slog.append({ kind: "error", id, code: "model_login", message: why });
+      this.error("model_login", CLAUDE_LOGIN_TURN_MESSAGE, id);
+      this.deps.modelLogin?.turnFailed();
+      return;
+    }
+    void this.slog.append({ kind: "error", id, code: "model_error", message: why });
+    this.error("model_error", "the model could not complete this turn", id);
   }
 
   /** Handles one validated client frame (hello is handled by the server). */
@@ -1448,11 +1471,10 @@ export class Session {
     const cancelled = turn.abort.signal.aborted;
     const finalText = turn.text;
     if (result.error && !cancelled) {
-      this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${result.error}`);
-      void this.slog.append({ kind: "error", id, code: "model_error", message: result.error });
-      this.error("model_error", "the model could not complete this turn", id);
+      this.turnFailed(id, result.error, result.errorKind);
       if (finalText) this.emit({ type: "assistant_done", id, text: finalText });
     } else {
+      if (!cancelled) this.deps.modelLogin?.turnSucceeded();
       this.emit({ type: "assistant_done", id, text: finalText });
     }
     const doneAt = Date.now();
@@ -1607,12 +1629,10 @@ export class Session {
         ...(out.retryAt !== undefined ? { retryAt: out.retryAt } : {}),
       });
     } else if (out.status !== "ok" && !cancelled) {
-      const why = out.error ?? out.status;
-      this.deps.logger.warn(`[shadow-core] turn ${id} failed: ${why}`);
-      void this.slog.append({ kind: "error", id, code: "model_error", message: why });
-      this.error("model_error", "the model could not complete this turn", id);
+      this.turnFailed(id, out.error ?? out.status, out.status === "error" ? out.errorKind : undefined);
       if (finalText) this.emit({ type: "assistant_done", id, text: finalText });
     } else {
+      if (out.status === "ok" && !cancelled) this.deps.modelLogin?.turnSucceeded();
       this.emit({ type: "assistant_done", id, text: finalText });
     }
     const doneAt = Date.now();

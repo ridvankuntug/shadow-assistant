@@ -172,7 +172,7 @@ The protocol number stays 1.
 | `ha_urgency_feedback` | Learned urgency of Home Assistant alerts (T7.w.11.10): `notification_action` also accepts `urgent_yes` / `urgent_no` ("Bu acildi" / "Acil değildi") on `source:"ha"` items, and the Development tab may list `kind:"ha_urgency"` suggestions that take `dev_action` `accept` ("Kabul") or `ignore` ("Yok say"). Without it clients offer neither (an older Core answers both actions with `bad_request`). |
 | `pc_permissions` | The PC permission list (T17.2, docs/11 D3): `pc_permissions_list` / `pc_permission_set` / `pc_permissions_seen` are answered and `pc_permissions_count` is sent. Without it clients hide the İzinler page and its count. |
 | `names` | Confirmed device names (T4.4b, docs/14 Decisions 6-8): `names_list` / `names_delete` are answered with `names`. Without it clients hide the "Cihaz adları" panel. (`confirm_request.remember` needs no feature: it is optional and old clients ignore it.) |
-| `rehearsal` | The Core runs in rehearsal mode (T11.5, CORE_REHEARSAL on): its notification producers are not started and urgent notifications are not spoken; the inbox still works. Clients show a "prova" band while it is listed. Old clients ignore it. |
+| `rehearsal` | The Core runs in rehearsal mode (T11.5, CORE_REHEARSAL on): its notification producers are not started (except the Claude login check, T20) and urgent notifications are not spoken; the inbox still works. Clients show a "prova" band while it is listed. Old clients ignore it. |
 
 Old clients ignore `features`. A Core sends `speech_chunk` only after the
 client's first `speech_prefs`, so clients that never send it see no change.
@@ -189,7 +189,8 @@ Agent SDK's `mcp__<service>__` prefix.
 | `bad_request` | Malformed frame, invalid base64/empty audio, audio > 25 MB, no speech recognized, speech service rejected the input, unsupported protocol. |
 | `stt_unavailable` | whisper-svc not configured, unreachable, loading (503) or timed out. |
 | `tts_unavailable` | tts-svc not configured, unreachable, loading or timed out; also a selected voice that is still being downloaded/loaded (retry shortly) or failed to load, and a `voices` request while tts-svc is not ready. |
-| `model_error` | The model turn failed (auth, API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
+| `model_error` | The model turn failed (API, max turns, …). The client should show a short failure message; partial text may follow as `assistant_done`. |
+| `model_login` | The model turn failed because the Core's Claude login was rejected (not logged in, expired or revoked; T20). `message` is a Turkish text the client can show as is (clients without this code show it as an unknown error with its message). The Core also keeps a `claude-login` inbox item while the login is down (docs/09 *(d)*). Otherwise like `model_error`. |
 | `busy` | A turn is already running (one turn per session at a time). |
 | `usage_limit` | The subscription's usage limit is reached. Optional `retryAt` (epoch ms) is when it resets. The turn is not retried or escalated. The client should show the reset time when it is known. |
 | `unknown_item` | `dev_action` names an `itemId` that is not (or no longer) listed; `notification_action` names a `notificationId` that does not exist (or was deleted); `pc_permission_set` names a `rowId` that is not in the list. |

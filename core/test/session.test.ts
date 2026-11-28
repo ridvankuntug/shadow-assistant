@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import type { PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
+import { CLAUDE_LOGIN_TURN_MESSAGE, type ModelLoginWatch } from "../src/claude-login.js";
 import { ConversationLog } from "../src/conversation-log.js";
 import { PermissionPolicy } from "../src/permissions.js";
 import { compileLexicon, type Lexicon } from "../src/pronunciation.js";
@@ -84,6 +85,7 @@ function harness(
     tts?: TtsClient;
     confirmTimeoutMs?: number;
     pronunciations?: Lexicon;
+    modelLogin?: ModelLoginWatch;
   } = {},
 ): Harness {
   const frames: ServerFrame[] = [];
@@ -105,6 +107,7 @@ function harness(
       logger: { info: () => {}, warn: () => {} },
       confirmTimeoutMs: opts.confirmTimeoutMs ?? 5_000,
       pronunciations: opts.pronunciations,
+      modelLogin: opts.modelLogin,
     },
     { sessionId: `s${counter}`, device: "browser" },
     (f) => {
@@ -387,6 +390,23 @@ test("model error → error model_error, back to idle", async () => {
   });
   await h2.send({ type: "user_text", id: "t1", text: "x" });
   assert.equal(h2.of("error")[0]?.code, "model_error");
+});
+
+test("T20 legacy path: errorKind login → error model_login (Turkish text) and the watch is told; success tells it back", async () => {
+  const calls: string[] = [];
+  const modelLogin: ModelLoginWatch = { turnFailed: () => calls.push("failed"), turnSucceeded: () => calls.push("ok") };
+  let n = 0;
+  const h = harness(async (_req, cb) => {
+    if (++n === 1) return { error: "assistant error: authentication_failed", errorKind: "login" };
+    cb.onDelta("Tamam.");
+  }, { modelLogin });
+  await h.send({ type: "user_text", id: "t1", text: "x" });
+  const err = h.of("error")[0];
+  assert.equal(err?.code, "model_login");
+  assert.equal(err?.message, CLAUDE_LOGIN_TURN_MESSAGE);
+  await h.send({ type: "user_text", id: "t2", text: "y" });
+  assert.deepEqual(calls, ["failed", "ok"]);
+  assert.equal(h.of("state").at(-1)?.state, "idle");
 });
 
 test("audio turn: transcript then handled like user_text", async () => {

@@ -759,7 +759,7 @@ export class DeviceAgent implements ProviderSession {
   }
 
   private build(a: Attempt, status: AttemptStatus, fallbackText: boolean): AttemptOutcome {
-    const r = a.stream.result(this.now() - a.submittedAt, { fallbackText });
+    const { errorKind, ...r } = a.stream.result(this.now() - a.submittedAt, { fallbackText });
     let error = r.error;
     // `cancelled`, or an answer already delivered before an internal tail error.
     if (status === "cancelled" || (status === "ok" && a.visibleDone)) error = undefined;
@@ -769,6 +769,8 @@ export class DeviceAgent implements ProviderSession {
     return {
       ...r,
       error,
+      // A login rejection only explains an `error` attempt (not a limit, timeout or cancel).
+      ...(status === "error" && errorKind ? { errorKind } : {}),
       costUsd: a.costUsd,
       status,
       model: a.model ?? a.req.model,

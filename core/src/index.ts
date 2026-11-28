@@ -17,6 +17,7 @@ import { ClaudeSdkProvider, RestartBackoff } from "./device-agent.js";
 import { DEVICE_SERVICE_NAME, DeviceStateStore, deviceStateService, isUsableDeviceName } from "./device-state.js";
 import { continuityPort, DeviceRegistry } from "./device-registry.js";
 import { BackupProducer, backupStatusPath } from "./backup-producer.js";
+import { ClaudeLoginMonitor, credentialsFile, fileCheckOff } from "./claude-login.js";
 import { ServiceProducer } from "./service-producer.js";
 import { AuthGate } from "./auth-gate.js";
 import { createHaAlerts } from "./ha-producer.js";
@@ -428,6 +429,19 @@ export async function main(): Promise<void> {
     },
     logger,
   });
+  // Claude login check (T20, docs/09 (d)): the CLI's credentials file every few minutes (no model call)
+  // and login errors of model turns (sessions report them). Runs in rehearsal too (rehearsal.ts).
+  const loginFileOff = fileCheckOff(process.env);
+  const claudeLogin = new ClaudeLoginMonitor({
+    notifications: {
+      raise: (input) => notificationCenter.raise(input),
+      resolve: (source, key) => notificationCenter.resolve(source, key),
+      list: () => notificationStore.list(),
+      suppressed: () => notificationCenter.suppressed(),
+    },
+    logger,
+    credentialsFile: loginFileOff ? undefined : credentialsFile(process.env),
+  });
   // HA alerts producer (docs/09 (c)): HA's persistent notifications over a read-only WebSocket client;
   // off (one info line) without HA_URL / HA_CORE_TOKEN. Adoption reads the store directly.
   // CORE_REHEARSAL (T11.5): not even built, so no "ha alerts: on" line and no HA WebSocket client.
@@ -471,6 +485,7 @@ export async function main(): Promise<void> {
           pcPermissions,
           names: confirmedNames,
           gateWords,
+          modelLogin: claudeLogin,
         },
         info,
         send,
@@ -541,8 +556,12 @@ export async function main(): Promise<void> {
   }
   for (const w of listeners.warnings) logger.warn(`[shadow-core] ${w}`);
   monitor.start();
-  // CORE_REHEARSAL (T11.5): none started; one warn line says what is off.
-  startNotificationProducers(cfg.rehearsal, [backupProducer, serviceProducer, haAlerts], logger);
+  // CORE_REHEARSAL (T11.5): none started; one warn line says what is off. The Claude login check
+  // (T20) starts in both modes: the Pi's own login is not something the live PC Core reports.
+  startNotificationProducers(cfg.rehearsal, [backupProducer, serviceProducer, haAlerts], logger, [claudeLogin]);
+  logger.info(
+    `[shadow-core] claude login check: on, every ${claudeLogin.intervalMs / 60_000} min (${loginFileOff ? `file check off: ${loginFileOff}; turn errors only` : "credentials file + turn errors"})`,
+  );
   // List the remote services once now, so the first session gets their tools and instructions.
   void gateway.warm();
   logger.info(`[shadow-core] mcp gateway: ${gateway.services.join(", ") || "no services"}`);
@@ -562,6 +581,7 @@ export async function main(): Promise<void> {
           { name: "health monitor", run: () => monitor.close() },
           { name: "backup producer", run: () => backupProducer.close() },
           { name: "service producer", run: () => serviceProducer.close() },
+          { name: "claude login check", run: () => claudeLogin.close() },
           { name: "ha alerts", run: () => haAlerts?.close() },
           // Closes every socket; each session flushes its conversation log lines.
           { name: "server", run: () => server.close() },

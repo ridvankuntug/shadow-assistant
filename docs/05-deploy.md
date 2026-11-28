@@ -297,7 +297,8 @@ All optional, set in `.env` (defaults in `.env.example`; details in
   urgent notifications are shown but not spoken in this window (docs/09).
 - Rehearsal: `CORE_REHEARSAL` (default off; T11.5, docs/13): on = the
   notification producers are not started and no urgent notification is
-  spoken (one startup warn line says so); the inbox still works. An invalid
+  spoken (one startup warn line says so); the inbox still works. The Claude
+  login check (T20, "Claude login") still runs. An invalid
   value stops the Core.
 - `SHADOW_PRONUNCIATIONS_FILE`: alternative pronunciation lexicon.
 
@@ -819,7 +820,8 @@ the Claude login, `<pi>` the Pi's SSH address, `<release>` the release file.
    value held in a user environment variable:
 
    ```powershell
-   [Environment]::GetEnvironmentVariable('HA_CORE_TOKEN','User') | ssh <user>@<pi> "tr -d '' | sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN"
+   [Environment]::GetEnvironmentVariable('HA_CORE_TOKEN','User') | ssh <user>@<pi> "tr -d '
+' | sudo bash ~/core-install/linux/install-core.sh set-secret HA_CORE_TOKEN"
    ```
 
    An existing secret is changed only with `--replace`. Restart the Core
@@ -1317,12 +1319,23 @@ installed release does the same:
 `.credentials.json` exists. Without it the Core starts, but its model
 sessions are not logged in (see the journal).
 
+**When the login drops (T20).** The Core checks `.credentials.json` every 5
+minutes (missing, unreadable or without a refresh token) and watches model
+turns for a rejected login. While it is down the inbox holds one item
+"Claude oturumu yenilenmeli", and a turn that fails on the login answers in
+the chat with that reason (`model_login`) instead of a generic error. Only
+apps that are open see it; there is no push (decision K6). Repeat the T11.3
+step above; the item closes by itself once the login works (the file is
+rewritten, or the next turn succeeds). The journal shows
+`claude login: down (…)` / `claude login: ok`. The check runs in rehearsal
+too.
+
 The unit also sets `DISABLE_AUTOUPDATER=1`: the CLI comes with the release,
 and its self-updater would write under `~/.local` and `~/.cache`. A few CLI
 features that the Core does not use keep fixed paths under the home (for
 example `~/.claude/state/`); they would fail there. Not yet verified on the
 Pi: a token refresh by the running Core (watch the journal for `EROFS` or
-login errors after the first day).
+`claude login: down` after the first day).
 
 Without `local.conf` the unit refuses to start (`status=217/USER`: its
 placeholder account does not exist), so it never runs as root.

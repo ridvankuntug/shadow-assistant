@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { AgentRunner, TurnCallbacks, TurnRequest, TurnResult } from "../src/agent.js";
+import { CLAUDE_LOGIN_TURN_MESSAGE, type ModelLoginWatch } from "../src/claude-login.js";
 import { ConversationLog } from "../src/conversation-log.js";
 import type { DirectToolClient, DirectToolResult, RemoteMcpClient } from "../src/mcp-direct.js";
 import { McpGateway, type GatewayToolResult } from "../src/mcp-gateway.js";
@@ -94,6 +95,7 @@ interface Step {
   status?: AttemptStatus;
   retryAt?: number;
   error?: string;
+  errorKind?: "login";
   /** Called before the visible end (e.g. to use a tool through the gate). */
   run?: (req: AttemptRequest) => Promise<void>;
   /** Hold `settled` until released. */
@@ -138,6 +140,7 @@ class FakeLive implements ProviderSession {
         model: req.model,
         ...(step.retryAt !== undefined ? { retryAt: step.retryAt } : {}),
         ...(step.error ? { error: step.error } : {}),
+        ...(step.errorKind ? { errorKind: step.errorKind } : {}),
         warm: true,
         queryAgeMs: 5_000,
         doneMs: 10,
@@ -243,6 +246,7 @@ function harness(o: {
   tts?: TtsClient;
   tierServices?: Partial<Record<1 | 2 | 3, readonly string[]>>;
   lexicon?: ReturnType<typeof compileLexicon>["lexicon"];
+  modelLogin?: ModelLoginWatch;
 }) {
   const frames: ServerFrame[] = [];
   const waiters: Array<() => void> = [];
@@ -269,6 +273,7 @@ function harness(o: {
       direct: new MockHa(),
       tierServices: o.tierServices,
       pronunciations: o.lexicon,
+      modelLogin: o.modelLogin,
     },
     { sessionId: `p${counter}`, device: "browser" },
     (f) => {
@@ -402,6 +407,34 @@ test("model error keeps partial text and sends model_error", async () => {
   await h.say("anlat");
   assert.equal(h.of("error")[0]?.code, "model_error");
   assert.equal(h.of("assistant_done")[0]?.text, "Yarım");
+});
+
+test("T20: a login rejection → error model_login with the Turkish text, the login watch told; a later ok turn tells it back", async () => {
+  const calls: string[] = [];
+  const modelLogin: ModelLoginWatch = { turnFailed: () => calls.push("failed"), turnSucceeded: () => calls.push("ok") };
+  let n = 0;
+  const live = new FakeLive(() =>
+    ++n === 1 ? { status: "error", error: "assistant error: authentication_failed", errorKind: "login" } : { deltas: ["Tamam."] },
+  );
+  const h = harness({ live, modelLogin, router: { route: () => ({ model: MODELS[2], tier: 2 }) } });
+  await h.say("selam");
+  const err = h.of("error")[0];
+  assert.equal(err?.code, "model_login");
+  assert.equal(err?.message, CLAUDE_LOGIN_TURN_MESSAGE);
+  assert.deepEqual(calls, ["failed"]);
+  await h.say("tekrar", "t2");
+  assert.deepEqual(calls, ["failed", "ok"]);
+  assert.equal(h.of("error").length, 1);
+});
+
+test("T20: other errors stay model_error and do not touch the login watch", async () => {
+  const calls: string[] = [];
+  const modelLogin: ModelLoginWatch = { turnFailed: () => calls.push("failed"), turnSucceeded: () => calls.push("ok") };
+  const live = new FakeLive(() => ({ status: "error", error: "assistant error: overloaded" }));
+  const h = harness({ live, modelLogin, router: { route: () => ({ model: MODELS[2], tier: 2 }) } });
+  await h.say("selam");
+  assert.equal(h.of("error")[0]?.code, "model_error");
+  assert.deepEqual(calls, []);
 });
 
 test("another socket of the same device is running an attempt → error busy", async () => {

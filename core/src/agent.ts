@@ -22,6 +22,7 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { isLoginError } from "./claude-login.js";
 import { gatewayToolGuard } from "./gateway-sdk.js";
 import type { PermissionCallback } from "./model-provider.js";
 import { buildTurnEnvelope } from "./turn-envelope.js";
@@ -71,6 +72,12 @@ export interface TurnResult {
   costUsd?: number;
   /** Set when the turn ended on an error (model/auth/API); text may be partial. */
   error?: string;
+  /**
+   * With `error` only: `login` = the provider rejected its login (not logged
+   * in, expired or revoked token, invalid credentials; T20). Absent = any other
+   * error (rate limit, overload, network, API, …).
+   */
+  errorKind?: "login";
 }
 
 /**
@@ -297,6 +304,7 @@ export class TurnStream {
   private costUsd: number | undefined;
   private durationMs: number | undefined;
   private error: string | undefined;
+  private errorKind: "login" | undefined;
   private finalText: string | undefined;
 
   constructor(private readonly cb: TurnCallbacks) {}
@@ -325,7 +333,11 @@ export class TurnStream {
       }
       case "assistant": {
         if (msg.parent_tool_use_id) return;
-        if (msg.error) this.error = `assistant error: ${msg.error}`;
+        if (msg.error) {
+          this.error = `assistant error: ${msg.error}`;
+          // The structured SDK error, never the message text (T20, claude-login.ts).
+          if (isLoginError(msg.error)) this.errorKind = "login";
+        }
         for (const block of msg.message.content) {
           if (block.type === "tool_use") {
             this.toolNames.set(block.id, block.name);
@@ -397,6 +409,7 @@ export class TurnStream {
       durationMs: this.durationMs ?? elapsedMs,
       costUsd: this.costUsd,
       error: this.error,
+      ...(this.error !== undefined && this.errorKind ? { errorKind: this.errorKind } : {}),
     };
   }
 }

@@ -1,4 +1,4 @@
-# 09 - Notification producers: backup, services, HA alerts
+# 09 - Notification producers: backup, services, HA alerts, Claude login
 
 Status: design (T7.w.11 in the vault plan). Builds on the notification store and
 its delivery ([`08-learning-fast-path.md`](08-learning-fast-path.md#t7w5-notification-store),
@@ -423,6 +423,36 @@ urgency*), UI in `controller.test.ts`, `notificationsPanel.test.ts`,
   `issue_id` type; a `pn:` item's type is derived from its key. Feedback on the
   `ha:access` item ("HA uyarıları okunamıyor") or any non-`ha` item →
   `bad_request`.
+
+### (d) Claude login down (T20)
+
+Decision K6: the warning reaches only apps that are open (inbox item, chat
+error); no push (FCM). Implemented in [`claude-login.ts`](../core/src/claude-login.ts),
+wired in `index.ts`; tests in `core/test/claude-login.test.ts`.
+
+- **Signals (no model call).** (1) A model turn whose SDK assistant message
+  carries the structured error `authentication_failed` (not logged in, expired
+  or revoked token, invalid credentials): down at once. Other SDK errors
+  (`rate_limit`, `overloaded`, `server_error`, `billing_error`, …) are not
+  login problems. (2) Every 5 min the CLI's `.credentials.json` in
+  `CLAUDE_CONFIG_DIR` (default `~/.claude`) is read: missing, unreadable, not
+  JSON or without a refresh token → down. Only the refresh token's presence is
+  checked; no token value is logged, stored or kept. The file check is off
+  with `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` set and on macOS
+  (Keychain); turn errors still count.
+- **Back.** The file check passes and no turn error is pending. A turn error is
+  cleared by a later successful turn, or by the credentials file being
+  rewritten since the error (a new `/login` or a successful token refresh).
+- **Item.** Source `claude-login`, key `login`, normal, one per outage (fixed
+  Turkish text pointing to the T11.3 step of docs/05 "Claude login"),
+  resolved when the login is back. Startup reconcile, "Tekrar gösterme" and
+  the 60 s store retry as in the other producers. State is in memory: a
+  pending turn error does not survive a restart (the next failing turn
+  raises the item again).
+- **Chat.** The failed turn gets `error` code `model_login` with a Turkish
+  `message` instead of `model_error` (docs/02 *Errors*).
+- **Rehearsal.** Runs with CORE_REHEARSAL on too: it watches this Core's own
+  login, which the live PC Core does not report.
 
 ### Urgent items while no client is connected (protocol change, proposed)
 

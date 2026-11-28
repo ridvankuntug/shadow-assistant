@@ -427,6 +427,29 @@ test("usage limit: rejected rate_limit_event + assistant rate_limit → usage_li
   agent.close();
 });
 
+test("T20: assistant authentication_failed → status error with errorKind login; the CLI's text is not an answer", async () => {
+  const f = new FakeSdk();
+  f.reply = (_m, ff) => {
+    if (ff.sent.length === 1) {
+      ff.assistant([{ type: "text", text: "Not logged in · Please run /login" }], { error: "authentication_failed" });
+      ff.result({ result: "Not logged in · Please run /login", is_error: true });
+    } else {
+      ff.assistant([{ type: "text", text: "busy" }], { error: "overloaded" });
+      ff.result({ result: "busy", is_error: true });
+    }
+  };
+  const deltas: string[] = [];
+  const agent = makeAgent(f);
+  const a = await agent.runAttempt(attempt("selam", { deltas })).settled;
+  assert.equal(a.status, "error");
+  assert.equal(a.errorKind, "login");
+  assert.deepEqual(deltas, []);
+  const b = await agent.runAttempt(attempt("tekrar")).settled;
+  assert.equal(b.status, "error");
+  assert.equal(b.errorKind, undefined);
+  agent.close();
+});
+
 test("usage limit from the result error text alone; other errors stay errors", async () => {
   const f = new FakeSdk();
   f.reply = (_m, ff) => {

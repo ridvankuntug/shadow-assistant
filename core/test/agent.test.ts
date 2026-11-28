@@ -178,6 +178,14 @@ test("TurnStream: no partials → final text; error results surface", () => {
   const a = new TurnStream({ onDelta: () => {} });
   a.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s4", error: "authentication_failed", message: { content: [] } }));
   assert.match(a.result(0).error ?? "", /authentication_failed/);
+  // T20: the structured SDK error marks a login rejection; other assistant errors do not.
+  assert.equal(a.result(0).errorKind, "login");
+  for (const other of ["rate_limit", "overloaded", "server_error", "billing_error", "unknown"]) {
+    const o = new TurnStream({ onDelta: () => {} });
+    o.consume(msg({ type: "assistant", parent_tool_use_id: null, session_id: "s5", error: other, message: { content: [] } }));
+    assert.equal(o.result(0).errorKind, undefined, other);
+  }
+  assert.equal(e.result(0).errorKind, undefined, "a result error alone is not a login error");
 });
 
 test("persistent options: one static prompt with tier1.md, all MCP servers, no tier/fork inputs", () => {
