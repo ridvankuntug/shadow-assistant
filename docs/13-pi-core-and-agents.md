@@ -842,8 +842,7 @@ differs from or adds to the steps above:
   (the updater, `install-core.sh`, the TLS script, the five units; covered by
   the signed `SHA256SUMS`). After a successful health check the updater runs
   the new release's `install-core.sh deploy-files`: atomic replace, no
-  symlinks, `daemon-reload` on a unit change, timers re-enabled only if they
-  were enabled. Never the public key (no release replaces its own trust
+  symlinks, `daemon-reload` and enabled timers re-enabled on every refresh. Never the public key (no release replaces its own trust
   root; rotation by hand), `core.env`, `local.conf` or the credstore. A
   rolled-back release never reaches this step. A changed
   `shadow-core.service` takes effect at the Core's next restart. docs/05

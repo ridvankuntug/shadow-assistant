@@ -1017,12 +1017,14 @@ minutes (up to 10 minutes random delay). A run:
    (the updater itself), the copy `/usr/local/lib/shadow-assistant/install-core.sh`,
    `/usr/local/sbin/shadow-core-tls` and the five units in
    `/etc/systemd/system/`. Everything is checked first (sources and
-   destinations regular files, no symlinks, sources root's and not writable
-   by others, the folders exist); then each file is replaced atomically
-   (temporary file + rename, so the running updater keeps reading its old
-   file). A changed unit: `systemctl daemon-reload`; a changed timer is
-   re-enabled only if it was enabled (the updater's timer never while
-   automatic updates are off). Never touched: the public key, `core.env`,
+   destinations regular files, no symlinks, sources and every folder on the
+   destination paths root's and not writable by others, the folders exist);
+   then each file is replaced atomically (temporary file + rename, so the
+   running updater keeps reading its old file). Then `systemctl
+   daemon-reload` and the two timers are re-enabled if they were enabled
+   (the updater's timer never while automatic updates are off); both on
+   every refresh, so a refresh interrupted after the copy is completed by
+   the next one. Never touched: the public key, `core.env`,
    `local.conf`, the credstore. A release without `deploy/linux/` (up to
    0.2.4): one journal line, nothing refreshed. A failure here keeps the
    Core update (it passed its health check) but leaves the unit failed;

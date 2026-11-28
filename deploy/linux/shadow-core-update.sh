@@ -37,7 +37,7 @@
 #   7. After a successful update only: installs the scripts and units of the
 #      new release (its deploy/linux/: this updater, the copy of
 #      install-core.sh, the TLS script, the five units) with that release's
-#      install-core.sh deploy-files; daemon-reload if a unit changed. Never
+#      install-core.sh deploy-files; daemon-reload. Never
 #      the public key, core.env, local.conf or the credstore. A release
 #      without deploy/linux/ (up to 0.2.4): skipped with a log line.
 # Offline, GitHub down or rate-limited, assets not uploaded yet: one log line,

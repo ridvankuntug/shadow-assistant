@@ -36,7 +36,7 @@
 #               only installs the scripts and units of this script's folder
 #               (the updater, this script's copy, the TLS script, the five
 #               units; never core.env, local.conf, the credstore or the
-#               public key); daemon-reload if a unit changed. The updater runs
+#               public key); daemon-reload, enabled timers re-enabled. The updater runs
 #               it from the deploy/linux/ folder of a release it has just
 #               installed; this folder and its files must be root's and not
 #               writable by others. No restart, no timer enabled.
@@ -516,24 +516,19 @@ readonly DEPLOY_FILES=(
 readonly DEPLOY_DIRS_REAL=("$SYSTEMD_DIR_REAL" /usr/local/sbin "$LIB_DIR_REAL")
 
 # copy_deploy_files: install_copy of every DEPLOY_FILES entry. Sets
-# UNIT_CHANGED (shadow-core.service) and CHANGED_UNITS (every unit copied).
+# UNIT_CHANGED when shadow-core.service was copied.
 # The TLS script and its weekly renewal timer (docs/05 section 7 "HTTPS
 # certificate"): the timer's service is skipped until the CA exists, so the
 # timer is enabled on every install; creating the CA is the separate step
 # "shadow-core-tls init --ip <pi-lan-ip>". The updater (T12.2) runs "release"
 # and "switch" from the copy of this script.
 UNIT_CHANGED=0
-CHANGED_UNITS=()
 copy_deploy_files() {
   local e mode name real
   for e in "${DEPLOY_FILES[@]}"; do
     IFS='|' read -r mode name real <<<"$e"
     install_copy "$mode" "$name" "$real"
-    [[ $COPIED -eq 1 ]] || continue
-    case "$name" in
-      *.service|*.timer) CHANGED_UNITS+=("$name") ;;
-    esac
-    [[ "$name" != "$UNIT_NAME" ]] || UNIT_CHANGED=1
+    if [[ $COPIED -eq 1 && "$name" == "$UNIT_NAME" ]]; then UNIT_CHANGED=1; fi
   done
 }
 
@@ -969,12 +964,23 @@ check_trusted_dir() {
 }
 
 check_deploy_targets() {
-  local d e mode name real dst
+  local d e mode name real dst comps=()
   # deploy-files never creates folders (the updater's sandbox may write only
-  # into these): they exist since the first install.
+  # into these): they exist since the first install. Every component of the
+  # path (from /, below --root with it) must be a real folder, root's and not
+  # writable by others: no symlinked parent redirects a write, and nobody
+  # else can swap an entry between this check and the rename.
+  local part comp
   for d in "${DEPLOY_DIRS_REAL[@]}"; do
     in_root "$(p "$d")"
-    [[ -d "$(p "$d")" && ! -L "$(p "$d")" ]] || die "$d is missing, not a folder or a symlink; nothing installed (run 'install' first)"
+    part=""
+    IFS='/' read -r -a comps <<<"${d#/}"
+    for comp in "${comps[@]}"; do
+      part="$part/$comp"
+      [[ -d "$(p "$part")" && ! -L "$(p "$part")" ]] || die "$part is missing, not a folder or a symlink; nothing installed (run 'install' first)"
+      if [[ $OWN_OK -eq 1 && "$(stat -c '%u' -- "$(p "$part")")" != 0 ]]; then die "$part is not owned by root; nothing installed"; fi
+      (( (8#$(file_mode "$(p "$part")") & 8#022) == 0 )) || die "$part is writable by group or others; nothing installed"
+    done
   done
   for e in "${DEPLOY_FILES[@]}"; do
     IFS='|' read -r mode name real <<<"$e"
@@ -1003,22 +1009,20 @@ deploy_files_main() {
   check_deploy_targets
   info "installing the scripts and units from $SCRIPT_DIR"
   copy_deploy_files
-  if [[ ${#CHANGED_UNITS[@]} -eq 0 ]]; then
-    info "the units are up to date; no daemon-reload"
-    return 0
-  fi
+  # daemon-reload and re-enabling on every run, changed or not: cheap and
+  # idempotent, and a run whose reload failed (or was killed after the copy)
+  # is completed by the next one, although the files are equal by then.
   sysctl daemon-reload
-  for u in "${CHANGED_UNITS[@]}"; do
-    [[ "$u" == *.timer ]] || continue
+  for u in "$TLS_TIMER" "$UPDATE_TIMER"; do
     # A changed [Install] section takes effect only through re-enabling; a
     # timer that is off stays off, and the updater's timer stays off while
     # automatic updates are off (core-update.disabled).
     if [[ "$u" == "$UPDATE_TIMER" && ( -e "$(p "$UPDATE_DISABLED_REAL")" || -L "$(p "$UPDATE_DISABLED_REAL")" ) ]]; then
-      info "$u changed; automatic updates are off ($UPDATE_DISABLED_REAL): not re-enabled"
+      info "$u: automatic updates are off ($UPDATE_DISABLED_REAL): not re-enabled"
     elif timer_enabled "$u"; then
       sysctl reenable "$u"
     else
-      info "$u changed; it is not enabled, so it stays off"
+      info "$u is not enabled; it stays off"
     fi
   done
   if [[ $UNIT_CHANGED -eq 1 ]]; then

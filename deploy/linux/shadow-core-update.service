@@ -11,7 +11,7 @@
 # GET /health with the new version; on failure it switches back and restarts.
 # After a successful update it installs the new release's scripts and units
 # (install-core.sh deploy-files: itself, the installer copy, the TLS script,
-# the five units; daemon-reload if one changed). Never the public key.
+# the five units; daemon-reload). Never the public key.
 # Offline or nothing new: exits 0. A rejected download, a failed pre-check or a
 # rollback leaves the unit failed: systemctl --failed,
 # journalctl -u shadow-core-update. By hand: sudo shadow-core-update --check
