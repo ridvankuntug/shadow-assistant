@@ -83,8 +83,12 @@ jobs:
           npm test
           npm run build
 
+      # UI_VERSION: the UI sends this release's exact X.Y.<run> as hello.clientVersion
+      # (ui/vite.config.ts; without it only X.Y from VERSION).
       - name: UI tests and build (ui/dist)
         working-directory: ui
+        env:
+          UI_VERSION: ${{ steps.version.outputs.version }}
         run: |
           npm ci
           npm test

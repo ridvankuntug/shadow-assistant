@@ -895,7 +895,10 @@ and checks the layout the way `install-core.sh` does. A push to `main` that
 changes `core/`, `ui/` or `VERSION`, or a manual run on `main` (Actions →
 Core → Run workflow), publishes the GitHub Release `core-v<X.Y>.<n>`
 (`X.Y` from `VERSION`, `<n>` the workflow's run number; Android's tags are
-`v<X.Y>.<n>`). Assets:
+`v<X.Y>.<n>`). The UI in the package is built with `UI_VERSION=<X.Y>.<n>`,
+so it sends the release's exact version as `hello.clientVersion` (the Android
+workflow does the same with the APK's `versionName`); a local build sends
+only `X.Y`. Assets:
 
 | File | What |
 | --- | --- |

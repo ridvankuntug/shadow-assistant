@@ -87,7 +87,7 @@ Android app and the Core are released by separate workflows).
 
 `hello.clientVersion` is the client's `X.Y[.<n>]`: the browser UI sends the
 version its build took from the root `VERSION` (env `UI_VERSION` may set
-`X.Y.<n>`), the UI inside the Android shell sends the app's `versionName`
+`X.Y.<n>`; the CI release builds set it to the release version), the UI inside the Android shell sends the app's `versionName`
 (`X.Y.<n>`, from the bridge's `getInfo().appVersion`). On `version_base` the UI
 shows a non-blocking band "Sürüm uyuşmuyor: arayüz X.Y, çekirdek A.B —
 güncelleyin" while that connection lasts.

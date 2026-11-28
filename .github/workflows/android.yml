@@ -106,9 +106,17 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      # UI_VERSION: the APK's versionName (<X.Y>.<run>, as Gradle derives it below), so a
+      # UI that cannot read the bridge still reports the exact version (ui/vite.config.ts).
+      # A malformed VERSION gives an invalid value that vite ignores; Gradle then fails.
       - name: Build UI bundle (ui/dist)
         working-directory: ui
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
+          base="$(head -n1 ../VERSION | tr -d '[:space:]')"
+          export UI_VERSION="$base.$RUN_NUMBER"
+          echo "UI version $UI_VERSION"
           npm ci
           npm run build
 
