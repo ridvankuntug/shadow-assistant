@@ -1,6 +1,5 @@
 {
   "name": "@shadow-assistant/core",
-  "version": "0.0.0",
   "private": true,
   "description": "Shadow Assistant Core: WebSocket API, router, permission gate, service registry and Home Assistant MCP bridge.",
   "license": "MIT",
