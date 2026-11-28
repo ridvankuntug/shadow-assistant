@@ -476,6 +476,21 @@ mkdir "$rel/.staging.Zz9999"
 upd --check
 check '[[ $RC -eq 0 && -d "$rel/.staging.Zz9999" ]]' "--check removed a folder"
 
+fresh "a .staging leftover that cannot be removed does not stop the run" 0.2.5
+publish 0.2.6
+api core-v0.2.6 core-v0.2.5
+rel="$R/opt/shadow-assistant/core/releases"
+mkdir -p "$rel/.staging.Uu1234/tree"; touch "$rel/.staging.Uu1234/tree/f"
+chown -R 65534:65534 "$rel/.staging.Uu1234/tree"; chmod 0755 "$rel/.staging.Uu1234/tree"
+if command -v setpriv >/dev/null; then
+  # As the unit: root without capabilities (CapabilityBoundingSet=), so no DAC override.
+  PATH="$W/bin:$PATH" SHADOW_UPDATE_TEST=1 SHADOW_UPDATE_HEALTH_TIMEOUT=2 FIX="$FIX" FAKE_ROOT="$R" FAKE_STATE="$FS"     setpriv --bounding-set=-all --inh-caps=-all bash "$HERE/shadow-core-update.sh" --root "$R" --now > "$W/out" 2>&1
+  RC=$?
+  check '[[ $RC -eq 0 && "$(current)" == releases/0.2.6 && -e "$rel/.staging.Uu1234/tree/f" ]] && out_has "could not remove all of releases/.staging.Uu1234"' "rc $RC current $(current)"
+else
+  echo "skipped (no setpriv): $CURRENT_TEST"
+fi
+
 fresh "untrusted public key (group-writable): refuse" 0.2.5
 publish 0.2.6
 api core-v0.2.6 core-v0.2.5

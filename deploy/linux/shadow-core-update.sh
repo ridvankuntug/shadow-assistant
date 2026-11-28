@@ -220,7 +220,12 @@ clean_staging() {
       continue
     fi
     log "removing releases/$name (left by an interrupted install)"
-    rm -rf -- "${releases:?}/$name"
+    # A leftover the service cannot delete (e.g. files of another account from
+    # a manual install killed before its chown; the unit has no capabilities)
+    # must not stop every later run before recover_pending: logged, kept.
+    if ! rm -rf -- "${releases:?}/$name" 2>/dev/null; then
+      err "could not remove all of releases/$name; remove it by hand (sudo rm -rf $CORE_REAL/releases/$name)"
+    fi
   done
 }
 
