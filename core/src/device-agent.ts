@@ -1005,11 +1005,11 @@ export class ClaudeSdkProvider implements ModelProvider {
       req.signal?.removeEventListener("abort", onAbort);
     }
     if (ac.signal.aborted) return { ...base, model, status: "cancelled" };
-    // Same semantics as session.ts: a login rejection only counts for an `error` outcome (not a
-    // limit or cancel), and only a normal answer says the login works.
+    // Same semantics as session.ts with a DeviceAgent attempt: a login rejection only counts for
+    // an `error` outcome (not a limit or cancel), and every `ok` outcome says the login works.
     const report = (r: OneShotResult): OneShotResult => {
       if (r.status === "error" && loginError) this.o.modelLogin?.turnFailed();
-      else if (r.status === "ok" && !loginError) this.o.modelLogin?.turnSucceeded();
+      else if (r.status === "ok") this.o.modelLogin?.turnSucceeded();
       return r;
     };
     const u = (res?.usage ?? {}) as unknown as Record<string, number | undefined>;
