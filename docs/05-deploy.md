@@ -1326,3 +1326,41 @@ login errors after the first day).
 
 Without `local.conf` the unit refuses to start (`status=217/USER`: its
 placeholder account does not exist), so it never runs as root.
+
+### Reading the data from the PC (T17.3)
+
+The data folder (`SHADOW_DATA_DIR`, `/var/lib/shadow-assistant/data/`) belongs
+to `<user>` (`0700`, files `0600`), the same account the SSH key logs in as
+(T9), so Claude Code (or a person) reads it over SSH with no extra service,
+share or mount. Claude Code runs the same commands through its shell tool.
+
+```sh
+ssh <user>@<pi> ls /var/lib/shadow-assistant/data
+ssh <user>@<pi> cat /var/lib/shadow-assistant/data/memory/state.json | python -m json.tool
+ssh <user>@<pi> ls /var/lib/shadow-assistant/data/conversations/<YYYY-MM-DD>
+ssh <user>@<pi> cat /var/lib/shadow-assistant/data/conversations/<YYYY-MM-DD>/<id>.jsonl
+ssh <user>@<pi> journalctl -u shadow-core --since today --no-pager
+ssh <user>@<pi> curl -s http://127.0.0.1:8700/health
+```
+
+The layout is the same as on the PC (`conversations/<date>/<id>.jsonl`,
+`memory/state.json`, `dev-notes/`, `sessions/`, `backup/status.json`, …).
+The Pi has no `jq`; pretty-print on the PC (`python -m json.tool`) or with
+`node -e` on the Pi.
+
+Rules:
+
+- **Read only.** The Core keeps this state in memory and rewrites the files
+  itself; a file edited over SSH while the unit runs is overwritten or read
+  back half-written. Changes go through the Core (the UI, the protocol), or
+  with the unit stopped (`sudo systemctl stop shadow-core`, then start it).
+- **Copies stay off git.** For a longer analysis, copy the folder to a scratch
+  place outside the repo and the vault, and delete it afterwards: it holds
+  conversations and memory.
+
+  ```sh
+  ssh <user>@<pi> tar -C /var/lib/shadow-assistant -cz data | tar -xz -C <scratch>
+  ```
+
+- **Not `claude/`.** `/var/lib/shadow-assistant/claude/` holds the Claude
+  login (see "Claude login"); it is not data and is not read or copied.
